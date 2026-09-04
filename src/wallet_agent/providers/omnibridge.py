@@ -25,14 +25,13 @@ def _equipment(address: str) -> str:
     return address[:32]
 
 
-def _success(response: dict[str, Any]) -> dict[str, Any]:
+def _success(response: dict[str, Any]) -> Any:
     code = str(response.get("resCode", ""))
     if code != "800":
         raise ProviderResponseError(
             code, str(response.get("resMsg", "Provider request failed")), category="client"
         )
-    data = response.get("data", {})
-    return data if isinstance(data, dict) else {}
+    return response.get("data", {})
 
 
 def _raw(amount: Decimal, decimals: int) -> str:
@@ -55,19 +54,37 @@ class OmniBridgeProvider:
 
     async def list_assets(self, query: AssetQuery) -> list[Asset]:
         payload = {"sourceFlag": self.source_flag}
+        if query.chain:
+            payload["mainNetwork"] = query.chain
         data = _success(await self.transport.post("/api/v1/queryCoinList", payload))
-        items = data.get("list", data.get("coins", []))
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("list", data.get("coins", []))
+        else:
+            items = []
+        chain_filter = query.chain.casefold() if query.chain else None
+        search_filter = query.search.casefold() if query.search else None
         return [
             Asset(
-                chain=str(x.get("chain", "")),
-                symbol=str(x.get("symbol", x.get("coinCode", ""))),
-                decimals=int(x.get("decimals", 0)),
-                address=x.get("address"),
-                name=x.get("name"),
-                logo_url=x.get("logoUrl"),
+                chain=str(x.get("mainNetwork", x.get("chain", ""))),
+                symbol=str(x.get("coinCode", x.get("symbol", ""))),
+                decimals=int(x.get("coinDecimal", x.get("decimals", 0))),
+                address=x.get("contact", x.get("address")),
+                name=x.get("coinName", x.get("name")),
+                logo_url=x.get("coinImageUrl", x.get("logoUrl")),
             )
             for x in items
             if isinstance(x, dict)
+            and (
+                chain_filter is None
+                or str(x.get("mainNetwork", x.get("chain", ""))).casefold() == chain_filter
+            )
+            and (
+                search_filter is None
+                or search_filter in str(x.get("coinCode", x.get("symbol", ""))).casefold()
+                or search_filter in str(x.get("coinName", x.get("name", ""))).casefold()
+            )
         ]
 
     async def quote(self, request: SwapQuoteRequest) -> NormalizedQuote:
@@ -95,12 +112,23 @@ class OmniBridgeProvider:
             "request": payload,
             "quote_data": data,
             "equipment_no": _equipment(request.sender_address),
+            "source_flag": self.source_flag,
             "source_type": self.source_type,
             "slippage_bps": request.slippage_bps,
             "destination_addr": request.recipient_address,
             "refund_addr": request.refund_address or request.sender_address,
         }
         self._quotes[reference] = metadata
+        provider_payload = {
+            "equipment_no": metadata["equipment_no"],
+            "source_flag": self.source_flag,
+            "source_type": self.source_type,
+            "destination_addr": request.recipient_address,
+            "refund_addr": request.refund_address or request.sender_address,
+            "slippage_bps": request.slippage_bps,
+            "deposit_min": str(data.get("depositMin", "0")),
+            "deposit_max": str(data.get("depositMax", "Infinity")),
+        }
         return NormalizedQuote(
             provider="omnibridge",
             source_asset=request.source_asset,
@@ -112,12 +140,19 @@ class OmniBridgeProvider:
             provider_fee=request.input_amount * fee_rate,
             network_fee=network_fee,
             provider_reference=reference,
-            provider_payload=metadata,
+            provider_payload=provider_payload,
         )
 
     async def prepare(self, quote: NormalizedQuote) -> DepositOrder:
         meta = self._quotes.get(quote.provider_reference) or quote.provider_payload
         qdata = meta.get("quote_data", {})
+        if not isinstance(qdata, dict):
+            qdata = {}
+        if "quote_data" not in meta:
+            qdata = {
+                "depositMin": meta.get("deposit_min", "0"),
+                "depositMax": meta.get("deposit_max", "Infinity"),
+            }
         amount = quote.input_amount
         minimum, maximum = (
             Decimal(str(qdata.get("depositMin", "0"))),
@@ -126,6 +161,20 @@ class OmniBridgeProvider:
         if amount < minimum or amount > maximum:
             raise ValueError(f"deposit amount must be between {minimum} and {maximum}")
         request = dict(meta.get("request", {}))
+        if not request:
+            deposit_code = (
+                quote.source_asset.symbol
+                if quote.source_asset.chain == "ETH" and not quote.source_asset.address
+                else f"{quote.source_asset.symbol}({quote.source_asset.chain})"
+            )
+            request = {
+                "depositCoinCode": deposit_code,
+                "receiveCoinCode": (
+                    f"{quote.destination_asset.symbol}({quote.destination_asset.chain})"
+                ),
+                "depositCoinAmt": str(quote.input_amount),
+                "sourceFlag": meta.get("source_flag", self.source_flag),
+            }
         request.update(
             {
                 "receiveCoinAmt": str(quote.expected_output),
@@ -133,7 +182,7 @@ class OmniBridgeProvider:
                 "refundAddr": meta.get("refund_addr", ""),
                 "equipmentNo": meta.get("equipment_no", ""),
                 "sourceType": meta.get("source_type", self.source_type),
-                "sourceFlag": self.source_flag,
+                "sourceFlag": meta.get("source_flag", self.source_flag),
                 "slippage": str(
                     Decimal(str(meta.get("slippage_bps", 200))) / Decimal(10000)
                 ),
@@ -168,16 +217,13 @@ class OmniBridgeProvider:
         )
 
     async def register_broadcast(self, provider_reference: str, tx_hash: str) -> ProviderOrder:
-        data = _success(
+        _success(
             await self.transport.post(
                 "/api/v2/modifyTxId",
                 {"orderId": provider_reference, "depositTxid": tx_hash},
                 idempotency_key=provider_reference,
             )
         )
-        # Successful modifyTxId responses commonly return a string marker rather than an object.
-        if data and not isinstance(data, dict):
-            raise ProviderResponseError("800", "Unexpected modifyTxId response", category="client")
         return ProviderOrder(
             provider="omnibridge",
             provider_order_id=provider_reference,

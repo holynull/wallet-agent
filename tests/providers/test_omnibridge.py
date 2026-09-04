@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from wallet_agent.domain.models import Asset, ProviderOrder, SwapQuoteRequest
+from wallet_agent.domain.models import Asset, AssetQuery, ProviderOrder, SwapQuoteRequest
 from wallet_agent.providers.http import ProviderResponseError
 from wallet_agent.providers.omnibridge import OmniBridgeProvider
 
@@ -52,6 +52,83 @@ def quote_response(**overrides: Any) -> dict[str, Any]:
     }
     data.update(overrides)
     return {"resCode": "800", "resMsg": "Success", "data": data}
+
+
+@pytest.mark.asyncio
+async def test_omnibridge_list_assets_maps_documented_array_shape_and_filters():
+    transport = FakeTransport(
+        {
+            "resCode": "800",
+            "resMsg": "Success",
+            "data": [
+                {
+                    "mainNetwork": "ETH",
+                    "coinCode": "USDT",
+                    "coinDecimal": "6",
+                    "contact": "0x0000000000000000000000000000000000000011",
+                    "coinImageUrl": "https://example.invalid/usdt.png",
+                },
+                {
+                    "mainNetwork": "BSC",
+                    "coinCode": "USDC",
+                    "coinDecimal": 18,
+                    "contact": "0x0000000000000000000000000000000000000022",
+                },
+            ],
+        }
+    )
+    provider = OmniBridgeProvider.from_transport(transport, source_flag="wallet-agent")
+
+    assets = await provider.list_assets(AssetQuery(chain="eth", search="usdt"))
+
+    assert assets == [
+        Asset(
+            chain="ETH",
+            symbol="USDT",
+            decimals=6,
+            address="0x0000000000000000000000000000000000000011",
+            logo_url="https://example.invalid/usdt.png",
+        )
+    ]
+    assert transport.calls[0]["payload"] == {
+        "sourceFlag": "wallet-agent",
+        "mainNetwork": "eth",
+    }
+
+
+@pytest.mark.asyncio
+async def test_omnibridge_quote_payload_contains_only_normalized_resume_metadata():
+    provider = OmniBridgeProvider.from_transport(
+        FakeTransport(
+            quote_response(),
+            {
+                "resCode": "800",
+                "resMsg": "Success",
+                "data": {"orderId": "resume-order", "platformAddr": "0xplatform"},
+            },
+        ),
+        source_flag="wallet-agent",
+        source_type="IOS",
+    )
+
+    quote = await provider.quote(valid_quote_request())
+
+    assert quote.provider_payload == {
+        "equipment_no": "0x1234567890abcdef1234567890abcd",
+        "source_flag": "wallet-agent",
+        "source_type": "IOS",
+        "destination_addr": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "refund_addr": "0x1234567890abcdef1234567890abcdef12345678",
+        "slippage_bps": 200,
+        "deposit_min": "0.038603",
+        "deposit_max": "14",
+    }
+    assert "request" not in quote.provider_payload
+    assert "quote_data" not in quote.provider_payload
+
+    provider._quotes.clear()
+    order = await provider.prepare(quote)
+    assert order.provider_order_id
 
 
 @pytest.mark.asyncio

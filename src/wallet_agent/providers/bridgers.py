@@ -117,11 +117,21 @@ class BridgersProvider:
         metadata = {
             "request": payload,
             "tx_data": tx,
+            "equipment_no": payload["equipmentNo"],
+            "source_flag": self.source_flag,
             "from_address": request.sender_address,
             "to_address": request.recipient_address,
             "slippage_bps": request.slippage_bps,
         }
         self._quotes[reference] = metadata
+        provider_payload = {
+            "equipment_no": payload["equipmentNo"],
+            "source_flag": self.source_flag,
+            "sender_address": request.sender_address,
+            "recipient_address": request.recipient_address,
+            "slippage_bps": request.slippage_bps,
+            "amount_out_min_raw": minimum_raw,
+        }
         return NormalizedQuote(
             provider="bridgers",
             source_asset=request.source_asset,
@@ -136,17 +146,32 @@ class BridgersProvider:
             network_fee=Decimal(str(tx["chainFee"])) if tx.get("chainFee") is not None else None,
             expires_at=None,
             provider_reference=reference,
-            provider_payload=metadata,
+            provider_payload=provider_payload,
         )
 
     async def prepare(self, quote: NormalizedQuote) -> UnsignedTransaction:
         meta = self._quotes.get(quote.provider_reference) or quote.provider_payload
         request = dict(meta.get("request", {}))
         tx_data = dict(meta.get("tx_data", {}))
+        if not request:
+            request = {
+                "equipmentNo": meta.get("equipment_no", _equipment(meta.get("sender_address", ""))),
+                "sourceFlag": meta.get("source_flag", self.source_flag),
+                "fromTokenAddress": quote.source_asset.address or "",
+                "toTokenAddress": quote.destination_asset.address or "",
+                "fromTokenAmount": quote.input_amount_raw,
+                "fromTokenChain": quote.source_asset.chain,
+                "toTokenChain": quote.destination_asset.chain,
+                "userAddr": meta.get("sender_address", ""),
+                "fromCoinCode": f"{quote.source_asset.symbol}({quote.source_asset.chain})",
+                "toCoinCode": f"{quote.destination_asset.symbol}({quote.destination_asset.chain})",
+            }
         request.update(
             {
-                "fromAddress": meta.get("from_address", request.get("userAddr", "")),
-                "toAddress": meta.get("to_address", ""),
+                "fromAddress": meta.get(
+                    "from_address", meta.get("sender_address", request.get("userAddr", ""))
+                ),
+                "toAddress": meta.get("to_address", meta.get("recipient_address", "")),
                 "amountOutMin": quote.minimum_output_raw,
                 "slippage": str(Decimal(str(meta.get("slippage_bps", 0))) / Decimal(10000)),
             }
@@ -176,12 +201,21 @@ class BridgersProvider:
     async def register_broadcast(self, provider_reference: str, tx_hash: str) -> ProviderOrder:
         meta = self._quotes.get(provider_reference, {})
         request = dict(meta.get("request", {}))
+        if not request:
+            request = {
+                "equipmentNo": meta.get("equipment_no", ""),
+                "sourceFlag": meta.get("source_flag", self.source_flag),
+            }
         request.update(
             {
                 "hash": tx_hash,
-                "fromAddress": meta.get("from_address", request.get("userAddr", "")),
-                "toAddress": meta.get("to_address", ""),
-                "amountOutMin": (meta.get("tx_data", {}) or {}).get("amountOutMin", ""),
+                "fromAddress": meta.get(
+                    "from_address", meta.get("sender_address", request.get("userAddr", ""))
+                ),
+                "toAddress": meta.get("to_address", meta.get("recipient_address", "")),
+                "amountOutMin": (meta.get("tx_data", {}) or {}).get(
+                    "amountOutMin", meta.get("amount_out_min_raw", "")
+                ),
             }
         )
         data = _ensure_success(

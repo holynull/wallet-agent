@@ -182,6 +182,36 @@ async def test_bridgers_quote_converts_units_and_preserves_raw_amounts():
 
 
 @pytest.mark.asyncio
+async def test_bridgers_quote_payload_contains_only_normalized_resume_metadata():
+    transport = FakeTransport(
+        quote_response(),
+        {
+            "resCode": "100",
+            "resMsg": "success",
+            "data": {"txData": {"data": "0xdeadbeef", "to": "0xrouter", "value": "0x0"}},
+        },
+    )
+    provider = BridgersProvider.from_transport(transport, source_flag="wallet-agent")
+
+    quote = await provider.quote(valid_quote_request())
+
+    assert quote.provider_payload == {
+        "equipment_no": "0x1234567890abcdef1234567890abcd",
+        "source_flag": "wallet-agent",
+        "sender_address": "0x1234567890abcdef1234567890abcdef12345678",
+        "recipient_address": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "slippage_bps": 100,
+        "amount_out_min_raw": "9700000",
+    }
+    assert "request" not in quote.provider_payload
+    assert "tx_data" not in quote.provider_payload
+
+    provider._quotes.clear()
+    transaction = await provider.prepare(quote)
+    assert transaction.data == "0xdeadbeef"
+
+
+@pytest.mark.asyncio
 async def test_bridgers_prepare_uses_quote_minimum_and_returns_unsigned_transaction():
     transport = FakeTransport(
         quote_response(),
