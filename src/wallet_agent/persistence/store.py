@@ -61,3 +61,51 @@ class InMemorySessionStore:
         updated = current.model_copy(update=changes)
         self._sessions[session_id] = updated
         return updated
+
+
+class SqliteSessionStore:
+    """Async SQLite session index for a single service instance or test.
+
+    LangGraph checkpoints remain owned by its configured checkpointer; this
+    table stores only the app-facing swap session projection.
+    """
+
+    def __init__(self, url: str = "sqlite+aiosqlite:///./wallet_agent.db") -> None:
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from .tables import SwapSessionRow
+
+        self.engine = create_async_engine(url)
+        self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
+        self.row_model = SwapSessionRow
+
+    async def init(self) -> None:
+        from .tables import Base
+
+        async with self.engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+    async def save(self, session: SwapSessionRecord) -> SwapSessionRecord:
+        async with self.session_factory() as db:
+            row = await db.get(self.row_model, session.session_id)
+            if row is None:
+                row = self.row_model(session_id=session.session_id)
+                db.add(row)
+            row.user_id = session.user_id
+            row.thread_id = session.thread_id
+            row.payload = session.model_dump_json()
+            await db.commit()
+        return session
+
+    async def get(self, session_id: str) -> SwapSessionRecord | None:
+        async with self.session_factory() as db:
+            row = await db.get(self.row_model, session_id)
+            return SwapSessionRecord.model_validate_json(row.payload) if row else None
+
+    async def update(self, session_id: str, **changes: object) -> SwapSessionRecord:
+        current = await self.get(session_id)
+        if current is None:
+            raise KeyError(session_id)
+        updated = current.model_copy(update={**changes, "updated_at": datetime.now(timezone.utc)})
+        await self.save(updated)
+        return updated

@@ -1,5 +1,5 @@
 """Durable business-session storage abstractions."""
 
-from .store import InMemorySessionStore, SessionStore, SwapSessionRecord
+from .store import InMemorySessionStore, SessionStore, SqliteSessionStore, SwapSessionRecord
 
-__all__ = ["InMemorySessionStore", "SessionStore", "SwapSessionRecord"]
+__all__ = ["InMemorySessionStore", "SessionStore", "SqliteSessionStore", "SwapSessionRecord"]
