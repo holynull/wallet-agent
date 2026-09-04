@@ -2,9 +2,10 @@
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Literal
+from enum import Enum
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 ProviderName = Literal["bridgers", "omnibridge"]
 OrderState = Literal[
@@ -23,27 +24,55 @@ RawInteger = Annotated[str, Field(pattern=r"^[0-9]+$")]
 _SENSITIVE_METADATA_KEYS = frozenset(
     {
         "authorization",
+        "authentication",
         "api_key",
         "apikey",
+        "api_token",
+        "apitoken",
+        "access_token",
+        "accesstoken",
+        "auth_token",
+        "authtoken",
+        "bearer_token",
+        "bearertoken",
+        "client_secret",
+        "clientsecret",
+        "credential",
+        "credentials",
+        "id_token",
+        "idtoken",
         "mnemonic",
         "password",
         "private_key",
+        "privatekey",
+        "refresh_token",
+        "refreshtoken",
         "secret",
         "seed",
+        "seed_phrase",
+        "seedphrase",
+        "session_token",
+        "sessiontoken",
         "signer",
-        "token",
+        "wallet_client",
+        "walletclient",
     }
 )
 
 
 class DomainModel(BaseModel):
-    """Base model that rejects unexpected provider-specific fields."""
+    """Base model that rejects extra fields and redacts arbitrary metadata."""
 
     model_config = ConfigDict(extra="forbid")
 
+    @model_validator(mode="before")
+    @classmethod
+    def redact_sensitive_mappings(cls, value: Any) -> Any:
+        return _redact_metadata(value)
 
-def _redact_metadata(value: JsonValue, key: str | None = None) -> JsonValue:
-    if key is not None and key.lower() in _SENSITIVE_METADATA_KEYS:
+
+def _redact_metadata(value: Any, key: str | None = None) -> Any:
+    if key is not None and _is_sensitive_key(key):
         return "[REDACTED]"
     if isinstance(value, dict):
         return {
@@ -53,6 +82,14 @@ def _redact_metadata(value: JsonValue, key: str | None = None) -> JsonValue:
     if isinstance(value, list):
         return [_redact_metadata(item) for item in value]
     return value
+
+
+def _is_sensitive_key(key: str) -> bool:
+    canonical_key = "".join(character for character in key.lower() if character.isalnum())
+    return canonical_key in {item.replace("_", "") for item in _SENSITIVE_METADATA_KEYS} or any(
+        fragment in canonical_key
+        for fragment in ("privatekey", "seedphrase", "clientsecret", "accesstoken", "refreshtoken")
+    )
 
 
 class Asset(DomainModel):
@@ -101,11 +138,6 @@ class NormalizedQuote(DomainModel):
     provider_reference: str
     provider_payload: dict[str, JsonValue] = Field(default_factory=dict)
 
-    @field_validator("provider_payload")
-    @classmethod
-    def redact_provider_payload(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        return {key: _redact_metadata(item, key) for key, item in value.items()}
-
 
 class UnsignedTransaction(DomainModel):
     chain: str
@@ -136,11 +168,6 @@ class DepositOrder(DomainModel):
     provider_reference: str
     provider_payload: dict[str, JsonValue] = Field(default_factory=dict)
 
-    @field_validator("provider_payload")
-    @classmethod
-    def redact_provider_payload(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        return {key: _redact_metadata(item, key) for key, item in value.items()}
-
 
 class ProviderOrder(DomainModel):
     provider: ProviderName
@@ -149,11 +176,6 @@ class ProviderOrder(DomainModel):
     tx_hash: str | None = None
     expires_at: datetime | None = None
     provider_payload: dict[str, JsonValue] = Field(default_factory=dict)
-
-    @field_validator("provider_payload")
-    @classmethod
-    def redact_provider_payload(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        return {key: _redact_metadata(item, key) for key, item in value.items()}
 
 
 class NormalizedOrderStatus(DomainModel):
@@ -167,11 +189,6 @@ class NormalizedOrderStatus(DomainModel):
     completed_at: datetime | None = None
     expires_at: datetime | None = None
     provider_payload: dict[str, JsonValue] = Field(default_factory=dict)
-
-    @field_validator("provider_payload")
-    @classmethod
-    def redact_provider_payload(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        return {key: _redact_metadata(item, key) for key, item in value.items()}
 
 
 class TokenBalance(DomainModel):
@@ -188,6 +205,36 @@ class WalletSnapshot(DomainModel):
     native_balance: TokenBalance | None = None
     token_balances: list[TokenBalance] = Field(default_factory=list)
     observed_at: datetime | None = None
+
+
+class TransactionStatus(str, Enum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    FAILED = "failed"
+    DROPPED = "dropped"
+    UNKNOWN = "unknown"
+
+
+class TransactionRecord(DomainModel):
+    chain: str
+    chain_id: int | str | None = None
+    tx_hash: str
+    status: TransactionStatus
+    from_address: str | None = None
+    to_address: str | None = None
+    value: str | None = None
+    block_number: int | None = Field(default=None, ge=0)
+    confirmed_at: datetime | None = None
+
+
+class FeeEstimate(DomainModel):
+    chain: str
+    chain_id: int | str | None = None
+    asset: Asset
+    amount: Decimal = Field(ge=0)
+    amount_raw: RawInteger
+    gas_limit: RawInteger | None = None
+    expires_at: datetime | None = None
 
 
 class AgentError(DomainModel):

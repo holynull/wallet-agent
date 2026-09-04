@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from wallet_agent.domain.models import (
+    AgentError,
     Asset,
     DepositOrder,
     NormalizedOrderStatus,
@@ -62,7 +63,11 @@ def test_order_models_keep_provider_payloads_redacted_and_expiry_explicit():
         input_amount_raw="10000000",
         expires_at=None,
         provider_reference="order-123",
-        provider_payload={"request_id": "request-123"},
+        provider_payload={
+            "request_id": "request-123",
+            "privateKey": "must-not-be-stored",
+            "nested": {"client_secret": "must-not-be-stored"},
+        },
     )
     provider_order = ProviderOrder(
         provider="omnibridge",
@@ -77,7 +82,11 @@ def test_order_models_keep_provider_payloads_redacted_and_expiry_explicit():
     )
 
     assert deposit.expires_at is None
-    assert deposit.provider_payload == {"request_id": "request-123"}
+    assert deposit.provider_payload == {
+        "request_id": "request-123",
+        "privateKey": "[REDACTED]",
+        "nested": {"client_secret": "[REDACTED]"},
+    }
     assert provider_order.tx_hash is None
     assert status.completed_at is None
 
@@ -95,3 +104,30 @@ def test_wallet_snapshot_uses_decimal_human_balance_and_raw_integer_balance():
     )
 
     assert snapshot.model_dump(mode="json")["native_balance"]["amount"] == "1.5"
+
+
+def test_arbitrary_domain_mappings_redact_canonicalized_secret_key_variants():
+    transaction = UnsignedTransaction(
+        chain="EVM",
+        chain_id=1,
+        to="0x0000000000000000000000000000000000000001",
+        data="0x",
+        value="0x0",
+        display={"seedPhrase": "must-not-be-stored", "input_amount": "1"},
+    )
+    error = AgentError(
+        code="PROVIDER_FAILURE",
+        message="Provider request failed.",
+        details={
+            "access_token": "must-not-be-stored",
+            "apiToken": "must-not-be-stored",
+            "nested": {"clientSecret": "must-not-be-stored"},
+        },
+    )
+
+    assert transaction.display == {"seedPhrase": "[REDACTED]", "input_amount": "1"}
+    assert error.details == {
+        "access_token": "[REDACTED]",
+        "apiToken": "[REDACTED]",
+        "nested": {"clientSecret": "[REDACTED]"},
+    }

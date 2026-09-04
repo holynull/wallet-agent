@@ -7,11 +7,14 @@ from .models import (
     Asset,
     AssetQuery,
     DepositOrder,
+    FeeEstimate,
     NormalizedOrderStatus,
     NormalizedQuote,
     ProviderOrder,
     SwapQuoteRequest,
     TokenBalance,
+    TransactionRecord,
+    TransactionStatus,
     UnsignedTransaction,
 )
 
@@ -44,10 +47,10 @@ class ChainAdapter(Protocol):
 
     async def get_transaction_history(
         self, address: str, *, limit: int = 20
-    ) -> list[dict[str, str]]: ...
+    ) -> list[TransactionRecord]: ...
 
     async def estimate_fee(
         self, *, to: str | None = None, data: str | None = None
-    ) -> dict[str, str]: ...
+    ) -> FeeEstimate: ...
 
-    async def get_transaction_status(self, tx_hash: str) -> str: ...
+    async def get_transaction_status(self, tx_hash: str) -> TransactionStatus: ...

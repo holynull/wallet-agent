@@ -5,6 +5,7 @@ import pytest
 
 from wallet_agent.domain.chains import Capability, CapabilityRegistry, CapabilitySnapshot
 from wallet_agent.domain.errors import ChainCapabilityUnavailable
+from wallet_agent.domain.models import FeeEstimate, TransactionRecord, TransactionStatus
 from wallet_agent.domain.providers import ChainAdapter, SwapProvider
 
 
@@ -56,6 +57,18 @@ def test_provider_and_chain_contract_methods_are_async():
 def test_contracts_use_concrete_protocol_return_annotations():
     provider_hints = get_type_hints(SwapProvider.quote)
     chain_hints = get_type_hints(ChainAdapter.get_token_balances)
+    history_hints = get_type_hints(ChainAdapter.get_transaction_history)
+    fee_hints = get_type_hints(ChainAdapter.estimate_fee)
+    status_hints = get_type_hints(ChainAdapter.get_transaction_status)
 
     assert provider_hints["return"].__name__ == "NormalizedQuote"
     assert chain_hints["return"].__origin__ is list
+    assert history_hints["return"] == list[TransactionRecord]
+    assert fee_hints["return"] is FeeEstimate
+    assert status_hints["return"] is TransactionStatus
+
+
+def test_transaction_status_is_finite():
+    assert TransactionStatus.CONFIRMED.value == "confirmed"
+    with pytest.raises(ValueError):
+        TransactionStatus("arbitrary-provider-status")
