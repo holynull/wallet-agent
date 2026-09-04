@@ -1,0 +1,9 @@
+.worktrees/
+.superpowers/sdd/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.venv/
+*.py[cod]
+.env
+.env.local
