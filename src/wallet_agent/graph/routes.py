@@ -1,0 +1,59 @@
+"""Explicit routing policy for graph transitions."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from langgraph.types import Send
+
+
+def route_after_intent(state: dict[str, Any]) -> str:
+    if state.get("broadcast_tx_hash"):
+        return "register_broadcast"
+    intent = state.get("intent", "clarification")
+    if intent == "wallet_query":
+        return "wallet_query"
+    if intent == "swap_quote":
+        return "swap_resolve"
+    if intent == "swap_prepare":
+        return "swap_resolve_prepare"
+    if intent == "swap_status":
+        return "status_poll"
+    return "response"
+
+
+def route_after_resolution(state: dict[str, Any]) -> str | list[Send]:
+    """Fan out quote providers, or continue directly to the confirmation gate."""
+    if state.get("intent") == "swap_prepare":
+        return "prepare"
+    providers = state.get("available_providers", [])
+    if not providers:
+        return "response"
+    # Carry the branch key in the declared request field as well; this keeps
+    # the ephemeral Send payload visible to TypedDict state validation.
+    base_request = dict(state.get("request", {}))
+    return [
+        Send(
+            "quote_provider",
+            {
+                "provider_name": name,
+                "request": {**base_request, "_provider_name": name},
+                "swap_request": state.get("swap_request"),
+            },
+        )
+        for name in providers
+    ]
+
+
+def route_after_quote_provider(state: dict[str, Any]) -> str:
+    return "quote_response"
+
+
+def route_after_status(state: dict[str, Any]) -> str:
+    snapshot = state.get("status_snapshot") or {}
+    status = snapshot.get("status")
+    if status in {"completed", "failed", "refunded", "timed_out", "kyc_required", "cancelled"}:
+        return "response"
+    if state.get("poll_attempts", 0) >= state.get("max_poll_attempts", 3):
+        return "response"
+    return "status_poll"

@@ -83,6 +83,8 @@ class EVMChainAdapter:
             value = await rpc_call(self.transport, "wallet_getTransactionHistory", [address, limit])
         except Exception:
             value = []
+        if isinstance(value, dict):
+            value = value.get("transactions", value.get("items", []))
         if not isinstance(value, list):
             return []
         return [self._record(item) for item in value if isinstance(item, dict)][:limit]

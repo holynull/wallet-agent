@@ -102,7 +102,13 @@ class SolanaChainAdapter:
                 chain=self.chain,
                 chain_id=self.chain_id,
                 tx_hash=str(x.get("signature", "")),
-                status=TransactionStatus.FAILED if x.get("err") else TransactionStatus.CONFIRMED,
+                status=(
+                    TransactionStatus.FAILED
+                    if x.get("err")
+                    else TransactionStatus.CONFIRMED
+                    if x.get("confirmationStatus") in {"confirmed", "finalized", None}
+                    else TransactionStatus.PENDING
+                ),
                 block_number=x.get("slot"),
             )
             for x in (rows or [])

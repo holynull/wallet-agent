@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from wallet_agent.domain.errors import ChainCapabilityUnavailable
 from wallet_agent.domain.models import AgentError
 from wallet_agent.persistence import InMemorySessionStore, SessionStore, SwapSessionRecord
 
@@ -210,17 +211,25 @@ def create_app(
         registry = app.state.chain_registry
         if registry is None:
             raise HTTPException(status_code=503, detail="chain registry unavailable")
-        adapter = (
-            registry.get_adapter(chain) if hasattr(registry, "get_adapter") else registry.get(chain)
-        )
-        if operation == "balances":
-            return {
-                "native": _jsonable(await adapter.get_native_balance(address)),
-                "tokens": _jsonable(await adapter.get_token_balances(address)),
-            }
-        if operation == "transactions":
-            return _jsonable(await adapter.get_transaction_history(address, limit=limit))
-        return _jsonable(await adapter.estimate_fee())
+        try:
+            adapter = (
+                registry.get_adapter(chain)
+                if hasattr(registry, "get_adapter")
+                else registry.get(chain)
+            )
+            if operation == "balances":
+                return {
+                    "native": _jsonable(await adapter.get_native_balance(address)),
+                    "tokens": _jsonable(await adapter.get_token_balances(address)),
+                }
+            if operation == "transactions":
+                return _jsonable(await adapter.get_transaction_history(address, limit=limit))
+            return _jsonable(await adapter.estimate_fee())
+        except ChainCapabilityUnavailable as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=exc.to_agent_error().model_dump(mode="json"),
+            ) from exc
 
     @app.get("/v1/wallet/{address}/balances")
     async def balances(address: str, chain: str) -> Any:

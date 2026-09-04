@@ -67,12 +67,16 @@ class TronChainAdapter:
 
     async def get_native_balance(self, address: str) -> TokenBalance:
         data = await http_call(self.transport, "get", f"/v1/accounts/{address}")
-        account = (data.get("data") or [{}])[0] if isinstance(data, dict) else {}
+        account = (data.get("data") or [{}])[0] if isinstance(data, dict) else data
+        if not isinstance(account, dict):
+            account = {}
         return token_balance(self.native_asset, account.get("balance", 0))
 
     async def get_token_balances(self, address: str) -> list[TokenBalance]:
         data = await http_call(self.transport, "get", f"/v1/accounts/{address}")
-        account = (data.get("data") or [{}])[0] if isinstance(data, dict) else {}
+        account = (data.get("data") or [{}])[0] if isinstance(data, dict) else data
+        if not isinstance(account, dict):
+            account = {}
         entries = account.get("trc20", []) if isinstance(account, dict) else []
         result: list[TokenBalance] = []
         for entry in entries if isinstance(entries, list) else []:
@@ -99,7 +103,7 @@ class TronChainAdapter:
         data = await http_call(
             self.transport, "get", f"/v1/accounts/{address}/transactions", params={"limit": limit}
         )
-        rows = data.get("data", []) if isinstance(data, dict) else []
+        rows = data.get("data", []) if isinstance(data, dict) else data
         return [self._record(x) for x in rows if isinstance(x, dict)][:limit]
 
     async def estimate_fee(self, *, to: str | None = None, data: str | None = None) -> FeeEstimate:
