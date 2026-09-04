@@ -14,13 +14,12 @@ from pydantic import Field
 
 from wallet_agent.domain.models import (
     DepositOrder,
+    DomainModel,
     NormalizedOrderStatus,
     NormalizedQuote,
     ProviderOrder,
     UnsignedTransaction,
 )
-
-from wallet_agent.domain.models import DomainModel
 
 
 class SwapSessionRecord(DomainModel):

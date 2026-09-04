@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from wallet_agent.domain.models import AgentError, AssetQuery, ProviderOrder
+from wallet_agent.domain.models import AgentError
 from wallet_agent.persistence import InMemorySessionStore, SessionStore, SwapSessionRecord
 
 
@@ -58,7 +58,11 @@ def _qualified_hash(chain: str, tx_hash: str) -> bool:
         return False
     chain = chain.upper()
     if chain in {"EVM", "ETH", "BSC", "BASE", "POLYGON", "ARBITRUM", "OPTIMISM"}:
-        return value.startswith("0x") and len(value) == 66 and all(c in "0123456789abcdefABCDEF" for c in value[2:])
+        return (
+            value.startswith("0x")
+            and len(value) == 66
+            and all(c in "0123456789abcdefABCDEF" for c in value[2:])
+        )
     if chain in {"TRON", "TRX"}:
         return len(value) == 64 and all(c.isalnum() for c in value)
     if chain in {"SOLANA", "SOL"}:
@@ -66,7 +70,13 @@ def _qualified_hash(chain: str, tx_hash: str) -> bool:
     return False
 
 
-def create_app(*, graph: Any = None, chain_registry: Any = None, providers: Mapping[str, Any] | None = None, store: SessionStore | None = None) -> FastAPI:
+def create_app(
+    *,
+    graph: Any = None,
+    chain_registry: Any = None,
+    providers: Mapping[str, Any] | None = None,
+    store: SessionStore | None = None,
+) -> FastAPI:
     app = FastAPI(title="Wallet Agent", version="0.1.0")
     session_store = store or InMemorySessionStore()
     provider_map = dict(providers or {})
@@ -83,15 +93,28 @@ def create_app(*, graph: Any = None, chain_registry: Any = None, providers: Mapp
                 result = input_state
                 app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
             else:
-                async for event in app.state.graph.astream(input_state, config=config, stream_mode="updates"):
+                async for event in app.state.graph.astream(
+                    input_state, config=config, stream_mode="updates"
+                ):
                     payload = {"event": "update", "data": event}
                     app.state.runs[run_id]["events"].append(payload)
-                result = app.state.graph.get_state(config).values if hasattr(app.state.graph, "get_state") else input_state
+                result = (
+                    app.state.graph.get_state(config).values
+                    if hasattr(app.state.graph, "get_state")
+                    else input_state
+                )
                 app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
             app.state.runs[run_id]["status"] = "complete"
         except Exception as exc:  # errors are returned without exception internals
             app.state.runs[run_id]["status"] = "failed"
-            app.state.runs[run_id]["events"].append({"event": "error", "error": AgentError(code="AGENT_EXECUTION_ERROR", message=str(exc)).model_dump(mode="json")})
+            app.state.runs[run_id]["events"].append(
+                {
+                    "event": "error",
+                    "error": AgentError(code="AGENT_EXECUTION_ERROR", message=str(exc)).model_dump(
+                        mode="json"
+                    ),
+                }
+            )
 
     @app.post("/v1/agent/turn")
     async def turn(payload: TurnRequest) -> dict[str, Any]:
@@ -118,18 +141,22 @@ def create_app(*, graph: Any = None, chain_registry: Any = None, providers: Mapp
                     return
                 run = app.state.runs.get(run_id)
                 if run is None:
-                    yield "event: error\ndata: {\"code\":\"RUN_NOT_FOUND\"}\n\n"
+                    yield 'event: error\ndata: {"code":"RUN_NOT_FOUND"}\n\n'
                     return
                 event_list = run["events"]
                 while seen < len(event_list):
                     event = event_list[seen]
                     seen += 1
                     kind = event.get("event", "update")
-                    yield f"event: {kind}\ndata: {json.dumps(_jsonable(event), ensure_ascii=True)}\n\n"
+                    data = json.dumps(_jsonable(event), ensure_ascii=True)
+                    yield f"event: {kind}\ndata: {data}\n\n"
                 if run.get("status") in {"complete", "failed"}:
                     return
                 await asyncio.sleep(0.05)
-        return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+        return StreamingResponse(
+            events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
+        )
 
     async def owned_session(session_id: str, user_id: str) -> SwapSessionRecord:
         session = await session_store.get(session_id)
@@ -153,17 +180,26 @@ def create_app(*, graph: Any = None, chain_registry: Any = None, providers: Mapp
     async def broadcast(session_id: str, payload: BroadcastRequest) -> dict[str, Any]:
         session = await owned_session(session_id, payload.user_id)
         if not _qualified_hash(payload.chain, payload.tx_hash):
-            raise HTTPException(status_code=422, detail="tx_hash must be a chain-qualified transaction hash")
+            raise HTTPException(
+                status_code=422, detail="tx_hash must be a chain-qualified transaction hash"
+            )
         if session.broadcast_tx_hash:
             if session.broadcast_tx_hash == payload.tx_hash:
                 return _jsonable(session)
-            raise HTTPException(status_code=409, detail="session already has a different broadcast hash")
+            raise HTTPException(
+                status_code=409, detail="session already has a different broadcast hash"
+            )
         provider = app.state.providers.get(session.quote.provider if session.quote else "")
         if provider is None or session.quote is None:
             raise HTTPException(status_code=409, detail="swap provider or quote unavailable")
         reference = session.quote.provider_reference
         order = await provider.register_broadcast(reference, payload.tx_hash)
-        updated = await session_store.update(session_id, status="broadcasted", broadcast_tx_hash=payload.tx_hash, provider_order=order)
+        updated = await session_store.update(
+            session_id,
+            status="broadcasted",
+            broadcast_tx_hash=payload.tx_hash,
+            provider_order=order,
+        )
         return _jsonable(updated)
 
     @app.get("/v1/swap/{session_id}")
@@ -174,9 +210,14 @@ def create_app(*, graph: Any = None, chain_registry: Any = None, providers: Mapp
         registry = app.state.chain_registry
         if registry is None:
             raise HTTPException(status_code=503, detail="chain registry unavailable")
-        adapter = registry.get_adapter(chain) if hasattr(registry, "get_adapter") else registry.get(chain)
+        adapter = (
+            registry.get_adapter(chain) if hasattr(registry, "get_adapter") else registry.get(chain)
+        )
         if operation == "balances":
-            return {"native": _jsonable(await adapter.get_native_balance(address)), "tokens": _jsonable(await adapter.get_token_balances(address))}
+            return {
+                "native": _jsonable(await adapter.get_native_balance(address)),
+                "tokens": _jsonable(await adapter.get_token_balances(address)),
+            }
         if operation == "transactions":
             return _jsonable(await adapter.get_transaction_history(address, limit=limit))
         return _jsonable(await adapter.estimate_fee())
