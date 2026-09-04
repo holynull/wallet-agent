@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wallet_agent.domain.errors import ChainCapabilityUnavailable
 from wallet_agent.domain.models import AgentError
@@ -26,6 +26,34 @@ class TurnRequest(BaseModel):
     address: str | None = None
     chain: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def reject_signing_material(self) -> "TurnRequest":
+        def visit(value: Any) -> bool:
+            if isinstance(value, Mapping):
+                for key, child in value.items():
+                    canonical = "".join(c for c in str(key).lower() if c.isalnum())
+                    if canonical in {
+                        "privatekey",
+                        "seedphrase",
+                        "mnemonic",
+                        "signer",
+                        "walletclient",
+                        "secret",
+                        "password",
+                        "accesstoken",
+                        "clientsecret",
+                    } or any(fragment in canonical for fragment in ("privatekey", "seedphrase")):
+                        return True
+                    if visit(child):
+                        return True
+            elif isinstance(value, (list, tuple)):
+                return any(visit(item) for item in value)
+            return False
+
+        if visit(self.metadata):
+            raise ValueError("signing material and credentials are not accepted")
+        return self
 
 
 class ConfirmRequest(BaseModel):
