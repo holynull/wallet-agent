@@ -13,21 +13,20 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    bridgers_enabled: bool = True
+    bridgers_enabled: bool = False
     bridgers_source_flag: str = ""
-    omnibridge_enabled: bool = True
+    omnibridge_enabled: bool = False
     omnibridge_source_flag: str = ""
 
     openai_api_key: str
     openai_model: str = "gpt-4o-mini"
     openai_base_url: str | None = None
 
-    provider_timeout_seconds: float = 15
-    http_timeout_seconds: float = 15
+    provider_timeout_seconds: float = Field(default=15, gt=0)
+    http_timeout_seconds: float = Field(default=15, gt=0)
     allowed_chains: list[str] = Field(default_factory=lambda: ["EVM", "TRON", "SOLANA"])
     rpc_urls: dict[str, str] = Field(default_factory=dict)
 
     persistence_url: str = "sqlite+aiosqlite:///./wallet_agent.db"
-    poll_interval_seconds: float = 5
-    poll_max_attempts: int = 20
-
+    poll_interval_seconds: float = Field(default=5, gt=0)
+    poll_max_attempts: int = Field(default=20, ge=1, le=1000)
