@@ -27,6 +27,9 @@ class ChainAdapterRegistry:
 
     get_adapter = get
 
+    def items(self):
+        return self._adapters.items()
+
     def require(self, chain: str, capability: Any) -> Any:
         adapter = self.get(chain)
         if not adapter.capabilities.supports(capability):

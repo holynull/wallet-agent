@@ -104,8 +104,24 @@ def create_app(
                     if hasattr(app.state.graph, "get_state")
                     else input_state
                 )
-                app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
-            app.state.runs[run_id]["status"] = "complete"
+                snapshot = (
+                    app.state.graph.get_state(config)
+                    if hasattr(app.state.graph, "get_state")
+                    else None
+                )
+                interrupted = bool(getattr(snapshot, "tasks", ())) and bool(
+                    getattr(snapshot, "next", ())
+                )
+                if interrupted or "__interrupt__" in result:
+                    app.state.runs[run_id]["status"] = "awaiting_confirmation"
+                    app.state.runs[run_id]["events"].append(
+                        {"event": "action_required", "state": result}
+                    )
+                else:
+                    app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
+                    app.state.runs[run_id]["status"] = "complete"
+            if app.state.runs[run_id]["status"] == "running":
+                app.state.runs[run_id]["status"] = "complete"
         except Exception as exc:  # errors are returned without exception internals
             app.state.runs[run_id]["status"] = "failed"
             app.state.runs[run_id]["events"].append(
@@ -151,7 +167,7 @@ def create_app(
                     kind = event.get("event", "update")
                     data = json.dumps(_jsonable(event), ensure_ascii=True)
                     yield f"event: {kind}\ndata: {data}\n\n"
-                if run.get("status") in {"complete", "failed"}:
+                if run.get("status") in {"complete", "failed", "awaiting_confirmation"}:
                     return
                 await asyncio.sleep(0.05)
 

@@ -14,8 +14,10 @@ class Settings(BaseSettings):
     )
 
     bridgers_enabled: bool = False
+    bridgers_base_url: str | None = None
     bridgers_source_flag: str = ""
     omnibridge_enabled: bool = False
+    omnibridge_base_url: str | None = None
     omnibridge_source_flag: str = ""
 
     openai_api_key: str

@@ -31,6 +31,8 @@ def build_graph(
         }
     if isinstance(chains, dict):
         chain_map = {str(k).upper(): v for k, v in chains.items()}
+    elif hasattr(chains, "items"):
+        chain_map = {str(k).upper(): v for k, v in chains.items()}
     else:
         chain_map = {
             str(getattr(item, "chain", "")).upper(): item

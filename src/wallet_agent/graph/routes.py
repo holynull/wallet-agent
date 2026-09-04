@@ -8,9 +8,9 @@ from langgraph.types import Send
 
 
 def route_after_intent(state: dict[str, Any]) -> str:
-    if state.get("broadcast_tx_hash"):
-        return "register_broadcast"
     intent = state.get("intent", "clarification")
+    if state.get("broadcast_tx_hash") and intent in {"swap_status", "swap_prepare"}:
+        return "register_broadcast"
     if intent == "wallet_query":
         return "wallet_query"
     if intent == "swap_quote":

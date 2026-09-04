@@ -153,6 +153,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
 
     async def quote_response(state: dict[str, Any]) -> dict[str, Any]:
         quotes = state.get("quote_candidates", [])
+        if not quotes and state.get("errors"):
+            return {"response": {"kind": "error", "errors": state["errors"]}}
         selected = (
             min(quotes, key=lambda item: str(item.get("provider_fee") or "0")) if quotes else None
         )
