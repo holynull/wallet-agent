@@ -131,3 +131,49 @@ def test_arbitrary_domain_mappings_redact_canonicalized_secret_key_variants():
         "apiToken": "[REDACTED]",
         "nested": {"clientSecret": "[REDACTED]"},
     }
+
+
+def test_arbitrary_domain_mappings_redact_common_sensitive_key_variants():
+    error = AgentError(
+        code="PROVIDER_FAILURE",
+        message="Provider request failed.",
+        details={
+            "token": "must-not-be-stored",
+            "TOKEN": "must-not-be-stored",
+            "secretKey": "must-not-be-stored",
+            "secret_key": "must-not-be-stored",
+            "secret-key": "must-not-be-stored",
+            "apiSecret": "must-not-be-stored",
+            "api_secret": "must-not-be-stored",
+            "api-secret": "must-not-be-stored",
+            "authorizationHeader": "must-not-be-stored",
+            "authorization_header": "must-not-be-stored",
+            "authorization-header": "must-not-be-stored",
+            "mnemonicWords": "must-not-be-stored",
+            "mnemonic_words": "must-not-be-stored",
+            "mnemonic-words": "must-not-be-stored",
+            "nested": {"ApiSecret": "must-not-be-stored"},
+            "token_symbol": "USDC",
+            "secretariat": "support-team",
+        },
+    )
+
+    assert error.details == {
+        "token": "[REDACTED]",
+        "TOKEN": "[REDACTED]",
+        "secretKey": "[REDACTED]",
+        "secret_key": "[REDACTED]",
+        "secret-key": "[REDACTED]",
+        "apiSecret": "[REDACTED]",
+        "api_secret": "[REDACTED]",
+        "api-secret": "[REDACTED]",
+        "authorizationHeader": "[REDACTED]",
+        "authorization_header": "[REDACTED]",
+        "authorization-header": "[REDACTED]",
+        "mnemonicWords": "[REDACTED]",
+        "mnemonic_words": "[REDACTED]",
+        "mnemonic-words": "[REDACTED]",
+        "nested": {"ApiSecret": "[REDACTED]"},
+        "token_symbol": "USDC",
+        "secretariat": "support-team",
+    }

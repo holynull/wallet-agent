@@ -1,5 +1,6 @@
 """Serializable models shared by wallet, provider, and orchestration layers."""
 
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
@@ -54,9 +55,23 @@ _SENSITIVE_METADATA_KEYS = frozenset(
         "session_token",
         "sessiontoken",
         "signer",
+        "token",
+        "secret_key",
+        "secretkey",
+        "api_secret",
+        "apisecret",
+        "authorization_header",
+        "authorizationheader",
+        "mnemonic_words",
+        "mnemonicwords",
         "wallet_client",
         "walletclient",
     }
+)
+
+_SENSITIVE_CANONICAL_KEYS = frozenset(
+    "".join(character for character in key.lower() if character.isalnum())
+    for key in _SENSITIVE_METADATA_KEYS
 )
 
 
@@ -74,7 +89,7 @@ class DomainModel(BaseModel):
 def _redact_metadata(value: Any, key: str | None = None) -> Any:
     if key is not None and _is_sensitive_key(key):
         return "[REDACTED]"
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {
             str(item_key): _redact_metadata(item_value, str(item_key))
             for item_key, item_value in value.items()
@@ -86,7 +101,7 @@ def _redact_metadata(value: Any, key: str | None = None) -> Any:
 
 def _is_sensitive_key(key: str) -> bool:
     canonical_key = "".join(character for character in key.lower() if character.isalnum())
-    return canonical_key in {item.replace("_", "") for item in _SENSITIVE_METADATA_KEYS} or any(
+    return canonical_key in _SENSITIVE_CANONICAL_KEYS or any(
         fragment in canonical_key
         for fragment in ("privatekey", "seedphrase", "clientsecret", "accesstoken", "refreshtoken")
     )
