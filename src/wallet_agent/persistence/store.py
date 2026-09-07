@@ -78,14 +78,21 @@ class SqliteSessionStore:
         self.engine = create_async_engine(url)
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
         self.row_model = SwapSessionRow
+        self._initialized = False
 
     async def init(self) -> None:
         from .tables import Base
 
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+        self._initialized = True
+
+    async def _ensure_init(self) -> None:
+        if not self._initialized:
+            await self.init()
 
     async def save(self, session: SwapSessionRecord) -> SwapSessionRecord:
+        await self._ensure_init()
         async with self.session_factory() as db:
             row = await db.get(self.row_model, session.session_id)
             if row is None:
@@ -98,6 +105,7 @@ class SqliteSessionStore:
         return session
 
     async def get(self, session_id: str) -> SwapSessionRecord | None:
+        await self._ensure_init()
         async with self.session_factory() as db:
             row = await db.get(self.row_model, session_id)
             return SwapSessionRecord.model_validate_json(row.payload) if row else None

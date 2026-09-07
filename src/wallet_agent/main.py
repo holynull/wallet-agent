@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from wallet_agent.api import create_app
 from wallet_agent.config import Settings
 from wallet_agent.graph import build_graph
+from wallet_agent.persistence import SqliteSessionStore, initialize_checkpointer
 from wallet_agent.providers import BridgersProvider, HttpJsonTransport, OmniBridgeProvider
 
 
@@ -58,10 +59,16 @@ def build_application(settings: Settings | None = None) -> Any:
         providers["omnibridge"] = OmniBridgeProvider.from_transport(
             transport, source_flag=settings.omnibridge_source_flag
         )
+    checkpoint_handle = initialize_checkpointer(settings.persistence_url)
     graph = build_graph(
-        model=model, providers=providers, max_poll_attempts=settings.poll_max_attempts
+        model=model,
+        providers=providers,
+        checkpointer=checkpoint_handle.checkpointer,
+        max_poll_attempts=settings.poll_max_attempts,
     )
-    application = create_app(graph=graph, providers=providers)
+    session_store = SqliteSessionStore(settings.persistence_url)
+    application = create_app(graph=graph, providers=providers, store=session_store)
+    application.state.checkpointer_handle = checkpoint_handle
     application.state.transports = transports
     return application
 
