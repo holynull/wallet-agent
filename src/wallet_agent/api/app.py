@@ -39,6 +39,7 @@ class TurnRequest(BaseModel):
     address: str | None = None
     chain: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    model_id: str | None = None
 
     @model_validator(mode="after")
     def reject_signing_material(self) -> "TurnRequest":
@@ -56,6 +57,9 @@ class TurnRequest(BaseModel):
                         "password",
                         "accesstoken",
                         "clientsecret",
+                        "apikey",
+                        "apibaseurl",
+                        "baseurl",
                     } or any(fragment in canonical for fragment in ("privatekey", "seedphrase")):
                         return True
                     if visit(child):
@@ -120,6 +124,7 @@ def create_app(
     store: SessionStore | None = None,
     token_verifier: TokenVerifier | None = None,
     require_auth: bool = False,
+    model_registry: Any = None,
 ) -> FastAPI:
     app = FastAPI(title="Wallet Agent", version="0.1.0")
     session_store = store or InMemorySessionStore()
@@ -131,6 +136,7 @@ def create_app(
     app.state.runs: dict[str, dict[str, Any]] = {}
     app.state.token_verifier = token_verifier
     app.state.require_auth = require_auth
+    app.state.model_registry = model_registry
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -324,6 +330,20 @@ def create_app(
             required=require_auth,
             fallback_user_id=payload.user_id,
         )
+        if model_registry is not None:
+            try:
+                selected_model_id = model_registry.validate(payload.model_id)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "MODEL_NOT_ALLOWED",
+                        "message": str(exc),
+                        "details": {"allowed_models": list(model_registry.model_ids)},
+                    },
+                ) from exc
+        else:
+            selected_model_id = payload.model_id
         conversation_id = payload.conversation_id or str(uuid.uuid4())
         run_id = str(uuid.uuid4())
         raw_swap_request = payload.metadata.get("swap_request") or payload.metadata.get("swap")
@@ -339,6 +359,7 @@ def create_app(
         input_state = {
             "conversation_id": conversation_id,
             "user_id": user_id,
+            "model_id": selected_model_id,
             "request": payload.model_dump(mode="json"),
             "messages": [{"role": "user", "content": payload.message}],
         }

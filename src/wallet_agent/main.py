@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from wallet_agent.api import create_app
 from wallet_agent.config import Settings
 from wallet_agent.graph import build_graph
+from wallet_agent.models import ModelRegistry, ModelRouter
 from wallet_agent.persistence import SqliteSessionStore, initialize_checkpointer
 from wallet_agent.providers import BridgersProvider, HttpJsonTransport, OmniBridgeProvider
 
@@ -32,11 +33,15 @@ def build_application(settings: Settings | None = None) -> Any:
     api_key = settings.deepseek_api_key or settings.openai_api_key
     if not api_key:
         raise ValueError("DEEPSEEK_API_KEY or OPENAI_API_KEY is required")
-    model = ChatOpenAI(
+    default_model = ChatOpenAI(
         model=settings.openai_model,
         api_key=api_key,
         base_url=settings.openai_base_url,
     ).with_structured_output(IntentOutput)
+    model_registry = ModelRegistry(
+        {settings.openai_model: default_model}, default_model_id=settings.openai_model
+    )
+    model = ModelRouter(model_registry)
     providers: dict[str, Any] = {}
     transports: list[HttpJsonTransport] = []
     if settings.bridgers_enabled:
@@ -67,7 +72,12 @@ def build_application(settings: Settings | None = None) -> Any:
         max_poll_attempts=settings.poll_max_attempts,
     )
     session_store = SqliteSessionStore(settings.persistence_url)
-    application = create_app(graph=graph, providers=providers, store=session_store)
+    application = create_app(
+        graph=graph,
+        providers=providers,
+        store=session_store,
+        model_registry=model_registry,
+    )
     application.state.checkpointer_handle = checkpoint_handle
     application.state.transports = transports
     return application
