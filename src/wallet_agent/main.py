@@ -28,9 +28,12 @@ def build_application(settings: Settings | None = None) -> Any:
     except ImportError as exc:  # pragma: no cover - dependency is locked in production
         raise RuntimeError("langchain-openai is required to run the service") from exc
 
+    api_key = settings.deepseek_api_key or settings.openai_api_key
+    if not api_key:
+        raise ValueError("DEEPSEEK_API_KEY or OPENAI_API_KEY is required")
     model = ChatOpenAI(
         model=settings.openai_model,
-        api_key=settings.openai_api_key,
+        api_key=api_key,
         base_url=settings.openai_base_url,
     ).with_structured_output(IntentOutput)
     providers: dict[str, Any] = {}

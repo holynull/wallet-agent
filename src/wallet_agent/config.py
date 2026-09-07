@@ -1,6 +1,6 @@
 """Application configuration loaded from environment variables and dotenv files."""
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,9 +20,12 @@ class Settings(BaseSettings):
     omnibridge_base_url: str | None = None
     omnibridge_source_flag: str = ""
 
-    openai_api_key: str
-    openai_model: str = "gpt-4o-mini"
-    openai_base_url: str | None = None
+    # DeepSeek is the default OpenAI-compatible backend. The OPENAI_* names
+    # remain supported for backwards compatibility with existing deployments.
+    deepseek_api_key: str | None = None
+    openai_api_key: str | None = None
+    openai_model: str = "deepseek-chat"
+    openai_base_url: str | None = "https://api.deepseek.com"
 
     provider_timeout_seconds: float = Field(default=15, gt=0)
     http_timeout_seconds: float = Field(default=15, gt=0)
@@ -32,3 +35,9 @@ class Settings(BaseSettings):
     persistence_url: str = "sqlite+aiosqlite:///./wallet_agent.db"
     poll_interval_seconds: float = Field(default=5, gt=0)
     poll_max_attempts: int = Field(default=20, ge=1, le=1000)
+
+    @model_validator(mode="after")
+    def require_model_key(self) -> "Settings":
+        if not (self.deepseek_api_key or self.openai_api_key):
+            raise ValueError("DEEPSEEK_API_KEY or OPENAI_API_KEY is required")
+        return self

@@ -8,10 +8,14 @@ and broadcasts them, then submits only the chain-qualified transaction hash.
 
 ```bash
 cp .env.example .env
-# Set OPENAI_API_KEY and explicitly enable providers with their base URLs.
+# Set DEEPSEEK_API_KEY and explicitly enable providers with their base URLs.
 uv sync
 PYTHONPATH=src uvicorn wallet_agent.main:app --reload
 ```
+
+The default model backend is DeepSeek's official OpenAI-compatible API:
+`https://api.deepseek.com` with `deepseek-chat`. To use another compatible
+backend, set `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_BASE_URL` instead.
 
 The HTTP API is rooted at `/v1`: agent turns and SSE streaming, swap
 confirmation/broadcast/status, and read-only wallet balances, transactions,
