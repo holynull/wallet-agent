@@ -10,10 +10,18 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wallet_agent.domain.errors import ChainCapabilityUnavailable
-from wallet_agent.domain.models import AgentError
+from wallet_agent.domain.models import (
+    AgentError,
+    DepositOrder,
+    NormalizedOrderStatus,
+    NormalizedQuote,
+    ProviderOrder,
+    UnsignedTransaction,
+)
 from wallet_agent.persistence import InMemorySessionStore, SessionStore, SwapSessionRecord
 
 
@@ -115,22 +123,105 @@ def create_app(
     app.state.session_store = session_store
     app.state.runs: dict[str, dict[str, Any]] = {}
 
-    async def run_graph(run_id: str, input_state: dict[str, Any], config: dict[str, Any]) -> None:
+    async def project_session(
+        session_id: str | None,
+        state: Mapping[str, Any],
+        *,
+        status: str | None = None,
+    ) -> SwapSessionRecord | None:
+        """Project only normalized graph values into the app-facing session index."""
+        if not session_id:
+            return None
+        current = await session_store.get(session_id)
+        if current is None:
+            return None
+        changes: dict[str, Any] = {}
+        selected = state.get("selected_quote")
+        if selected:
+            changes["quote"] = (
+                selected
+                if isinstance(selected, NormalizedQuote)
+                else NormalizedQuote.model_validate(selected)
+            )
+        pending = state.get("pending_transaction")
+        if pending:
+            if isinstance(pending, (UnsignedTransaction, DepositOrder)):
+                changes["pending_transaction"] = pending
+            else:
+                try:
+                    changes["pending_transaction"] = UnsignedTransaction.model_validate(pending)
+                except Exception:
+                    changes["pending_transaction"] = DepositOrder.model_validate(pending)
+        orders = state.get("provider_orders") or {}
+        if orders:
+            raw_order = next(iter(orders.values()))
+            changes["provider_order"] = (
+                raw_order
+                if isinstance(raw_order, ProviderOrder)
+                else ProviderOrder.model_validate(raw_order)
+            )
+        snapshot = state.get("status_snapshot")
+        if snapshot:
+            changes["order_status"] = (
+                snapshot
+                if isinstance(snapshot, NormalizedOrderStatus)
+                else NormalizedOrderStatus.model_validate(snapshot)
+            )
+        tx_hash = state.get("broadcast_tx_hash")
+        if tx_hash:
+            changes["broadcast_tx_hash"] = str(tx_hash)
+        if status:
+            changes["status"] = status
+        if not changes:
+            return current
+        return await session_store.update(session_id, **changes)
+
+    async def run_graph(
+        run_id: str,
+        input_state: dict[str, Any],
+        config: dict[str, Any],
+        *,
+        session_id: str | None = None,
+    ) -> None:
         app.state.runs[run_id] = {"status": "running", "events": []}
         try:
             if app.state.graph is None:
                 result = input_state
                 app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
             else:
-                async for event in app.state.graph.astream(
-                    input_state, config=config, stream_mode="updates"
+                async def execute(graph_input: dict[str, Any]) -> dict[str, Any]:
+                    async for event in app.state.graph.astream(
+                        graph_input, config=config, stream_mode="updates"
+                    ):
+                        app.state.runs[run_id]["events"].append(
+                            {"event": "update", "data": event}
+                        )
+                    snapshot = app.state.graph.get_state(config)
+                    return dict(snapshot.values)
+
+                result = await execute(input_state)
+                # A swap turn owns a business session. Once quotes are available,
+                # continue the same thread into the confirmation interrupt so the
+                # mobile client has one stable session_id for the full lifecycle.
+                if (
+                    session_id
+                    and result.get("response", {}).get("kind") == "swap_quote"
+                    and result.get("selected_quote")
+                    and not result.get("pending_transaction")
                 ):
-                    payload = {"event": "update", "data": event}
-                    app.state.runs[run_id]["events"].append(payload)
+                    await project_session(session_id, result, status="quoted")
+                    result = await execute(
+                        {
+                            "intent": "swap_prepare",
+                            "swap_request": result.get("swap_request"),
+                            "selected_quote": result.get("selected_quote"),
+                            "swap_session": {"session_id": session_id},
+                        }
+                    )
                 result = (
                     app.state.graph.get_state(config).values
                     if hasattr(app.state.graph, "get_state")
-                    else input_state
+                    else result
                 )
                 snapshot = (
                     app.state.graph.get_state(config)
@@ -145,9 +236,11 @@ def create_app(
                     app.state.runs[run_id]["events"].append(
                         {"event": "action_required", "state": result}
                     )
+                    await project_session(session_id, result, status="awaiting_confirmation")
                 else:
                     app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
                     app.state.runs[run_id]["status"] = "complete"
+                    await project_session(session_id, result, status="completed")
             if app.state.runs[run_id]["status"] == "running":
                 app.state.runs[run_id]["status"] = "complete"
         except Exception as exc:  # errors are returned without exception internals
@@ -165,17 +258,38 @@ def create_app(
     async def turn(payload: TurnRequest) -> dict[str, Any]:
         conversation_id = payload.conversation_id or str(uuid.uuid4())
         run_id = str(uuid.uuid4())
+        raw_swap_request = payload.metadata.get("swap_request") or payload.metadata.get("swap")
+        session_id = str(uuid.uuid4()) if raw_swap_request is not None else None
+        if session_id:
+            await session_store.save(
+                SwapSessionRecord(
+                    session_id=session_id,
+                    user_id=payload.user_id,
+                    thread_id=conversation_id,
+                )
+            )
         input_state = {
             "conversation_id": conversation_id,
             "user_id": payload.user_id,
             "request": payload.model_dump(mode="json"),
             "messages": [{"role": "user", "content": payload.message}],
         }
+        if raw_swap_request is not None:
+            input_state["swap_request"] = raw_swap_request
         config = {"configurable": {"thread_id": conversation_id}}
         app.state.runs[run_id] = {"status": "queued", "events": []}
-        task = asyncio.create_task(run_graph(run_id, input_state, config))
+        task = asyncio.create_task(
+            run_graph(run_id, input_state, config, session_id=session_id)
+        )
         app.state.runs[run_id]["task"] = task
-        return {"run_id": run_id, "conversation_id": conversation_id, "status": "running"}
+        response = {
+            "run_id": run_id,
+            "conversation_id": conversation_id,
+            "status": "running",
+        }
+        if session_id:
+            response["session_id"] = session_id
+        return response
 
     @app.get("/v1/agent/stream/{run_id}")
     async def stream(run_id: str, request: Request) -> StreamingResponse:
@@ -214,12 +328,19 @@ def create_app(
         session = await owned_session(session_id, payload.user_id)
         if not payload.approved:
             return _jsonable(await session_store.update(session_id, status="cancelled"))
+        if session.pending_transaction is not None:
+            return _jsonable(session)
         graph = app.state.graph
         if graph is None:
             return _jsonable(await session_store.update(session_id, status="confirmed"))
         config = {"configurable": {"thread_id": session.thread_id}}
-        result = await graph.ainvoke({"user_confirmation": {"approved": True}}, config=config)
-        return _jsonable(result)
+        result = await graph.ainvoke(
+            Command(resume={"approved": True}),
+            config=config,
+        )
+        status = "prepared" if result.get("pending_transaction") else "confirmed"
+        updated = await project_session(session_id, result, status=status)
+        return _jsonable(updated or result)
 
     @app.post("/v1/swap/{session_id}/broadcast")
     async def broadcast(session_id: str, payload: BroadcastRequest) -> dict[str, Any]:
