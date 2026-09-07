@@ -4,6 +4,7 @@ from .evm import EVMAdapter, EVMChain, EVMChainAdapter
 from .registry import ChainAdapterRegistry, ChainRegistry, build_default_registry
 from .solana import SolanaAdapter, SolanaChain, SolanaChainAdapter
 from .stubs import UnsupportedChainAdapter
+from .transports import FailoverHttpTransport, FailoverJsonRpcTransport
 from .tron import TronAdapter, TronChain, TronChainAdapter
 
 __all__ = [
@@ -19,5 +20,7 @@ __all__ = [
     "TronChain",
     "TronChainAdapter",
     "UnsupportedChainAdapter",
+    "FailoverHttpTransport",
+    "FailoverJsonRpcTransport",
     "build_default_registry",
 ]

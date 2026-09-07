@@ -45,10 +45,11 @@ def build_default_registry(
     evm_transport: Any = None,
     tron_transport: Any = None,
     solana_transport: Any = None,
-    rpc_urls: dict[str, str] | None = None,
+    rpc_urls: dict[str, str | list[str]] | None = None,
+    rpc_timeout_seconds: float = 10,
+    rpc_max_attempts: int = 2,
     include_stubs: bool = True,
 ) -> ChainAdapterRegistry:
-    del rpc_urls  # transports are intentionally injected by the application boundary
     adapters: dict[str, Any] = {}
     if evm_transport is not None:
         evm = EVMChainAdapter(evm_transport)
@@ -59,6 +60,40 @@ def build_default_registry(
         adapters["TRON"] = TronChainAdapter(tron_transport)
     if solana_transport is not None:
         adapters["SOLANA"] = SolanaChainAdapter(solana_transport)
+    if rpc_urls:
+        from .transports import FailoverHttpTransport, FailoverJsonRpcTransport
+
+        def urls(chain: str) -> list[str]:
+            value = rpc_urls.get(chain) or rpc_urls.get(chain.upper())
+            if isinstance(value, str):
+                return [value]
+            return list(value or [])
+
+        chain_ids = {"ETH": 1, "BSC": 56, "BASE": 8453, "ARBITRUM": 42161,
+                     "OPTIMISM": 10, "POLYGON": 137}
+        for chain, chain_id in chain_ids.items():
+            if chain not in adapters and urls(chain):
+                adapters[chain] = EVMChainAdapter(
+                    FailoverJsonRpcTransport(
+                        urls(chain),
+                        timeout_seconds=rpc_timeout_seconds,
+                        max_attempts=rpc_max_attempts,
+                    ),
+                    chain=chain,
+                    chain_id=chain_id,
+                )
+        if "TRON" not in adapters and urls("TRON"):
+            adapters["TRON"] = TronChainAdapter(
+                FailoverHttpTransport(urls("TRON"), timeout_seconds=rpc_timeout_seconds)
+            )
+        if "SOLANA" not in adapters and urls("SOLANA"):
+            adapters["SOLANA"] = SolanaChainAdapter(
+                FailoverJsonRpcTransport(
+                    urls("SOLANA"),
+                    timeout_seconds=rpc_timeout_seconds,
+                    max_attempts=rpc_max_attempts,
+                )
+            )
     if include_stubs:
         for chain in ("SUI", "APTOS", "XRP", "XLM", "WAVES"):
             adapters.setdefault(chain, UnsupportedChainAdapter(chain))

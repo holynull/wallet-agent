@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from wallet_agent.api import StaticTokenVerifier, create_app
+from wallet_agent.chains import build_default_registry
 from wallet_agent.config import Settings
 from wallet_agent.graph import build_graph
 from wallet_agent.models import ModelRegistry, ModelRouter
@@ -75,6 +76,11 @@ def build_application(settings: Settings | None = None) -> Any:
         max_poll_attempts=settings.poll_max_attempts,
     )
     session_store = SqliteSessionStore(settings.persistence_url)
+    chain_registry = build_default_registry(
+        rpc_urls=settings.rpc_urls,
+        rpc_timeout_seconds=settings.rpc_timeout_seconds,
+        rpc_max_attempts=settings.rpc_max_attempts,
+    )
     application = create_app(
         graph=graph,
         providers=providers,
@@ -82,6 +88,7 @@ def build_application(settings: Settings | None = None) -> Any:
         model_registry=model_registry,
         token_verifier=StaticTokenVerifier(settings.auth_tokens) if settings.auth_tokens else None,
         require_auth=settings.auth_required,
+        chain_registry=chain_registry,
     )
     application.state.checkpointer_handle = checkpoint_handle
     application.state.transports = transports
