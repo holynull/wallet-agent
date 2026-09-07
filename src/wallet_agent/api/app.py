@@ -26,12 +26,15 @@ from wallet_agent.domain.models import (
 )
 from wallet_agent.persistence import InMemorySessionStore, SessionStore, SwapSessionRecord
 
+from .auth import TokenVerifier
+from .dependencies import authenticated_user
+
 
 class TurnRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     conversation_id: str | None = None
-    user_id: str
+    user_id: str | None = None
     message: str
     address: str | None = None
     chain: str | None = None
@@ -69,14 +72,14 @@ class TurnRequest(BaseModel):
 class ConfirmRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    user_id: str
+    user_id: str | None = None
     approved: bool
 
 
 class BroadcastRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    user_id: str
+    user_id: str | None = None
     chain: str
     tx_hash: str = Field(min_length=8)
 
@@ -115,6 +118,8 @@ def create_app(
     chain_registry: Any = None,
     providers: Mapping[str, Any] | None = None,
     store: SessionStore | None = None,
+    token_verifier: TokenVerifier | None = None,
+    require_auth: bool = False,
 ) -> FastAPI:
     app = FastAPI(title="Wallet Agent", version="0.1.0")
     session_store = store or InMemorySessionStore()
@@ -124,6 +129,8 @@ def create_app(
     app.state.providers = provider_map
     app.state.session_store = session_store
     app.state.runs: dict[str, dict[str, Any]] = {}
+    app.state.token_verifier = token_verifier
+    app.state.require_auth = require_auth
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -299,7 +306,24 @@ def create_app(
             )
 
     @app.post("/v1/agent/turn")
-    async def turn(payload: TurnRequest) -> dict[str, Any]:
+    async def turn(request: Request, payload: TurnRequest) -> dict[str, Any]:
+        if payload.user_id is None and token_verifier is None and not require_auth:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "VALIDATION_ERROR",
+                    "message": "Request validation failed.",
+                    "details": {
+                        "errors": [{"loc": ["body", "user_id"], "msg": "Field required"}]
+                    },
+                },
+            )
+        user_id = await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id=payload.user_id,
+        )
         conversation_id = payload.conversation_id or str(uuid.uuid4())
         run_id = str(uuid.uuid4())
         raw_swap_request = payload.metadata.get("swap_request") or payload.metadata.get("swap")
@@ -308,13 +332,13 @@ def create_app(
             await session_store.save(
                 SwapSessionRecord(
                     session_id=session_id,
-                    user_id=payload.user_id,
+                    user_id=user_id,
                     thread_id=conversation_id,
                 )
             )
         input_state = {
             "conversation_id": conversation_id,
-            "user_id": payload.user_id,
+            "user_id": user_id,
             "request": payload.model_dump(mode="json"),
             "messages": [{"role": "user", "content": payload.message}],
         }
@@ -371,8 +395,14 @@ def create_app(
         return session
 
     @app.post("/v1/swap/{session_id}/confirm")
-    async def confirm(session_id: str, payload: ConfirmRequest) -> dict[str, Any]:
-        session = await owned_session(session_id, payload.user_id)
+    async def confirm(request: Request, session_id: str, payload: ConfirmRequest) -> dict[str, Any]:
+        user_id = await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id=payload.user_id,
+        )
+        session = await owned_session(session_id, user_id)
         if not payload.approved:
             return _jsonable(await session_store.update(session_id, status="cancelled"))
         if session.pending_transaction is not None:
@@ -390,8 +420,16 @@ def create_app(
         return _jsonable(updated or result)
 
     @app.post("/v1/swap/{session_id}/broadcast")
-    async def broadcast(session_id: str, payload: BroadcastRequest) -> dict[str, Any]:
-        session = await owned_session(session_id, payload.user_id)
+    async def broadcast(
+        request: Request, session_id: str, payload: BroadcastRequest
+    ) -> dict[str, Any]:
+        user_id = await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id=payload.user_id,
+        )
+        session = await owned_session(session_id, user_id)
         if not _qualified_hash(payload.chain, payload.tx_hash):
             raise HTTPException(
                 status_code=422, detail="tx_hash must be a chain-qualified transaction hash"
@@ -416,8 +454,16 @@ def create_app(
         return _jsonable(updated)
 
     @app.get("/v1/swap/{session_id}")
-    async def get_swap(session_id: str, user_id: str) -> dict[str, Any]:
-        return _jsonable(await owned_session(session_id, user_id))
+    async def get_swap(
+        request: Request, session_id: str, user_id: str | None = None
+    ) -> dict[str, Any]:
+        authenticated = await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id=user_id,
+        )
+        return _jsonable(await owned_session(session_id, authenticated))
 
     async def wallet_operation(address: str, chain: str, operation: str, limit: int = 20) -> Any:
         registry = app.state.chain_registry
@@ -444,15 +490,18 @@ def create_app(
             ) from exc
 
     @app.get("/v1/wallet/{address}/balances")
-    async def balances(address: str, chain: str) -> Any:
+    async def balances(request: Request, address: str, chain: str) -> Any:
+        await authenticated_user(request, verifier=token_verifier, required=require_auth)
         return await wallet_operation(address, chain, "balances")
 
     @app.get("/v1/wallet/{address}/transactions")
-    async def transactions(address: str, chain: str, limit: int = 20) -> Any:
+    async def transactions(request: Request, address: str, chain: str, limit: int = 20) -> Any:
+        await authenticated_user(request, verifier=token_verifier, required=require_auth)
         return await wallet_operation(address, chain, "transactions", limit)
 
     @app.get("/v1/wallet/{address}/fees")
-    async def fees(address: str, chain: str) -> Any:
+    async def fees(request: Request, address: str, chain: str) -> Any:
+        await authenticated_user(request, verifier=token_verifier, required=require_auth)
         return await wallet_operation(address, chain, "fees")
 
     return app
