@@ -9,7 +9,9 @@ from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -122,6 +124,48 @@ def create_app(
     app.state.providers = provider_map
     app.state.session_store = session_store
     app.state.runs: dict[str, dict[str, Any]] = {}
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": "VALIDATION_ERROR",
+                "message": "Request validation failed.",
+                "details": {"errors": jsonable_encoder(exc.errors())},
+            },
+        )
+
+    @app.exception_handler(HTTPException)
+    async def http_error(_request: Request, exc: HTTPException) -> JSONResponse:
+        detail = exc.detail
+        if isinstance(detail, Mapping) and detail.get("code") and detail.get("message"):
+            body = {
+                "code": detail["code"],
+                "message": detail["message"],
+            }
+            if detail.get("details"):
+                body["details"] = detail["details"]
+        else:
+            body = {
+                "code": f"HTTP_{exc.status_code}",
+                "message": str(detail),
+            }
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=jsonable_encoder(body),
+            headers=exc.headers,
+        )
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/ready")
+    async def ready() -> dict[str, str]:
+        if app.state.graph is None:
+            raise HTTPException(status_code=503, detail="agent graph is not configured")
+        return {"status": "ready"}
 
     async def project_session(
         session_id: str | None,
@@ -300,7 +344,10 @@ def create_app(
                     return
                 run = app.state.runs.get(run_id)
                 if run is None:
-                    yield 'event: error\ndata: {"code":"RUN_NOT_FOUND"}\n\n'
+                    yield (
+                        "event: error\ndata: "
+                        '{"code":"RUN_NOT_FOUND","message":"Run not found."}\n\n'
+                    )
                     return
                 event_list = run["events"]
                 while seen < len(event_list):
