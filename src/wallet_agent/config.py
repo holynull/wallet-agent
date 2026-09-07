@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_model: str = "deepseek-chat"
     openai_base_url: str | None = "https://api.deepseek.com"
+    allowed_model_ids: list[str] = Field(default_factory=lambda: ["deepseek-chat"])
 
     provider_timeout_seconds: float = Field(default=15, gt=0)
     http_timeout_seconds: float = Field(default=15, gt=0)

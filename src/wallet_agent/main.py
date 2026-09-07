@@ -33,13 +33,16 @@ def build_application(settings: Settings | None = None) -> Any:
     api_key = settings.deepseek_api_key or settings.openai_api_key
     if not api_key:
         raise ValueError("DEEPSEEK_API_KEY or OPENAI_API_KEY is required")
-    default_model = ChatOpenAI(
-        model=settings.openai_model,
-        api_key=api_key,
-        base_url=settings.openai_base_url,
-    ).with_structured_output(IntentOutput)
+    model_clients = {
+        model_id: ChatOpenAI(
+            model=model_id,
+            api_key=api_key,
+            base_url=settings.openai_base_url,
+        ).with_structured_output(IntentOutput)
+        for model_id in dict.fromkeys([settings.openai_model, *settings.allowed_model_ids])
+    }
     model_registry = ModelRegistry(
-        {settings.openai_model: default_model}, default_model_id=settings.openai_model
+        model_clients, default_model_id=settings.openai_model
     )
     model = ModelRouter(model_registry)
     providers: dict[str, Any] = {}

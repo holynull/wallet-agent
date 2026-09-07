@@ -32,6 +32,7 @@ packages = ["src/wallet_agent"]
 [tool.pytest.ini_options]
 addopts = "-q"
 asyncio_mode = "auto"
+markers = ["integration: tests that call external provider, RPC, or model services"]
 
 [tool.ruff]
 line-length = 100
