@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     rpc_urls: dict[str, str] = Field(default_factory=dict)
 
     persistence_url: str = "sqlite+aiosqlite:///./wallet_agent.db"
+    auth_required: bool = False
+    auth_tokens: dict[str, str] = Field(default_factory=dict)
     poll_interval_seconds: float = Field(default=5, gt=0)
     poll_max_attempts: int = Field(default=20, ge=1, le=1000)
 

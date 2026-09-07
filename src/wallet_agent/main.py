@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from wallet_agent.api import create_app
+from wallet_agent.api import StaticTokenVerifier, create_app
 from wallet_agent.config import Settings
 from wallet_agent.graph import build_graph
 from wallet_agent.models import ModelRegistry, ModelRouter
@@ -80,6 +80,8 @@ def build_application(settings: Settings | None = None) -> Any:
         providers=providers,
         store=session_store,
         model_registry=model_registry,
+        token_verifier=StaticTokenVerifier(settings.auth_tokens) if settings.auth_tokens else None,
+        require_auth=settings.auth_required,
     )
     application.state.checkpointer_handle = checkpoint_handle
     application.state.transports = transports
