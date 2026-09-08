@@ -123,6 +123,7 @@ def create_app(
     graph: Any = None,
     chain_registry: Any = None,
     providers: Mapping[str, Any] | None = None,
+    price_provider: Any | None = None,
     store: SessionStore | None = None,
     token_verifier: TokenVerifier | None = None,
     require_auth: bool = False,
@@ -134,6 +135,7 @@ def create_app(
     app.state.graph = graph
     app.state.chain_registry = chain_registry
     app.state.providers = provider_map
+    app.state.price_provider = price_provider
     app.state.session_store = session_store
     app.state.runs: dict[str, dict[str, Any]] = {}
     app.state.token_verifier = token_verifier

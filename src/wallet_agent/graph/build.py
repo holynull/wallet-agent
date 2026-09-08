@@ -17,6 +17,7 @@ def build_graph(
     model: Any,
     providers: Any = (),
     chains: Any = (),
+    price_provider: Any | None = None,
     checkpointer: Any | None = None,
     max_poll_attempts: int = 3,
 ) -> Any:
@@ -43,6 +44,7 @@ def build_graph(
         model=model,
         providers=provider_map,
         chains=chain_map,
+        price_provider=price_provider,
         max_poll_attempts=max(1, max_poll_attempts),
     )
     n = make_nodes(runtime)

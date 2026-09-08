@@ -21,6 +21,7 @@ class GraphRuntime:
     model: Any
     providers: dict[str, Any]
     chains: dict[str, Any]
+    price_provider: Any | None = None
     max_poll_attempts: int = 3
 
 

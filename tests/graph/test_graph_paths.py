@@ -55,7 +55,9 @@ def quote_request():
 @pytest.mark.asyncio
 async def test_quote_path_fans_out_and_reduces_candidates():
     graph = build_graph(
-        model=FakeModel(), providers=[FakeProvider("bridgers"), FakeProvider("omnibridge")]
+        model=FakeModel(),
+        providers=[FakeProvider("bridgers"), FakeProvider("omnibridge")],
+        price_provider=object(),
     )
     result = await graph.ainvoke(
         {
@@ -75,7 +77,7 @@ async def test_malformed_model_output_routes_to_clarification():
         async def ainvoke(self, value):
             return "not structured"
 
-    graph = build_graph(model=BadModel(), providers=[])
+    graph = build_graph(model=BadModel(), providers=[], price_provider=object())
     result = await graph.ainvoke(
         {"conversation_id": "c1", "user_id": "u1", "message": "swap"},
         config={"configurable": {"thread_id": "bad"}},

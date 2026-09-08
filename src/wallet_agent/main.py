@@ -17,6 +17,7 @@ from wallet_agent.config import Settings
 from wallet_agent.graph import build_graph
 from wallet_agent.models import ModelRegistry, ModelRouter
 from wallet_agent.persistence import SqliteSessionStore, initialize_checkpointer
+from wallet_agent.prices import CoinGeckoPriceProvider
 from wallet_agent.providers import BridgersProvider, HttpJsonTransport, OmniBridgeProvider
 
 
@@ -48,6 +49,8 @@ def build_application(settings: Settings | None = None) -> Any:
     model = ModelRouter(model_registry)
     providers: dict[str, Any] = {}
     transports: list[HttpJsonTransport] = []
+    price_provider = None
+    default_coingecko_base_url = "https://pro-api.coingecko.com/api/v3"
     if settings.bridgers_enabled:
         if not settings.bridgers_base_url:
             raise ValueError("BRIDGERS_BASE_URL is required when BRIDGERS_ENABLED=true")
@@ -68,10 +71,29 @@ def build_application(settings: Settings | None = None) -> Any:
         providers["omnibridge"] = OmniBridgeProvider.from_transport(
             transport, source_flag=settings.omnibridge_source_flag
         )
+    if (
+        settings.coingecko_api_key
+        or settings.coingecko_token_ids
+        or settings.coingecko_native_ids
+        or settings.coingecko_base_url != default_coingecko_base_url
+    ):
+        price_transport = HttpJsonTransport(
+            settings.coingecko_base_url, timeout_seconds=settings.http_timeout_seconds
+        )
+        transports.append(price_transport)
+        price_provider = CoinGeckoPriceProvider(
+            price_transport,
+            token_id_by_address=settings.coingecko_token_ids,
+            native_id_by_symbol=settings.coingecko_native_ids,
+            ttl_seconds=settings.price_cache_ttl_seconds,
+            api_key=settings.coingecko_api_key,
+            base_url=settings.coingecko_base_url,
+        )
     checkpoint_handle = initialize_checkpointer(settings.persistence_url)
     graph = build_graph(
         model=model,
         providers=providers,
+        price_provider=price_provider,
         checkpointer=checkpoint_handle.checkpointer,
         max_poll_attempts=settings.poll_max_attempts,
     )
@@ -84,6 +106,7 @@ def build_application(settings: Settings | None = None) -> Any:
     application = create_app(
         graph=graph,
         providers=providers,
+        price_provider=price_provider,
         store=session_store,
         model_registry=model_registry,
         token_verifier=StaticTokenVerifier(settings.auth_tokens) if settings.auth_tokens else None,

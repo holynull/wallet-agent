@@ -14,6 +14,10 @@ def test_settings_load_non_secret_defaults(monkeypatch):
     assert settings.allowed_chains == ["EVM", "TRON", "SOLANA"]
     assert settings.openai_model == "deepseek-chat"
     assert settings.openai_base_url == "https://api.deepseek.com"
+    assert settings.coingecko_api_key is None
+    assert settings.coingecko_token_ids == {}
+    assert settings.coingecko_native_ids == {}
+    assert settings.price_cache_ttl_seconds == 60
 
 
 @pytest.mark.parametrize(

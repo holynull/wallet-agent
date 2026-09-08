@@ -103,5 +103,29 @@ class HttpJsonTransport:
 
         raise RuntimeError("unreachable")
 
+    async def get(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        logger.debug("provider GET %s param_keys=%s", path, sorted(params or {}))
+        for attempt in range(self.max_attempts):
+            try:
+                response = await self.client.get(path, params=params, headers=headers)
+                response.raise_for_status()
+                result = response.json()
+                if not isinstance(result, dict):
+                    raise ValueError("Provider response must be a JSON object")
+                return result
+            except httpx.TransportError:
+                if attempt + 1 >= self.max_attempts:
+                    raise
+                if self.retry_delay_seconds:
+                    await asyncio.sleep(self.retry_delay_seconds)
+
+        raise RuntimeError("unreachable")
+
     async def aclose(self) -> None:
         await self.client.aclose()

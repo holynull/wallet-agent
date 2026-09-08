@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     rpc_timeout_seconds: float = Field(default=10, gt=0)
     rpc_max_attempts: int = Field(default=2, ge=1, le=5)
 
+    coingecko_api_key: str | None = None
+    coingecko_base_url: str = "https://pro-api.coingecko.com/api/v3"
+    coingecko_token_ids: dict[str, str] = Field(default_factory=dict)
+    coingecko_native_ids: dict[str, str] = Field(default_factory=dict)
+    price_cache_ttl_seconds: int = Field(default=60, ge=0)
+
     persistence_url: str = "sqlite+aiosqlite:///./wallet_agent.db"
     auth_required: bool = False
     auth_tokens: dict[str, str] = Field(default_factory=dict)
