@@ -37,6 +37,7 @@ OWNER = "0x" + "1" * 40
 SPENDER = "0x" + "2" * 40
 RECIPIENT = "0x" + "3" * 40
 USDC = Asset(chain="EVM", symbol="USDC", decimals=6, address="0x" + "4" * 40)
+BAD_TOKEN = Asset(chain="EVM", symbol="BAD", decimals=6, address="0x123")
 
 
 def test_build_native_transfer_uses_unsigned_transfer_shape():
@@ -100,6 +101,45 @@ def test_build_erc20_approve_rejects_negative_amount():
             spender=SPENDER,
             amount_raw="-1",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda adapter: adapter.get_token_balance(BAD_TOKEN, OWNER),
+        lambda adapter: adapter.get_allowance(BAD_TOKEN, OWNER, SPENDER),
+    ],
+)
+async def test_malformed_token_address_is_rejected_for_reads(call):
+    adapter = EVMChainAdapter(RpcFake())
+
+    with pytest.raises(ValueError):
+        await call(adapter)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda adapter: adapter.build_erc20_transfer(
+            token=BAD_TOKEN,
+            from_address=OWNER,
+            to_address=RECIPIENT,
+            amount_raw="15",
+        ),
+        lambda adapter: adapter.build_erc20_approve(
+            token=BAD_TOKEN,
+            owner=OWNER,
+            spender=SPENDER,
+            amount_raw="15",
+        ),
+    ],
+)
+def test_malformed_token_address_is_rejected_for_builders(call):
+    adapter = EVMChainAdapter(RpcFake())
+
+    with pytest.raises(ValueError):
+        call(adapter)
 
 
 @pytest.mark.asyncio

@@ -65,9 +65,13 @@ class EVMChainAdapter:
     async def validate_address(self, address: str) -> bool:
         return bool(_ADDRESS.fullmatch(address.strip()))
 
-    async def get_token_balance(self, asset: Asset, owner: str) -> TokenBalance:
-        if not asset.address:
+    def _token_contract_address(self, token: Asset) -> str:
+        if not token.address:
             raise ValueError("token address is required")
+        return validate_evm_address(token.address)
+
+    async def get_token_balance(self, asset: Asset, owner: str) -> TokenBalance:
+        token_address = self._token_contract_address(asset)
         owner_address = validate_evm_address(owner)
         raw = quantity(
             await rpc_call(
@@ -75,7 +79,7 @@ class EVMChainAdapter:
                 "eth_call",
                 [
                     {
-                        "to": asset.address,
+                        "to": token_address,
                         "data": build_erc20_calldata(
                             "70a08231", encode_evm_address_word(owner_address)
                         ),
@@ -102,8 +106,7 @@ class EVMChainAdapter:
         return balances
 
     async def get_allowance(self, token: Asset, owner: str, spender: str) -> str:
-        if not token.address:
-            raise ValueError("token address is required")
+        token_address = self._token_contract_address(token)
         owner_address = validate_evm_address(owner)
         spender_address = validate_evm_address(spender)
         raw = await rpc_call(
@@ -111,7 +114,7 @@ class EVMChainAdapter:
             "eth_call",
             [
                 {
-                    "to": token.address,
+                    "to": token_address,
                     "data": build_erc20_calldata(
                         "dd62ed3e",
                         encode_evm_address_word(owner_address),
@@ -193,15 +196,14 @@ class EVMChainAdapter:
     def build_erc20_transfer(
         self, *, token: Asset, from_address: str, to_address: str, amount_raw: str
     ) -> UnsignedTransaction:
-        if not token.address:
-            raise ValueError("token address is required")
+        token_address = self._token_contract_address(token)
         validate_evm_address(from_address)
         to = validate_evm_address(to_address)
         value = normalize_raw_integer(amount_raw)
         return UnsignedTransaction(
             chain=self.chain,
             chain_id=self.chain_id,
-            to=token.address,
+            to=token_address,
             data=build_erc20_calldata(
                 "a9059cbb", encode_evm_address_word(to), encode_evm_uint256_word(value)
             ),
@@ -218,15 +220,14 @@ class EVMChainAdapter:
     def build_erc20_approve(
         self, *, token: Asset, owner: str, spender: str, amount_raw: str
     ) -> UnsignedTransaction:
-        if not token.address:
-            raise ValueError("token address is required")
+        token_address = self._token_contract_address(token)
         validate_evm_address(owner)
         spender_address = validate_evm_address(spender)
         value = normalize_raw_integer(amount_raw)
         return UnsignedTransaction(
             chain=self.chain,
             chain_id=self.chain_id,
-            to=token.address,
+            to=token_address,
             data=build_erc20_calldata(
                 "095ea7b3", encode_evm_address_word(spender_address), encode_evm_uint256_word(value)
             ),
