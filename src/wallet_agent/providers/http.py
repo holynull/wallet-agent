@@ -77,6 +77,10 @@ class HttpJsonTransport:
             transport=transport,
         )
 
+    @staticmethod
+    def _retryable_status(status_code: int) -> bool:
+        return status_code == 429 or 500 <= status_code < 600
+
     async def post(
         self,
         path: str,
@@ -100,6 +104,41 @@ class HttpJsonTransport:
                     raise
                 if self.retry_delay_seconds:
                     await asyncio.sleep(self.retry_delay_seconds)
+
+        raise RuntimeError("unreachable")
+
+    async def get(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        logger.debug("provider GET %s param_keys=%s", path, sorted(params or {}))
+        for attempt in range(self.max_attempts):
+            try:
+                response = await self.client.get(path, params=params, headers=headers)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if (
+                    not self._retryable_status(exc.response.status_code)
+                    or attempt + 1 >= self.max_attempts
+                ):
+                    raise
+                if self.retry_delay_seconds:
+                    await asyncio.sleep(self.retry_delay_seconds)
+                continue
+            except httpx.TransportError:
+                if attempt + 1 >= self.max_attempts:
+                    raise
+                if self.retry_delay_seconds:
+                    await asyncio.sleep(self.retry_delay_seconds)
+                continue
+
+            result = response.json()
+            if not isinstance(result, dict):
+                raise ValueError("Provider response must be a JSON object")
+            return result
 
         raise RuntimeError("unreachable")
 

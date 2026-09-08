@@ -213,6 +213,12 @@ class TokenBalance(DomainModel):
     usd_value: Decimal | None = Field(default=None, ge=0)
 
 
+class TokenPrice(DomainModel):
+    asset: Asset
+    usd_price: Decimal = Field(ge=0)
+    observed_at: datetime | None = None
+
+
 class WalletSnapshot(DomainModel):
     address: str
     chain: str

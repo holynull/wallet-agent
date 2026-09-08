@@ -77,6 +77,56 @@ async def test_http_transport_does_not_retry_non_transport_http_failures():
 
 
 @pytest.mark.asyncio
+async def test_http_transport_retries_retryable_get_statuses():
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(429, json={"error": "rate limited"}, request=request)
+        return httpx.Response(200, json={"data": {"ok": True}}, request=request)
+
+    transport = HttpJsonTransport(
+        base_url="https://provider.invalid",
+        max_attempts=3,
+        retry_delay_seconds=0,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        response = await transport.get("/quote", params={"asset": "ETH"})
+    finally:
+        await transport.aclose()
+
+    assert response == {"data": {"ok": True}}
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_http_transport_does_not_retry_permanent_get_statuses():
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(404, json={"error": "not found"}, request=request)
+
+    transport = HttpJsonTransport(
+        base_url="https://provider.invalid",
+        max_attempts=3,
+        retry_delay_seconds=0,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await transport.get("/quote", params={"asset": "ETH"})
+    finally:
+        await transport.aclose()
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
 async def test_http_transport_sends_idempotency_key_without_logging_payload(caplog):
     observed_key = None
 
