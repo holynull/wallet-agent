@@ -12,6 +12,10 @@ Intent = Literal[
     "swap_status",
     "clarification",
     "unsupported",
+    "transfer",
+    "swap_select",
+    "swap_allowance",
+    "price_query",
 ]
 
 
@@ -43,3 +47,7 @@ class AgentState(TypedDict, total=False):
     errors: Annotated[list[dict[str, Any]], operator.add]
     response: NotRequired[dict[str, Any] | None]
     route: NotRequired[str | None]
+    approval_transaction: NotRequired[dict[str, Any] | None]
+    allowance_requirement: NotRequired[dict[str, Any] | None]
+    approval_tx_hash: NotRequired[str | None]
+    authorization_stage: NotRequired[str | None]

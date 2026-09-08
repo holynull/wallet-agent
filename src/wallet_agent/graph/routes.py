@@ -13,6 +13,12 @@ def route_after_intent(state: dict[str, Any]) -> str:
         return "register_broadcast"
     if intent == "wallet_query":
         return "wallet_query"
+    if intent == "transfer":
+        return "transfer"
+    if intent in {"swap_select", "swap_allowance"}:
+        return "swap_allowance"
+    if intent == "price_query":
+        return "price_query"
     if intent == "swap_quote":
         return "swap_resolve"
     if intent == "swap_prepare":

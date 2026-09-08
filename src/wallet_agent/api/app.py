@@ -89,6 +89,17 @@ class BroadcastRequest(BaseModel):
     chain: str
     tx_hash: str = Field(min_length=8)
 
+class ApprovalBroadcastRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    user_id: str | None = None
+    chain: str
+    approve_tx_hash: str = Field(min_length=8)
+
+class QuoteSelectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    user_id: str | None = None
+    provider_reference: str
+
 
 def _jsonable(value: Any) -> Any:
     if hasattr(value, "model_dump"):
@@ -235,6 +246,11 @@ def create_app(
         tx_hash = state.get("broadcast_tx_hash")
         if tx_hash:
             changes["broadcast_tx_hash"] = str(tx_hash)
+        if state.get("authorization_stage") is not None:
+            changes["stage"] = state["authorization_stage"]
+        for field in ("approval_transaction", "approval_tx_hash", "allowance_requirement"):
+            if state.get(field) is not None:
+                changes[field] = state[field]
         if status:
             changes["status"] = status
         if not changes:
@@ -481,6 +497,39 @@ def create_app(
             provider_order=order,
         )
         return _jsonable(updated)
+
+    @app.post("/v1/swap/{session_id}/select-quote")
+    async def select_quote(request: Request, session_id: str, payload: QuoteSelectionRequest) -> dict[str, Any]:
+        user_id = await authenticated_user(request, verifier=token_verifier, required=require_auth, fallback_user_id=payload.user_id)
+        session = await owned_session(session_id, user_id)
+        if session.quote is None or session.quote.provider_reference != payload.provider_reference:
+            raise HTTPException(status_code=404, detail="quote not found")
+        if app.state.graph is None:
+            return _jsonable(await session_store.update(session_id, stage="quote_selected", selected_provider_reference=payload.provider_reference))
+        result = await app.state.graph.ainvoke({"intent": "swap_allowance", "selected_quote": session.quote.model_dump(mode="json")}, config={"configurable": {"thread_id": session.thread_id}})
+        updated = await project_session(session_id, result, status=result.get("authorization_stage", "approval_required"))
+        return _jsonable(updated or result)
+
+    @app.post("/v1/swap/{session_id}/approve-broadcast")
+    async def approve_broadcast(request: Request, session_id: str, payload: ApprovalBroadcastRequest) -> dict[str, Any]:
+        user_id = await authenticated_user(request, verifier=token_verifier, required=require_auth, fallback_user_id=payload.user_id)
+        session = await owned_session(session_id, user_id)
+        if not _qualified_hash(payload.chain, payload.approve_tx_hash):
+            raise HTTPException(status_code=422, detail="approve_tx_hash must be a chain-qualified transaction hash")
+        if session.approval_tx_hash:
+            if session.approval_tx_hash == payload.approve_tx_hash:
+                return _jsonable(session)
+            raise HTTPException(status_code=409, detail="session already has a different approval hash")
+        return _jsonable(await session_store.update(session_id, approval_tx_hash=payload.approve_tx_hash, stage="approval_submitted"))
+
+    @app.post("/v1/swap/{session_id}/continue")
+    async def continue_swap(request: Request, session_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        user_id = await authenticated_user(request, verifier=token_verifier, required=require_auth, fallback_user_id=(payload or {}).get("user_id"))
+        session = await owned_session(session_id, user_id)
+        if app.state.graph is None:
+            return _jsonable(session)
+        result = await app.state.graph.ainvoke(Command(resume={"approve_tx_hash": session.approval_tx_hash}), config={"configurable": {"thread_id": session.thread_id}})
+        return _jsonable(await project_session(session_id, result, status=result.get("authorization_stage", "swap_ready")))
 
     @app.get("/v1/swap/{session_id}")
     async def get_swap(

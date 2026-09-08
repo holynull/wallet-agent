@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any
 
 from wallet_agent.domain.models import (
+    AllowanceRequirement,
     Asset,
     AssetQuery,
     NormalizedOrderStatus,
@@ -63,10 +64,14 @@ class BridgersProvider:
         *,
         source_flag: str = "",
         source_type: str | None = None,
+        spender_by_chain: dict[str, str] | None = None,
+        swap_spender: str | None = None,
     ) -> None:
         self.transport = transport
         self.source_flag = source_flag
         self.source_type = source_type
+        self.spender_by_chain = {str(k).upper(): str(v) for k, v in (spender_by_chain or {}).items()}
+        self.swap_spender = swap_spender
         self._quotes: dict[str, dict[str, Any]] = {}
 
     @classmethod
@@ -132,6 +137,22 @@ class BridgersProvider:
             "slippage_bps": request.slippage_bps,
             "amount_out_min_raw": minimum_raw,
         }
+        spender = self.spender_by_chain.get(request.source_asset.chain.upper()) or self.swap_spender
+        if not spender:
+            candidate = tx.get("contractAddress") or tx.get("spender") or tx.get("swapContract")
+            spender = str(candidate) if candidate else None
+        allowance = None
+        if spender and request.source_asset.address and request.source_asset.chain.upper() not in {"ETH", "EVM_NATIVE"}:
+            try:
+                allowance = AllowanceRequirement(
+                    token=request.source_asset,
+                    owner=request.sender_address,
+                    spender=spender,
+                    required_amount_raw=request.input_amount_raw,
+                    current_allowance_raw="0",
+                )
+            except Exception:
+                allowance = None
         return NormalizedQuote(
             provider="bridgers",
             source_asset=request.source_asset,
@@ -147,6 +168,7 @@ class BridgersProvider:
             expires_at=None,
             provider_reference=reference,
             provider_payload=provider_payload,
+            allowance_requirement=allowance,
         )
 
     async def prepare(self, quote: NormalizedQuote) -> UnsignedTransaction:
