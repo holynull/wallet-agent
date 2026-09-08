@@ -28,10 +28,16 @@ class SwapSessionRecord(DomainModel):
     thread_id: str
     status: str = "created"
     quote: NormalizedQuote | None = None
+    quote_candidates: list[NormalizedQuote] = Field(default_factory=list)
     pending_transaction: UnsignedTransaction | DepositOrder | None = None
     provider_order: ProviderOrder | None = None
     order_status: NormalizedOrderStatus | None = None
     broadcast_tx_hash: str | None = None
+    stage: str | None = None
+    selected_provider_reference: str | None = None
+    approval_transaction: dict | None = None
+    approval_tx_hash: str | None = None
+    allowance_requirement: dict | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

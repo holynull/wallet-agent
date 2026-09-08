@@ -42,10 +42,19 @@ The default model backend is DeepSeek's official OpenAI-compatible API:
 `https://api.deepseek.com` with `deepseek-chat`. To use another compatible
 backend, set `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_BASE_URL` instead.
 
-The HTTP API is rooted at `/v1`: agent turns and SSE streaming, swap
-confirmation/broadcast/status, and read-only wallet balances, transactions,
-and fee estimates. Use a stable `conversation_id` as the LangGraph
-`thread_id` when reconnecting.
+The HTTP API is rooted at `/v1`: agent turns and SSE streaming, explicit swap
+quote selection (`/swap/{session_id}/select-quote`), allowance/approval gating
+(`/approve-broadcast` then `/continue`), transfer preparation, token prices, and
+read-only wallet balances, transactions, and fee estimates. The app must choose
+the returned `provider_reference`; the service never picks a quote silently.
+Use a stable `conversation_id` as the LangGraph `thread_id` when reconnecting.
+
+For swap authorization, the service returns an ERC-20 `approval_transaction`
+when allowance is insufficient. Sign and broadcast that transaction in the app,
+submit only its hash, then call `/continue`. The service verifies the receipt
+and rereads allowance before calling the provider to create the final unsigned
+swap transaction. See [docs/evm-wallet-actions.md](docs/evm-wallet-actions.md)
+for request/response examples.
 
 Provider and chain transports are injectable, so tests never call external
 services. Unsupported chain families return `CHAIN_CAPABILITY_UNAVAILABLE`;

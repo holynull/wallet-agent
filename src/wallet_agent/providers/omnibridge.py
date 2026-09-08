@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any
 
 from wallet_agent.domain.models import (
+    AllowanceRequirement,
     Asset,
     AssetQuery,
     DepositOrder,
@@ -41,10 +42,22 @@ def _raw(amount: Decimal, decimals: int) -> str:
 class OmniBridgeProvider:
     provider_name = "omnibridge"
 
-    def __init__(self, transport: Any, *, source_flag: str = "", source_type: str = "H5") -> None:
+    def __init__(
+        self,
+        transport: Any,
+        *,
+        source_flag: str = "",
+        source_type: str = "H5",
+        spender_by_chain: dict[str, str] | None = None,
+        swap_spender: str | None = None,
+    ) -> None:
         self.transport = transport
         self.source_flag = source_flag
         self.source_type = source_type
+        self.spender_by_chain = {
+            str(k).upper(): str(v) for k, v in (spender_by_chain or {}).items()
+        }
+        self.swap_spender = swap_spender
         self._quotes: dict[str, dict[str, Any]] = {}
         self._orders: dict[str, dict[str, Any]] = {}
 
@@ -129,6 +142,28 @@ class OmniBridgeProvider:
             "deposit_min": str(data.get("depositMin", "0")),
             "deposit_max": str(data.get("depositMax", "Infinity")),
         }
+        spender = self.spender_by_chain.get(request.source_asset.chain.upper()) or self.swap_spender
+        if not spender:
+            candidate = (
+                data.get("spender") or data.get("contractAddress") or data.get("swapContract")
+            )
+            spender = str(candidate) if candidate else None
+        allowance = None
+        if (
+            spender
+            and request.source_asset.address
+            and request.source_asset.chain.upper() not in {"ETH", "EVM_NATIVE"}
+        ):
+            try:
+                allowance = AllowanceRequirement(
+                    token=request.source_asset,
+                    owner=request.sender_address,
+                    spender=spender,
+                    required_amount_raw=request.input_amount_raw,
+                    current_allowance_raw="0",
+                )
+            except Exception:
+                allowance = None
         return NormalizedQuote(
             provider="omnibridge",
             source_asset=request.source_asset,
@@ -141,6 +176,7 @@ class OmniBridgeProvider:
             network_fee=network_fee,
             provider_reference=reference,
             provider_payload=provider_payload,
+            allowance_requirement=allowance,
         )
 
     async def prepare(self, quote: NormalizedQuote) -> DepositOrder:

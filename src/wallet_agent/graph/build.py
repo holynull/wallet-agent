@@ -17,6 +17,7 @@ def build_graph(
     model: Any,
     providers: Any = (),
     chains: Any = (),
+    price_provider: Any | None = None,
     checkpointer: Any | None = None,
     max_poll_attempts: int = 3,
 ) -> Any:
@@ -43,6 +44,7 @@ def build_graph(
         model=model,
         providers=provider_map,
         chains=chain_map,
+        price_provider=price_provider,
         max_poll_attempts=max(1, max_poll_attempts),
     )
     n = make_nodes(runtime)
@@ -52,6 +54,9 @@ def build_graph(
     builder.add_node("quote_provider", n["quote_provider"])
     builder.add_node("quote_response", n["quote_response"])
     builder.add_node("wallet_query", n["wallet_query"])
+    builder.add_node("price_query", n["price_query"])
+    builder.add_node("transfer", n["transfer"])
+    builder.add_node("swap_allowance", n["swap_allowance"])
     builder.add_node("prepare", n["prepare"])
     builder.add_node("register_broadcast", n["register_broadcast"])
     builder.add_node("status_poll", n["status_poll"])
@@ -62,6 +67,9 @@ def build_graph(
         route_after_intent,
         {
             "wallet_query": "wallet_query",
+            "transfer": "transfer",
+            "swap_allowance": "swap_allowance",
+            "price_query": "price_query",
             "swap_resolve": "resolve_swap",
             "swap_resolve_prepare": "resolve_swap",
             "status_poll": "status_poll",
@@ -75,6 +83,9 @@ def build_graph(
     builder.add_edge("quote_provider", "quote_response")
     builder.add_edge("quote_response", END)
     builder.add_edge("wallet_query", END)
+    builder.add_edge("price_query", END)
+    builder.add_edge("transfer", END)
+    builder.add_edge("swap_allowance", END)
     builder.add_edge("prepare", END)
     builder.add_edge("register_broadcast", "status_poll")
     builder.add_edge("response", END)

@@ -13,6 +13,7 @@ from .models import (
     ProviderOrder,
     SwapQuoteRequest,
     TokenBalance,
+    TokenPrice,
     TransactionRecord,
     TransactionStatus,
     UnsignedTransaction,
@@ -41,9 +42,15 @@ class ChainAdapter(Protocol):
 
     async def validate_address(self, address: str) -> bool: ...
 
+    async def get_token_balance(self, asset: Asset, owner: str) -> TokenBalance: ...
+
     async def get_native_balance(self, address: str) -> TokenBalance: ...
 
     async def get_token_balances(self, address: str) -> list[TokenBalance]: ...
+
+    async def get_allowance(self, token: Asset, owner: str, spender: str) -> str: ...
+
+    async def get_transaction_receipt(self, tx_hash: str) -> dict[str, object] | None: ...
 
     async def get_transaction_history(
         self, address: str, *, limit: int = 20
@@ -54,3 +61,21 @@ class ChainAdapter(Protocol):
     ) -> FeeEstimate: ...
 
     async def get_transaction_status(self, tx_hash: str) -> TransactionStatus: ...
+
+    def build_native_transfer(
+        self, *, from_address: str, to_address: str, amount_raw: str
+    ) -> UnsignedTransaction: ...
+
+    def build_erc20_transfer(
+        self, *, token: Asset, from_address: str, to_address: str, amount_raw: str
+    ) -> UnsignedTransaction: ...
+
+    def build_erc20_approve(
+        self, *, token: Asset, owner: str, spender: str, amount_raw: str
+    ) -> UnsignedTransaction: ...
+
+
+class TokenPriceProvider(Protocol):
+    """Normalized interface for batch asset price lookup."""
+
+    async def get_prices(self, assets: list[Asset]) -> list[TokenPrice]: ...

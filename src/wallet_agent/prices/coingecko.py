@@ -28,7 +28,7 @@ def _asset_id(
 
 
 @dataclass
-class _CachedEntry:
+class _CachedBatch:
     expires_at: float
     payload: dict[str, Any]
 
@@ -48,77 +48,58 @@ class CoinGeckoPriceProvider:
     ) -> None:
         self.transport = transport
         self.token_id_by_address = {
-            str(key).lower(): str(value) for key, value in (token_id_by_address or {}).items()
+            str(k).lower(): str(v) for k, v in (token_id_by_address or {}).items()
         }
         self.native_id_by_symbol = {
-            str(key).upper(): str(value) for key, value in (native_id_by_symbol or {}).items()
+            str(k).upper(): str(v) for k, v in (native_id_by_symbol or {}).items()
         }
         self.ttl_seconds = max(0, int(ttl_seconds))
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.last_error: AgentError | None = None
-        self._cache: dict[str, _CachedEntry] = {}
+        self._cache: _CachedBatch | None = None
         self._lock = asyncio.Lock()
 
     async def get_prices(self, assets: list[Asset]) -> list[TokenPrice]:
-        requested_ids: list[str] = []
+        now = asyncio.get_running_loop().time()
+        if self._cache and self._cache.expires_at > now:
+            self.last_error = None
+            return self._build_prices(assets, self._cache.payload)
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            if self._cache and self._cache.expires_at > now:
+                self.last_error = None
+                return self._build_prices(assets, self._cache.payload)
+            try:
+                payload = await self._fetch_batch(assets)
+            except Exception as exc:
+                self.last_error = AgentError(
+                    code="COINGECKO_UNAVAILABLE",
+                    message=str(exc) or "CoinGecko unavailable",
+                    retryable=True,
+                    details={"provider": "coingecko"},
+                )
+                return []
+            self.last_error = None
+            if self.ttl_seconds > 0:
+                self._cache = _CachedBatch(expires_at=now + self.ttl_seconds, payload=payload)
+            return self._build_prices(assets, payload)
+
+    async def _fetch_batch(self, assets: list[Asset]) -> dict[str, Any]:
+        ids: list[str] = []
         for asset in assets:
             asset_id = _asset_id(
                 asset,
                 token_id_by_address=self.token_id_by_address,
                 native_id_by_symbol=self.native_id_by_symbol,
             )
-            if asset_id and asset_id not in requested_ids:
-                requested_ids.append(asset_id)
-        if not requested_ids:
-            self.last_error = None
-            return []
-
-        async with self._lock:
-            now = asyncio.get_running_loop().time()
-            payload = self._cached_payload(requested_ids, now)
-            missing_ids = [asset_id for asset_id in requested_ids if asset_id not in payload]
-            if missing_ids:
-                try:
-                    fetched = await self._fetch_batch(missing_ids)
-                except Exception as exc:
-                    if not payload:
-                        self.last_error = AgentError(
-                            code="COINGECKO_UNAVAILABLE",
-                            message=str(exc) or "CoinGecko unavailable",
-                            retryable=True,
-                            details={"provider": "coingecko"},
-                        )
-                        return []
-                    self.last_error = AgentError(
-                        code="COINGECKO_UNAVAILABLE",
-                        message=str(exc) or "CoinGecko unavailable",
-                        retryable=True,
-                        details={"provider": "coingecko"},
-                    )
-                    return self._build_prices(assets, payload)
-                if self.ttl_seconds > 0:
-                    expires_at = now + self.ttl_seconds
-                    for asset_id, entry in fetched.items():
-                        self._cache[asset_id] = _CachedEntry(expires_at=expires_at, payload=entry)
-                payload.update(fetched)
-            self.last_error = None
-            return self._build_prices(assets, payload)
-
-    def _cached_payload(self, asset_ids: list[str], now: float) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        for asset_id in asset_ids:
-            cached = self._cache.get(asset_id)
-            if cached and cached.expires_at > now:
-                payload[asset_id] = cached.payload
-        return payload
-
-    async def _fetch_batch(self, asset_ids: list[str]) -> dict[str, Any]:
-        if not asset_ids:
+            if asset_id and asset_id not in ids:
+                ids.append(asset_id)
+        if not ids:
             return {}
         headers = {"x-cg-pro-api-key": self.api_key} if self.api_key else None
         params = {
-            "ids": ",".join(asset_ids),
+            "ids": ",".join(ids),
             "vs_currencies": "usd",
             "include_last_updated_at": "true",
         }

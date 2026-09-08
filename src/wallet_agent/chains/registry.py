@@ -69,8 +69,14 @@ def build_default_registry(
                 return [value]
             return list(value or [])
 
-        chain_ids = {"ETH": 1, "BSC": 56, "BASE": 8453, "ARBITRUM": 42161,
-                     "OPTIMISM": 10, "POLYGON": 137}
+        chain_ids = {
+            "ETH": 1,
+            "BSC": 56,
+            "BASE": 8453,
+            "ARBITRUM": 42161,
+            "OPTIMISM": 10,
+            "POLYGON": 137,
+        }
         for chain, chain_id in chain_ids.items():
             if chain not in adapters and urls(chain):
                 adapters[chain] = EVMChainAdapter(

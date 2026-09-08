@@ -1,14 +1,21 @@
 from decimal import Decimal
 
+import pytest
+
 from wallet_agent.domain.models import (
     AgentError,
+    AllowanceRequirement,
+    ApprovalTransaction,
     Asset,
     DepositOrder,
     NormalizedOrderStatus,
     NormalizedQuote,
     ProviderOrder,
+    SwapAuthorizationState,
     SwapQuoteRequest,
     TokenBalance,
+    TokenPrice,
+    TransferRequest,
     UnsignedTransaction,
     WalletSnapshot,
 )
@@ -177,3 +184,88 @@ def test_arbitrary_domain_mappings_redact_common_sensitive_key_variants():
         "token_symbol": "USDC",
         "secretariat": "support-team",
     }
+
+
+def test_transfer_request_normalizes_amount_and_requires_evm_addresses():
+    request = TransferRequest(
+        chain="BASE",
+        sender="0x" + "1" * 40,
+        recipient="0x" + "2" * 40,
+        amount="1.25",
+        amount_raw="1250000000000000000",
+        token=None,
+    )
+
+    assert request.amount_raw == "1250000000000000000"
+    assert request.amount == Decimal("1.25")
+
+
+def test_transfer_request_rejects_non_evm_sender_address():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        TransferRequest(
+            chain="BASE",
+            sender="not-an-evm-address",
+            recipient="0x" + "2" * 40,
+            amount="1.25",
+            amount_raw="1250000000000000000",
+            token=None,
+        )
+
+
+def test_allowance_requirement_is_serializable_in_normalized_quote():
+    requirement = AllowanceRequirement(
+        token=Asset(chain="BASE", symbol="USDC", decimals=6, address="0x" + "3" * 40),
+        owner="0x" + "1" * 40,
+        spender="0x" + "4" * 40,
+        required_amount_raw="1000000",
+        current_allowance_raw="0",
+    )
+    quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=Asset(
+            chain="BASE", symbol="USDC", decimals=6, address="0x" + "3" * 40
+        ),
+        destination_asset=Asset(
+            chain="BSC", symbol="USDT", decimals=6, address="0x" + "5" * 40
+        ),
+        input_amount="1",
+        input_amount_raw="1000000",
+        expected_output="0.99",
+        expected_output_raw="990000",
+        provider_reference="quote-1",
+        allowance_requirement=requirement,
+    )
+
+    assert quote.model_dump(mode="json")["allowance_requirement"]["spender"] == "0x" + "4" * 40
+
+
+def test_price_and_authorization_contracts_serialize_nested_wallet_actions():
+    token = Asset(chain="BASE", symbol="USDC", decimals=6, address="0x" + "3" * 40)
+    requirement = AllowanceRequirement(
+        token=token,
+        owner="0x" + "1" * 40,
+        spender="0x" + "4" * 40,
+        required_amount_raw="1000000",
+        current_allowance_raw="0",
+    )
+    approval = ApprovalTransaction(
+        chain="BASE",
+        to="0x" + "3" * 40,
+        data="0x095ea7b3",
+        value="0",
+        token=token,
+        owner="0x" + "1" * 40,
+        spender="0x" + "4" * 40,
+        amount_raw="1000000",
+    )
+    state = SwapAuthorizationState(
+        stage="approval_required",
+        allowance_requirement=requirement,
+        approval_transaction=approval,
+    )
+    price = TokenPrice(asset=token, usd_price="1.00")
+
+    assert price.model_dump(mode="json")["usd_price"] == "1.00"
+    assert state.model_dump(mode="json")["approval_transaction"]["data"] == "0x095ea7b3"

@@ -13,9 +13,21 @@ from wallet_agent.domain.models import (
     TokenBalance,
     TransactionRecord,
     TransactionStatus,
+    UnsignedTransaction,
 )
 
-from ._common import parse_status, quantity, rpc_call, token_balance
+from ._common import (
+    build_erc20_calldata,
+    encode_evm_address_word,
+    encode_evm_uint256_word,
+    normalize_raw_integer,
+    parse_status,
+    quantity,
+    receipt_success,
+    rpc_call,
+    token_balance,
+    validate_evm_address,
+)
 
 _ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
@@ -53,6 +65,31 @@ class EVMChainAdapter:
     async def validate_address(self, address: str) -> bool:
         return bool(_ADDRESS.fullmatch(address.strip()))
 
+    def _token_contract_address(self, token: Asset) -> str:
+        if not token.address:
+            raise ValueError("token address is required")
+        return validate_evm_address(token.address)
+
+    async def get_token_balance(self, asset: Asset, owner: str) -> TokenBalance:
+        token_address = self._token_contract_address(asset)
+        owner_address = validate_evm_address(owner)
+        raw = quantity(
+            await rpc_call(
+                self.transport,
+                "eth_call",
+                [
+                    {
+                        "to": token_address,
+                        "data": build_erc20_calldata(
+                            "70a08231", encode_evm_address_word(owner_address)
+                        ),
+                    },
+                    "latest",
+                ],
+            )
+        )
+        return token_balance(asset, raw)
+
     async def get_native_balance(self, address: str) -> TokenBalance:
         raw = quantity(await rpc_call(self.transport, "eth_getBalance", [address, "latest"]))
         return token_balance(self.native_asset, raw)
@@ -60,21 +97,38 @@ class EVMChainAdapter:
     async def get_token_balances(self, address: str) -> list[TokenBalance]:
         # ERC-20 balanceOf calls are deterministic and work with any standard EVM node.
         balances: list[TokenBalance] = []
-        selector = "70a08231"
-        encoded_address = address.lower().removeprefix("0x").rjust(64, "0")
         for asset in self.token_assets:
             if not asset.address:
                 continue
-            data = "0x" + selector + encoded_address
-            raw = await rpc_call(
-                self.transport,
-                "eth_call",
-                [{"to": asset.address, "data": data}, "latest"],
-            )
-            amount = quantity(raw)
+            amount = quantity((await self.get_token_balance(asset, address)).amount_raw)
             if amount:
                 balances.append(token_balance(asset, amount))
         return balances
+
+    async def get_allowance(self, token: Asset, owner: str, spender: str) -> str:
+        token_address = self._token_contract_address(token)
+        owner_address = validate_evm_address(owner)
+        spender_address = validate_evm_address(spender)
+        raw = await rpc_call(
+            self.transport,
+            "eth_call",
+            [
+                {
+                    "to": token_address,
+                    "data": build_erc20_calldata(
+                        "dd62ed3e",
+                        encode_evm_address_word(owner_address),
+                        encode_evm_address_word(spender_address),
+                    ),
+                },
+                "latest",
+            ],
+        )
+        return normalize_raw_integer(quantity(raw))
+
+    async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
+        receipt = await rpc_call(self.transport, "eth_getTransactionReceipt", [tx_hash])
+        return receipt if isinstance(receipt, dict) else None
 
     async def get_transaction_history(
         self, address: str, *, limit: int = 20
@@ -108,11 +162,84 @@ class EVMChainAdapter:
         )
 
     async def get_transaction_status(self, tx_hash: str) -> TransactionStatus:
-        receipt = await rpc_call(self.transport, "eth_getTransactionReceipt", [tx_hash])
+        receipt = await self.get_transaction_receipt(tx_hash)
         if receipt is None:
             return TransactionStatus.PENDING
-        status = parse_status(receipt.get("status") if isinstance(receipt, dict) else receipt)
-        return TransactionStatus(status)
+        status = receipt_success(receipt)
+        if status is None:
+            status = parse_status(receipt.get("status"))
+            return TransactionStatus(status)
+        if status:
+            return TransactionStatus.CONFIRMED
+        return TransactionStatus.FAILED
+
+    def build_native_transfer(
+        self, *, from_address: str, to_address: str, amount_raw: str
+    ) -> UnsignedTransaction:
+        validate_evm_address(from_address)
+        to = validate_evm_address(to_address)
+        value = normalize_raw_integer(amount_raw)
+        return UnsignedTransaction(
+            chain=self.chain,
+            chain_id=self.chain_id,
+            to=to,
+            data="0x",
+            value=value,
+            display={
+                "action": "native_transfer",
+                "from": from_address,
+                "to": to,
+                "amount_raw": value,
+            },
+        )
+
+    def build_erc20_transfer(
+        self, *, token: Asset, from_address: str, to_address: str, amount_raw: str
+    ) -> UnsignedTransaction:
+        token_address = self._token_contract_address(token)
+        validate_evm_address(from_address)
+        to = validate_evm_address(to_address)
+        value = normalize_raw_integer(amount_raw)
+        return UnsignedTransaction(
+            chain=self.chain,
+            chain_id=self.chain_id,
+            to=token_address,
+            data=build_erc20_calldata(
+                "a9059cbb", encode_evm_address_word(to), encode_evm_uint256_word(value)
+            ),
+            value="0",
+            display={
+                "action": "erc20_transfer",
+                "token": token.symbol,
+                "from": from_address,
+                "to": to,
+                "amount_raw": value,
+            },
+        )
+
+    def build_erc20_approve(
+        self, *, token: Asset, owner: str, spender: str, amount_raw: str
+    ) -> UnsignedTransaction:
+        token_address = self._token_contract_address(token)
+        validate_evm_address(owner)
+        spender_address = validate_evm_address(spender)
+        value = normalize_raw_integer(amount_raw)
+        return UnsignedTransaction(
+            chain=self.chain,
+            chain_id=self.chain_id,
+            to=token_address,
+            data=build_erc20_calldata(
+                "095ea7b3", encode_evm_address_word(spender_address), encode_evm_uint256_word(value)
+            ),
+            value="0",
+            display={
+                "action": "erc20_approve",
+                "token": token.symbol,
+                "owner": owner,
+                "spender": spender_address,
+                "amount_raw": value,
+            },
+        )
 
     def _record(self, item: dict[str, Any]) -> TransactionRecord:
         status = parse_status(item.get("status") or item.get("txreceipt_status"))

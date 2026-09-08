@@ -16,9 +16,13 @@ class Settings(BaseSettings):
     bridgers_enabled: bool = False
     bridgers_base_url: str | None = None
     bridgers_source_flag: str = ""
+    bridgers_spender_by_chain: dict[str, str] = Field(default_factory=dict)
+    bridgers_swap_spender: str | None = None
     omnibridge_enabled: bool = False
     omnibridge_base_url: str | None = None
     omnibridge_source_flag: str = ""
+    omnibridge_spender_by_chain: dict[str, str] = Field(default_factory=dict)
+    omnibridge_swap_spender: str | None = None
 
     # DeepSeek is the default OpenAI-compatible backend. The OPENAI_* names
     # remain supported for backwards compatibility with existing deployments.
@@ -34,6 +38,12 @@ class Settings(BaseSettings):
     rpc_urls: dict[str, str | list[str]] = Field(default_factory=dict)
     rpc_timeout_seconds: float = Field(default=10, gt=0)
     rpc_max_attempts: int = Field(default=2, ge=1, le=5)
+
+    coingecko_api_key: str | None = None
+    coingecko_base_url: str = "https://pro-api.coingecko.com/api/v3"
+    coingecko_token_ids: dict[str, str] = Field(default_factory=dict)
+    coingecko_native_ids: dict[str, str] = Field(default_factory=dict)
+    price_cache_ttl_seconds: int = Field(default=60, ge=0)
 
     persistence_url: str = "sqlite+aiosqlite:///./wallet_agent.db"
     auth_required: bool = False
