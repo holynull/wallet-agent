@@ -28,6 +28,7 @@ class SwapSessionRecord(DomainModel):
     thread_id: str
     status: str = "created"
     quote: NormalizedQuote | None = None
+    quote_candidates: list[NormalizedQuote] = Field(default_factory=list)
     pending_transaction: UnsignedTransaction | DepositOrder | None = None
     provider_order: ProviderOrder | None = None
     order_status: NormalizedOrderStatus | None = None

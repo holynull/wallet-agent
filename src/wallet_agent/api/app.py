@@ -219,6 +219,12 @@ def create_app(
                 if isinstance(selected, NormalizedQuote)
                 else NormalizedQuote.model_validate(selected)
             )
+        candidates = state.get("quote_candidates") or []
+        if candidates:
+            changes["quote_candidates"] = [
+                item if isinstance(item, NormalizedQuote) else NormalizedQuote.model_validate(item)
+                for item in candidates
+            ]
         pending = state.get("pending_transaction")
         if pending:
             if isinstance(pending, (UnsignedTransaction, DepositOrder)):
@@ -502,11 +508,24 @@ def create_app(
     async def select_quote(request: Request, session_id: str, payload: QuoteSelectionRequest) -> dict[str, Any]:
         user_id = await authenticated_user(request, verifier=token_verifier, required=require_auth, fallback_user_id=payload.user_id)
         session = await owned_session(session_id, user_id)
-        if session.quote is None or session.quote.provider_reference != payload.provider_reference:
+        selected_quote = session.quote
+        if selected_quote is None:
+            selected_quote = next(
+                (
+                    candidate
+                    for candidate in session.quote_candidates
+                    if candidate.provider_reference == payload.provider_reference
+                ),
+                None,
+            )
+        if selected_quote is None or selected_quote.provider_reference != payload.provider_reference:
             raise HTTPException(status_code=404, detail="quote not found")
         if app.state.graph is None:
             return _jsonable(await session_store.update(session_id, stage="quote_selected", selected_provider_reference=payload.provider_reference))
-        result = await app.state.graph.ainvoke({"intent": "swap_allowance", "selected_quote": session.quote.model_dump(mode="json")}, config={"configurable": {"thread_id": session.thread_id}})
+        result = await app.state.graph.ainvoke(
+            {"intent": "swap_allowance", "selected_quote": selected_quote.model_dump(mode="json")},
+            config={"configurable": {"thread_id": session.thread_id}},
+        )
         updated = await project_session(session_id, result, status=result.get("authorization_stage", "approval_required"))
         return _jsonable(updated or result)
 
