@@ -21,6 +21,7 @@ OrderState = Literal[
     "cancelled",
 ]
 RawInteger = Annotated[str, Field(pattern=r"^[0-9]+$")]
+EVMAddress = Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{40}$")]
 
 _SENSITIVE_METADATA_KEYS = frozenset(
     {
@@ -83,11 +84,19 @@ class DomainModel(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def redact_sensitive_mappings(cls, value: Any) -> Any:
-        return _redact_metadata(value)
+        if not isinstance(value, Mapping):
+            return _redact_metadata(value)
+        protected_keys = frozenset(cls.model_fields)
+        return {
+            str(item_key): _redact_metadata(item_value, str(item_key), protected_keys)
+            for item_key, item_value in value.items()
+        }
 
 
-def _redact_metadata(value: Any, key: str | None = None) -> Any:
-    if key is not None and _is_sensitive_key(key):
+def _redact_metadata(
+    value: Any, key: str | None = None, protected_keys: frozenset[str] | None = None
+) -> Any:
+    if key is not None and _is_sensitive_key(key) and (protected_keys is None or key not in protected_keys):
         return "[REDACTED]"
     if isinstance(value, Mapping):
         return {
@@ -135,6 +144,70 @@ class SwapQuoteRequest(DomainModel):
     expires_at: datetime | None = None
 
 
+class TransferRequest(DomainModel):
+    """A user-authorized native or ERC-20 transfer request."""
+
+    chain: str
+    sender: EVMAddress
+    recipient: EVMAddress
+    amount: Decimal = Field(gt=0)
+    amount_raw: RawInteger
+    token: Asset | None = None
+
+
+class AllowanceRequirement(DomainModel):
+    """On-chain allowance needed before a provider swap can be prepared."""
+
+    token: Asset
+    owner: EVMAddress
+    spender: EVMAddress
+    required_amount_raw: RawInteger
+    current_allowance_raw: RawInteger
+
+
+class ApprovalTransaction(DomainModel):
+    """Unsigned ERC-20 approval transaction and its authorization context."""
+
+    chain: str
+    chain_id: int | str | None = None
+    to: EVMAddress
+    data: str
+    value: RawInteger = "0"
+    token: Asset
+    owner: EVMAddress
+    spender: EVMAddress
+    amount_raw: RawInteger
+    expires_at: datetime | None = None
+
+
+class TokenPrice(DomainModel):
+    """A point-in-time USD price snapshot for an asset."""
+
+    asset: Asset
+    usd_price: Decimal = Field(ge=0)
+    observed_at: datetime | None = None
+
+
+AuthorizationStage = Literal[
+    "approval_required",
+    "swap_ready",
+    "swap_prepared",
+    "pending",
+    "completed",
+    "failed",
+]
+
+
+class SwapAuthorizationState(DomainModel):
+    """Checkpoint-safe state for the allowance and approval gate."""
+
+    stage: AuthorizationStage
+    allowance_requirement: AllowanceRequirement | None = None
+    approval_transaction: ApprovalTransaction | None = None
+    approval_tx_hash: str | None = None
+    pending_transaction: "UnsignedTransaction | None" = None
+
+
 class NormalizedQuote(DomainModel):
     provider: ProviderName
     source_asset: Asset
@@ -152,6 +225,10 @@ class NormalizedQuote(DomainModel):
     expires_at: datetime | None = None
     provider_reference: str
     provider_payload: dict[str, JsonValue] = Field(default_factory=dict)
+    usd_input_value: Decimal | None = Field(default=None, ge=0)
+    usd_expected_output: Decimal | None = Field(default=None, ge=0)
+    price_snapshots: list[TokenPrice] = Field(default_factory=list)
+    allowance_requirement: AllowanceRequirement | None = None
 
 
 class UnsignedTransaction(DomainModel):
