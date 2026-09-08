@@ -6,7 +6,7 @@ import pytest
 from wallet_agent.domain.chains import Capability, CapabilityRegistry, CapabilitySnapshot
 from wallet_agent.domain.errors import ChainCapabilityUnavailable
 from wallet_agent.domain.models import FeeEstimate, TransactionRecord, TransactionStatus
-from wallet_agent.domain.providers import ChainAdapter, SwapProvider
+from wallet_agent.domain.providers import ChainAdapter, SwapProvider, TokenPriceProvider
 
 
 def test_unknown_capability_is_structured():
@@ -52,6 +52,7 @@ def test_provider_and_chain_contract_methods_are_async():
     assert all(
         asyncio.iscoroutinefunction(getattr(ChainAdapter, method)) for method in chain_methods
     )
+    assert asyncio.iscoroutinefunction(TokenPriceProvider.get_prices)
 
 
 def test_contracts_use_concrete_protocol_return_annotations():

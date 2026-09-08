@@ -6,7 +6,6 @@ from .chains import CapabilitySnapshot
 from .models import (
     Asset,
     AssetQuery,
-    TokenPrice,
     DepositOrder,
     FeeEstimate,
     NormalizedOrderStatus,
@@ -14,6 +13,7 @@ from .models import (
     ProviderOrder,
     SwapQuoteRequest,
     TokenBalance,
+    TokenPrice,
     TransactionRecord,
     TransactionStatus,
     UnsignedTransaction,
@@ -60,4 +60,4 @@ class ChainAdapter(Protocol):
 class TokenPriceProvider(Protocol):
     """Normalized interface for batch asset price lookup."""
 
-    def get_prices(self, assets: list[Asset]) -> list[TokenPrice]: ...
+    async def get_prices(self, assets: list[Asset]) -> list[TokenPrice]: ...

@@ -14,3 +14,9 @@ Verification:
 
 Notes:
 - The worktree venv resolves the installed package from the main checkout, so verification used `PYTHONPATH=src` to force the worktree source.
+
+Review fix:
+- Changed `TokenPriceProvider.get_prices` to `async def`.
+- Kept the provider import block Ruff-clean.
+- Verified with `PYTHONPATH=src pytest tests/domain/test_contracts.py tests/domain/test_models.py -q`
+- Verified with `PYTHONPATH=src ruff check src/wallet_agent/domain/models.py src/wallet_agent/domain/providers.py tests/domain/test_contracts.py tests/domain/test_models.py`

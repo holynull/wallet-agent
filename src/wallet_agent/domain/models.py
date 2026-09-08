@@ -96,7 +96,9 @@ class DomainModel(BaseModel):
 def _redact_metadata(
     value: Any, key: str | None = None, protected_keys: frozenset[str] | None = None
 ) -> Any:
-    if key is not None and _is_sensitive_key(key) and (protected_keys is None or key not in protected_keys):
+    if key is not None and _is_sensitive_key(key) and (
+        protected_keys is None or key not in protected_keys
+    ):
         return "[REDACTED]"
     if isinstance(value, Mapping):
         return {
