@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from wallet_agent.domain.models import Asset, NormalizedQuote, SwapQuoteRequest, UnsignedTransaction
+from wallet_agent.domain.models import Asset, NormalizedQuote, SwapQuoteRequest, TokenPrice, UnsignedTransaction
 from wallet_agent.graph.build import build_graph
 
 
@@ -12,9 +12,10 @@ class FakeModel:
 
 
 class FakeProvider:
-    def __init__(self, name: str):
+    def __init__(self, name: str, *, price_snapshots: dict[str, TokenPrice] | None = None):
         self.provider_name = name
         self.calls = []
+        self.price_snapshots = price_snapshots or {}
 
     async def quote(self, request):
         self.calls.append(("quote", request))
@@ -27,6 +28,7 @@ class FakeProvider:
             expected_output=Decimal("9"),
             expected_output_raw="9000000",
             provider_reference=f"{self.provider_name}-ref",
+            price_snapshots=self.price_snapshots,
         )
 
     async def prepare(self, quote):
@@ -67,6 +69,46 @@ async def test_quote_path_fans_out_and_reduces_candidates():
         config={"configurable": {"thread_id": "t-1"}},
     )
     assert {quote["provider"] for quote in result["quote_candidates"]} == {"bridgers", "omnibridge"}
+
+
+@pytest.mark.asyncio
+async def test_quote_path_preserves_all_candidates_and_price_snapshots_without_selection():
+    source = Asset(chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x1")
+    destination = Asset(chain="BSC", chain_id=56, symbol="USDT", decimals=6, address="0x2")
+    graph = build_graph(
+        model=FakeModel(),
+        providers=[
+            FakeProvider(
+                "bridgers",
+                price_snapshots={
+                    "BASE:8453:USDC:0x1": TokenPrice(asset=source, usd_price=Decimal("1"))
+                },
+            ),
+            FakeProvider(
+                "omnibridge",
+                price_snapshots={
+                    "BSC:56:USDT:0x2": TokenPrice(asset=destination, usd_price=Decimal("1"))
+                },
+            ),
+        ],
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "c1",
+            "user_id": "u1",
+            "intent": "swap_quote",
+            "swap_request": quote_request(),
+        },
+        config={"configurable": {"thread_id": "t-2"}},
+    )
+    assert [quote["provider"] for quote in result["quote_candidates"]] == [
+        "bridgers",
+        "omnibridge",
+    ]
+    assert result["selected_quote"] is None
+    assert result["response"]["kind"] == "swap_quote"
+    assert result["response"]["price_snapshots"]["BASE:8453:USDC:0x1"]["usd_price"] == "1"
+    assert result["response"]["price_snapshots"]["BSC:56:USDT:0x2"]["usd_price"] == "1"
 
 
 @pytest.mark.asyncio

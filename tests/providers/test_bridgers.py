@@ -232,6 +232,18 @@ async def test_bridgers_quote_converts_units_and_preserves_raw_amounts():
 
 
 @pytest.mark.asyncio
+async def test_bridgers_evm_quote_exposes_allowance_requirement():
+    transport = FakeTransport(quote_response())
+    provider = BridgersProvider.from_transport(transport, source_flag="wallet-agent")
+
+    quote = await provider.quote(valid_quote_request())
+
+    assert quote.allowance_requirement is not None
+    assert quote.allowance_requirement.spender == "0x0000000000000000000000000000000000000033"
+    assert quote.allowance_requirement.required_amount_raw == valid_quote_request().input_amount_raw
+
+
+@pytest.mark.asyncio
 async def test_bridgers_quote_payload_contains_only_normalized_resume_metadata():
     transport = FakeTransport(
         quote_response(),

@@ -125,6 +125,7 @@ async def test_omnibridge_quote_payload_contains_only_normalized_resume_metadata
     }
     assert "request" not in quote.provider_payload
     assert "quote_data" not in quote.provider_payload
+    assert quote.allowance_requirement is None
 
     provider._quotes.clear()
     order = await provider.prepare(quote)
