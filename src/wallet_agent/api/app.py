@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from wallet_agent.domain.errors import ChainCapabilityUnavailable
 from wallet_agent.domain.models import (
     AgentError,
+    Asset,
     DepositOrder,
     NormalizedOrderStatus,
     NormalizedQuote,
@@ -89,16 +90,30 @@ class BroadcastRequest(BaseModel):
     chain: str
     tx_hash: str = Field(min_length=8)
 
+
 class ApprovalBroadcastRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     user_id: str | None = None
     chain: str
     approve_tx_hash: str = Field(min_length=8)
 
+
 class QuoteSelectionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     user_id: str | None = None
     provider_reference: str
+
+
+class TransferPrepareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str | None = None
+    chain: str
+    sender: str
+    recipient: str
+    amount: str
+    amount_raw: str
+    token: Asset | None = None
 
 
 def _jsonable(value: Any) -> Any:
@@ -276,13 +291,12 @@ def create_app(
                 result = input_state
                 app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
             else:
+
                 async def execute(graph_input: dict[str, Any]) -> dict[str, Any]:
                     async for event in app.state.graph.astream(
                         graph_input, config=config, stream_mode="updates"
                     ):
-                        app.state.runs[run_id]["events"].append(
-                            {"event": "update", "data": event}
-                        )
+                        app.state.runs[run_id]["events"].append({"event": "update", "data": event})
                     snapshot = app.state.graph.get_state(config)
                     return dict(snapshot.values)
 
@@ -327,7 +341,11 @@ def create_app(
                 else:
                     app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
                     app.state.runs[run_id]["status"] = "complete"
-                    await project_session(session_id, result, status="completed")
+                    response_kind = (result.get("response") or {}).get("kind")
+                    session_status = (
+                        "transfer_ready" if response_kind == "transfer_prepare" else "completed"
+                    )
+                    await project_session(session_id, result, status=session_status)
             if app.state.runs[run_id]["status"] == "running":
                 app.state.runs[run_id]["status"] = "complete"
         except Exception as exc:  # errors are returned without exception internals
@@ -349,9 +367,7 @@ def create_app(
                 detail={
                     "code": "VALIDATION_ERROR",
                     "message": "Request validation failed.",
-                    "details": {
-                        "errors": [{"loc": ["body", "user_id"], "msg": "Field required"}]
-                    },
+                    "details": {"errors": [{"loc": ["body", "user_id"], "msg": "Field required"}]},
                 },
             )
         user_id = await authenticated_user(
@@ -377,7 +393,15 @@ def create_app(
         conversation_id = payload.conversation_id or str(uuid.uuid4())
         run_id = str(uuid.uuid4())
         raw_swap_request = payload.metadata.get("swap_request") or payload.metadata.get("swap")
-        session_id = str(uuid.uuid4()) if raw_swap_request is not None else None
+        raw_transfer_request = payload.metadata.get("transfer_request") or payload.metadata.get(
+            "transfer"
+        )
+        raw_price_request = payload.metadata.get("price_request") or payload.metadata.get("price")
+        session_id = (
+            str(uuid.uuid4())
+            if (raw_swap_request is not None or raw_transfer_request is not None)
+            else None
+        )
         if session_id:
             await session_store.save(
                 SwapSessionRecord(
@@ -395,11 +419,15 @@ def create_app(
         }
         if raw_swap_request is not None:
             input_state["swap_request"] = raw_swap_request
+        if raw_transfer_request is not None:
+            input_state["intent"] = "transfer"
+            input_state["transfer_request"] = raw_transfer_request
+        if raw_price_request is not None:
+            input_state["intent"] = "price_query"
+            input_state["price_request"] = raw_price_request
         config = {"configurable": {"thread_id": conversation_id}}
         app.state.runs[run_id] = {"status": "queued", "events": []}
-        task = asyncio.create_task(
-            run_graph(run_id, input_state, config, session_id=session_id)
-        )
+        task = asyncio.create_task(run_graph(run_id, input_state, config, session_id=session_id))
         app.state.runs[run_id]["task"] = task
         response = {
             "run_id": run_id,
@@ -505,50 +533,195 @@ def create_app(
         return _jsonable(updated)
 
     @app.post("/v1/swap/{session_id}/select-quote")
-    async def select_quote(request: Request, session_id: str, payload: QuoteSelectionRequest) -> dict[str, Any]:
-        user_id = await authenticated_user(request, verifier=token_verifier, required=require_auth, fallback_user_id=payload.user_id)
+    async def select_quote(
+        request: Request, session_id: str, payload: QuoteSelectionRequest
+    ) -> dict[str, Any]:
+        user_id = await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id=payload.user_id,
+        )
         session = await owned_session(session_id, user_id)
-        selected_quote = session.quote
-        if selected_quote is None:
-            selected_quote = next(
-                (
-                    candidate
-                    for candidate in session.quote_candidates
-                    if candidate.provider_reference == payload.provider_reference
-                ),
-                None,
-            )
-        if selected_quote is None or selected_quote.provider_reference != payload.provider_reference:
+        # The app must explicitly choose one of the persisted candidates. A
+        # previously selected quote is only valid when its reference matches.
+        selected_quote = next(
+            (
+                candidate
+                for candidate in session.quote_candidates
+                if candidate.provider_reference == payload.provider_reference
+            ),
+            None,
+        )
+        if (
+            selected_quote is None
+            and session.quote is not None
+            and session.quote.provider_reference == payload.provider_reference
+        ):
+            selected_quote = session.quote
+        if (
+            selected_quote is None
+            or selected_quote.provider_reference != payload.provider_reference
+        ):
             raise HTTPException(status_code=404, detail="quote not found")
         if app.state.graph is None:
-            return _jsonable(await session_store.update(session_id, stage="quote_selected", selected_provider_reference=payload.provider_reference))
+            return _jsonable(
+                await session_store.update(
+                    session_id,
+                    stage="quote_selected",
+                    selected_provider_reference=payload.provider_reference,
+                )
+            )
         result = await app.state.graph.ainvoke(
             {"intent": "swap_allowance", "selected_quote": selected_quote.model_dump(mode="json")},
             config={"configurable": {"thread_id": session.thread_id}},
         )
-        updated = await project_session(session_id, result, status=result.get("authorization_stage", "approval_required"))
+        updated = await project_session(
+            session_id, result, status=result.get("authorization_stage", "approval_required")
+        )
+        if updated is not None:
+            updated = await session_store.update(
+                session_id,
+                selected_provider_reference=payload.provider_reference,
+            )
+        # An interrupt aborts the node before its return value is committed.
+        # Persist the deterministic approval payload so the app can sign it.
+        if (
+            updated is not None
+            and updated.approval_transaction is None
+            and selected_quote.allowance_requirement is not None
+            and app.state.chain_registry is not None
+        ):
+            requirement = selected_quote.allowance_requirement
+            try:
+                adapter = app.state.chain_registry.get_adapter(requirement.token.chain)
+                tx = adapter.build_erc20_approve(
+                    token=requirement.token,
+                    owner=requirement.owner,
+                    spender=requirement.spender,
+                    amount_raw=requirement.required_amount_raw,
+                )
+                approval = {
+                    "chain": requirement.token.chain,
+                    "chain_id": requirement.token.chain_id,
+                    "to": tx.to,
+                    "data": tx.data,
+                    "value": tx.value,
+                    "token": requirement.token.model_dump(mode="json"),
+                    "owner": requirement.owner,
+                    "spender": requirement.spender,
+                    "amount_raw": requirement.required_amount_raw,
+                    "expires_at": None,
+                }
+                updated = await session_store.update(
+                    session_id,
+                    stage="approval_required",
+                    approval_transaction=approval,
+                    allowance_requirement=requirement.model_dump(mode="json"),
+                )
+            except Exception:
+                pass
         return _jsonable(updated or result)
 
     @app.post("/v1/swap/{session_id}/approve-broadcast")
-    async def approve_broadcast(request: Request, session_id: str, payload: ApprovalBroadcastRequest) -> dict[str, Any]:
-        user_id = await authenticated_user(request, verifier=token_verifier, required=require_auth, fallback_user_id=payload.user_id)
+    async def approve_broadcast(
+        request: Request, session_id: str, payload: ApprovalBroadcastRequest
+    ) -> dict[str, Any]:
+        user_id = await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id=payload.user_id,
+        )
         session = await owned_session(session_id, user_id)
         if not _qualified_hash(payload.chain, payload.approve_tx_hash):
-            raise HTTPException(status_code=422, detail="approve_tx_hash must be a chain-qualified transaction hash")
+            raise HTTPException(
+                status_code=422, detail="approve_tx_hash must be a chain-qualified transaction hash"
+            )
         if session.approval_tx_hash:
             if session.approval_tx_hash == payload.approve_tx_hash:
                 return _jsonable(session)
-            raise HTTPException(status_code=409, detail="session already has a different approval hash")
-        return _jsonable(await session_store.update(session_id, approval_tx_hash=payload.approve_tx_hash, stage="approval_submitted"))
+            raise HTTPException(
+                status_code=409, detail="session already has a different approval hash"
+            )
+        return _jsonable(
+            await session_store.update(
+                session_id, approval_tx_hash=payload.approve_tx_hash, stage="approval_submitted"
+            )
+        )
 
     @app.post("/v1/swap/{session_id}/continue")
-    async def continue_swap(request: Request, session_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        user_id = await authenticated_user(request, verifier=token_verifier, required=require_auth, fallback_user_id=(payload or {}).get("user_id"))
+    async def continue_swap(
+        request: Request, session_id: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        user_id = await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id=(payload or {}).get("user_id"),
+        )
         session = await owned_session(session_id, user_id)
         if app.state.graph is None:
             return _jsonable(session)
-        result = await app.state.graph.ainvoke(Command(resume={"approve_tx_hash": session.approval_tx_hash}), config={"configurable": {"thread_id": session.thread_id}})
-        return _jsonable(await project_session(session_id, result, status=result.get("authorization_stage", "swap_ready")))
+        result = await app.state.graph.ainvoke(
+            Command(resume={"approve_tx_hash": session.approval_tx_hash}),
+            config={"configurable": {"thread_id": session.thread_id}},
+        )
+        return _jsonable(
+            await project_session(
+                session_id, result, status=result.get("authorization_stage", "swap_ready")
+            )
+        )
+
+    @app.post("/v1/transfer/{session_id}/prepare")
+    async def prepare_transfer(
+        request: Request, session_id: str, payload: TransferPrepareRequest
+    ) -> dict[str, Any]:
+        user_id = await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id=payload.user_id,
+        )
+        session = await owned_session(session_id, user_id)
+        if (
+            session.stage in {"prepared", "swap_ready", "transfer_ready"}
+            and session.pending_transaction is not None
+        ):
+            return _jsonable(session)
+        if app.state.graph is None:
+            raise HTTPException(status_code=503, detail="agent graph is not configured")
+        result = await app.state.graph.ainvoke(
+            {
+                "intent": "transfer",
+                "transfer_request": payload.model_dump(mode="json", exclude={"user_id"}),
+            },
+            config={"configurable": {"thread_id": session.thread_id}},
+        )
+        response = result.get("response") or {}
+        status = "transfer_ready" if response.get("kind") == "transfer_prepare" else "failed"
+        return _jsonable(await project_session(session_id, result, status=status) or result)
+
+    @app.get("/v1/prices/token")
+    async def token_prices(
+        request: Request,
+        chain: str,
+        symbol: str,
+        decimals: int = 18,
+        address: str | None = None,
+    ) -> dict[str, Any]:
+        await authenticated_user(request, verifier=token_verifier, required=require_auth)
+        provider = app.state.price_provider
+        if provider is None:
+            raise HTTPException(status_code=503, detail="price provider unavailable")
+        try:
+            asset = Asset(chain=chain, symbol=symbol, decimals=decimals, address=address)
+            prices = await provider.get_prices([asset])
+            return {"prices": [_jsonable(item) for item in prices]}
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502, detail={"code": "PRICE_QUERY_FAILED", "message": str(exc)}
+            ) from exc
 
     @app.get("/v1/swap/{session_id}")
     async def get_swap(

@@ -54,6 +54,7 @@ def build_graph(
     builder.add_node("quote_provider", n["quote_provider"])
     builder.add_node("quote_response", n["quote_response"])
     builder.add_node("wallet_query", n["wallet_query"])
+    builder.add_node("price_query", n["price_query"])
     builder.add_node("transfer", n["transfer"])
     builder.add_node("swap_allowance", n["swap_allowance"])
     builder.add_node("prepare", n["prepare"])
@@ -68,7 +69,7 @@ def build_graph(
             "wallet_query": "wallet_query",
             "transfer": "transfer",
             "swap_allowance": "swap_allowance",
-            "price_query": "response",
+            "price_query": "price_query",
             "swap_resolve": "resolve_swap",
             "swap_resolve_prepare": "resolve_swap",
             "status_poll": "status_poll",
@@ -82,6 +83,7 @@ def build_graph(
     builder.add_edge("quote_provider", "quote_response")
     builder.add_edge("quote_response", END)
     builder.add_edge("wallet_query", END)
+    builder.add_edge("price_query", END)
     builder.add_edge("transfer", END)
     builder.add_edge("swap_allowance", END)
     builder.add_edge("prepare", END)

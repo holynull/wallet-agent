@@ -70,7 +70,9 @@ class BridgersProvider:
         self.transport = transport
         self.source_flag = source_flag
         self.source_type = source_type
-        self.spender_by_chain = {str(k).upper(): str(v) for k, v in (spender_by_chain or {}).items()}
+        self.spender_by_chain = {
+            str(k).upper(): str(v) for k, v in (spender_by_chain or {}).items()
+        }
         self.swap_spender = swap_spender
         self._quotes: dict[str, dict[str, Any]] = {}
 
@@ -142,7 +144,11 @@ class BridgersProvider:
             candidate = tx.get("contractAddress") or tx.get("spender") or tx.get("swapContract")
             spender = str(candidate) if candidate else None
         allowance = None
-        if spender and request.source_asset.address and request.source_asset.chain.upper() not in {"ETH", "EVM_NATIVE"}:
+        if (
+            spender
+            and request.source_asset.address
+            and request.source_asset.chain.upper() not in {"ETH", "EVM_NATIVE"}
+        ):
             try:
                 allowance = AllowanceRequirement(
                     token=request.source_asset,

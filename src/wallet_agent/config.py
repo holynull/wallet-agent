@@ -16,9 +16,13 @@ class Settings(BaseSettings):
     bridgers_enabled: bool = False
     bridgers_base_url: str | None = None
     bridgers_source_flag: str = ""
+    bridgers_spender_by_chain: dict[str, str] = Field(default_factory=dict)
+    bridgers_swap_spender: str | None = None
     omnibridge_enabled: bool = False
     omnibridge_base_url: str | None = None
     omnibridge_source_flag: str = ""
+    omnibridge_spender_by_chain: dict[str, str] = Field(default_factory=dict)
+    omnibridge_swap_spender: str | None = None
 
     # DeepSeek is the default OpenAI-compatible backend. The OPENAI_* names
     # remain supported for backwards compatibility with existing deployments.

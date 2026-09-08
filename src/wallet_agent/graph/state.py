@@ -29,6 +29,8 @@ class AgentState(TypedDict, total=False):
     wallet_context: NotRequired[dict[str, Any] | None]
     capabilities: NotRequired[dict[str, Any] | None]
     swap_request: NotRequired[dict[str, Any] | None]
+    transfer_request: NotRequired[dict[str, Any] | None]
+    price_request: NotRequired[dict[str, Any] | None]
     available_providers: NotRequired[list[str]]
     provider_name: NotRequired[str]
     available_providers: NotRequired[list[str]]

@@ -76,7 +76,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "swap_status",
             "clarification",
             "unsupported",
-            "transfer", "swap_select", "swap_allowance", "price_query",
+            "transfer",
+            "swap_select",
+            "swap_allowance",
+            "price_query",
         }
         if existing in valid:
             return {"route": existing, "max_poll_attempts": runtime.max_poll_attempts}
@@ -167,6 +170,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 assets.extend([item.get("source_asset"), item.get("destination_asset")])
             try:
                 from wallet_agent.domain.models import Asset
+
                 parsed_assets = [Asset.model_validate(a) for a in assets if a]
                 prices = await runtime.price_provider.get_prices(parsed_assets)
                 price_map = {(p.asset.chain, p.asset.symbol, p.asset.address): p for p in prices}
@@ -192,79 +196,208 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             Decimal(str(q.get("input_amount", 0))) * src.usd_price
                         )
                     if dst:
-                        q["usd_expected_output"] = str(Decimal(str(q.get("expected_output", 0))) * dst.usd_price)
+                        q["usd_expected_output"] = str(
+                            Decimal(str(q.get("expected_output", 0))) * dst.usd_price
+                        )
                     enriched.append(q)
                 quotes = enriched
             except Exception:
                 pass
-        return {"selected_quote": selected, "quote_candidates": quotes, "response": {"kind": "swap_quote", "quotes": quotes}}
+        return {
+            "selected_quote": selected,
+            "quote_candidates": quotes,
+            "response": {"kind": "swap_quote", "quotes": quotes},
+        }
 
     async def transfer(state: dict[str, Any]) -> dict[str, Any]:
-        raw = state.get("request", {}).get("transfer_request") or state.get("transfer_request") or state.get("request", {})
+        raw = (
+            state.get("request", {}).get("transfer_request")
+            or state.get("transfer_request")
+            or state.get("request", {})
+        )
         try:
             req = TransferRequest.model_validate(raw)
         except Exception as exc:
-            return {"response": {"kind": "error", "errors": [_error("INVALID_TRANSFER_PARAMETERS", str(exc))]}}
+            return {
+                "response": {
+                    "kind": "error",
+                    "errors": [_error("INVALID_TRANSFER_PARAMETERS", str(exc))],
+                }
+            }
         adapter = runtime.chains.get(req.chain.upper())
         if adapter is None:
-            return {"response": {"kind": "error", "errors": [_error("CHAIN_CAPABILITY_UNAVAILABLE", f"Chain {req.chain} is unavailable.")]}}
+            return {
+                "response": {
+                    "kind": "error",
+                    "errors": [
+                        _error("CHAIN_CAPABILITY_UNAVAILABLE", f"Chain {req.chain} is unavailable.")
+                    ],
+                }
+            }
         try:
             if req.token is None:
                 balance = await adapter.get_native_balance(req.sender)
                 if int(balance.amount_raw) < int(req.amount_raw):
-                    return {"response": {"kind": "error", "errors": [_error("INSUFFICIENT_BALANCE", "Insufficient native balance.")]}}
-                tx = adapter.build_native_transfer(from_address=req.sender, to_address=req.recipient, amount_raw=req.amount_raw)
+                    return {
+                        "response": {
+                            "kind": "error",
+                            "errors": [
+                                _error("INSUFFICIENT_BALANCE", "Insufficient native balance.")
+                            ],
+                        }
+                    }
+                tx = adapter.build_native_transfer(
+                    from_address=req.sender, to_address=req.recipient, amount_raw=req.amount_raw
+                )
             else:
                 balance = await adapter.get_token_balance(req.token, req.sender)
                 if int(balance.amount_raw) < int(req.amount_raw):
-                    return {"response": {"kind": "error", "errors": [_error("INSUFFICIENT_BALANCE", "Insufficient token balance.")]}}
-                tx = adapter.build_erc20_transfer(token=req.token, from_address=req.sender, to_address=req.recipient, amount_raw=req.amount_raw)
-            return {"pending_transaction": tx.model_dump(mode="json"), "response": {"kind": "transfer_prepare", "pending_transaction": tx.model_dump(mode="json")}}
+                    return {
+                        "response": {
+                            "kind": "error",
+                            "errors": [
+                                _error("INSUFFICIENT_BALANCE", "Insufficient token balance.")
+                            ],
+                        }
+                    }
+                tx = adapter.build_erc20_transfer(
+                    token=req.token,
+                    from_address=req.sender,
+                    to_address=req.recipient,
+                    amount_raw=req.amount_raw,
+                )
+            return {
+                "pending_transaction": tx.model_dump(mode="json"),
+                "response": {
+                    "kind": "transfer_prepare",
+                    "pending_transaction": tx.model_dump(mode="json"),
+                },
+            }
         except Exception as exc:
-            return {"response": {"kind": "error", "errors": [_error("TRANSFER_PREPARE_FAILED", str(exc))]}}
+            return {
+                "response": {
+                    "kind": "error",
+                    "errors": [_error("TRANSFER_PREPARE_FAILED", str(exc))],
+                }
+            }
 
     async def swap_allowance(state: dict[str, Any]) -> dict[str, Any]:
         selected = state.get("selected_quote")
         if not selected:
-            return {"response": {"stage": "quote_selection_required", "quotes": state.get("quote_candidates", [])}}
+            return {
+                "response": {
+                    "stage": "quote_selection_required",
+                    "quotes": state.get("quote_candidates", []),
+                }
+            }
         quote = _quote(selected)
         requirement = quote.allowance_requirement
         if requirement is None:
             # Native swaps do not need approval; prepare directly.
             provider = runtime.providers.get(str(selected.get("provider")))
             if provider is None:
-                return {"response": {"stage": "failed", "errors": [_error("PROVIDER_UNAVAILABLE", "Provider unavailable")]}}
+                return {
+                    "response": {
+                        "stage": "failed",
+                        "errors": [_error("PROVIDER_UNAVAILABLE", "Provider unavailable")],
+                    }
+                }
             prepared = await provider.prepare(quote)
             dumped = _dump(prepared)
-            return {"pending_transaction": dumped, "authorization_stage": "swap_ready", "response": {"stage": "swap_ready", "pending_transaction": dumped}}
+            return {
+                "pending_transaction": dumped,
+                "authorization_stage": "swap_ready",
+                "response": {"stage": "swap_ready", "pending_transaction": dumped},
+            }
         adapter = runtime.chains.get(requirement.token.chain.upper())
         if adapter is None:
-            return {"response": {"stage": "failed", "errors": [_error("CHAIN_CAPABILITY_UNAVAILABLE", "Chain adapter unavailable")]}}
-        allowance_raw = await adapter.get_allowance(requirement.token, requirement.owner, requirement.spender)
+            return {
+                "response": {
+                    "stage": "failed",
+                    "errors": [_error("CHAIN_CAPABILITY_UNAVAILABLE", "Chain adapter unavailable")],
+                }
+            }
+        allowance_raw = await adapter.get_allowance(
+            requirement.token, requirement.owner, requirement.spender
+        )
         required = int(requirement.required_amount_raw)
         if int(allowance_raw) < required and not state.get("approval_tx_hash"):
-            approval = adapter.build_erc20_approve(token=requirement.token, owner=requirement.owner, spender=requirement.spender, amount_raw=requirement.required_amount_raw)
-            approval_model = ApprovalTransaction(chain=requirement.token.chain, chain_id=requirement.token.chain_id, to=approval.to, data=approval.data, value=approval.value, token=requirement.token, owner=requirement.owner, spender=requirement.spender, amount_raw=requirement.required_amount_raw)
-            answer = interrupt({"kind": "approval_required", "approval_transaction": approval_model.model_dump(mode="json")})
+            approval = adapter.build_erc20_approve(
+                token=requirement.token,
+                owner=requirement.owner,
+                spender=requirement.spender,
+                amount_raw=requirement.required_amount_raw,
+            )
+            approval_model = ApprovalTransaction(
+                chain=requirement.token.chain,
+                chain_id=requirement.token.chain_id,
+                to=approval.to,
+                data=approval.data,
+                value=approval.value,
+                token=requirement.token,
+                owner=requirement.owner,
+                spender=requirement.spender,
+                amount_raw=requirement.required_amount_raw,
+            )
+            answer = interrupt(
+                {
+                    "kind": "approval_required",
+                    "approval_transaction": approval_model.model_dump(mode="json"),
+                }
+            )
             if isinstance(answer, dict):
                 h = answer.get("approve_tx_hash") or answer.get("tx_hash")
                 if h:
-                    return {"approval_transaction": approval_model.model_dump(mode="json"), "approval_tx_hash": str(h), "allowance_requirement": requirement.model_dump(mode="json"), "authorization_stage": "approval_submitted"}
-            return {"approval_transaction": approval_model.model_dump(mode="json"), "allowance_requirement": requirement.model_dump(mode="json"), "authorization_stage": "approval_required", "response": {"stage": "approval_required", "approval_transaction": approval_model.model_dump(mode="json")}}
+                    return {
+                        "approval_transaction": approval_model.model_dump(mode="json"),
+                        "approval_tx_hash": str(h),
+                        "allowance_requirement": requirement.model_dump(mode="json"),
+                        "authorization_stage": "approval_submitted",
+                    }
+            return {
+                "approval_transaction": approval_model.model_dump(mode="json"),
+                "allowance_requirement": requirement.model_dump(mode="json"),
+                "authorization_stage": "approval_required",
+                "response": {
+                    "stage": "approval_required",
+                    "approval_transaction": approval_model.model_dump(mode="json"),
+                },
+            }
         if state.get("approval_tx_hash"):
             receipt = await adapter.get_transaction_receipt(str(state["approval_tx_hash"]))
             success = receipt_success(receipt)
             if success is False or receipt is None:
-                return {"response": {"stage": "approval_pending" if receipt is None else "approval_failed", "approval_transaction": state.get("approval_transaction")}}
-            allowance_raw = await adapter.get_allowance(requirement.token, requirement.owner, requirement.spender)
+                return {
+                    "response": {
+                        "stage": "approval_pending" if receipt is None else "approval_failed",
+                        "approval_transaction": state.get("approval_transaction"),
+                    }
+                }
+            allowance_raw = await adapter.get_allowance(
+                requirement.token, requirement.owner, requirement.spender
+            )
             if int(allowance_raw) < required:
-                return {"response": {"stage": "approval_required", "approval_transaction": state.get("approval_transaction")}}
+                return {
+                    "response": {
+                        "stage": "approval_required",
+                        "approval_transaction": state.get("approval_transaction"),
+                    }
+                }
         provider = runtime.providers.get(str(selected.get("provider")))
         if provider is None:
-            return {"response": {"stage": "failed", "errors": [_error("PROVIDER_UNAVAILABLE", "Provider unavailable")]}}
+            return {
+                "response": {
+                    "stage": "failed",
+                    "errors": [_error("PROVIDER_UNAVAILABLE", "Provider unavailable")],
+                }
+            }
         prepared = await provider.prepare(quote)
         dumped = _dump(prepared)
-        return {"pending_transaction": dumped, "authorization_stage": "swap_ready", "response": {"stage": "swap_ready", "pending_transaction": dumped}}
+        return {
+            "pending_transaction": dumped,
+            "authorization_stage": "swap_ready",
+            "response": {"stage": "swap_ready", "pending_transaction": dumped},
+        }
 
     async def wallet_query(state: dict[str, Any]) -> dict[str, Any]:
         request = state.get("request", {})
@@ -297,6 +430,39 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             }
         except Exception as exc:
             return {"errors": [_error("WALLET_QUERY_FAILED", str(exc))]}
+
+    async def price_query(state: dict[str, Any]) -> dict[str, Any]:
+        """Resolve a token/native USD price through the injected provider."""
+        if runtime.price_provider is None:
+            return {
+                "response": {
+                    "kind": "error",
+                    "errors": [_error("PRICE_PROVIDER_UNAVAILABLE", "Price provider unavailable.")],
+                }
+            }
+        raw = state.get("price_request") or state.get("request", {}).get("price_request")
+        if raw is None:
+            return {
+                "response": {
+                    "kind": "clarification",
+                    "errors": [
+                        _error("MISSING_PRICE_PARAMETERS", "Price parameters are required.")
+                    ],
+                }
+            }
+        try:
+            from wallet_agent.domain.models import Asset
+
+            asset = Asset.model_validate(raw)
+            prices = await runtime.price_provider.get_prices([asset])
+            return {"response": {"kind": "price_query", "prices": [_dump(item) for item in prices]}}
+        except Exception as exc:
+            return {
+                "response": {
+                    "kind": "error",
+                    "errors": [_error("PRICE_QUERY_FAILED", str(exc), retryable=True)],
+                }
+            }
 
     async def prepare(state: dict[str, Any]) -> dict[str, Any]:
         selected = state.get("selected_quote")

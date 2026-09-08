@@ -43,9 +43,7 @@ def build_application(settings: Settings | None = None) -> Any:
         ).with_structured_output(IntentOutput)
         for model_id in dict.fromkeys([settings.openai_model, *settings.allowed_model_ids])
     }
-    model_registry = ModelRegistry(
-        model_clients, default_model_id=settings.openai_model
-    )
+    model_registry = ModelRegistry(model_clients, default_model_id=settings.openai_model)
     model = ModelRouter(model_registry)
     providers: dict[str, Any] = {}
     transports: list[HttpJsonTransport] = []
@@ -59,7 +57,10 @@ def build_application(settings: Settings | None = None) -> Any:
         )
         transports.append(transport)
         providers["bridgers"] = BridgersProvider.from_transport(
-            transport, source_flag=settings.bridgers_source_flag
+            transport,
+            source_flag=settings.bridgers_source_flag,
+            spender_by_chain=settings.bridgers_spender_by_chain,
+            swap_spender=settings.bridgers_swap_spender,
         )
     if settings.omnibridge_enabled:
         if not settings.omnibridge_base_url:
@@ -69,7 +70,10 @@ def build_application(settings: Settings | None = None) -> Any:
         )
         transports.append(transport)
         providers["omnibridge"] = OmniBridgeProvider.from_transport(
-            transport, source_flag=settings.omnibridge_source_flag
+            transport,
+            source_flag=settings.omnibridge_source_flag,
+            spender_by_chain=settings.omnibridge_spender_by_chain,
+            swap_spender=settings.omnibridge_swap_spender,
         )
     if (
         settings.coingecko_api_key
@@ -89,20 +93,21 @@ def build_application(settings: Settings | None = None) -> Any:
             api_key=settings.coingecko_api_key,
             base_url=settings.coingecko_base_url,
         )
-    checkpoint_handle = initialize_checkpointer(settings.persistence_url)
-    graph = build_graph(
-        model=model,
-        providers=providers,
-        price_provider=price_provider,
-        checkpointer=checkpoint_handle.checkpointer,
-        max_poll_attempts=settings.poll_max_attempts,
-    )
-    session_store = SqliteSessionStore(settings.persistence_url)
     chain_registry = build_default_registry(
         rpc_urls=settings.rpc_urls,
         rpc_timeout_seconds=settings.rpc_timeout_seconds,
         rpc_max_attempts=settings.rpc_max_attempts,
     )
+    checkpoint_handle = initialize_checkpointer(settings.persistence_url)
+    graph = build_graph(
+        model=model,
+        providers=providers,
+        chains=dict(chain_registry.items()),
+        price_provider=price_provider,
+        checkpointer=checkpoint_handle.checkpointer,
+        max_poll_attempts=settings.poll_max_attempts,
+    )
+    session_store = SqliteSessionStore(settings.persistence_url)
     application = create_app(
         graph=graph,
         providers=providers,
