@@ -13,6 +13,31 @@ uv sync
 PYTHONPATH=src uvicorn wallet_agent.main:app --reload
 ```
 
+## Docker + real mobile-call demo
+
+The Docker service uses the real configuration from `.env`; it does not use a
+fake model or fake provider. Set `DEEPSEEK_API_KEY`, configure the RPC URLs, and
+enable Bridgers/OmniBridge only when their source flags and sandbox/production
+access are ready.
+
+```bash
+cp .env.example .env
+# edit .env and set the real key and provider settings
+docker compose up --build
+```
+
+Open [http://localhost:8000/demo/](http://localhost:8000/demo/) in a browser.
+The page calls the same REST/SSE endpoints that a mobile app uses: turn,
+stream, confirm, session, and broadcast. It never accepts or sends private
+keys. The user must sign and broadcast the unsigned transaction in a real
+wallet, then paste only the chain-qualified transaction hash into the demo.
+
+For a command-line check after startup:
+
+```bash
+python scripts/smoke_test.py --base-url http://localhost:8000
+```
+
 The default model backend is DeepSeek's official OpenAI-compatible API:
 `https://api.deepseek.com` with `deepseek-chat`. To use another compatible
 backend, set `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_BASE_URL` instead.

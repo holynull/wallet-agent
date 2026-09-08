@@ -6,12 +6,14 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -137,6 +139,10 @@ def create_app(
     app.state.token_verifier = token_verifier
     app.state.require_auth = require_auth
     app.state.model_registry = model_registry
+
+    demo_dir = Path(__file__).resolve().parents[3] / "demo"
+    if demo_dir.is_dir():
+        app.mount("/demo", StaticFiles(directory=demo_dir, html=True), name="demo")
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:

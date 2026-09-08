@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wallet Agent Mobile Demo</title>
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #10131a; color: #eef1f7; }
+    main { max-width: 920px; margin: 0 auto; padding: 24px 16px 56px; }
+    h1 { margin: 0 0 4px; font-size: 28px; }
+    h2 { margin: 22px 0 10px; font-size: 18px; }
+    .muted { color: #9ba5b5; }
+    .warning { border: 1px solid #d99b36; background: #2a2111; color: #ffd992; padding: 12px; border-radius: 10px; }
+    .card { margin-top: 16px; padding: 16px; border: 1px solid #2c3442; border-radius: 12px; background: #171c25; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    label { display: grid; gap: 5px; color: #b5bfce; font-size: 13px; }
+    input, textarea, select, button { box-sizing: border-box; width: 100%; border-radius: 8px; border: 1px solid #3a4557; background: #0f141c; color: #eef1f7; padding: 10px; font: inherit; }
+    textarea { min-height: 74px; resize: vertical; }
+    button { cursor: pointer; background: #3867d6; border-color: #4d7cf0; font-weight: 600; }
+    button.secondary { background: #27303e; border-color: #455268; }
+    button:disabled { opacity: .55; cursor: wait; }
+    .actions { display: flex; gap: 8px; margin-top: 12px; }
+    .actions button { flex: 1; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0b0e13; padding: 12px; border-radius: 8px; max-height: 320px; overflow: auto; }
+    .status { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .pill { border-radius: 999px; padding: 5px 9px; background: #263142; color: #cbd5e5; font-size: 12px; }
+    @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } main { padding: 18px 12px 40px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Wallet Agent Mobile Demo</h1>
+  <div class="muted">真实 API 联调页面 · 同源调用 · 不保存私钥</div>
+
+  <div class="warning" style="margin-top: 14px">
+    这是移动端调用示例。服务端只生成报价和未签名交易；私钥（private key）、助记词、signer 永远留在钱包 App 内。
+    请在 App 本地签名并广播后，只提交 chain-qualified transaction hash。
+  </div>
+
+  <section class="card">
+    <h2>1. 连接配置</h2>
+    <div class="grid">
+      <label>Bearer token（AUTH_REQUIRED=true 时填写）
+        <input id="token" type="password" autocomplete="off" placeholder="只在浏览器内存中使用">
+      </label>
+      <label>用户 ID（仅兼容未启用认证的本地服务）
+        <input id="userId" value="mobile-demo-user">
+      </label>
+      <label>模型 ID
+        <input id="modelId" value="deepseek-chat">
+      </label>
+      <label>conversation_id（断线重连时保持不变）
+        <input id="conversationId" placeholder="首次发送自动生成">
+      </label>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>2. 对话 / Swap 请求</h2>
+    <label>消息
+      <textarea id="message">我想查询一下资产或发起一次兑换</textarea>
+    </label>
+    <label style="display:flex; align-items:center; gap:8px; margin-top:10px">
+      <input id="swapEnabled" type="checkbox" style="width:auto"> 将本次消息作为真实 swap quote 请求
+    </label>
+    <div id="swapFields" hidden>
+      <div class="grid" style="margin-top:10px">
+        <label>源链 <input id="sourceChain" value="BASE"></label>
+        <label>目标链 <input id="destinationChain" value="BSC"></label>
+        <label>源币种 <input id="sourceSymbol" value="USDC"></label>
+        <label>目标币种 <input id="destinationSymbol" value="USDT"></label>
+        <label>源 token 地址 <input id="sourceAddress" placeholder="0x..."></label>
+        <label>目标 token 地址 <input id="destinationAddress" placeholder="0x..."></label>
+        <label>源 decimals <input id="sourceDecimals" type="number" value="6"></label>
+        <label>目标 decimals <input id="destinationDecimals" type="number" value="6"></label>
+        <label>数量（人类可读） <input id="inputAmount" value="1"></label>
+        <label>数量（最小单位整数） <input id="inputAmountRaw" value="1000000"></label>
+        <label>发送地址 <input id="senderAddress" placeholder="0x..."></label>
+        <label>接收地址 <input id="recipientAddress" placeholder="0x..."></label>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="sendButton">发送真实请求</button>
+      <button id="healthButton" class="secondary">检查 /health</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>3. Swap 操作</h2>
+    <div class="status">
+      <span class="pill">run_id: <span id="runId">-</span></span>
+      <span class="pill">session_id: <span id="sessionId">-</span></span>
+      <span class="pill">状态: <span id="sessionStatus">-</span></span>
+    </div>
+    <div class="actions">
+      <button id="confirmButton" disabled>确认报价并准备未签名交易</button>
+      <button id="refreshButton" class="secondary" disabled>刷新 session</button>
+    </div>
+    <div class="grid" style="margin-top:10px">
+      <label>广播链 <input id="broadcastChain" value="BASE"></label>
+      <label>已在钱包 App 广播的 tx hash <input id="txHash" placeholder="0x...（这里只填 hash）"></label>
+    </div>
+    <button id="broadcastButton" style="margin-top:10px" disabled>提交 tx hash 到 provider</button>
+  </section>
+
+  <section class="card">
+    <h2>事件与响应</h2>
+    <pre id="output">等待请求…</pre>
+  </section>
+</main>
+<script>
+  const state = { runId: null, sessionId: null, conversationId: null, streamAbort: null };
+  const $ = (id) => document.getElementById(id);
+  const output = $('output');
+  const write = (value) => { output.textContent += (output.textContent ? '\n\n' : '') + (typeof value === 'string' ? value : JSON.stringify(value, null, 2)); output.scrollTop = output.scrollHeight; };
+  const authHeaders = () => { const token = $('token').value.trim(); return token ? { Authorization: `Bearer ${token}` } : {}; };
+  const jsonHeaders = () => ({ ...authHeaders(), 'Content-Type': 'application/json' });
+  const setPill = () => { $('runId').textContent = state.runId || '-'; $('sessionId').textContent = state.sessionId || '-'; };
+  const api = async (path, options = {}) => { const response = await fetch(path, options); const body = await response.json().catch(() => ({})); if (!response.ok) throw new Error(JSON.stringify(body)); return body; };
+
+  $('swapEnabled').addEventListener('change', (event) => { $('swapFields').hidden = !event.target.checked; });
+  $('healthButton').addEventListener('click', async () => { try { write(await api('/health')); } catch (error) { write(`health error: ${error.message}`); } });
+
+  function swapRequest() {
+    const asset = (chain, symbol, decimals, address) => ({ chain, symbol, decimals: Number(decimals), address: address || null });
+    return {
+      source_asset: asset($('sourceChain').value.trim(), $('sourceSymbol').value.trim(), $('sourceDecimals').value, $('sourceAddress').value.trim()),
+      destination_asset: asset($('destinationChain').value.trim(), $('destinationSymbol').value.trim(), $('destinationDecimals').value, $('destinationAddress').value.trim()),
+      input_amount: $('inputAmount').value.trim(), input_amount_raw: $('inputAmountRaw').value.trim(),
+      sender_address: $('senderAddress').value.trim(), recipient_address: $('recipientAddress').value.trim()
+    };
+  }
+
+  async function readSse(runId) {
+    const response = await fetch(`/v1/agent/stream/${runId}`, { headers: authHeaders(), signal: state.streamAbort.signal });
+    if (!response.ok) throw new Error(await response.text());
+    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+    while (true) {
+      const chunk = await reader.read(); if (chunk.done) break; buffer += decoder.decode(chunk.value, { stream: true });
+      const frames = buffer.split('\n\n'); buffer = frames.pop() || '';
+      for (const frame of frames) {
+        const event = (frame.match(/^event: (.+)$/m) || [])[1] || 'message';
+        const data = (frame.match(/^data: (.+)$/m) || [])[1] || '{}'; let parsed; try { parsed = JSON.parse(data); } catch { parsed = data; }
+        write({ event, data: parsed });
+        if (event === 'action_required') { $('confirmButton').disabled = !state.sessionId; }
+      }
+    }
+  }
+
+  $('sendButton').addEventListener('click', async () => {
+    $('sendButton').disabled = true; output.textContent = '';
+    try {
+      const body = { conversation_id: $('conversationId').value.trim() || undefined, user_id: $('userId').value.trim() || undefined, message: $('message').value, model_id: $('modelId').value.trim() || undefined, metadata: {} };
+      if ($('swapEnabled').checked) { body.metadata.swap_request = swapRequest(); }
+      const turn = await api('/v1/agent/turn', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(body) });
+      state.runId = turn.run_id; state.sessionId = turn.session_id || null; state.conversationId = turn.conversation_id; $('conversationId').value = state.conversationId; setPill(); write(turn);
+      state.streamAbort = new AbortController(); await readSse(state.runId);
+      if (state.sessionId) { $('confirmButton').disabled = false; $('refreshButton').disabled = false; }
+    } catch (error) { write(`request error: ${error.message}`); } finally { $('sendButton').disabled = false; }
+  });
+
+  $('confirmButton').addEventListener('click', async () => { try { const body = await api(`/v1/swap/${state.sessionId}/confirm`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: $('userId').value.trim() || undefined, approved: true }) }); write(body); $('sessionStatus').textContent = body.status || 'prepared'; $('broadcastButton').disabled = false; } catch (error) { write(`confirm error: ${error.message}`); } });
+  $('refreshButton').addEventListener('click', async () => { try { const body = await api(`/v1/swap/${state.sessionId}?user_id=${encodeURIComponent($('userId').value.trim())}`, { headers: authHeaders() }); write(body); $('sessionStatus').textContent = body.status || '-'; } catch (error) { write(`session error: ${error.message}`); } });
+  $('broadcastButton').addEventListener('click', async () => { try { const body = await api(`/v1/swap/${state.sessionId}/broadcast`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: $('userId').value.trim() || undefined, chain: $('broadcastChain').value.trim(), tx_hash: $('txHash').value.trim() }) }); write(body); $('sessionStatus').textContent = body.status || 'broadcasted'; } catch (error) { write(`broadcast error: ${error.message}`); } });
+</script>
+</body>
+</html>
