@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
 from wallet_agent.domain.models import Asset, TokenBalance
+
+_ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 
 async def rpc_call(transport: Any, method: str, params: list[Any]) -> Any:
@@ -69,6 +72,53 @@ def quantity(value: Any) -> int:
         return value
     text = str(value or "0")
     return int(text, 16) if text.lower().startswith("0x") else int(text or 0)
+
+
+def normalize_raw_integer(value: Any) -> str:
+    if isinstance(value, bool):
+        raise ValueError("raw amount must be an integer")
+    if isinstance(value, int):
+        raw = value
+    else:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("raw amount must be an integer")
+        if any(char in text for char in ".eE"):
+            raise ValueError("raw amount must be an integer")
+        raw = int(text, 10)
+    if raw < 0:
+        raise ValueError("raw amount must be non-negative")
+    return str(raw)
+
+
+def validate_evm_address(address: str) -> str:
+    text = address.strip()
+    if not _ADDRESS.fullmatch(text):
+        raise ValueError(f"invalid EVM address: {address}")
+    return text
+
+
+def encode_evm_address_word(address: str) -> str:
+    return validate_evm_address(address).removeprefix("0x").lower().rjust(64, "0")
+
+
+def encode_evm_uint256_word(value: Any) -> str:
+    return format(int(normalize_raw_integer(value)), "064x")
+
+
+def build_erc20_calldata(selector: str, *words: str) -> str:
+    return "0x" + selector + "".join(words)
+
+
+def receipt_success(receipt: Mapping[str, Any] | None) -> bool | None:
+    if not isinstance(receipt, Mapping):
+        return None
+    text = str(receipt.get("status") or "").lower()
+    if text in {"0x1", "1"}:
+        return True
+    if text in {"0x0", "0"}:
+        return False
+    return None
 
 
 def parse_status(value: Any) -> str:
