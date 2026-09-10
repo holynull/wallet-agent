@@ -10,8 +10,10 @@ and broadcasts them, then submits only the chain-qualified transaction hash.
 cp .env.example .env
 # Set DEEPSEEK_API_KEY and explicitly enable providers with their base URLs.
 uv sync
-PYTHONPATH=src uvicorn wallet_agent.main:app --reload
+./scripts/start_local.sh
 ```
+
+开发过程中需要热重载时，可以运行 `./scripts/start_local.sh --reload`。
 
 ## Docker + real mobile-call demo
 
@@ -31,6 +33,9 @@ The page calls the same REST/SSE endpoints that a mobile app uses: turn,
 stream, confirm, session, and broadcast. It never accepts or sends private
 keys. The user must sign and broadcast the unsigned transaction in a real
 wallet, then paste only the chain-qualified transaction hash into the demo.
+
+本地调试的完整步骤（包括浏览器 Network/Console、SSE、报价选择和
+approve/兑换交易流程）见 [docs/local-demo-debugging.md](docs/local-demo-debugging.md)。
 
 For a command-line check after startup:
 
