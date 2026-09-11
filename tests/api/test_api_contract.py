@@ -59,6 +59,87 @@ async def test_sse_completion_and_missing_run_contract():
 
 
 @pytest.mark.asyncio
+async def test_run_graph_uses_async_state_snapshot_when_available():
+    class AsyncSnapshotGraph:
+        async def astream(self, value, *, config, stream_mode):
+            yield {"response": {"kind": "clarification"}}
+
+        async def aget_state(self, _config):
+            class Snapshot:
+                values = {"response": {"kind": "clarification"}}
+                tasks = ()
+                next = ()
+
+            return Snapshot()
+
+        def get_state(self, _config):
+            raise AssertionError("synchronous checkpoint access must not be used")
+
+    app, client = await client_for(graph=AsyncSnapshotGraph())
+    async with client:
+        turn = await client.post(
+            "/v1/agent/turn", json={"user_id": "alice", "message": "hello"}
+        )
+        await app.state.runs[turn.json()["run_id"]]["task"]
+        stream = await client.get(f"/v1/agent/stream/{turn.json()['run_id']}")
+
+    assert "event: complete" in stream.text
+    assert "event: error" not in stream.text
+
+
+@pytest.mark.asyncio
+async def test_turn_forwards_public_wallet_context_and_reuses_session_id():
+    class CapturingGraph:
+        def __init__(self):
+            self.inputs = []
+
+        async def astream(self, value, *, config, stream_mode):
+            self.inputs.append((value, config, stream_mode))
+            yield {"response": {"kind": "clarification"}}
+
+        def get_state(self, _config):
+            class Snapshot:
+                values = {"response": {"kind": "clarification"}}
+                tasks = ()
+                next = ()
+
+            return Snapshot()
+
+    graph = CapturingGraph()
+    app, client = await client_for(graph=graph)
+    async with client:
+        first = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "message": "把 1 USDC 换成 USDT",
+                "address": "0x" + "1" * 40,
+                "chain": "BASE",
+            },
+        )
+        assert first.status_code == 200
+        await app.state.runs[first.json()["run_id"]]["task"]
+        second = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "conversation_id": first.json()["conversation_id"],
+                "session_id": first.json()["session_id"],
+                "message": "源 token 地址是 0x2222222222222222222222222222222222222222",
+                "address": "0x" + "1" * 40,
+                "chain": "BASE",
+            },
+        )
+        assert second.status_code == 200
+        await app.state.runs[second.json()["run_id"]]["task"]
+    assert graph.inputs[0][0]["wallet_context"] == {
+        "address": "0x" + "1" * 40,
+        "chain": "BASE",
+    }
+    assert second.json()["session_id"] == first.json()["session_id"]
+
+
+@pytest.mark.asyncio
 async def test_unsupported_chain_error_is_stable():
     class Registry:
         def get_adapter(self, chain):
@@ -71,3 +152,201 @@ async def test_unsupported_chain_error_is_stable():
     body = response.json()
     assert body["code"] == "CHAIN_CAPABILITY_UNAVAILABLE"
     assert body["details"]["chain"] == "SUI"
+
+
+@pytest.mark.asyncio
+async def test_transaction_status_endpoint_returns_user_readable_status():
+    class Adapter:
+        async def get_transaction_status(self, _tx_hash):
+            from wallet_agent.domain.models import TransactionStatus
+
+            return TransactionStatus.CONFIRMED
+
+        async def get_transaction_receipt(self, _tx_hash):
+            return {"status": "0x1", "blockNumber": "0x10"}
+
+    class Registry:
+        def get_adapter(self, _chain):
+            return Adapter()
+
+    _app, client = await client_for(chain_registry=Registry())
+    tx_hash = "0x" + "a" * 64
+    async with client:
+        response = await client.get(f"/v1/transactions/BASE/{tx_hash}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "confirmed"
+    assert response.json()["message"] == "交易已确认。"
+    assert response.json()["receipt"]["status"] == "0x1"
+
+
+@pytest.mark.asyncio
+async def test_transaction_status_endpoint_rejects_invalid_hash():
+    _app, client = await client_for()
+    async with client:
+        response = await client.get("/v1/transactions/BASE/not-a-hash")
+    assert response.status_code == 422
+    assert response.json()["code"] == "INVALID_TRANSACTION_HASH"
+
+
+@pytest.mark.asyncio
+async def test_turn_accepts_explicit_transaction_query():
+    class CapturingGraph:
+        def __init__(self):
+            self.input = None
+
+        async def astream(self, value, *, config, stream_mode):
+            self.input = value
+            yield {"response": {"kind": "transaction_status"}}
+
+        def get_state(self, _config):
+            class Snapshot:
+                values = {"response": {"kind": "transaction_status"}}
+                tasks = ()
+                next = ()
+
+            return Snapshot()
+
+    graph = CapturingGraph()
+    app, client = await client_for(graph=graph)
+    async with client:
+        response = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "message": "查这笔交易",
+                "metadata": {
+                    "transaction_query": {
+                        "chain": "BASE",
+                        "tx_hash": "0x" + "a" * 64,
+                    }
+                },
+            },
+        )
+        await app.state.runs[response.json()["run_id"]]["task"]
+    assert response.status_code == 200
+    assert graph.input["intent"] == "transaction_status"
+    assert graph.input["transaction_query"]["chain"] == "BASE"
+
+
+@pytest.mark.asyncio
+async def test_turn_accepts_only_supported_agent_test_intents():
+    class CapturingGraph:
+        def __init__(self):
+            self.input = None
+
+        async def astream(self, value, *, config, stream_mode):
+            self.input = value
+            yield {"response": {"kind": "unsupported"}}
+
+        def get_state(self, _config):
+            class Snapshot:
+                values = {"response": {"kind": "unsupported"}}
+                tasks = ()
+                next = ()
+
+            return Snapshot()
+
+    graph = CapturingGraph()
+    app, client = await client_for(graph=graph)
+    async with client:
+        accepted = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "message": "调试不支持分支",
+                "metadata": {"agent_test_intent": "unsupported"},
+            },
+        )
+        await app.state.runs[accepted.json()["run_id"]]["task"]
+        rejected = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "message": "调试未知分支",
+                "metadata": {"agent_test_intent": "not-an-intent"},
+            },
+        )
+        malformed = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "message": "调试非法分支",
+                "metadata": {"agent_test_intent": ["unsupported"]},
+            },
+        )
+
+    assert accepted.status_code == 200
+    assert graph.input["intent"] == "unsupported"
+    assert graph.input["forced_intent"] == "unsupported"
+    assert rejected.status_code == 422
+    assert rejected.json()["code"] == "INVALID_AGENT_TEST_INTENT"
+    assert malformed.status_code == 422
+    assert malformed.json()["code"] == "INVALID_AGENT_TEST_INTENT"
+
+
+@pytest.mark.asyncio
+async def test_portfolio_and_gas_endpoints_return_structured_results():
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, FeeEstimate, TokenBalance, TokenPrice
+
+    class Adapter:
+        async def get_native_balance(self, _address):
+            asset = Asset(chain="BASE", symbol="ETH", decimals=18)
+            return TokenBalance(asset=asset, amount=Decimal("1"), amount_raw="100")
+
+        async def get_token_balances(self, _address):
+            return []
+
+        async def estimate_fee(self, *, to=None, data=None):
+            asset = Asset(chain="BASE", symbol="ETH", decimals=18)
+            return FeeEstimate(
+                chain="BASE",
+                asset=asset,
+                amount=Decimal("0.5"),
+                amount_raw="50",
+            )
+
+    class Registry:
+        def get_adapter(self, _chain):
+            return Adapter()
+
+    class Prices:
+        async def get_prices(self, assets):
+            return [TokenPrice(asset=asset, usd_price=Decimal("2")) for asset in assets]
+
+    app, client = await client_for(chain_registry=Registry())
+    app.state.price_provider = Prices()
+    address = "0x" + "1" * 40
+    async with client:
+        portfolio = await client.get(f"/v1/wallet/{address}/portfolio", params={"chain": "BASE"})
+        gas = await client.get(f"/v1/wallet/{address}/gas", params={"chain": "BASE"})
+    assert portfolio.status_code == 200
+    assert portfolio.json()["price_status"] == "available"
+    assert portfolio.json()["total_usd_value"] == "2"
+    assert gas.status_code == 200
+    assert gas.json()["sufficient"] is True
+    assert gas.json()["shortfall_raw"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_assets_endpoint_filters_provider_and_deduplicates():
+    from wallet_agent.domain.models import Asset
+
+    class Provider:
+        async def list_assets(self, _query):
+            return [
+                Asset(chain="BASE", symbol="USDC", decimals=6, address="0x" + "3" * 40),
+                Asset(chain="BASE", symbol="USDC", decimals=6, address="0x" + "3" * 40),
+            ]
+
+    app, client = await client_for()
+    app.state.providers = {"bridgers": Provider()}
+    async with client:
+        response = await client.get(
+            "/v1/assets",
+            params={"chain": "BASE", "search": "USDC", "provider": "bridgers"},
+        )
+    assert response.status_code == 200
+    assert len(response.json()["assets"]) == 1
+    assert response.json()["assets"][0]["address"] == "0x" + "3" * 40

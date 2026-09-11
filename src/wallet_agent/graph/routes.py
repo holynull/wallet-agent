@@ -19,6 +19,14 @@ def route_after_intent(state: dict[str, Any]) -> str:
         return "swap_allowance"
     if intent == "price_query":
         return "price_query"
+    if intent == "transaction_status":
+        return "transaction_status"
+    if intent == "portfolio_query":
+        return "portfolio_query"
+    if intent == "gas_check":
+        return "gas_check"
+    if intent == "asset_discovery":
+        return "asset_discovery"
     if intent == "swap_quote":
         return "swap_resolve"
     if intent == "swap_prepare":

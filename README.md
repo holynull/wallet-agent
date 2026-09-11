@@ -30,12 +30,15 @@ docker compose up --build
 
 Open [http://localhost:8000/demo/](http://localhost:8000/demo/) in a browser.
 The page calls the same REST/SSE endpoints that a mobile app uses: turn,
-stream, confirm, session, and broadcast. It never accepts or sends private
-keys. The user must sign and broadcast the unsigned transaction in a real
-wallet, then paste only the chain-qualified transaction hash into the demo.
+stream, quote selection, approval, session, and broadcast. It never accepts or
+sends private keys. After the user explicitly selects a quote, the browser
+wallet signs and broadcasts each unsigned transaction locally; the demo sends
+only the returned chain-qualified transaction hash to the service.
 
 本地调试的完整步骤（包括浏览器 Network/Console、SSE、报价选择和
 approve/兑换交易流程）见 [docs/local-demo-debugging.md](docs/local-demo-debugging.md)。
+
+Demo 现在支持对话式兑换和 EIP-1193 浏览器钱包连接；钱包插件只提供公开地址和链信息，签名仍在浏览器钱包本地完成。详见 [docs/mobile-integration.md](docs/mobile-integration.md)。
 
 For a command-line check after startup:
 
@@ -50,9 +53,17 @@ backend, set `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_BASE_URL` instead.
 The HTTP API is rooted at `/v1`: agent turns and SSE streaming, explicit swap
 quote selection (`/swap/{session_id}/select-quote`), allowance/approval gating
 (`/approve-broadcast` then `/continue`), transfer preparation, token prices, and
-read-only wallet balances, transactions, and fee estimates. The app must choose
-the returned `provider_reference`; the service never picks a quote silently.
+read-only wallet balances, transactions, fee estimates, and transaction status
+lookup (`/transactions/{chain}/{tx_hash}`). Transfer and swap preparation return
+machine-readable preflight checks before signing. The app must choose the
+returned `provider_reference`; the service never picks a quote silently.
 Use a stable `conversation_id` as the LangGraph `thread_id` when reconnecting.
+
+能力扩展路线见 [docs/wallet-agent-capability-roadmap.md](docs/wallet-agent-capability-roadmap.md)。
+资产组合和 Gas 助手还提供
+`/wallet/{address}/portfolio`、`/wallet/{address}/gas`，也可通过对话
+intent `portfolio_query`、`gas_check` 调用。Token 资产发现提供
+`GET /assets?chain=BASE&search=USDC` 和对话 intent `asset_discovery`。
 
 For swap authorization, the service returns an ERC-20 `approval_transaction`
 when allowance is insufficient. Sign and broadcast that transaction in the app,

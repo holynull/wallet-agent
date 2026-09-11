@@ -15,7 +15,22 @@ Intent = Literal[
     "swap_select",
     "swap_allowance",
     "price_query",
+    "transaction_status",
+    "portfolio_query",
+    "gas_check",
+    "asset_discovery",
 ]
+
+
+class ConversationState(TypedDict, total=False):
+    """Serializable task snapshot exposed to the model and the demo."""
+
+    goal: str
+    stage: str
+    status: str
+    slots: dict[str, Any]
+    missing_fields: list[str]
+    updated_by: str
 
 
 def _merge_quote_candidates(
@@ -23,6 +38,8 @@ def _merge_quote_candidates(
     incoming: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
     """Append fan-out results while replacing entries enriched by later nodes."""
+    if any(item.get("__clear__") for item in (incoming or [])):
+        return []
     merged: dict[str, dict[str, Any]] = {}
     for item in [*(existing or []), *(incoming or [])]:
         key = str(item.get("provider_reference") or item.get("provider") or len(merged))
@@ -44,13 +61,27 @@ class AgentState(TypedDict, total=False):
     user_id: str
     request: dict[str, Any]
     intent: Intent
+    conversation_state: NotRequired[ConversationState | None]
+    task_stage: NotRequired[str | None]
     wallet_context: NotRequired[dict[str, Any] | None]
     capabilities: NotRequired[dict[str, Any] | None]
     swap_request: NotRequired[dict[str, Any] | None]
+    swap_draft: NotRequired[dict[str, Any] | None]
+    token_candidates: NotRequired[list[dict[str, Any]]]
+    transfer_draft: NotRequired[dict[str, Any] | None]
+    missing_fields: NotRequired[list[str]]
+    forced_intent: NotRequired[str | None]
     transfer_request: NotRequired[dict[str, Any] | None]
+    preflight: NotRequired[dict[str, Any] | None]
+    transaction_query: NotRequired[dict[str, Any] | None]
+    transaction_status_snapshot: NotRequired[dict[str, Any] | None]
+    portfolio_request: NotRequired[dict[str, Any] | None]
+    portfolio_snapshot: NotRequired[dict[str, Any] | None]
+    gas_request: NotRequired[dict[str, Any] | None]
+    gas_snapshot: NotRequired[dict[str, Any] | None]
+    asset_query: NotRequired[dict[str, Any] | None]
+    asset_snapshot: NotRequired[dict[str, Any] | None]
     price_request: NotRequired[dict[str, Any] | None]
-    available_providers: NotRequired[list[str]]
-    provider_name: NotRequired[str]
     available_providers: NotRequired[list[str]]
     provider_name: NotRequired[str]
     quote_candidates: Annotated[list[dict[str, Any]], _merge_quote_candidates]
@@ -66,6 +97,8 @@ class AgentState(TypedDict, total=False):
     max_poll_attempts: NotRequired[int]
     errors: Annotated[list[dict[str, Any]], _merge_errors]
     response: NotRequired[dict[str, Any] | None]
+    tool_result: NotRequired[dict[str, Any] | None]
+    messages: NotRequired[list[Any]]
     route: NotRequired[str | None]
     approval_transaction: NotRequired[dict[str, Any] | None]
     allowance_requirement: NotRequired[dict[str, Any] | None]

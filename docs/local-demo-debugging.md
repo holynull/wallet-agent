@@ -148,6 +148,34 @@ python scripts/smoke_test.py --base-url http://localhost:8000
 http://localhost:8000/demo/
 ```
 
+### 连接浏览器钱包
+
+Demo 支持 CatWallet、MetaMask、Rabby、OKX Wallet 等 EIP-1193 浏览器钱包插件。打开页面后点击“连接钱包”，插件只会向页面提供当前账户地址和 `chainId`。这些公开信息会随着对话请求发送给 Agent，用于查询余额、生成报价和构造未签名交易。
+
+页面会优先选择 CatWallet：包括 EIP-6963 announcement、CatWallet 的
+`isCatWallet`/名称标记、`window.catWallet`、`window.catwallet`，以及
+`window.ethereum.providers` 中的 CatWallet Provider。没有识别到 CatWallet
+时，才回退到 `window.ethereum` 或其他 EIP-1193 Provider。点击“连接钱包”
+时会再次请求 EIP-6963 announcement，以覆盖插件延迟注入的情况。
+
+Demo 不会读取或发送：
+
+- private key；
+- seed phrase 或 mnemonic；
+- signer、wallet client；
+- `window.ethereum` 对象本身。
+
+如果服务端启用了 Bearer 认证，可在页面顶部的可选令牌输入框中填写
+token。令牌只保存在当前页面内存中，并通过 `Authorization` 请求头发送；
+不要把 token 写入兑换消息或 metadata。
+
+账户切换后，页面会清除当前兑换 session，要求重新确认，避免把旧账户的报价或交易交给新账户签名。
+网络切换不会清除 session。用户在 Approve 或 Swap 签名前，如果钱包当前链
+不是 from token 所在链，Demo 会请求 `wallet_switchEthereumChain` 自动切换；
+切换成功后继续签名，切换被拒绝或钱包不支持时则停止签名并提示用户手动切链。
+
+如果浏览器没有安装钱包插件，Demo 仍可显示聊天界面，但不能执行真实签名和广播。
+
 Demo 与移动端使用相同的 REST/SSE API。浏览器开发者工具中的以下位置最有用：
 
 ### Network
@@ -180,15 +208,75 @@ POST /v1/swap/{session_id}/broadcast
 - `pending_transaction`：授权确认后返回的兑换未签名交易；
 - `stage`：当前业务阶段。
 
+页面顶部的“后端调试数据”面板会记录 Demo 看到的原始后端数据：
+
+- `API GET /health`、`API GET /ready`；
+- `API POST /v1/agent/turn`；
+- `SSE CONNECT {run_id}`；
+- 每条 `SSE update`、`SSE complete`、`SSE error` 事件；
+- 非 JSON 错误响应的原始文本。
+
+点击面板里的“联调检查”，Demo 会按顺序执行 health、ready、一次
+`你好，联调检查` Agent turn 和对应 SSE 读取。这个入口不需要连接钱包，
+适合先确认浏览器页面、HTTP API、Agent 图和 SSE 是否打通。若页面上出现
+异常，先展开该面板，把最后几条 `API`/`SSE` 数据和启动终端日志对照。
+
+### Agent 功能测试矩阵
+
+点击“测试全部 Agent 功能”可以逐项验证 Agent 的主要 intent 和终止分支：
+
+- `clarification`、`unsupported`；
+- `wallet_query`、`portfolio_query`、`gas_check`；
+- `asset_discovery`、`price_query`、`transaction_status`；
+- `transfer` 的预检查和未签名交易准备；
+- `swap_quote`、`swap_select`、`swap_allowance`、`swap_prepare`、`swap_status`。
+
+测试项使用独立的 `conversation_id`，不会覆盖当前聊天或兑换 session。每项
+测试都会把 request、API 返回和完整 SSE 事件写入“后端调试数据”面板。
+需要钱包的查询在未连接钱包时显示为“阻塞”；RPC、价格服务或兑换 Provider
+未配置或不可用时也显示为“阻塞”，避免把环境依赖问题误报为代码失败。
+
+该矩阵只执行到签名前的安全边界。它不会调用 `eth_sendTransaction`，不会
+自动签名、广播或提交 Approve hash。真实交易仍需在下方聊天流程中明确点击
+钱包操作按钮。
+
+同样的链路也可以用命令行复现：
+
+```bash
+python3 scripts/smoke_test.py --base-url http://127.0.0.1:8000
+```
+
+如果需要指定消息或用户：
+
+```bash
+python3 scripts/smoke_test.py \
+  --base-url http://127.0.0.1:8000 \
+  --user-id debug-user \
+  --message "你好，联调检查"
+```
+
+聊天式流程中，直接输入自然语言即可，例如：
+
+```text
+把 1 USDC 从 Base 换成 BSC 上的 USDT
+```
+
+如果缺少 Token 合约地址或其他必要信息，Agent 会在聊天中追问；参数完整后才会返回报价卡片。
+
+转账也遵循同样的链规则：钱包必须在转账所在链上签名。如果当前钱包在
+其他链，点击转账卡片的签名按钮时，Demo 会先请求自动切链；切链成功后
+再调用 `eth_sendTransaction`。转账不会调用兑换 Provider，也不会提交到
+`/v1/swap/{session_id}/broadcast`。
+
 ## 5. 先调试普通对话
 
-在 Demo 中关闭“将本次消息作为真实 swap quote 请求”，消息填写：
+消息填写：
 
 ```text
 你好，请简要介绍一下你能帮助我做什么。
 ```
 
-点击“发送真实请求”。页面会先收到一个 `run_id`，然后通过 SSE 读取执行事件。正常情况下可以看到 `update` 和 `complete` 事件。
+点击“发送”。页面会先收到一个 `run_id`，然后通过 SSE 读取执行事件。正常情况下可以看到 `update` 和 `complete` 事件。
 
 也可以直接使用命令行：
 
@@ -214,12 +302,11 @@ curl -N http://localhost:8000/v1/agent/stream/替换为_run_id
 
 在 Demo 中依次执行：
 
-1. 勾选“将本次消息作为真实 swap quote 请求”；
-2. 填写源链、目标链、源/目标 Token 地址、数量、发送地址和接收地址；
-3. 点击“发送真实请求”；
+1. 连接浏览器钱包；
+2. 在聊天框输入兑换意图，例如“把 1 USDC 从 Base 换成 BSC 上的 USDT”；
+3. 如果缺少 Token 合约地址、decimals 等字段，按 Agent 的追问继续发送补充信息；
 4. 等待完整的 `quote_candidates` 报价列表；
-5. 在页面中选择一个报价；
-6. 点击“选择报价并检查 allowance”。
+5. 在聊天消息中的报价卡片选择一个报价。
 
 服务端不会自动选择报价，App 必须原样提交用户选择的 `provider_reference`。
 
@@ -240,14 +327,13 @@ curl -N http://localhost:8000/v1/agent/stream/替换为_run_id
 
 此时按以下顺序操作：
 
-1. 钱包 App 在本地签名并广播 approve 交易；
-2. 只将已广播交易的 hash 填入 Demo；
-3. 点击“提交 approve hash 并继续”；
-4. 服务端检查 approve receipt 是否成功；
-5. 服务端重新读取链上 Allowance；
-6. Allowance 足够后，服务端才生成 `pending_transaction`；
-7. 钱包 App 本地签名并广播最终兑换交易；
-8. 将最终交易 hash 提交到 `/v1/swap/{session_id}/broadcast`。
+1. 点击 Approve 卡片中的钱包签名按钮；
+2. 钱包插件在本地签名并广播交易，Demo 只提交返回的交易 hash；
+3. 服务端检查 approve receipt 是否成功；
+4. 服务端重新读取链上 Allowance；
+5. Allowance 足够后，服务端才生成 `pending_transaction`；
+6. 点击兑换交易卡片中的钱包签名按钮；
+7. 钱包插件在本地广播最终兑换交易，Demo 只提交最终交易 hash。
 
 兑换状态通常按以下顺序变化：
 

@@ -32,11 +32,29 @@ from wallet_agent.persistence import InMemorySessionStore, SessionStore, SwapSes
 from .auth import TokenVerifier
 from .dependencies import authenticated_user
 
+_AGENT_TEST_INTENTS = {
+    "wallet_query",
+    "swap_quote",
+    "swap_prepare",
+    "swap_status",
+    "clarification",
+    "unsupported",
+    "transfer",
+    "swap_select",
+    "swap_allowance",
+    "price_query",
+    "transaction_status",
+    "portfolio_query",
+    "gas_check",
+    "asset_discovery",
+}
+
 
 class TurnRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     conversation_id: str | None = None
+    session_id: str | None = None
     user_id: str | None = None
     message: str
     address: str | None = None
@@ -131,7 +149,18 @@ def _qualified_hash(chain: str, tx_hash: str) -> bool:
     if not value or any(c.isspace() for c in value):
         return False
     chain = chain.upper()
-    if chain in {"EVM", "ETH", "BSC", "BASE", "POLYGON", "ARBITRUM", "OPTIMISM"}:
+    if chain in {
+        "EVM",
+        "ETH",
+        "BSC",
+        "BASE",
+        "POLYGON",
+        "MATIC",
+        "ARBITRUM",
+        "ARB",
+        "OPTIMISM",
+        "OP",
+    }:
         return (
             value.startswith("0x")
             and len(value) == 66
@@ -142,6 +171,14 @@ def _qualified_hash(chain: str, tx_hash: str) -> bool:
     if chain in {"SOLANA", "SOL"}:
         return 32 <= len(value) <= 128 and all(c.isalnum() for c in value)
     return False
+
+
+def _looks_like_swap(message: str) -> bool:
+    text = message.lower()
+    return any(
+        token in text
+        for token in ("swap", "exchange", "transfer", "send", "兑换", "换成", "换", "转账", "转")
+    )
 
 
 def create_app(
@@ -272,6 +309,8 @@ def create_app(
         for field in ("approval_transaction", "approval_tx_hash", "allowance_requirement"):
             if state.get(field) is not None:
                 changes[field] = state[field]
+        if state.get("preflight") is not None:
+            changes["preflight"] = state["preflight"]
         if status:
             changes["status"] = status
         if not changes:
@@ -291,13 +330,17 @@ def create_app(
                 result = input_state
                 app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
             else:
+                async def get_snapshot() -> Any:
+                    if hasattr(app.state.graph, "aget_state"):
+                        return await app.state.graph.aget_state(config)
+                    return app.state.graph.get_state(config)
 
                 async def execute(graph_input: dict[str, Any]) -> dict[str, Any]:
                     async for event in app.state.graph.astream(
                         graph_input, config=config, stream_mode="updates"
                     ):
                         app.state.runs[run_id]["events"].append({"event": "update", "data": event})
-                    snapshot = app.state.graph.get_state(config)
+                    snapshot = await get_snapshot()
                     return dict(snapshot.values)
 
                 result = await execute(input_state)
@@ -314,21 +357,14 @@ def create_app(
                     result = await execute(
                         {
                             "intent": "swap_prepare",
+                            "forced_intent": "swap_prepare",
                             "swap_request": result.get("swap_request"),
                             "selected_quote": result.get("selected_quote"),
                             "swap_session": {"session_id": session_id},
                         }
                     )
-                result = (
-                    app.state.graph.get_state(config).values
-                    if hasattr(app.state.graph, "get_state")
-                    else result
-                )
-                snapshot = (
-                    app.state.graph.get_state(config)
-                    if hasattr(app.state.graph, "get_state")
-                    else None
-                )
+                snapshot = await get_snapshot()
+                result = snapshot.values
                 interrupted = bool(getattr(snapshot, "tasks", ())) and bool(
                     getattr(snapshot, "next", ())
                 )
@@ -390,26 +426,74 @@ def create_app(
                 ) from exc
         else:
             selected_model_id = payload.model_id
-        conversation_id = payload.conversation_id or str(uuid.uuid4())
+        existing_session = None
+        if payload.session_id:
+            existing_session = await session_store.get(payload.session_id)
+            if existing_session is None or existing_session.user_id != user_id:
+                raise HTTPException(status_code=404, detail="swap session not found")
+            if payload.conversation_id and payload.conversation_id != existing_session.thread_id:
+                raise HTTPException(
+                    status_code=409, detail="conversation_id does not match session"
+                )
+        conversation_id = payload.conversation_id or (
+            existing_session.thread_id if existing_session else str(uuid.uuid4())
+        )
         run_id = str(uuid.uuid4())
+        raw_agent_test_intent = payload.metadata.get("agent_test_intent")
+        if (
+            raw_agent_test_intent is not None
+            and (
+                not isinstance(raw_agent_test_intent, str)
+                or raw_agent_test_intent not in _AGENT_TEST_INTENTS
+            )
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "INVALID_AGENT_TEST_INTENT",
+                    "message": "agent_test_intent is not supported.",
+                    "details": {"allowed_intents": sorted(_AGENT_TEST_INTENTS)},
+                },
+            )
         raw_swap_request = payload.metadata.get("swap_request") or payload.metadata.get("swap")
         raw_transfer_request = payload.metadata.get("transfer_request") or payload.metadata.get(
             "transfer"
         )
         raw_price_request = payload.metadata.get("price_request") or payload.metadata.get("price")
-        session_id = (
-            str(uuid.uuid4())
-            if (raw_swap_request is not None or raw_transfer_request is not None)
-            else None
+        raw_transaction_query = payload.metadata.get("transaction_query") or payload.metadata.get(
+            "transaction"
         )
+        raw_portfolio_query = payload.metadata.get("portfolio_query") or payload.metadata.get(
+            "portfolio"
+        )
+        raw_gas_query = payload.metadata.get("gas_request") or payload.metadata.get("gas")
+        raw_asset_query = payload.metadata.get("asset_query") or payload.metadata.get("assets")
+        session_id = payload.session_id
+        if session_id is None and (
+            raw_swap_request is not None
+            or raw_transfer_request is not None
+            or _looks_like_swap(payload.message)
+        ):
+            session_id = str(uuid.uuid4())
         if session_id:
-            await session_store.save(
-                SwapSessionRecord(
-                    session_id=session_id,
-                    user_id=user_id,
-                    thread_id=conversation_id,
+            if existing_session is None:
+                await session_store.save(
+                    SwapSessionRecord(
+                        session_id=session_id,
+                        user_id=user_id,
+                        thread_id=conversation_id,
+                    )
                 )
-            )
+            elif existing_session.thread_id != conversation_id:
+                raise HTTPException(status_code=409, detail="session thread cannot be changed")
+        wallet_context: dict[str, Any] = {}
+        if payload.address:
+            wallet_context["address"] = payload.address
+        if payload.chain:
+            wallet_context["chain"] = payload.chain
+        metadata_chain_id = payload.metadata.get("wallet_chain_id")
+        if metadata_chain_id is not None:
+            wallet_context["chain_id"] = metadata_chain_id
         input_state = {
             "conversation_id": conversation_id,
             "user_id": user_id,
@@ -417,14 +501,37 @@ def create_app(
             "request": payload.model_dump(mode="json"),
             "messages": [{"role": "user", "content": payload.message}],
         }
+        if wallet_context:
+            input_state["wallet_context"] = wallet_context
         if raw_swap_request is not None:
             input_state["swap_request"] = raw_swap_request
         if raw_transfer_request is not None:
+            input_state["forced_intent"] = "transfer"
             input_state["intent"] = "transfer"
             input_state["transfer_request"] = raw_transfer_request
         if raw_price_request is not None:
+            input_state["forced_intent"] = "price_query"
             input_state["intent"] = "price_query"
             input_state["price_request"] = raw_price_request
+        if raw_transaction_query is not None:
+            input_state["forced_intent"] = "transaction_status"
+            input_state["intent"] = "transaction_status"
+            input_state["transaction_query"] = raw_transaction_query
+        if raw_portfolio_query is not None:
+            input_state["forced_intent"] = "portfolio_query"
+            input_state["intent"] = "portfolio_query"
+            input_state["portfolio_request"] = raw_portfolio_query
+        if raw_gas_query is not None:
+            input_state["forced_intent"] = "gas_check"
+            input_state["intent"] = "gas_check"
+            input_state["gas_request"] = raw_gas_query
+        if raw_asset_query is not None:
+            input_state["forced_intent"] = "asset_discovery"
+            input_state["intent"] = "asset_discovery"
+            input_state["asset_query"] = raw_asset_query
+        if raw_agent_test_intent is not None:
+            input_state["forced_intent"] = raw_agent_test_intent
+            input_state["intent"] = raw_agent_test_intent
         config = {"configurable": {"thread_id": conversation_id}}
         app.state.runs[run_id] = {"status": "queued", "events": []}
         task = asyncio.create_task(run_graph(run_id, input_state, config, session_id=session_id))
@@ -497,6 +604,17 @@ def create_app(
         status = "prepared" if result.get("pending_transaction") else "confirmed"
         updated = await project_session(session_id, result, status=status)
         return _jsonable(updated or result)
+
+    @app.post("/v1/swap/{session_id}/cancel")
+    async def cancel(request: Request, session_id: str, payload: ConfirmRequest) -> dict[str, Any]:
+        user_id = await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id=payload.user_id,
+        )
+        await owned_session(session_id, user_id)
+        return _jsonable(await session_store.update(session_id, status="cancelled"))
 
     @app.post("/v1/swap/{session_id}/broadcast")
     async def broadcast(
@@ -573,7 +691,11 @@ def create_app(
                 )
             )
         result = await app.state.graph.ainvoke(
-            {"intent": "swap_allowance", "selected_quote": selected_quote.model_dump(mode="json")},
+            {
+                "intent": "swap_allowance",
+                "forced_intent": "swap_allowance",
+                "selected_quote": selected_quote.model_dump(mode="json"),
+            },
             config={"configurable": {"thread_id": session.thread_id}},
         )
         updated = await project_session(
@@ -694,6 +816,7 @@ def create_app(
         result = await app.state.graph.ainvoke(
             {
                 "intent": "transfer",
+                "forced_intent": "transfer",
                 "transfer_request": payload.model_dump(mode="json", exclude={"user_id"}),
             },
             config={"configurable": {"thread_id": session.thread_id}},
@@ -701,6 +824,72 @@ def create_app(
         response = result.get("response") or {}
         status = "transfer_ready" if response.get("kind") == "transfer_prepare" else "failed"
         return _jsonable(await project_session(session_id, result, status=status) or result)
+
+    @app.get("/v1/transactions/{chain}/{tx_hash}")
+    async def transaction_status(
+        request: Request,
+        chain: str,
+        tx_hash: str,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id=user_id,
+        )
+        if not _qualified_hash(chain, tx_hash):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "INVALID_TRANSACTION_HASH",
+                    "message": "tx_hash must be a chain-qualified transaction hash",
+                    "details": {"chain": chain},
+                },
+            )
+        registry = app.state.chain_registry
+        if registry is None:
+            raise HTTPException(status_code=503, detail="chain registry unavailable")
+        try:
+            adapter = (
+                registry.get_adapter(chain)
+                if hasattr(registry, "get_adapter")
+                else registry.get(chain)
+            )
+            status = await adapter.get_transaction_status(tx_hash)
+            status_value = getattr(status, "value", str(status))
+            messages = {
+                "pending": "交易已提交，正在等待链上确认。",
+                "confirmed": "交易已确认。",
+                "failed": "交易执行失败或已回滚。",
+                "dropped": "交易可能已被节点丢弃，请检查钱包或重新提交。",
+                "unknown": "暂时无法确定交易状态。",
+            }
+            result: dict[str, Any] = {
+                "chain": chain.upper(),
+                "tx_hash": tx_hash,
+                "status": status_value,
+                "message": messages.get(status_value, messages["unknown"]),
+            }
+            if hasattr(adapter, "get_transaction_receipt"):
+                receipt = await adapter.get_transaction_receipt(tx_hash)
+                if receipt is not None:
+                    result["receipt"] = _jsonable(receipt)
+            return result
+        except ChainCapabilityUnavailable as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=exc.to_agent_error().model_dump(mode="json"),
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "TRANSACTION_STATUS_FAILED",
+                    "message": str(exc),
+                    "details": {"chain": chain, "tx_hash": tx_hash},
+                },
+            ) from exc
 
     @app.get("/v1/prices/token")
     async def token_prices(
@@ -773,6 +962,166 @@ def create_app(
     async def fees(request: Request, address: str, chain: str) -> Any:
         await authenticated_user(request, verifier=token_verifier, required=require_auth)
         return await wallet_operation(address, chain, "fees")
+
+    @app.get("/v1/wallet/{address}/portfolio")
+    async def portfolio(request: Request, address: str, chain: str) -> Any:
+        await authenticated_user(request, verifier=token_verifier, required=require_auth)
+        registry = app.state.chain_registry
+        if registry is None:
+            raise HTTPException(status_code=503, detail="chain registry unavailable")
+        try:
+            adapter = (
+                registry.get_adapter(chain)
+                if hasattr(registry, "get_adapter")
+                else registry.get(chain)
+            )
+            balances = [await adapter.get_native_balance(address)]
+            if hasattr(adapter, "get_token_balances"):
+                balances.extend(await adapter.get_token_balances(address))
+            prices = []
+            if app.state.price_provider is not None:
+                try:
+                    prices = await app.state.price_provider.get_prices(
+                        [balance.asset for balance in balances]
+                    )
+                except Exception:
+                    prices = []
+            price_map = {
+                (
+                    str(price.asset.chain).upper(),
+                    str(price.asset.symbol).upper(),
+                    str(price.asset.address or "").lower(),
+                ): price
+                for price in prices
+            }
+            assets = []
+            total_usd = 0
+            has_value = False
+            for balance in balances:
+                item = _jsonable(balance)
+                key = (
+                    str(balance.asset.chain).upper(),
+                    str(balance.asset.symbol).upper(),
+                    str(balance.asset.address or "").lower(),
+                )
+                price = price_map.get(key)
+                if price is not None:
+                    usd_value = balance.amount * price.usd_price
+                    item["usd_value"] = str(usd_value)
+                    total_usd += usd_value
+                    has_value = True
+                assets.append(item)
+            return {
+                "address": address,
+                "chain": chain.upper(),
+                "assets": assets,
+                "total_usd_value": str(total_usd) if has_value else None,
+                "price_status": "available" if prices else "unavailable",
+                "price_snapshots": [_jsonable(price) for price in prices],
+            }
+        except ChainCapabilityUnavailable as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=exc.to_agent_error().model_dump(mode="json"),
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "PORTFOLIO_QUERY_FAILED", "message": str(exc)},
+            ) from exc
+
+    @app.get("/v1/wallet/{address}/gas")
+    async def gas(
+        request: Request,
+        address: str,
+        chain: str,
+        to: str | None = None,
+        data: str | None = None,
+    ) -> Any:
+        await authenticated_user(request, verifier=token_verifier, required=require_auth)
+        registry = app.state.chain_registry
+        if registry is None:
+            raise HTTPException(status_code=503, detail="chain registry unavailable")
+        try:
+            adapter = (
+                registry.get_adapter(chain)
+                if hasattr(registry, "get_adapter")
+                else registry.get(chain)
+            )
+            fee = await adapter.estimate_fee(to=to, data=data)
+            native = await adapter.get_native_balance(address)
+            fee_raw = int(fee.amount_raw)
+            balance_raw = int(native.amount_raw)
+            sufficient = balance_raw >= fee_raw
+            return {
+                "address": address,
+                "chain": chain.upper(),
+                "fee_estimate": _jsonable(fee),
+                "native_balance": _jsonable(native),
+                "sufficient": sufficient,
+                "shortfall_raw": str(max(fee_raw - balance_raw, 0)),
+                "message": (
+                    "当前原生币余额足够支付预计网络手续费。"
+                    if sufficient
+                    else "当前原生币余额不足以支付预计网络手续费。"
+                ),
+            }
+        except ChainCapabilityUnavailable as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=exc.to_agent_error().model_dump(mode="json"),
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "GAS_CHECK_FAILED", "message": str(exc)},
+            ) from exc
+
+    @app.get("/v1/assets")
+    async def assets(
+        request: Request,
+        chain: str | None = None,
+        search: str | None = None,
+        provider: str | None = None,
+    ) -> Any:
+        await authenticated_user(request, verifier=token_verifier, required=require_auth)
+        providers_to_query = app.state.providers
+        if provider:
+            providers_to_query = {
+                name: item for name, item in providers_to_query.items() if name == provider
+            }
+        if not providers_to_query:
+            raise HTTPException(status_code=503, detail="asset provider unavailable")
+        from wallet_agent.domain.models import AssetQuery
+
+        query = AssetQuery(chain=chain, search=search, provider=provider)
+        result: dict[tuple[str, str, str], Any] = {}
+        errors = []
+        for provider_name, asset_provider in providers_to_query.items():
+            if not hasattr(asset_provider, "list_assets"):
+                continue
+            try:
+                values = await asset_provider.list_assets(query)
+                for asset in values:
+                    key = (
+                        str(asset.chain).upper(),
+                        str(asset.symbol).upper(),
+                        str(asset.address or "").lower(),
+                    )
+                    result[key] = asset
+            except Exception as exc:
+                errors.append(
+                    {
+                        "provider": provider_name,
+                        "code": "ASSET_DISCOVERY_FAILED",
+                        "message": str(exc),
+                    }
+                )
+        return {
+            "query": _jsonable(query),
+            "assets": [_jsonable(asset) for asset in result.values()],
+            "provider_errors": errors,
+        }
 
     return app
 

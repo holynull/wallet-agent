@@ -23,6 +23,34 @@ from wallet_agent.providers import BridgersProvider, HttpJsonTransport, OmniBrid
 
 class IntentOutput(BaseModel):
     intent: str
+    source_chain: str | None = None
+    destination_chain: str | None = None
+    source_symbol: str | None = None
+    destination_symbol: str | None = None
+    source_token_address: str | None = None
+    destination_token_address: str | None = None
+    source_decimals: int | None = None
+    destination_decimals: int | None = None
+    input_amount: str | None = None
+    input_amount_raw: str | None = None
+    sender_address: str | None = None
+    recipient_address: str | None = None
+    transfer_chain: str | None = None
+    transfer_symbol: str | None = None
+    transfer_token_address: str | None = None
+    transfer_decimals: int | None = None
+    transfer_amount: str | None = None
+    transfer_amount_raw: str | None = None
+    transfer_sender: str | None = None
+    transfer_recipient: str | None = None
+    transaction_chain: str | None = None
+    transaction_hash: str | None = None
+    portfolio_chain: str | None = None
+    gas_chain: str | None = None
+    gas_to: str | None = None
+    gas_data: str | None = None
+    asset_chain: str | None = None
+    asset_search: str | None = None
 
 
 def build_application(settings: Settings | None = None) -> Any:
@@ -40,7 +68,7 @@ def build_application(settings: Settings | None = None) -> Any:
             model=model_id,
             api_key=api_key,
             base_url=settings.openai_base_url,
-        ).with_structured_output(IntentOutput)
+        ).with_structured_output(IntentOutput, method="json_mode")
         for model_id in dict.fromkeys([settings.openai_model, *settings.allowed_model_ids])
     }
     model_registry = ModelRegistry(model_clients, default_model_id=settings.openai_model)

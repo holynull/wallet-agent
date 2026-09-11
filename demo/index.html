@@ -3,233 +3,952 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Wallet Agent Mobile Demo</title>
+  <title>Wallet Agent · Chat Swap</title>
   <style>
     :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { margin: 0; background: #10131a; color: #eef1f7; }
-    main { max-width: 920px; margin: 0 auto; padding: 24px 16px 56px; }
-    h1 { margin: 0 0 4px; font-size: 28px; }
-    h2 { margin: 22px 0 10px; font-size: 18px; }
-    .muted { color: #9ba5b5; }
-    .warning { border: 1px solid #d99b36; background: #2a2111; color: #ffd992; padding: 12px; border-radius: 10px; }
-    .card { margin-top: 16px; padding: 16px; border: 1px solid #2c3442; border-radius: 12px; background: #171c25; }
-    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-    label { display: grid; gap: 5px; color: #b5bfce; font-size: 13px; }
-    input, textarea, select, button { box-sizing: border-box; width: 100%; border-radius: 8px; border: 1px solid #3a4557; background: #0f141c; color: #eef1f7; padding: 10px; font: inherit; }
-    textarea { min-height: 74px; resize: vertical; }
-    button { cursor: pointer; background: #3867d6; border-color: #4d7cf0; font-weight: 600; }
-    button.secondary { background: #27303e; border-color: #455268; }
-    button:disabled { opacity: .55; cursor: wait; }
-    .actions { display: flex; gap: 8px; margin-top: 12px; }
-    .actions button { flex: 1; }
-    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0b0e13; padding: 12px; border-radius: 8px; max-height: 320px; overflow: auto; }
-    .status { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-    .pill { border-radius: 999px; padding: 5px 9px; background: #263142; color: #cbd5e5; font-size: 12px; }
-    .quote-list { display: grid; gap: 10px; margin-top: 12px; }
-    .quote-card { padding: 12px; border: 1px solid #3a4557; border-radius: 10px; background: #111722; }
-    .quote-card.selected { border-color: #4d7cf0; box-shadow: 0 0 0 1px #4d7cf0; }
-    .quote-card h3 { margin: 0 0 8px; font-size: 15px; }
-    .quote-card p { margin: 5px 0; color: #b5bfce; font-size: 13px; }
-    @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } main { padding: 18px 12px 40px; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0d1117; color: #edf2f7; }
+    main { width: min(760px, 100%); min-height: 100vh; margin: 0 auto; display: flex; flex-direction: column; background: #111821; }
+    header { position: sticky; top: 0; z-index: 2; padding: 16px; border-bottom: 1px solid #283242; background: rgba(17, 24, 33, .96); backdrop-filter: blur(10px); }
+    header h1 { margin: 0; font-size: 20px; }
+    header p { margin: 4px 0 12px; color: #9aa8bb; font-size: 12px; }
+    .wallet-bar { display: flex; align-items: center; gap: 8px; }
+    .wallet-status { flex: 1; min-width: 0; color: #b9c5d6; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .token-input { width: 150px; min-width: 0; padding: 8px; border: 1px solid #3b4b63; border-radius: 8px; outline: none; color: #edf2f7; background: #0d141d; font: inherit; font-size: 11px; }
+    .token-input:focus { border-color: #5c85e8; }
+    button { border: 1px solid #4269c7; border-radius: 8px; padding: 9px 12px; color: white; background: #2f5fc9; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+    button.secondary { border-color: #435166; background: #263142; }
+    button:disabled { opacity: .5; cursor: wait; }
+    #messages { flex: 1; padding: 18px 14px 120px; overflow-y: auto; }
+    .message { display: flex; margin: 10px 0; }
+    .message.user { justify-content: flex-end; }
+    .bubble { max-width: 88%; padding: 11px 13px; border-radius: 14px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .message.user .bubble { background: #2f5fc9; border-bottom-right-radius: 4px; }
+    .message.assistant .bubble { background: #202a37; border: 1px solid #304055; border-bottom-left-radius: 4px; }
+    .message.system .bubble { width: 100%; color: #9aa8bb; background: transparent; font-size: 12px; text-align: center; }
+    .card { width: 100%; margin: 8px 0; padding: 13px; border: 1px solid #344256; border-radius: 12px; background: #18212d; }
+    .card h3 { margin: 0 0 9px; font-size: 14px; }
+    .card p { margin: 6px 0; color: #bdc8d7; font-size: 12px; }
+    .card pre { max-height: 220px; margin: 8px 0; padding: 10px; overflow: auto; border-radius: 8px; background: #0a0f15; color: #c9d5e5; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .quote-grid { display: grid; gap: 8px; }
+    .quote { padding: 10px; border: 1px solid #3b4b63; border-radius: 9px; background: #121a24; }
+    .quote strong { display: block; margin-bottom: 4px; }
+    .quote span { display: block; color: #afbdcf; font-size: 12px; }
+    .card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .card-actions button { flex: 1; min-width: 150px; }
+    .composer { position: fixed; bottom: 0; z-index: 2; width: min(760px, 100%); padding: 10px 12px 14px; border-top: 1px solid #283242; background: rgba(17, 24, 33, .97); }
+    .composer-row { display: flex; gap: 8px; align-items: flex-end; }
+    textarea { flex: 1; min-height: 42px; max-height: 130px; resize: vertical; padding: 11px; border: 1px solid #3b4b63; border-radius: 9px; outline: none; color: #edf2f7; background: #0d141d; font: inherit; font-size: 14px; }
+    textarea:focus { border-color: #5c85e8; }
+    .meta { display: flex; gap: 8px; margin-top: 7px; color: #8493a7; font-size: 11px; }
+    .meta span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .debug-panel { margin: 12px 14px 0; border: 1px solid #344256; border-radius: 9px; background: #0d141d; }
+    .debug-panel summary { padding: 9px 11px; color: #b9c5d6; cursor: pointer; font-size: 12px; }
+    .debug-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 11px 10px; }
+    .debug-actions button { width: auto; min-width: 120px; padding: 7px 10px; font-size: 12px; }
+    .debug-panel pre { max-height: 300px; margin: 0; padding: 10px 11px; overflow: auto; border-top: 1px solid #283242; color: #b9c8dc; font-size: 11px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .agent-test-hint { margin: 0; padding: 0 11px 9px; color: #8493a7; font-size: 11px; line-height: 1.45; }
+    .agent-test-list { border-top: 1px solid #283242; }
+    .agent-test-row { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; gap: 8px; align-items: start; padding: 9px 11px; border-bottom: 1px solid #202b39; }
+    .agent-test-row:last-child { border-bottom: 0; }
+    .agent-test-dot { width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: #66758a; }
+    .agent-test-row.pass .agent-test-dot { background: #4cc38a; }
+    .agent-test-row.blocked .agent-test-dot { background: #d6a84f; }
+    .agent-test-row.fail .agent-test-dot { background: #e06c75; }
+    .agent-test-row.running .agent-test-dot { background: #5c85e8; box-shadow: 0 0 0 3px rgba(92, 133, 232, .18); }
+    .agent-test-name { min-width: 0; font-size: 12px; font-weight: 600; }
+    .agent-test-detail { margin-top: 3px; color: #8493a7; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+    .agent-test-status { color: #b9c5d6; font-size: 11px; white-space: nowrap; }
+    @media (max-width: 640px) { header { padding: 13px 12px; } #messages { padding-left: 10px; padding-right: 10px; } .bubble { max-width: 94%; } }
   </style>
 </head>
 <body>
 <main>
-  <h1>Wallet Agent Mobile Demo</h1>
-  <div class="muted">真实 API 联调页面 · 同源调用 · 不保存私钥</div>
+  <header>
+    <h1>Wallet Agent Mobile Demo</h1>
+    <p>通过自然语言兑换 · 浏览器钱包只在本地签名和广播 · private key 永远不会发送到服务端</p>
+    <div class="wallet-bar">
+      <div id="walletStatus" class="wallet-status">未连接浏览器钱包</div>
+      <input id="token" class="token-input" type="password" autocomplete="off" placeholder="Bearer token（可选）" aria-label="Bearer token">
+      <button id="connectButton">连接钱包</button>
+      <button id="refreshButton" class="secondary" hidden>刷新</button>
+    </div>
+  </header>
 
-  <div class="warning" style="margin-top: 14px">
-    这是移动端调用示例。服务端只生成报价和未签名交易；私钥（private key）、助记词、signer 永远留在钱包 App 内。
-    请在 App 本地签名并广播后，只提交 chain-qualified transaction hash。
-  </div>
+  <details id="debugPanel" class="debug-panel">
+    <summary>后端调试数据（0 条）</summary>
+    <div class="debug-actions">
+      <button id="debugSmokeButton" class="secondary" type="button">联调检查</button>
+      <button id="debugClearButton" class="secondary" type="button">清空</button>
+    </div>
+    <pre id="debugOutput">等待后端响应…</pre>
+  </details>
 
-  <section class="card">
-    <h2>1. 连接配置</h2>
-    <div class="grid">
-      <label>Bearer token（AUTH_REQUIRED=true 时填写）
-        <input id="token" type="password" autocomplete="off" placeholder="只在浏览器内存中使用">
-      </label>
-      <label>用户 ID（仅兼容未启用认证的本地服务）
-        <input id="userId" value="mobile-demo-user">
-      </label>
-      <label>模型 ID
-        <input id="modelId" value="deepseek-chat">
-      </label>
-      <label>conversation_id（断线重连时保持不变）
-        <input id="conversationId" placeholder="首次发送自动生成">
-      </label>
+  <details id="agentTestPanel" class="debug-panel">
+    <summary>Agent 功能测试（未运行）</summary>
+    <div class="debug-actions">
+      <button id="runAgentTestsButton" type="button">测试全部 Agent 功能</button>
     </div>
-  </section>
+    <p class="agent-test-hint">只验证 Agent 分支、后端数据和签名前边界；不会自动签名、Approve 或广播交易。</p>
+    <div id="agentTestResults" class="agent-test-list"></div>
+  </details>
 
-  <section class="card">
-    <h2>2. 对话 / Swap 请求</h2>
-    <label>消息
-      <textarea id="message">我想查询一下资产或发起一次兑换</textarea>
-    </label>
-    <label style="display:flex; align-items:center; gap:8px; margin-top:10px">
-      <input id="swapEnabled" type="checkbox" style="width:auto"> 将本次消息作为真实 swap quote 请求
-    </label>
-    <div id="swapFields" hidden>
-      <div class="grid" style="margin-top:10px">
-        <label>源链 <input id="sourceChain" value="BASE"></label>
-        <label>目标链 <input id="destinationChain" value="BSC"></label>
-        <label>源币种 <input id="sourceSymbol" value="USDC"></label>
-        <label>目标币种 <input id="destinationSymbol" value="USDT"></label>
-        <label>源 token 地址 <input id="sourceAddress" placeholder="0x..."></label>
-        <label>目标 token 地址 <input id="destinationAddress" placeholder="0x..."></label>
-        <label>源 decimals <input id="sourceDecimals" type="number" value="6"></label>
-        <label>目标 decimals <input id="destinationDecimals" type="number" value="6"></label>
-        <label>数量（人类可读） <input id="inputAmount" value="1"></label>
-        <label>数量（最小单位整数） <input id="inputAmountRaw" value="1000000"></label>
-        <label>发送地址 <input id="senderAddress" placeholder="0x..."></label>
-        <label>接收地址 <input id="recipientAddress" placeholder="0x..."></label>
-      </div>
-    </div>
-    <div class="actions">
-      <button id="sendButton">发送真实请求</button>
-      <button id="healthButton" class="secondary">检查 /health</button>
-    </div>
-  </section>
+  <section id="messages" aria-live="polite"></section>
 
-  <section class="card">
-    <h2>3. Swap 操作</h2>
-    <div class="status">
-      <span class="pill">run_id: <span id="runId">-</span></span>
-      <span class="pill">session_id: <span id="sessionId">-</span></span>
-      <span class="pill">状态: <span id="sessionStatus">-</span></span>
+  <section class="composer">
+    <div class="composer-row">
+      <textarea id="composer" placeholder="例如：把 1 USDC 从 Base 换成 BSC 上的 USDT" aria-label="消息"></textarea>
+      <button id="sendButton">发送</button>
     </div>
-    <div id="quoteCandidates" class="quote-list" aria-live="polite"></div>
-    <div class="actions">
-      <button id="selectQuoteButton" disabled>选择报价并检查 allowance</button>
-      <button id="refreshButton" class="secondary" disabled>刷新 session</button>
+    <div class="meta">
+      <span id="conversationMeta">conversation: 新会话</span>
+      <span id="sessionMeta">session: 未创建</span>
     </div>
-    <p class="muted">必须先从完整报价列表中选择 provider_reference。服务端不会自行替用户选择兑换服务商。</p>
-  </section>
-
-  <section id="approvalSection" class="card" hidden>
-    <h2>4. Approve 授权</h2>
-    <p class="muted">请在钱包 App 本地签名并广播以下未签名 approve 交易。不要提交私钥、助记词或 signer。</p>
-    <pre id="approvalTransaction">等待 allowance 检查…</pre>
-    <div class="grid" style="margin-top:10px">
-      <label>Approve 广播链 <input id="approvalChain" value="BASE"></label>
-      <label>App 已广播的 approve tx hash <input id="approvalTxHash" placeholder="0x...（这里只填 hash）"></label>
-    </div>
-    <div class="actions">
-      <button id="submitApprovalButton" disabled>提交 approve hash 并继续</button>
-      <button id="continueButton" class="secondary" disabled>再次检查授权并继续</button>
-    </div>
-  </section>
-
-  <section id="swapTransactionSection" class="card" hidden>
-    <h2>5. Swap 未签名交易</h2>
-    <p class="muted">授权已在链上确认且 allowance 足够后，才会生成以下兑换交易。</p>
-    <pre id="swapTransaction">等待授权确认…</pre>
-    <div class="grid" style="margin-top:10px">
-      <label>Swap 广播链 <input id="broadcastChain" value="BASE"></label>
-      <label>App 已广播的 swap tx hash <input id="txHash" placeholder="0x...（这里只填 hash）"></label>
-    </div>
-    <button id="broadcastButton" style="margin-top:10px" disabled>提交 swap tx hash 到 provider</button>
-  </section>
-
-  <section class="card">
-    <h2>6. 事件与响应</h2>
-    <pre id="output">等待请求…</pre>
   </section>
 </main>
 <script>
-  const state = { runId: null, sessionId: null, conversationId: null, streamAbort: null, quotes: [], selectedProviderReference: null };
+  const state = {
+    provider: null, providerInfo: null, address: null, chainId: null, chain: null,
+    conversationId: null, sessionId: null, runId: null, streamAbort: null,
+    quotes: [], selectedProviderReference: null, lastResponse: null, boundProvider: null,
+    debugLog: [], agentTestResults: {}, typingQueue: Promise.resolve()
+  };
   const $ = (id) => document.getElementById(id);
-  const output = $('output');
-  const write = (value) => { output.textContent += (output.textContent ? '\n\n' : '') + (typeof value === 'string' ? value : JSON.stringify(value, null, 2)); output.scrollTop = output.scrollHeight; };
-  const authHeaders = () => { const token = $('token').value.trim(); return token ? { Authorization: `Bearer ${token}` } : {}; };
-  const jsonHeaders = () => ({ ...authHeaders(), 'Content-Type': 'application/json' });
-  const setPill = () => { $('runId').textContent = state.runId || '-'; $('sessionId').textContent = state.sessionId || '-'; };
-  const api = async (path, options = {}) => { const response = await fetch(path, options); const body = await response.json().catch(() => ({})); if (!response.ok) throw new Error(JSON.stringify(body)); return body; };
+  const messages = $('messages');
+  const knownChains = {
+    '0x1': 'ETH', '0x38': 'BSC', '0x89': 'POLYGON',
+    '0xa': 'OPTIMISM', '0x2105': 'BASE', '0xa4b1': 'ARBITRUM'
+  };
 
-  $('swapEnabled').addEventListener('change', (event) => { $('swapFields').hidden = !event.target.checked; });
-  $('healthButton').addEventListener('click', async () => { try { write(await api('/health')); } catch (error) { write(`health error: ${error.message}`); } });
-
-  function swapRequest() {
-    const asset = (chain, symbol, decimals, address) => ({ chain, symbol, decimals: Number(decimals), address: address || null });
-    return {
-      source_asset: asset($('sourceChain').value.trim(), $('sourceSymbol').value.trim(), $('sourceDecimals').value, $('sourceAddress').value.trim()),
-      destination_asset: asset($('destinationChain').value.trim(), $('destinationSymbol').value.trim(), $('destinationDecimals').value, $('destinationAddress').value.trim()),
-      input_amount: $('inputAmount').value.trim(), input_amount_raw: $('inputAmountRaw').value.trim(),
-      sender_address: $('senderAddress').value.trim(), recipient_address: $('recipientAddress').value.trim()
-    };
+  function json(value) { return JSON.stringify(value, null, 2); }
+  function recordDebug(type, data) {
+    state.debugLog.push({
+      time: new Date().toISOString(),
+      type,
+      data
+    });
+    if (state.debugLog.length > 100) state.debugLog.shift();
+    const panel = $('debugPanel');
+    $('debugOutput').textContent = state.debugLog.map((item) => `[${item.time}] ${item.type}\n${json(item.data)}`).join('\n\n');
+    panel.querySelector('summary').textContent = `后端调试数据（${state.debugLog.length} 条）`;
+  }
+  function clearDebug() {
+    state.debugLog = [];
+    $('debugOutput').textContent = '等待后端响应…';
+    $('debugPanel').querySelector('summary').textContent = '后端调试数据（0 条）';
+  }
+  function chainName(chainId) { return knownChains[String(chainId).toLowerCase()] || `EVM(${chainId})`; }
+  function chainIdNumber(chainId) { return Number.parseInt(String(chainId), String(chainId).startsWith('0x') ? 16 : 10); }
+  const knownChainIds = Object.fromEntries(Object.entries(knownChains).map(([id, name]) => [name, chainIdNumber(id)]));
+  function addMessage(role, text, content = null) {
+    const row = document.createElement('div'); row.className = `message ${role}`;
+    const bubble = document.createElement('div'); bubble.className = 'bubble';
+    if (content) bubble.append(content); else bubble.textContent = text == null ? '' : String(text);
+    row.append(bubble); messages.append(row); messages.scrollTop = messages.scrollHeight; return row;
+  }
+  function addTypingMessage(text) {
+    const row = addMessage('assistant', '');
+    const bubble = row.querySelector('.bubble');
+    const value = text == null ? '' : String(text);
+    state.typingQueue = state.typingQueue.catch(() => {}).then(async () => {
+      for (const character of value) {
+        bubble.textContent += character;
+        messages.scrollTop = messages.scrollHeight;
+        await new Promise((resolve) => setTimeout(resolve, 15));
+      }
+    });
+    return state.typingQueue;
+  }
+  function addSystem(text) { addMessage('system', text); }
+  function addCard(key, card) {
+    const existing = messages.querySelector(`[data-card-key="${key}"]`);
+    const row = document.createElement('div'); row.className = 'message assistant'; row.dataset.cardKey = key;
+    const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.append(card); row.append(bubble);
+    if (existing) existing.replaceWith(row); else messages.append(row);
+    messages.scrollTop = messages.scrollHeight;
+  }
+  function disableWalletActions() {
+    messages.querySelectorAll('[data-wallet-action="true"]').forEach((button) => { button.disabled = true; });
+  }
+  function resetWalletSession() {
+    state.conversationId = null; state.sessionId = null; state.runId = null;
+    state.quotes = []; state.selectedProviderReference = null; state.lastResponse = null;
+    if (state.streamAbort) state.streamAbort.abort();
+    disableWalletActions(); updateMeta();
+  }
+  function authHeaders() {
+    const token = $('token').value.trim();
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  }
+  function jsonHeaders() { return { ...authHeaders(), 'Content-Type': 'application/json' }; }
+  async function api(path, options = {}) {
+    const response = await fetch(path, options);
+    const raw = await response.text();
+    let body;
+    try { body = raw ? JSON.parse(raw) : {}; } catch { body = { raw }; }
+    recordDebug(`API ${options.method || 'GET'} ${path} · ${response.status}`, body);
+    if (!response.ok) throw new Error(JSON.stringify(body));
+    return body;
+  }
+  function updateMeta() {
+    $('conversationMeta').textContent = `conversation: ${state.conversationId || '新会话'}`;
+    $('sessionMeta').textContent = `session: ${state.sessionId || '未创建'}`;
+  }
+  function updateWalletStatus() {
+    if (!state.address) {
+      $('walletStatus').textContent = '未连接浏览器钱包'; $('connectButton').textContent = '连接钱包'; return;
+    }
+    const walletName = state.providerInfo?.name || '浏览器钱包';
+    $('walletStatus').textContent = `${walletName} · ${state.chain || 'EVM'} · ${state.address.slice(0, 6)}…${state.address.slice(-4)}`;
+    $('connectButton').textContent = '重新连接';
   }
 
-  function transactionDisplay(transaction) {
-    return transaction ? JSON.stringify(transaction, null, 2) : '等待服务端返回未签名交易…';
+  function providerText(info, provider, source = '') {
+    return [
+      source, info?.name, info?.rdns, info?.uuid,
+      provider?.name, provider?.providerName, provider?.walletName,
+      provider?._name, provider?.isCatWallet, provider?.isCatwallet, provider?._isCatWallet
+    ].filter((value) => value != null).join(' ').toLowerCase();
   }
-
-  function renderQuotes() {
-    const list = $('quoteCandidates'); list.replaceChildren();
-    for (const quote of state.quotes) {
-      const card = document.createElement('article');
-      card.className = `quote-card${quote.provider_reference === state.selectedProviderReference ? ' selected' : ''}`;
-      const title = document.createElement('h3'); title.textContent = `${quote.provider || 'provider'} · ${quote.provider_reference || '缺少 provider_reference'}`;
-      const details = document.createElement('p');
-      details.textContent = `${quote.input_amount || '-'} ${quote.source_asset?.symbol || ''} → ${quote.expected_output || '-'} ${quote.destination_asset?.symbol || ''}`;
-      const select = document.createElement('button'); select.className = 'secondary'; select.textContent = quote.provider_reference === state.selectedProviderReference ? '已选择' : '选择此报价';
-      select.disabled = !quote.provider_reference; select.addEventListener('click', () => { state.selectedProviderReference = quote.provider_reference; renderQuotes(); $('selectQuoteButton').disabled = false; });
-      card.append(title, details, select); list.append(card);
+  function isCatWallet(info, provider, source = '') {
+    const markers = [
+      provider?.isCatWallet, provider?.isCatwallet, provider?._isCatWallet,
+      provider?.providerName, provider?.walletName, provider?.name
+    ];
+    return markers.some((value) => value === true || (
+      typeof value === 'string' && value.toLowerCase().includes('catwallet')
+    )) || providerText(info, provider, source).includes('catwallet')
+      || providerText(info, provider, source).includes('cat wallet');
+  }
+  function providerEntry(info, provider, source = '') {
+    if (!provider || typeof provider.request !== 'function') return null;
+    const fallbackInfo = isCatWallet(info, provider, source) ? { name: 'CatWallet' } : null;
+    return { info: info || fallbackInfo, provider, source };
+  }
+  function isCatWalletEntry(entry) {
+    return Boolean(entry && isCatWallet(entry.info, entry.provider, entry.source));
+  }
+  function providerPriority(entry) {
+    if (isCatWalletEntry(entry)) return 0;
+    if (entry?.source?.includes('window.ethereum') && !entry.source.includes('providers')) return 2;
+    if (entry?.source?.includes('window.ethereum.providers')) return 3;
+    if (entry?.source?.includes('eip6963')) return 4;
+    return 5;
+  }
+  function rememberProvider(info, provider, source = '') {
+    const entry = providerEntry(info, provider, source);
+    if (!entry) return;
+    window.__walletProviders ||= [];
+    const existing = window.__walletProviders.find((item) => item.provider === provider);
+    if (existing) {
+      existing.info ||= entry.info;
+      existing.source = [existing.source, entry.source].filter(Boolean).join(' ');
+    } else {
+      window.__walletProviders.push(entry);
+    }
+    const selected = chooseProvider();
+    if (selected && (!state.provider || !state.address)) {
+      state.provider = selected.provider;
+      state.providerInfo = selected.info;
     }
   }
-
-  function applySession(data) {
-    const session = data?.state || data?.data?.state || data;
-    if (!session || typeof session !== 'object') return;
-    if (session.session_id) state.sessionId = session.session_id;
-    if (Array.isArray(session.quote_candidates)) { state.quotes = session.quote_candidates; renderQuotes(); }
-    if (session.selected_provider_reference) state.selectedProviderReference = session.selected_provider_reference;
-    if (session.quote?.provider_reference && !state.selectedProviderReference) state.selectedProviderReference = session.quote.provider_reference;
-    const response = session.response || {};
-    const approval = session.approval_transaction || response.approval_transaction;
-    if (approval) { $('approvalSection').hidden = false; $('approvalTransaction').textContent = transactionDisplay(approval); $('submitApprovalButton').disabled = false; }
-    const pending = session.pending_transaction || response.pending_transaction;
-    if (pending) { $('swapTransactionSection').hidden = false; $('swapTransaction').textContent = transactionDisplay(pending); $('broadcastButton').disabled = false; }
-    const stage = session.stage || session.authorization_stage || response.stage;
-    if (stage) $('sessionStatus').textContent = stage;
-    if (session.approval_tx_hash) $('continueButton').disabled = false;
-    setPill();
+  function chooseProvider() {
+    const entries = window.__walletProviders || [];
+    return entries.slice().sort((left, right) => providerPriority(left) - providerPriority(right))[0] || null;
+  }
+  function requestWalletProviders() {
+    window.dispatchEvent(new Event('eip6963:requestProvider'));
+  }
+  function rememberInjectedProviders() {
+    rememberProvider(null, window.catWallet, 'window.catWallet');
+    rememberProvider(null, window.catwallet, 'window.catwallet');
+    const injectedProviders = Array.isArray(window.ethereum?.providers)
+      ? window.ethereum.providers : [];
+    injectedProviders.forEach((provider) => {
+      rememberProvider(null, provider, 'window.ethereum.providers');
+    });
+    rememberProvider(null, window.ethereum, 'window.ethereum');
+  }
+  function discoverWalletProviders() {
+    window.__walletProviders = [];
+    window.addEventListener('eip6963:announceProvider', (event) => {
+      rememberProvider(event.detail?.info, event.detail?.provider, 'eip6963');
+    });
+    rememberInjectedProviders();
+    requestWalletProviders();
+  }
+  async function waitForProvider() {
+    rememberInjectedProviders();
+    requestWalletProviders();
+    const deadline = Date.now() + 1200;
+    while (Date.now() < deadline) {
+      rememberInjectedProviders();
+      const current = chooseProvider();
+      if (current && isCatWalletEntry(current)) return current;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return chooseProvider();
   }
 
-  async function readSse(runId) {
-    const response = await fetch(`/v1/agent/stream/${runId}`, { headers: authHeaders(), signal: state.streamAbort.signal });
-    if (!response.ok) throw new Error(await response.text());
+  async function connectWallet() {
+    const selected = await waitForProvider();
+    if (!selected) {
+      addMessage('assistant', '没有检测到浏览器钱包插件。请安装 CatWallet、MetaMask、Rabby 或其他 EIP-1193 钱包。'); return;
+    }
+    try {
+      state.provider = selected.provider;
+      state.providerInfo = selected.info;
+      bindWalletEvents();
+      const accounts = await state.provider.request({ method: 'eth_requestAccounts' });
+      if (!accounts?.[0]) throw new Error('钱包没有返回账户');
+      const nextAddress = accounts[0];
+      const nextChainId = await state.provider.request({ method: 'eth_chainId' });
+      const walletChanged = state.address && (state.address !== nextAddress || state.chainId !== nextChainId);
+      state.address = nextAddress; state.chainId = nextChainId; state.chain = chainName(state.chainId);
+      if (walletChanged) resetWalletSession();
+      updateWalletStatus(); $('refreshButton').hidden = false;
+      addSystem(`钱包已连接：${state.chain} ${state.address}`);
+    } catch (error) { addMessage('assistant', `连接钱包失败：${error.message || error}`); }
+  }
+  function bindWalletEvents() {
+    const provider = state.provider;
+    if (!provider?.on || state.boundProvider === provider) return;
+    state.boundProvider = provider;
+    provider.on('accountsChanged', (accounts) => {
+      state.address = accounts?.[0] || null; resetWalletSession();
+      updateWalletStatus(); updateMeta(); addSystem(state.address ? '钱包账户已切换，请重新确认兑换信息。' : '钱包已断开。');
+    });
+    provider.on('chainChanged', (chainId) => {
+      state.chainId = chainId; state.chain = chainName(chainId);
+      updateWalletStatus(); updateMeta(); addSystem(`网络已切换为 ${state.chain}，当前兑换会话仍然保留。`);
+    });
+  }
+  function walletMetadata() { return state.address ? { wallet_chain_id: state.chainId } : {}; }
+
+  async function readSse(runId, options = {}) {
+    const signal = options.signal || state.streamAbort?.signal;
+    const response = await fetch(`/v1/agent/stream/${runId}`, { headers: authHeaders(), signal });
+    if (!response.ok) {
+      const raw = await response.text();
+      recordDebug(`SSE CONNECT ${runId} · ${response.status}`, { raw });
+      throw new Error(raw);
+    }
+    recordDebug(`SSE CONNECT ${runId} · ${response.status}`, { headers: Object.fromEntries(response.headers.entries()) });
     const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+    const events = [];
     while (true) {
       const chunk = await reader.read(); if (chunk.done) break; buffer += decoder.decode(chunk.value, { stream: true });
       const frames = buffer.split('\n\n'); buffer = frames.pop() || '';
       for (const frame of frames) {
-        const event = (frame.match(/^event: (.+)$/m) || [])[1] || 'message';
-        const data = (frame.match(/^data: (.+)$/m) || [])[1] || '{}'; let parsed; try { parsed = JSON.parse(data); } catch { parsed = data; }
-        write({ event, data: parsed });
-        applySession(parsed);
-        if (event === 'action_required' && state.sessionId) { $('refreshButton').disabled = false; }
+        const event = (frame.match(/^event: (.+)$/m) || [])[1] || 'message'; const data = (frame.match(/^data: (.+)$/m) || [])[1] || '{}';
+        let parsed; try { parsed = JSON.parse(data); } catch { parsed = { data }; }
+        recordDebug(`SSE ${event}`, parsed);
+        const current = applyEvent(event, parsed, options.apply !== false);
+        events.push({ event, payload: parsed, state: current });
       }
     }
+    if (buffer.trim()) recordDebug('SSE trailing data', buffer);
+    return events;
   }
-
-  $('sendButton').addEventListener('click', async () => {
-    $('sendButton').disabled = true; output.textContent = '';
+  function responseState(data) {
+    const current = data?.state || data?.data?.state || data?.data || data;
+    if (current?.response?.response && typeof current.response.response === 'object') {
+      return { ...current, response: current.response.response };
+    }
+    return current;
+  }
+  function applyEvent(event, data, shouldRender = true) {
+    const current = responseState(data);
+    if (shouldRender && current?.session_id) state.sessionId = current.session_id;
+    if (shouldRender && Array.isArray(current?.quote_candidates)) { state.quotes = current.quote_candidates; renderQuotes(); }
+    if (shouldRender && current?.selected_provider_reference) state.selectedProviderReference = current.selected_provider_reference;
+    if (shouldRender && current?.response) renderResponse(current.response);
+    if (shouldRender && (current?.preflight || current?.response?.preflight)) {
+      renderPreflight(current.preflight || current.response.preflight);
+    }
+    if (shouldRender && current?.approval_transaction) renderApproval(current.approval_transaction);
+    if (shouldRender && current?.pending_transaction) {
+      if (current.response?.kind === 'transfer_prepare') renderTransfer(current.pending_transaction);
+      else renderSwap(current.pending_transaction);
+    }
+    if (shouldRender && event === 'error') addTypingMessage(current?.error?.message || 'Agent 执行失败。');
+    if (shouldRender) updateMeta();
+    return current;
+  }
+  function renderResponse(response) {
+    const fingerprint = json(response); if (fingerprint === state.lastResponse) return; state.lastResponse = fingerprint;
+    if (response.kind === 'clarification') {
+      const missing = (response.missing_fields || []).join('、');
+      addTypingMessage(response.message || (
+        missing ? `还需要补充：${missing}` : '你好！请告诉我你想查询余额、转账或兑换什么。'
+      ));
+      if (Array.isArray(response.token_candidates) && response.token_candidates.length) {
+        renderTokenCandidates(response.token_candidates);
+      }
+    }
+    else if (response.kind === 'error') addTypingMessage((response.errors || []).map((item) => item.message || item.code).join('\n') || '请求失败。');
+    else if (response.kind === 'swap_quote') {
+      const quotes = response.quotes || [];
+      addTypingMessage(quotes.length
+        ? `我找到了 ${quotes.length} 个兑换报价，请比较后选择一个 Provider。`
+        : '暂时没有找到可用的兑换报价。');
+    }
+    else if (response.kind === 'transaction_status') {
+      const status = typeof response.status === 'object'
+        ? (response.status.status || response.status.state || 'unknown')
+        : (response.status || 'unknown');
+      const messages = {
+        pending: '交易已经提交，正在等待链上确认。',
+        confirmed: '交易已确认，资产状态应该很快同步到钱包。',
+        completed: '兑换已完成，可以在目标链查看到账资产。',
+        failed: '交易执行失败或已回滚，请检查交易详情和余额。',
+        timed_out: '暂时还没有等到 Provider 的最终结果，可以稍后再次查询。',
+        unknown: '暂时无法确定交易状态，建议稍后重试查询。'
+      };
+      addTypingMessage(response.message || messages[status] || `交易状态：${status}`);
+    }
+    else if (response.kind === 'swap_status') {
+      const status = typeof response.status === 'object'
+        ? (response.status.status || response.status.state || 'unknown')
+        : (response.status || 'unknown');
+      const messages = {
+        pending: '兑换订单已提交，Provider 仍在处理中。',
+        completed: '兑换已完成，可以到目标链查看到账资产。',
+        failed: '兑换没有成功完成，请检查订单详情或稍后重试。',
+        timed_out: 'Provider 暂时没有返回最终结果，订单可能仍在处理中，建议稍后查询。',
+        unknown: '暂时拿不到兑换订单的最新状态，建议稍后重新查询。'
+      };
+      addTypingMessage(response.message || messages[status] || `兑换订单状态：${status}`);
+    }
+    else if (response.kind === 'wallet_query') {
+      const wallet = response.wallet || {};
+      const native = wallet.native_balance;
+      addTypingMessage(native
+        ? `当前 ${wallet.chain || '钱包'} 的原生资产余额是 ${native.amount} ${native.asset?.symbol || ''}，Token 共 ${wallet.token_balances?.length || 0} 项。`
+        : '我已查询到钱包信息，但暂时没有可展示的余额数据。');
+      renderWallet(wallet);
+    }
+    else if (response.kind === 'portfolio_query') {
+      const portfolio = response.portfolio || {};
+      addTypingMessage(`你在 ${portfolio.chain || '当前网络'} 上共有 ${portfolio.assets?.length || 0} 项资产，USD 估值为 ${portfolio.total_usd_value ?? '暂不可用'}。`);
+      renderPortfolio(portfolio);
+    }
+    else if (response.kind === 'gas_check') {
+      addTypingMessage(response.sufficient
+        ? `当前 ${response.chain || '网络'} 的 Gas 余额足够，预计手续费约 ${response.fee_estimate?.amount || '-'} ${response.fee_estimate?.asset?.symbol || ''}。`
+        : `当前 Gas 余额不足，预计还缺少 ${response.shortfall_raw || '-'} 个最小单位。`);
+      renderGas(response);
+    }
+    else if (response.kind === 'asset_discovery') {
+      addTypingMessage(`我找到了 ${response.assets?.length || 0} 个 Token 结果，详细合约地址和精度见下方。`);
+      renderAssets(response);
+    }
+    else if (response.message) addTypingMessage(response.message);
+  }
+  function renderTokenCandidates(candidates) {
+    const card = document.createElement('div'); card.className = 'card';
+    const title = document.createElement('h3'); title.textContent = '请选择 Token'; card.append(title);
+    const actions = document.createElement('div'); actions.className = 'card-actions';
+    candidates.forEach((item, index) => {
+      const button = document.createElement('button'); button.className = 'secondary';
+      button.textContent = `${index + 1}. ${item.symbol} · ${item.chain} · ${item.address.slice(0, 8)}…`;
+      button.onclick = () => {
+        const side = item.side === 'source' ? '来源' : '目标';
+        addMessage('user', `选择${side} Token ${item.address}`);
+        $('composer').value = `${side} Token 合约地址是 ${item.address}，精度是 ${item.decimals}`;
+        sendMessage();
+      };
+      actions.append(button);
+    });
+    card.append(actions); addCard('token-candidates', card);
+  }
+  function renderPreflight(preflight) {
+    if (!preflight) return;
+    const card = document.createElement('div'); card.className = 'card';
+    const title = document.createElement('h3'); title.textContent = preflight.ok ? '交易预检查通过' : '交易预检查未通过';
+    const summary = document.createElement('p'); summary.textContent = (preflight.checks || []).map((item) => `${item.status === 'passed' ? '✓' : item.status === 'warning' ? '!' : '×'} ${item.message}`).join('\n');
+    summary.style.whiteSpace = 'pre-line';
+    card.append(title, summary);
+    addCard('preflight', card);
+  }
+  function renderPortfolio(portfolio) {
+    if (!portfolio) return;
+    const card = document.createElement('div'); card.className = 'card';
+    const title = document.createElement('h3'); title.textContent = '资产组合';
+    const summary = document.createElement('p');
+    summary.textContent = `${portfolio.chain || '-'} · ${portfolio.assets?.length || 0} 项资产 · USD 估值：${portfolio.total_usd_value ?? '暂不可用'}`;
+    const pre = document.createElement('pre'); pre.textContent = json(portfolio.assets || []);
+    card.append(title, summary, pre); addCard('portfolio', card);
+  }
+  function renderWallet(wallet) {
+    if (!wallet) return;
+    const card = document.createElement('div'); card.className = 'card';
+    const title = document.createElement('h3'); title.textContent = '钱包余额';
+    const native = wallet.native_balance;
+    const tokens = wallet.token_balances || [];
+    const summary = document.createElement('p');
+    summary.textContent = `${wallet.chain || '-'} · ${wallet.address || '-'}\n原生资产：${native?.amount ?? '-'} ${native?.asset?.symbol || ''}\nToken：${tokens.length} 项`;
+    summary.style.whiteSpace = 'pre-line';
+    const pre = document.createElement('pre');
+    pre.textContent = json({ native_balance: native || null, token_balances: tokens });
+    card.append(title, summary, pre);
+    addCard('wallet', card);
+  }
+  function renderGas(gas) {
+    const card = document.createElement('div'); card.className = 'card';
+    const title = document.createElement('h3'); title.textContent = gas.sufficient ? 'Gas 余额足够' : 'Gas 余额不足';
+    const summary = document.createElement('p');
+    summary.textContent = `${gas.message || ''}\n预计手续费：${gas.fee_estimate?.amount || '-'} ${gas.fee_estimate?.asset?.symbol || ''}\n当前余额：${gas.native_balance?.amount || '-'} ${gas.native_balance?.asset?.symbol || ''}\n缺口：${gas.shortfall_raw || '0'}（最小单位）`;
+    summary.style.whiteSpace = 'pre-line';
+    card.append(title, summary); addCard('gas', card);
+  }
+  function renderAssets(result) {
+    const card = document.createElement('div'); card.className = 'card';
+    const title = document.createElement('h3'); title.textContent = 'Token 资产发现';
+    const summary = document.createElement('p'); summary.textContent = `找到 ${result.assets?.length || 0} 个结果`;
+    const pre = document.createElement('pre'); pre.textContent = json(result.assets || []);
+    card.append(title, summary, pre); addCard('assets', card);
+  }
+  function renderQuotes() {
+    if (!state.quotes.length) return;
+    const card = document.createElement('div'); card.className = 'card'; const title = document.createElement('h3'); title.textContent = '报价列表'; card.append(title);
+    const grid = document.createElement('div'); grid.className = 'quote-grid';
+    for (const quote of state.quotes) {
+      const item = document.createElement('div'); item.className = 'quote'; const provider = document.createElement('strong'); provider.textContent = `${quote.provider || 'Provider'} · ${quote.provider_reference || '-'}`;
+      const details = document.createElement('span'); details.textContent = `${quote.input_amount || '-'} ${quote.source_asset?.symbol || ''} → ${quote.expected_output || '-'} ${quote.destination_asset?.symbol || ''}`;
+      const choose = document.createElement('button'); choose.className = 'secondary'; choose.dataset.walletAction = 'true'; choose.textContent = quote.provider_reference === state.selectedProviderReference ? '已选择' : '选择此报价'; choose.disabled = !quote.provider_reference; choose.onclick = () => selectQuote(quote.provider_reference);
+      item.append(provider, details, choose); grid.append(item);
+    }
+    card.append(grid); addCard('quotes', card);
+  }
+  async function selectQuote(reference) {
+    if (!state.sessionId) return addMessage('assistant', '当前没有兑换 session。请重新发起兑换。'); state.selectedProviderReference = reference;
     try {
-      const body = { conversation_id: $('conversationId').value.trim() || undefined, user_id: $('userId').value.trim() || undefined, message: $('message').value, model_id: $('modelId').value.trim() || undefined, metadata: {} };
-      if ($('swapEnabled').checked) { body.metadata.swap_request = swapRequest(); }
-      const turn = await api('/v1/agent/turn', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(body) });
-      state.runId = turn.run_id; state.sessionId = turn.session_id || null; state.conversationId = turn.conversation_id; $('conversationId').value = state.conversationId; setPill(); write(turn);
-      state.streamAbort = new AbortController(); await readSse(state.runId);
-      if (state.sessionId) { $('refreshButton').disabled = false; }
-    } catch (error) { write(`request error: ${error.message}`); } finally { $('sendButton').disabled = false; }
-  });
-
-  $('selectQuoteButton').addEventListener('click', async () => { try { if (!state.selectedProviderReference) throw new Error('请先选择报价'); const body = await api(`/v1/swap/${state.sessionId}/select-quote`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: $('userId').value.trim() || undefined, provider_reference: state.selectedProviderReference }) }); write(body); applySession(body); } catch (error) { write(`select quote error: ${error.message}`); } });
-  $('refreshButton').addEventListener('click', async () => { try { const body = await api(`/v1/swap/${state.sessionId}?user_id=${encodeURIComponent($('userId').value.trim())}`, { headers: authHeaders() }); write(body); applySession(body); } catch (error) { write(`session error: ${error.message}`); } });
-  async function continueSwap() { const body = await api(`/v1/swap/${state.sessionId}/continue`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: $('userId').value.trim() || undefined }) }); write(body); applySession(body); }
-  $('submitApprovalButton').addEventListener('click', async () => { try { const body = await api(`/v1/swap/${state.sessionId}/approve-broadcast`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: $('userId').value.trim() || undefined, chain: $('approvalChain').value.trim(), approve_tx_hash: $('approvalTxHash').value.trim() }) }); write(body); applySession(body); await continueSwap(); } catch (error) { write(`approve error: ${error.message}`); } });
-  $('continueButton').addEventListener('click', async () => { try { await continueSwap(); } catch (error) { write(`continue error: ${error.message}`); } });
-  $('broadcastButton').addEventListener('click', async () => { try { const body = await api(`/v1/swap/${state.sessionId}/broadcast`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: $('userId').value.trim() || undefined, chain: $('broadcastChain').value.trim(), tx_hash: $('txHash').value.trim() }) }); write(body); $('sessionStatus').textContent = body.status || 'broadcasted'; } catch (error) { write(`broadcast error: ${error.message}`); } });
+      const body = await api(`/v1/swap/${state.sessionId}/select-quote`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo', provider_reference: reference }) });
+      applyEvent('session', body); addMessage('assistant', '报价已选择，正在检查余额和 Allowance。');
+    } catch (error) { addMessage('assistant', `选择报价失败：${error.message}`); }
+  }
+  function transactionValue(value) { if (value == null || value === '') return '0x0'; const text = String(value); return text.startsWith('0x') ? text : `0x${BigInt(text).toString(16)}`; }
+  function chainIdHex(chainId) {
+    const number = chainIdNumber(chainId);
+    if (!Number.isSafeInteger(number) || number <= 0) throw new Error(`无法识别目标网络 chainId：${chainId}`);
+    return `0x${number.toString(16)}`;
+  }
+  function transactionChainId(transaction) {
+    return transaction.chain_id ?? knownChainIds[String(transaction.chain || '').toUpperCase()];
+  }
+  async function ensureWalletChain(transaction) {
+    const expectedChainId = transactionChainId(transaction);
+    if (expectedChainId == null) return;
+    const activeChainId = await state.provider.request({ method: 'eth_chainId' });
+    if (chainIdNumber(activeChainId) === chainIdNumber(expectedChainId)) {
+      state.chainId = activeChainId; state.chain = chainName(activeChainId); updateWalletStatus();
+      return;
+    }
+    const targetChainId = chainIdHex(expectedChainId);
+    const targetChain = transaction.chain || chainName(expectedChainId);
+    addSystem(`需要切换到 ${targetChain}，正在请求钱包切链。`);
+    try {
+      await state.provider.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: targetChainId }]
+      });
+    } catch (error) {
+      if (error?.code === 4001) {
+        throw new Error(`你拒绝了切换到 ${targetChain} 网络，请切换后重试`);
+      }
+      if (error?.code === 4902) {
+        throw new Error(`钱包中未添加 ${targetChain} 网络，请先添加该网络后重试`);
+      }
+      if (error?.code === -32601 || /not supported|unsupported/i.test(error?.message || '')) {
+        throw new Error(`当前钱包不支持自动切换网络，请手动切换到 ${targetChain} 后重试`);
+      }
+      throw new Error(`切换到 ${targetChain} 失败：${error?.message || error}`);
+    }
+    const switchedChainId = await state.provider.request({ method: 'eth_chainId' });
+    if (chainIdNumber(switchedChainId) !== chainIdNumber(expectedChainId)) {
+      throw new Error(`钱包未切换到 ${targetChain}，请手动切换后重试`);
+    }
+    state.chainId = switchedChainId; state.chain = chainName(switchedChainId);
+    updateWalletStatus(); updateMeta(); addSystem(`已切换到 ${targetChain}，继续进行签名。`);
+  }
+  async function sendUnsignedTransaction(transaction) {
+    if (!state.provider || !state.address) throw new Error('请先连接浏览器钱包');
+    await ensureWalletChain(transaction);
+    return state.provider.request({ method: 'eth_sendTransaction', params: [{ from: state.address, to: transaction.to, data: transaction.data || '0x', value: transactionValue(transaction.value) }] });
+  }
+  function renderApproval(transaction) {
+    const card = document.createElement('div'); card.className = 'card'; const title = document.createElement('h3'); title.textContent = '需要 Approve 授权'; const text = document.createElement('p'); text.textContent = '请确认授权额度，浏览器钱包会在本地弹窗签名。'; const pre = document.createElement('pre'); pre.textContent = json(transaction); const actions = document.createElement('div'); actions.className = 'card-actions';
+    const sign = document.createElement('button'); sign.dataset.walletAction = 'true'; sign.textContent = '钱包签名并广播 Approve'; sign.onclick = async () => { sign.disabled = true; try { const hash = await sendUnsignedTransaction(transaction); await api(`/v1/swap/${state.sessionId}/approve-broadcast`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo', chain: transaction.chain, approve_tx_hash: hash }) }); const body = await api(`/v1/swap/${state.sessionId}/continue`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo' }) }); applyEvent('session', body); addMessage('assistant', `Approve 已广播：${hash}。正在等待链上确认。`); } catch (error) { sign.disabled = false; addMessage('assistant', `Approve 失败：${error.message}`); } };
+    actions.append(sign); card.append(title, text, pre, actions); addCard('approval', card);
+  }
+  function renderSwap(transaction) {
+    const card = document.createElement('div'); card.className = 'card'; const title = document.createElement('h3'); title.textContent = '兑换交易已准备好'; const pre = document.createElement('pre'); pre.textContent = json(transaction); const actions = document.createElement('div'); actions.className = 'card-actions';
+    const sign = document.createElement('button'); sign.dataset.walletAction = 'true'; sign.textContent = '钱包签名并广播 Swap'; sign.onclick = async () => { sign.disabled = true; try { const hash = await sendUnsignedTransaction(transaction); await api(`/v1/swap/${state.sessionId}/broadcast`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo', chain: transaction.chain, tx_hash: hash }) }); addMessage('assistant', `Swap 已广播：${hash}`); } catch (error) { sign.disabled = false; addMessage('assistant', `Swap 失败：${error.message}`); } };
+    actions.append(sign); card.append(title, pre, actions); addCard('swap', card);
+  }
+  function renderTransfer(transaction) {
+    const card = document.createElement('div'); card.className = 'card';
+    const title = document.createElement('h3'); title.textContent = '转账交易已准备好';
+    const text = document.createElement('p'); text.textContent = '请确认收款地址和金额，钱包会在当前转账链本地签名并广播。';
+    const pre = document.createElement('pre'); pre.textContent = json(transaction);
+    const actions = document.createElement('div'); actions.className = 'card-actions';
+    const sign = document.createElement('button'); sign.dataset.walletAction = 'true'; sign.textContent = '钱包签名并广播转账';
+    const status = document.createElement('button'); status.className = 'secondary'; status.textContent = '查询交易状态'; status.disabled = true;
+    sign.onclick = async () => {
+      sign.disabled = true;
+      try {
+        const hash = await sendUnsignedTransaction(transaction);
+        addMessage('assistant', `转账已广播：${hash}`);
+        status.disabled = false;
+        status.onclick = async () => {
+          try {
+            const result = await api(`/v1/transactions/${encodeURIComponent(transaction.chain)}/${encodeURIComponent(hash)}`);
+            renderResponse({ kind: 'transaction_status', ...result });
+          } catch (error) { addMessage('assistant', `查询交易状态失败：${error.message}`); }
+        };
+      } catch (error) {
+        sign.disabled = false;
+        addMessage('assistant', `转账失败：${error.message}`);
+      }
+    };
+    actions.append(sign, status); card.append(title, text, pre, actions); addCard('transfer', card);
+  }
+  async function sendMessage() {
+    const input = $('composer'); const message = input.value.trim(); if (!message) return; addMessage('user', message); input.value = ''; $('sendButton').disabled = true;
+    if (/^(取消|停止|退出)(兑换|交易)?$/.test(message)) {
+      if (state.sessionId) {
+        try {
+          await api(`/v1/swap/${state.sessionId}/cancel`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo' }) });
+          addTypingMessage('已取消当前兑换。你可以随时重新发起新的兑换。');
+        } catch (error) { addTypingMessage(`取消兑换失败：${error.message}`); }
+      } else addTypingMessage('当前没有进行中的兑换。');
+      $('sendButton').disabled = false; input.focus(); return;
+    }
+    if (/^(选|选择)(第)?一|1号|第一个/.test(message) && state.quotes.length) {
+      const quote = state.quotes[0];
+      await selectQuote(quote.provider_reference);
+      $('sendButton').disabled = false; input.focus(); return;
+    }
+    try {
+      const body = { user_id: 'browser-demo', conversation_id: state.conversationId || undefined, session_id: state.sessionId || undefined, message, address: state.address || undefined, chain: state.chain || undefined, metadata: walletMetadata() };
+      const turn = await api('/v1/agent/turn', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(body) }); state.runId = turn.run_id; state.conversationId = turn.conversation_id; state.sessionId = turn.session_id || state.sessionId; updateMeta(); state.streamAbort = new AbortController(); await readSse(state.runId);
+    } catch (error) { addMessage('assistant', `请求失败：${error.message}`); } finally { $('sendButton').disabled = false; input.focus(); }
+  }
+  async function refreshSession() {
+    if (!state.sessionId) return addSystem('当前没有可刷新的兑换 session。');
+    try {
+      applyEvent('session', await api(`/v1/swap/${state.sessionId}?user_id=browser-demo`));
+      addSystem('兑换 session 已刷新。');
+    } catch (error) { addMessage('assistant', `刷新 session 失败：${error.message}`); }
+  }
+  async function runDebugSmoke() {
+    const button = $('debugSmokeButton');
+    button.disabled = true;
+    $('debugPanel').open = true;
+    addSystem('开始联调检查：health → ready → agent turn → SSE。');
+    try {
+      await api('/health');
+      await api('/ready');
+      const turn = await api('/v1/agent/turn', {
+        method: 'POST',
+        headers: jsonHeaders(),
+        body: JSON.stringify({
+          user_id: 'browser-demo',
+          message: '你好，联调检查',
+          metadata: walletMetadata()
+        })
+      });
+      state.runId = turn.run_id;
+      state.conversationId = turn.conversation_id;
+      state.sessionId = turn.session_id || state.sessionId;
+      updateMeta();
+      state.streamAbort = new AbortController();
+      await readSse(state.runId);
+      addSystem('联调检查完成。');
+    } catch (error) {
+      addMessage('assistant', `联调检查失败：${error.message || error}`);
+      recordDebug('SMOKE ERROR', { message: error.message || String(error) });
+    } finally {
+      button.disabled = false;
+    }
+  }
+  function agentSwapMetadata(address) {
+    return {
+      swap_request: {
+        source_asset: { chain: 'BASE', chain_id: 8453, symbol: 'USDC', decimals: 6, address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' },
+        destination_asset: { chain: 'BSC', chain_id: 56, symbol: 'USDT', decimals: 18, address: '0x55d398326f99059fF775485246999027B3197955' },
+        input_amount: '10',
+        input_amount_raw: '10000000',
+        sender_address: address,
+        recipient_address: address
+      }
+    };
+  }
+  const agentTestSpecs = [
+    { id: 'clarification', name: '问候与澄清', intent: 'clarification', message: '你好', expectedKinds: ['clarification'] },
+    { id: 'unsupported', name: '不支持的请求', intent: 'unsupported', message: '测试不支持的功能分支', expectedKinds: ['unsupported'] },
+    {
+      id: 'wallet_query', name: '钱包余额查询', intent: 'wallet_query', message: '查询钱包余额',
+      requiresWallet: true, expectedKinds: ['wallet_query']
+    },
+    {
+      id: 'portfolio_query', name: '资产组合查询', intent: 'portfolio_query', message: '查看我的资产组合',
+      requiresWallet: true, expectedKinds: ['portfolio_query'],
+      metadata: ({ chain, address }) => ({ portfolio_query: { chain, address } })
+    },
+    {
+      id: 'gas_check', name: 'Gas 检查', intent: 'gas_check', message: '检查当前网络手续费',
+      requiresWallet: true, expectedKinds: ['gas_check'],
+      metadata: ({ chain, address }) => ({ gas_request: { chain, address } })
+    },
+    {
+      id: 'asset_discovery', name: 'Token 资产发现', intent: 'asset_discovery', message: '搜索 USDC Token',
+      expectedKinds: ['asset_discovery'], requiresAssets: true,
+      metadata: ({ chain }) => ({ asset_query: { chain, search: 'USDC' } })
+    },
+    {
+      id: 'price_query', name: 'Token 价格查询', intent: 'price_query', message: '查询 ETH 价格',
+      expectedKinds: ['price_query'], requiresPrices: true,
+      metadata: ({ chain }) => ({ price_request: { chain, symbol: 'ETH', decimals: 18 } })
+    },
+    {
+      id: 'transaction_status', name: '交易状态查询', intent: 'transaction_status', message: '查询交易状态',
+      expectedKinds: ['transaction_status'],
+      metadata: ({ chain }) => ({ transaction_query: { chain, tx_hash: `0x${'a'.repeat(64)}` } })
+    },
+    {
+      id: 'transfer', name: '转账预检查与交易准备', intent: 'transfer', message: '准备一笔只读转账测试',
+      expectedKinds: ['transfer_prepare'], acceptsPreflightFailure: true,
+      metadata: ({ chain, address }) => ({
+        transfer_request: {
+          chain,
+          sender: address,
+          recipient: `0x${'2'.repeat(40)}`,
+          amount: '0.000001',
+          amount_raw: '1000000000000',
+          token: null
+        }
+      })
+    },
+    {
+      id: 'swap_quote', name: '兑换报价', intent: 'swap_quote', message: '准备兑换报价测试',
+      expectedKinds: ['swap_quote'],
+      requiresQuote: true, metadata: ({ address }) => agentSwapMetadata(address)
+    },
+    {
+      id: 'swap_select', name: '报价选择分支', intent: 'swap_select', message: '测试报价选择分支',
+      expectedStages: ['quote_selection_required']
+    },
+    {
+      id: 'swap_allowance', name: 'Allowance 检查分支', intent: 'swap_allowance', message: '测试 Allowance 检查分支',
+      expectedStages: ['quote_selection_required']
+    },
+    {
+      id: 'swap_prepare', name: '兑换交易准备边界', intent: 'swap_prepare', message: '测试兑换交易准备边界',
+      expectedKinds: ['clarification'], metadata: ({ address }) => agentSwapMetadata(address)
+    },
+    {
+      id: 'swap_status', name: '兑换订单状态', intent: 'swap_status', message: '测试兑换订单状态分支',
+      expectedKinds: ['swap_status']
+    }
+  ];
+  const agentTestStatusText = {
+    idle: '未运行',
+    running: '运行中',
+    pass: '通过',
+    blocked: '阻塞',
+    fail: '失败'
+  };
+  const blockedAgentCodes = new Set([
+    'CHAIN_CAPABILITY_UNAVAILABLE',
+    'PRICE_PROVIDER_UNAVAILABLE',
+    'ASSET_PROVIDER_UNAVAILABLE',
+    'PROVIDER_UNAVAILABLE',
+    'PROVIDER_QUOTE_FAILED',
+    'PROVIDER_PREPARE_FAILED',
+    'PROVIDER_REGISTER_FAILED',
+    'PROVIDER_STATUS_FAILED',
+    'WALLET_QUERY_FAILED',
+    'PORTFOLIO_QUERY_FAILED',
+    'GAS_CHECK_FAILED',
+    'PRICE_QUERY_FAILED',
+    'TRANSACTION_STATUS_FAILED',
+    'ASSET_DISCOVERY_FAILED',
+    'TRANSFER_PREPARE_FAILED'
+  ]);
+  function renderAgentTestList() {
+    const container = $('agentTestResults');
+    container.replaceChildren();
+    for (const spec of agentTestSpecs) {
+      const result = state.agentTestResults[spec.id] || { status: 'idle', detail: '未运行' };
+      const row = document.createElement('div');
+      row.className = `agent-test-row ${result.status}`;
+      row.dataset.agentTestId = spec.id;
+      const dot = document.createElement('span'); dot.className = 'agent-test-dot';
+      const body = document.createElement('div');
+      const name = document.createElement('div'); name.className = 'agent-test-name'; name.textContent = `${spec.name} · ${spec.intent}`;
+      const detail = document.createElement('div'); detail.className = 'agent-test-detail'; detail.textContent = result.detail || '';
+      body.append(name, detail);
+      const status = document.createElement('span'); status.className = 'agent-test-status'; status.textContent = agentTestStatusText[result.status] || result.status;
+      row.append(dot, body, status); container.append(row);
+    }
+  }
+  function updateAgentTestSummary() {
+    const values = Object.values(state.agentTestResults);
+    const counts = values.reduce((result, item) => {
+      result[item.status] = (result[item.status] || 0) + 1;
+      return result;
+    }, {});
+    const summary = $('agentTestPanel').querySelector('summary');
+    if (!values.length) {
+      summary.textContent = 'Agent 功能测试（未运行）';
+      return;
+    }
+    summary.textContent = `Agent 功能测试（通过 ${counts.pass || 0} · 阻塞 ${counts.blocked || 0} · 失败 ${counts.fail || 0}）`;
+  }
+  function errorCodes(value, result = new Set()) {
+    if (!value || typeof value !== 'object') return result;
+    if (typeof value.code === 'string') result.add(value.code);
+    if (Array.isArray(value)) value.forEach((item) => errorCodes(item, result));
+    else Object.values(value).forEach((item) => errorCodes(item, result));
+    return result;
+  }
+  function stateFromTestEvents(events) {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      if (events[index]?.state && typeof events[index].state === 'object') return events[index].state;
+    }
+    return {};
+  }
+  function classifyAgentTest(spec, result) {
+    const states = (result.events || []).map((item) => item.state).filter((item) => item && typeof item === 'object');
+    const finalState = stateFromTestEvents(result.events || []);
+    const codes = [...errorCodes(result.error), ...errorCodes(result.events || [])];
+    const uniqueCodes = [...new Set(codes)];
+    const kinds = states.flatMap((item) => [item.kind, item.response?.kind]).filter(Boolean);
+    const stages = states.flatMap((item) => [item.stage, item.response?.stage]).filter(Boolean);
+    const hasQuote = states.some((item) => (
+      (Array.isArray(item.quote_candidates) && item.quote_candidates.length > 0)
+      || (Array.isArray(item.response?.quotes) && item.response.quotes.length > 0)
+    ));
+    const hasPrices = states.some((item) => (
+      (Array.isArray(item.prices) && item.prices.length > 0)
+      || (Array.isArray(item.response?.prices) && item.response.prices.length > 0)
+    ));
+    const hasAssets = states.some((item) => (
+      (Array.isArray(item.assets) && item.assets.length > 0)
+      || (Array.isArray(item.response?.assets) && item.response.assets.length > 0)
+    ));
+    const expectedKind = (spec.expectedKinds || []).find((kind) => kinds.includes(kind));
+    const expectedStage = (spec.expectedStages || []).find((stage) => stages.includes(stage));
+    if (expectedKind && (!spec.requiresQuote || hasQuote) && (!spec.requiresPrices || hasPrices) && (!spec.requiresAssets || hasAssets)) {
+      return { status: 'pass', detail: `返回 ${expectedKind}${uniqueCodes.length ? ` · ${uniqueCodes.join(', ')}` : ''}`, codes: uniqueCodes, finalState };
+    }
+    if (expectedKind && spec.requiresPrices && !hasPrices && !uniqueCodes.length) {
+      return { status: 'blocked', detail: '到达价格查询分支，但未返回价格数据。', codes: uniqueCodes, finalState };
+    }
+    if (expectedKind && spec.requiresAssets && !hasAssets && !uniqueCodes.length) {
+      return { status: 'blocked', detail: '到达资产发现分支，但未返回资产数据。', codes: uniqueCodes, finalState };
+    }
+    if (expectedKind && spec.requiresQuote && !hasQuote && !uniqueCodes.length) {
+      return { status: 'blocked', detail: '到达兑换报价分支，但未返回候选报价。', codes: uniqueCodes, finalState };
+    }
+    if (expectedStage) {
+      return { status: 'pass', detail: `到达 ${expectedStage}`, codes: uniqueCodes, finalState };
+    }
+    if (spec.acceptsPreflightFailure && uniqueCodes.includes('TRANSACTION_PREFLIGHT_FAILED')) {
+      return { status: 'pass', detail: '已到达签名前预检查边界，因当前余额或费用条件阻断', codes: uniqueCodes, finalState };
+    }
+    const dependencyCodes = uniqueCodes.filter((code) => blockedAgentCodes.has(code) || code.endsWith('_UNAVAILABLE'));
+    if (dependencyCodes.length) {
+      return { status: 'blocked', detail: `依赖不可用：${dependencyCodes.join(', ')}`, codes: uniqueCodes, finalState };
+    }
+    if (result.error) {
+      return { status: 'fail', detail: result.error.message || '请求失败', codes: uniqueCodes, finalState };
+    }
+    return {
+      status: 'fail',
+      detail: `未得到预期结果${uniqueCodes.length ? ` · ${uniqueCodes.join(', ')}` : ''}`,
+      codes: uniqueCodes,
+      finalState
+    };
+  }
+  function testAddress() { return state.address || `0x${'1'.repeat(40)}`; }
+  function testChain() { return state.chain || 'BASE'; }
+  async function runSingleAgentTest(spec) {
+    const chain = testChain();
+    const address = testAddress();
+    if (spec.requiresWallet && (!state.address || !state.chain)) {
+      recordDebug(`AGENT TEST ${spec.id}`, {
+        skipped: true,
+        reason: 'wallet_not_connected',
+        detail: '需要先连接浏览器钱包，再测试该能力。'
+      });
+      return {
+        status: 'blocked',
+        detail: '需要先连接浏览器钱包，再测试该能力。',
+        codes: ['WALLET_NOT_CONNECTED'],
+        events: []
+      };
+    }
+    const extraMetadata = typeof spec.metadata === 'function' ? spec.metadata({ chain, address }) : {};
+    const requestBody = {
+      user_id: 'browser-demo',
+      conversation_id: `agent-test-${Date.now()}-${spec.id}`,
+      message: spec.message,
+      address: spec.requiresWallet ? state.address : undefined,
+      chain: spec.requiresWallet ? state.chain : undefined,
+      metadata: { ...extraMetadata, agent_test_intent: spec.intent }
+    };
+    const controller = new AbortController();
+    try {
+      const turn = await api('/v1/agent/turn', {
+        method: 'POST',
+        headers: jsonHeaders(),
+        body: JSON.stringify(requestBody)
+      });
+      const events = await readSse(turn.run_id, { apply: false, signal: controller.signal });
+      const result = classifyAgentTest(spec, { turn, events });
+      recordDebug(`AGENT TEST ${spec.id}`, { request: requestBody, turn, events, result });
+      return { ...result, events };
+    } catch (error) {
+      const result = classifyAgentTest(spec, { error, events: [] });
+      recordDebug(`AGENT TEST ${spec.id}`, { request: requestBody, error: error.message || String(error), result });
+      return result;
+    }
+  }
+  async function runAgentTests() {
+    const button = $('runAgentTestsButton');
+    button.disabled = true;
+    $('agentTestPanel').open = true;
+    state.agentTestResults = {};
+    renderAgentTestList();
+    updateAgentTestSummary();
+    addSystem('开始测试全部 Agent 功能。真实签名、Approve 和广播不会自动执行。');
+    try {
+      for (const spec of agentTestSpecs) {
+        state.agentTestResults[spec.id] = { status: 'running', detail: '正在请求后端并读取 SSE…' };
+        renderAgentTestList();
+        updateAgentTestSummary();
+        state.agentTestResults[spec.id] = await runSingleAgentTest(spec);
+        renderAgentTestList();
+        updateAgentTestSummary();
+      }
+      const values = Object.values(state.agentTestResults);
+      const passed = values.filter((item) => item.status === 'pass').length;
+      const blocked = values.filter((item) => item.status === 'blocked').length;
+      const failed = values.filter((item) => item.status === 'fail').length;
+      addSystem(`Agent 功能测试完成：通过 ${passed}，阻塞 ${blocked}，失败 ${failed}。原始数据已写入调试面板。`);
+    } finally {
+      button.disabled = false;
+    }
+  }
+  renderAgentTestList(); updateAgentTestSummary();
+  $('connectButton').onclick = connectWallet; $('refreshButton').onclick = refreshSession; $('sendButton').onclick = sendMessage;
+  $('debugSmokeButton').onclick = runDebugSmoke; $('debugClearButton').onclick = clearDebug;
+  $('runAgentTestsButton').onclick = runAgentTests;
+  $('composer').addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); } });
+  discoverWalletProviders(); updateMeta(); addMessage('assistant', '你好，我可以帮你查询余额、比较兑换报价，并准备未签名交易。先连接浏览器钱包，然后告诉我你想兑换什么。');
 </script>
 </body>
 </html>

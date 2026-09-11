@@ -4,8 +4,10 @@ import pytest
 
 from wallet_agent.domain.models import (
     Asset,
+    FeeEstimate,
     NormalizedQuote,
     SwapQuoteRequest,
+    TokenBalance,
     TokenPrice,
     UnsignedTransaction,
 )
@@ -15,6 +17,22 @@ from wallet_agent.graph.build import build_graph
 class FakeModel:
     async def ainvoke(self, value):
         return {"intent": value.get("intent", "clarification")}
+
+
+class SwapExtractionModel:
+    def __init__(self, output):
+        self.output = output
+
+    async def ainvoke(self, _value):
+        return self.output
+
+
+class SequentialSwapExtractionModel:
+    def __init__(self, outputs):
+        self.outputs = iter(outputs)
+
+    async def ainvoke(self, _value):
+        return next(self.outputs)
 
 
 class FakeProvider:
@@ -80,6 +98,22 @@ async def test_quote_path_fans_out_and_reduces_candidates():
 
 
 @pytest.mark.asyncio
+async def test_quote_path_reports_missing_provider_instead_of_empty_success():
+    graph = build_graph(model=FakeModel(), providers=[])
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "c-no-provider",
+            "user_id": "u1",
+            "intent": "swap_quote",
+            "swap_request": quote_request(),
+        },
+        config={"configurable": {"thread_id": "t-no-provider"}},
+    )
+    assert result["response"]["kind"] == "error"
+    assert result["response"]["errors"][0]["code"] == "PROVIDER_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
 async def test_quote_path_preserves_all_candidates_and_price_snapshots_without_selection():
     source = Asset(chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x1")
     destination = Asset(chain="BSC", chain_id=56, symbol="USDT", decimals=6, address="0x2")
@@ -132,3 +166,468 @@ async def test_malformed_model_output_routes_to_clarification():
     )
     assert result["intent"] == "clarification"
     assert result["response"]["kind"] == "clarification"
+
+
+@pytest.mark.asyncio
+async def test_greeting_returns_a_helpful_clarification_message():
+    graph = build_graph(
+        model=SwapExtractionModel({"intent": "clarification"}),
+        providers=[],
+        price_provider=object(),
+    )
+    result = await graph.ainvoke(
+        {"conversation_id": "c-greeting", "user_id": "u1", "message": "你好"},
+        config={"configurable": {"thread_id": "greeting"}},
+    )
+    assert result["response"]["kind"] == "clarification"
+    assert result["response"]["message"].startswith("你好！")
+
+
+@pytest.mark.asyncio
+async def test_conversational_swap_returns_missing_fields_without_calling_provider():
+    provider = FakeProvider("bridgers")
+    graph = build_graph(
+        model=SwapExtractionModel(
+            {
+                "intent": "swap_quote",
+                "source_chain": "BASE",
+                "destination_chain": "BSC",
+                "source_symbol": "USDC",
+                "destination_symbol": "USDT",
+                "input_amount": "1",
+            }
+        ),
+        providers=[provider],
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "chat-1",
+            "user_id": "u1",
+            "message": "把 1 USDC 换成 USDT",
+            "wallet_context": {"address": "0x" + "1" * 40, "chain": "BASE", "chain_id": 8453},
+        },
+        config={"configurable": {"thread_id": "chat-1"}},
+    )
+    assert result["response"]["kind"] == "clarification"
+    assert "source_token_address" in result["response"]["missing_fields"]
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_conversational_swap_uses_wallet_address_and_enters_quote_path():
+    provider = FakeProvider("bridgers")
+    graph = build_graph(
+        model=SwapExtractionModel(
+            {
+                "intent": "swap_quote",
+                "source_chain": "BASE",
+                "destination_chain": "BSC",
+                "source_symbol": "USDC",
+                "destination_symbol": "USDT",
+                "source_token_address": "0x" + "2" * 40,
+                "destination_token_address": "0x" + "3" * 40,
+                "source_decimals": 6,
+                "destination_decimals": 6,
+                "input_amount": "1",
+            }
+        ),
+        providers=[provider],
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "chat-2",
+            "user_id": "u1",
+            "message": "把 1 USDC 换成 USDT",
+            "wallet_context": {"address": "0x" + "1" * 40, "chain": "BASE", "chain_id": 8453},
+        },
+        config={"configurable": {"thread_id": "chat-2"}},
+    )
+    assert result["response"]["kind"] == "swap_quote"
+    assert result["swap_request"]["sender_address"] == "0x" + "1" * 40
+    assert result["swap_request"]["recipient_address"] == "0x" + "1" * 40
+    assert result["swap_request"]["input_amount_raw"] == "1000000"
+    assert len(result["quote_candidates"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_conversational_swap_merges_draft_across_turns():
+    provider = FakeProvider("bridgers")
+    graph = build_graph(
+        model=SequentialSwapExtractionModel(
+            [
+                {
+                    "intent": "swap_quote",
+                    "source_chain": "BASE",
+                    "destination_chain": "BSC",
+                    "source_symbol": "USDC",
+                    "destination_symbol": "USDT",
+                    "input_amount": "1",
+                },
+                {
+                    "intent": "swap_quote",
+                    "source_token_address": "0x" + "2" * 40,
+                    "destination_token_address": "0x" + "3" * 40,
+                    "source_decimals": 6,
+                    "destination_decimals": 6,
+                },
+            ]
+        ),
+        providers=[provider],
+    )
+    config = {"configurable": {"thread_id": "chat-3"}}
+    wallet_context = {
+        "address": "0x" + "1" * 40,
+        "chain": "BASE",
+        "chain_id": 8453,
+    }
+
+    first = await graph.ainvoke(
+        {
+            "conversation_id": "chat-3",
+            "user_id": "u1",
+            "request": {"message": "把 1 USDC 换成 USDT"},
+            "wallet_context": wallet_context,
+        },
+        config=config,
+    )
+    second = await graph.ainvoke(
+        {
+            "conversation_id": "chat-3",
+            "user_id": "u1",
+            "request": {"message": "源 token 和目标 token 地址分别是已提供的地址"},
+        },
+        config=config,
+    )
+
+    assert first["response"]["kind"] == "clarification"
+    assert second["response"]["kind"] == "swap_quote"
+    assert second["swap_draft"]["source_symbol"] == "USDC"
+    assert second["swap_request"]["source_asset"]["address"] == "0x" + "2" * 40
+    assert second["swap_request"]["sender_address"] == wallet_context["address"]
+    assert provider.calls
+
+
+class TransferAdapter:
+    def __init__(
+        self,
+        *,
+        native_raw="2000000000000000000",
+        token_raw="2000000",
+        fee_raw="1000000000000000",
+    ):
+        self.native_raw = native_raw
+        self.token_raw = token_raw
+        self.fee_raw = fee_raw
+
+    async def validate_address(self, address):
+        return address.startswith("0x") and len(address) == 42
+
+    async def get_native_balance(self, _address):
+        asset = Asset(chain="BASE", symbol="ETH", decimals=18)
+        return TokenBalance(
+            asset=asset,
+            amount=Decimal(self.native_raw) / Decimal(10**18),
+            amount_raw=self.native_raw,
+        )
+
+    async def estimate_fee(self, *, to=None, data=None):
+        asset = Asset(chain="BASE", symbol="ETH", decimals=18)
+        return FeeEstimate(
+            chain="BASE",
+            chain_id=8453,
+            asset=asset,
+            amount=Decimal(self.fee_raw) / Decimal(10**18),
+            amount_raw=self.fee_raw,
+            gas_limit="21000",
+        )
+
+    async def get_token_balance(self, _token, _address):
+        asset = Asset(chain="BASE", symbol="USDC", decimals=6, address="0x" + "3" * 40)
+        return TokenBalance(
+            asset=asset,
+            amount=Decimal(self.token_raw) / Decimal(10**6),
+            amount_raw=self.token_raw,
+        )
+
+    def build_native_transfer(self, *, from_address, to_address, amount_raw):
+        return UnsignedTransaction(
+            chain="BASE",
+            chain_id=8453,
+            to=to_address,
+            data="0x",
+            value=amount_raw,
+        )
+
+    def build_erc20_transfer(self, *, token, from_address, to_address, amount_raw):
+        return UnsignedTransaction(
+            chain=token.chain,
+            chain_id=8453,
+            to=token.address,
+            data="0xa9059cbb",
+            value="0",
+        )
+
+    async def get_transaction_status(self, _tx_hash):
+        from wallet_agent.domain.models import TransactionStatus
+
+        return TransactionStatus.CONFIRMED
+
+    async def get_token_balances(self, _address):
+        return []
+
+
+@pytest.mark.asyncio
+async def test_conversational_transfer_extracts_fields_and_returns_preflight():
+    graph = build_graph(
+        model=SwapExtractionModel(
+            {
+                "intent": "transfer",
+                "transfer_chain": "BASE",
+                "transfer_symbol": "ETH",
+                "transfer_amount": "1",
+                "transfer_recipient": "0x" + "2" * 40,
+            }
+        ),
+        chains={"BASE": TransferAdapter()},
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "transfer-1",
+            "user_id": "u1",
+            "message": "转 1 ETH 给这个地址",
+            "wallet_context": {
+                "address": "0x" + "1" * 40,
+                "chain": "BASE",
+                "chain_id": 8453,
+            },
+        },
+        config={"configurable": {"thread_id": "transfer-1"}},
+    )
+    assert result["response"]["kind"] == "transfer_prepare"
+    assert result["transfer_request"]["sender"] == "0x" + "1" * 40
+    assert result["preflight"]["ok"] is True
+    assert result["preflight"]["fee_estimate"]["amount_raw"] == "1000000000000000"
+
+
+@pytest.mark.asyncio
+async def test_conversational_transfer_asks_for_missing_recipient():
+    graph = build_graph(
+        model=SwapExtractionModel(
+            {
+                "intent": "transfer",
+                "transfer_chain": "BASE",
+                "transfer_symbol": "ETH",
+                "transfer_amount": "1",
+            }
+        ),
+        chains={"BASE": TransferAdapter()},
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "transfer-2",
+            "user_id": "u1",
+            "message": "转 1 ETH",
+            "wallet_context": {"address": "0x" + "1" * 40, "chain": "BASE"},
+        },
+        config={"configurable": {"thread_id": "transfer-2"}},
+    )
+    assert result["response"]["kind"] == "clarification"
+    assert "transfer_recipient" in result["response"]["missing_fields"]
+
+
+@pytest.mark.asyncio
+async def test_transaction_status_node_returns_human_readable_result():
+    graph = build_graph(model=FakeModel(), chains={"BASE": TransferAdapter()})
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "tx-1",
+            "user_id": "u1",
+            "intent": "transaction_status",
+            "transaction_query": {
+                "chain": "BASE",
+                "tx_hash": "0x" + "a" * 64,
+            },
+        },
+        config={"configurable": {"thread_id": "tx-1"}},
+    )
+    assert result["response"]["kind"] == "transaction_status"
+    assert result["transaction_status_snapshot"]["status"] == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_transfer_preflight_blocks_when_native_amount_and_fee_exceed_balance():
+    graph = build_graph(
+        model=FakeModel(),
+        chains={
+            "BASE": TransferAdapter(
+                native_raw="1000000000000000000",
+                fee_raw="100000000000000000",
+            )
+        },
+    )
+    result = await graph.ainvoke(
+        {
+            "intent": "transfer",
+            "transfer_request": {
+                "chain": "BASE",
+                "sender": "0x" + "1" * 40,
+                "recipient": "0x" + "2" * 40,
+                "amount": "1",
+                "amount_raw": "1000000000000000000",
+            },
+        },
+        config={"configurable": {"thread_id": "transfer-insufficient-native"}},
+    )
+    assert result["response"]["kind"] == "error"
+    assert result["preflight"]["ok"] is False
+    assert any(
+        item.get("code") == "INSUFFICIENT_BALANCE" for item in result["preflight"]["checks"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_token_transfer_preflight_blocks_when_native_gas_is_insufficient():
+    graph = build_graph(
+        model=FakeModel(),
+        chains={"BASE": TransferAdapter(native_raw="1", token_raw="2000000", fee_raw="100")},
+    )
+    result = await graph.ainvoke(
+        {
+            "intent": "transfer",
+            "transfer_request": {
+                "chain": "BASE",
+                "sender": "0x" + "1" * 40,
+                "recipient": "0x" + "2" * 40,
+                "amount": "1",
+                "amount_raw": "1000000",
+                "token": {
+                    "chain": "BASE",
+                    "symbol": "USDC",
+                    "decimals": 6,
+                    "address": "0x" + "3" * 40,
+                },
+            },
+        },
+        config={"configurable": {"thread_id": "transfer-insufficient-gas"}},
+    )
+    assert result["response"]["kind"] == "error"
+    assert any(
+        item.get("code") == "INSUFFICIENT_GAS" for item in result["preflight"]["checks"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_transfer_preflight_blocks_when_wallet_account_does_not_match_sender():
+    graph = build_graph(model=FakeModel(), chains={"BASE": TransferAdapter()})
+    result = await graph.ainvoke(
+        {
+            "intent": "transfer",
+            "transfer_request": {
+                "chain": "BASE",
+                "sender": "0x" + "1" * 40,
+                "recipient": "0x" + "2" * 40,
+                "amount": "1",
+                "amount_raw": "1000000000000000000",
+            },
+            "wallet_context": {
+                "address": "0x" + "9" * 40,
+                "chain": "BASE",
+            },
+        },
+        config={"configurable": {"thread_id": "transfer-account-mismatch"}},
+    )
+    assert result["response"]["kind"] == "error"
+    assert any(
+        item["code"] == "WALLET_ACCOUNT_MISMATCH" for item in result["preflight"]["checks"]
+    )
+
+
+class PortfolioPriceProvider:
+    async def get_prices(self, assets):
+        return [
+            TokenPrice(asset=asset, usd_price=Decimal("2"))
+            for asset in assets
+        ]
+
+
+class AssetProvider:
+    provider_name = "bridgers"
+
+    async def list_assets(self, query):
+        return [
+            Asset(
+                chain=query.chain or "BASE",
+                symbol="USDC",
+                decimals=6,
+                address="0x" + "3" * 40,
+            ),
+            Asset(
+                chain=query.chain or "BASE",
+                symbol="USDC",
+                decimals=6,
+                address="0x" + "3" * 40,
+            ),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_portfolio_query_returns_balances_and_usd_snapshot():
+    graph = build_graph(
+        model=FakeModel(),
+        chains={"BASE": TransferAdapter()},
+        price_provider=PortfolioPriceProvider(),
+    )
+    result = await graph.ainvoke(
+        {
+            "intent": "portfolio_query",
+            "portfolio_request": {
+                "chain": "BASE",
+                "address": "0x" + "1" * 40,
+            },
+        },
+        config={"configurable": {"thread_id": "portfolio-1"}},
+    )
+    assert result["response"]["kind"] == "portfolio_query"
+    assert result["portfolio_snapshot"]["price_status"] == "available"
+    assert result["portfolio_snapshot"]["total_usd_value"] == "4"
+
+
+@pytest.mark.asyncio
+async def test_gas_check_reports_native_balance_shortfall():
+    graph = build_graph(
+        model=FakeModel(),
+        chains={
+            "BASE": TransferAdapter(
+                native_raw="1",
+                fee_raw="100",
+            )
+        },
+    )
+    result = await graph.ainvoke(
+        {
+            "intent": "gas_check",
+            "gas_request": {
+                "chain": "BASE",
+                "address": "0x" + "1" * 40,
+            },
+        },
+        config={"configurable": {"thread_id": "gas-1"}},
+    )
+    assert result["response"]["kind"] == "gas_check"
+    assert result["gas_snapshot"]["sufficient"] is False
+    assert result["gas_snapshot"]["shortfall_raw"] == "99"
+
+
+@pytest.mark.asyncio
+async def test_asset_discovery_merges_provider_results():
+    graph = build_graph(model=FakeModel(), providers=[AssetProvider()])
+    result = await graph.ainvoke(
+        {
+            "intent": "asset_discovery",
+            "asset_query": {"chain": "BASE", "search": "USDC"},
+        },
+        config={"configurable": {"thread_id": "assets-1"}},
+    )
+    assert result["response"]["kind"] == "asset_discovery"
+    assert len(result["asset_snapshot"]["assets"]) == 1
+    assert result["asset_snapshot"]["assets"][0]["symbol"] == "USDC"
