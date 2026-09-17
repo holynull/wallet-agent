@@ -59,6 +59,39 @@ def test_identical_patch_does_not_increment_revision():
     assert result.invalidation == {}
 
 
+def test_task_patch_normalizes_chain_and_symbol_noise():
+    task = new_active_task("swap", task_id="swap-1")
+
+    result = merge_task_patch(
+        task,
+        {
+            "source_chain": "Base",
+            "destination_chain": " base ",
+            "source_symbol": "usdc",
+            "destination_symbol": "usd't",
+        },
+    )
+
+    assert result.task["slots"] == {
+        "source_chain": "BASE",
+        "destination_chain": "BASE",
+        "source_symbol": "USDC",
+        "destination_symbol": "USDT",
+    }
+
+
+def test_normalized_equivalent_patch_does_not_increment_revision():
+    task = merge_task_patch(
+        new_active_task("transfer", task_id="transfer-1"),
+        {"chain": "BASE", "symbol": "USDC"},
+    ).task
+
+    result = merge_task_patch(task, {"chain": "Base", "symbol": "usd-c"})
+
+    assert result.task["revision"] == 1
+    assert result.changed_slots == frozenset()
+
+
 def test_swap_chain_correction_clears_resolved_asset_metadata():
     task = new_active_task("swap", task_id="swap-1")
     task["revision"] = 2

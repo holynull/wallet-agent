@@ -1,8 +1,9 @@
 """Narrow structured-output contracts for wallet request understanding."""
 
-from typing import Literal
+from collections.abc import Mapping
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 IntentName = Literal[
     "wallet_query",
@@ -30,6 +31,15 @@ class RouteDecision(UnderstandingModel):
     """Task classification only; capability slots use separate schemas."""
 
     intent: IntentName = Field(description="当前用户请求对应的钱包任务类型")
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_json_mode_marker(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and value.get("type") == "json_object":
+            normalized = dict(value)
+            normalized.pop("type")
+            return normalized
+        return value
 
 
 class TransferSlotPatch(UnderstandingModel):

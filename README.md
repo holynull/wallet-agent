@@ -99,6 +99,7 @@ sign or broadcast transactions:
 .venv/bin/python -m evals.wallet_agent_evals --online
 ```
 
-The first command is deterministic and CI-safe. The opt-in online mode evaluates
-the configured model's Chinese intent extraction and multi-turn slot retention.
-See [evals/README.md](evals/README.md) for the case coverage and safety boundary.
+The first command runs the deterministic 13-case CI suite. The opt-in online
+mode evaluates the configured model's Chinese intent extraction, slot
+normalization, corrections, cancellation, and multi-turn retention. See
+[evals/README.md](evals/README.md) for the case coverage and safety boundary.

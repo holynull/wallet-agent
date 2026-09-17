@@ -39,6 +39,15 @@ def test_route_decision_rejects_transaction_slot_fields():
         RouteDecision(intent="transfer", transfer_amount="1")
 
 
+def test_route_decision_accepts_deepseek_json_object_marker():
+    decision = RouteDecision.model_validate(
+        {"type": "json_object", "intent": "wallet_query"}
+    )
+
+    assert decision.intent == "wallet_query"
+    assert decision.model_dump() == {"intent": "wallet_query"}
+
+
 @pytest.mark.asyncio
 async def test_transfer_extractor_names_every_slot_and_preserves_values():
     recipient = "0x" + "2" * 40

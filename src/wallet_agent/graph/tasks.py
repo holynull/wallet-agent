@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +21,9 @@ _TRANSFER_TO_LEGACY = {
     "recipient": "transfer_recipient",
 }
 _TRANSFER_FROM_LEGACY = {legacy: canonical for canonical, legacy in _TRANSFER_TO_LEGACY.items()}
+_CHAIN_SLOT_KEYS = frozenset({"chain", "source_chain", "destination_chain"})
+_SYMBOL_SLOT_KEYS = frozenset({"symbol", "source_symbol", "destination_symbol"})
+_SYMBOL_NOISE = re.compile(r"[\s'\-`\u2018\u2019]+")
 
 
 @dataclass(frozen=True)
@@ -81,7 +85,11 @@ def merge_task_patch(
 ) -> TaskMergeResult:
     updated = _copy_task(task)
     raw_patch = patch.model_dump(exclude_none=True) if hasattr(patch, "model_dump") else dict(patch)
-    normalized = {str(key): value for key, value in raw_patch.items() if value is not None}
+    normalized = {
+        str(key): _normalize_slot_value(str(key), value)
+        for key, value in raw_patch.items()
+        if value is not None
+    }
     slots = dict(updated.get("slots") or {})
     changed = frozenset(key for key, value in normalized.items() if slots.get(key) != value)
     if not changed:
@@ -137,11 +145,26 @@ def task_invalidation(kind: TaskKind, changed_slots: frozenset[str]) -> dict[str
 def _canonical_slots(kind: TaskKind, draft: Mapping[str, Any]) -> dict[str, Any]:
     if kind == "transfer":
         return {
-            _TRANSFER_FROM_LEGACY.get(str(key), str(key)): value
+            canonical: _normalize_slot_value(canonical, value)
             for key, value in draft.items()
+            for canonical in (_TRANSFER_FROM_LEGACY.get(str(key), str(key)),)
             if value is not None
         }
-    return {str(key): value for key, value in draft.items() if value is not None}
+    return {
+        str(key): _normalize_slot_value(str(key), value)
+        for key, value in draft.items()
+        if value is not None
+    }
+
+
+def _normalize_slot_value(key: str, value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    if key in _CHAIN_SLOT_KEYS:
+        return value.strip().upper()
+    if key in _SYMBOL_SLOT_KEYS:
+        return _SYMBOL_NOISE.sub("", value).upper()
+    return value
 
 
 def _copy_task(task: Mapping[str, Any]) -> ActiveTask:

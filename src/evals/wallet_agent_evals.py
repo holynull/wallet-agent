@@ -354,6 +354,156 @@ CASES = (
             "forbid_broadcast": True,
         },
     ),
+    EvalCase(
+        id="swap_followup_clarification_keeps_slots",
+        capability="swap",
+        turns=("我想用 1 USDC 换 USDT", "都在 Base 链"),
+        offline_outputs=(
+            {
+                "intent": "swap_quote",
+                "source_symbol": "USDC",
+                "destination_symbol": "USDT",
+                "input_amount": "1",
+            },
+            {
+                "intent": "clarification",
+                "source_chain": "BASE",
+                "destination_chain": "BASE",
+            },
+        ),
+        expected={
+            "response_kind": "swap_quote",
+            "equals": {
+                "active_task.revision": 2,
+                "active_task.slots.source_symbol": "USDC",
+                "swap_request.source_asset.chain": "BASE",
+            },
+            "side_effects": {"quote_calls": 1},
+            "forbid_prepare": True,
+            "forbid_broadcast": True,
+        },
+    ),
+    EvalCase(
+        id="swap_chain_correction_invalidates_quote",
+        capability="swap",
+        turns=("在 Base 用 1 USDC 换 USDT", "改成 2 USDC"),
+        offline_outputs=(
+            {
+                "intent": "swap_quote",
+                "source_chain": "BASE",
+                "destination_chain": "BASE",
+                "source_symbol": "USDC",
+                "destination_symbol": "USDT",
+                "input_amount": "1",
+            },
+            {"intent": "swap_quote", "input_amount": "2"},
+        ),
+        expected={
+            "response_kind": "swap_quote",
+            "equals": {
+                "active_task.revision": 2,
+                "swap_request.input_amount": "2",
+                "response.quotes.0.provider_reference": "eval-quote-2",
+            },
+            "side_effects": {"quote_calls": 2},
+            "forbid_prepare": True,
+            "forbid_broadcast": True,
+        },
+    ),
+    EvalCase(
+        id="swap_cancel_clears_artifacts",
+        capability="swap",
+        turns=("我想用 1 USDC 换 USDT", "取消兑换"),
+        offline_outputs=(
+            {
+                "intent": "swap_quote",
+                "source_symbol": "USDC",
+                "destination_symbol": "USDT",
+                "input_amount": "1",
+            },
+        ),
+        expected={
+            "response_kind": "cancelled",
+            "equals": {
+                "active_task.status": "cancelled",
+                "selected_quote": None,
+                "pending_transaction": None,
+            },
+            "side_effects": {"quote_calls": 0},
+            "forbid_prepare": True,
+            "forbid_broadcast": True,
+        },
+    ),
+    EvalCase(
+        id="balance_during_swap_preserves_task",
+        capability="swap",
+        turns=("我想用 1 USDC 换 USDT", "先看看我的钱包余额"),
+        offline_outputs=(
+            {
+                "intent": "swap_quote",
+                "source_symbol": "USDC",
+                "destination_symbol": "USDT",
+                "input_amount": "1",
+            },
+            {"intent": "wallet_query"},
+        ),
+        expected={
+            "response_kind": "wallet_query",
+            "equals": {
+                "active_task.kind": "swap",
+                "active_task.status": "collecting",
+                "active_task.slots.input_amount": "1",
+            },
+            "forbid_prepare": True,
+            "forbid_broadcast": True,
+        },
+    ),
+    EvalCase(
+        id="transfer_compact_amount",
+        capability="transfer",
+        turns=(f"Base上给{RECIPIENT_ADDRESS}转0.01ETH",),
+        offline_outputs=(
+            {
+                "intent": "transfer",
+                "transfer_chain": "BASE",
+                "transfer_symbol": "ETH",
+                "transfer_amount": "0.01",
+                "transfer_recipient": RECIPIENT_ADDRESS,
+            },
+        ),
+        expected={
+            "response_kind": "transfer_prepare",
+            "equals": {
+                "pending_transaction.value": "10000000000000000",
+                "active_task.slots.amount": "0.01",
+            },
+            "forbid_broadcast": True,
+        },
+    ),
+    EvalCase(
+        id="swap_symbol_typo",
+        capability="swap",
+        turns=("在 Base 用 1 USDC 换 usd't",),
+        offline_outputs=(
+            {
+                "intent": "swap_quote",
+                "source_chain": "BASE",
+                "destination_chain": "BASE",
+                "source_symbol": "USDC",
+                "destination_symbol": "USDT",
+                "input_amount": "1",
+            },
+        ),
+        expected={
+            "response_kind": "swap_quote",
+            "equals": {
+                "active_task.slots.destination_symbol": "USDT",
+                "response.quotes.0.expected_output": "0.99",
+            },
+            "forbid_prepare": True,
+            "forbid_broadcast": True,
+        },
+    ),
 )
 
 
@@ -388,6 +538,10 @@ def evaluate_expectations(
         actual = _path_value(state, path)
         if not isinstance(actual, (list, tuple, set)) or wanted not in actual:
             failures.append(f"{path}: expected to contain {wanted!r}, got {actual!r}")
+    for name, wanted in expected.get("side_effects", {}).items():
+        actual = side_effects.get(name, 0)
+        if actual != wanted:
+            failures.append(f"{name}: expected {wanted}, got {actual}")
     if expected.get("forbid_prepare") and side_effects.get("prepare_calls", 0) != 0:
         failures.append(
             f"prepare_calls: expected 0, got {side_effects.get('prepare_calls', 0)}"
@@ -507,18 +661,33 @@ async def run_online_evals() -> dict[str, Any]:
     from langchain_openai import ChatOpenAI
 
     from wallet_agent.config import Settings
-    from wallet_agent.main import IntentOutput
-    from wallet_agent.models import ModelRegistry, ModelRouter
+    from wallet_agent.models import (
+        ModelRegistry,
+        ModelRouter,
+        RouteDecision,
+        SwapSlotPatch,
+        TransferSlotPatch,
+    )
 
     settings = Settings()
     api_key = settings.deepseek_api_key or settings.openai_api_key
-    client = ChatOpenAI(
+    base_client = ChatOpenAI(
         model=settings.openai_model,
         api_key=api_key,
         base_url=settings.openai_base_url,
-    ).with_structured_output(IntentOutput, method="json_mode")
+    )
+    classifier = base_client.with_structured_output(RouteDecision, method="json_mode")
+    transfer = base_client.with_structured_output(TransferSlotPatch, method="json_mode")
+    swap = base_client.with_structured_output(SwapSlotPatch, method="json_mode")
     router = ModelRouter(
-        ModelRegistry({settings.openai_model: client}, default_model_id=settings.openai_model)
+        ModelRegistry(
+            {settings.openai_model: classifier},
+            default_model_id=settings.openai_model,
+            extractors={
+                "transfer": {settings.openai_model: transfer},
+                "swap": {settings.openai_model: swap},
+            },
+        )
     )
     return await _run_suite(
         lambda _case: router,
