@@ -27,7 +27,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/wallet_agent"]
+packages = ["src/wallet_agent", "src/evals"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

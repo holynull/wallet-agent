@@ -90,3 +90,15 @@ reports. `/v1/swap/{session_id}/broadcast` accepts only a hash and chain.
 .venv/bin/ruff check src tests
 python3 -m compileall src
 ```
+
+Core wallet capability evals use simulated chains and providers, so they never
+sign or broadcast transactions:
+
+```bash
+.venv/bin/python -m evals.wallet_agent_evals
+.venv/bin/python -m evals.wallet_agent_evals --online
+```
+
+The first command is deterministic and CI-safe. The opt-in online mode evaluates
+the configured model's Chinese intent extraction and multi-turn slot retention.
+See [evals/README.md](evals/README.md) for the case coverage and safety boundary.
