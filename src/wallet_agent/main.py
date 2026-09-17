@@ -9,57 +9,22 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
-
 from wallet_agent.api import StaticTokenVerifier, create_app
 from wallet_agent.chains import build_default_registry
 from wallet_agent.config import Settings
 from wallet_agent.graph import build_graph
-from wallet_agent.models import ModelRegistry, ModelRouter
+from wallet_agent.models import (
+    ModelRegistry,
+    ModelRouter,
+    RouteDecision,
+    SwapSlotPatch,
+    TransferSlotPatch,
+)
 from wallet_agent.persistence import SqliteSessionStore, initialize_checkpointer
 from wallet_agent.prices import CoinGeckoPriceProvider
 from wallet_agent.providers import BridgersProvider, HttpJsonTransport, OmniBridgeProvider
 
-
-class IntentOutput(BaseModel):
-    intent: str
-    source_chain: str | None = None
-    source_chain_id: int | str | None = None
-    destination_chain: str | None = None
-    destination_chain_id: int | str | None = None
-    source_symbol: str | None = None
-    destination_symbol: str | None = None
-    source_token_address: str | None = None
-    destination_token_address: str | None = None
-    source_decimals: int | None = None
-    destination_decimals: int | None = None
-    source_name: str | None = None
-    destination_name: str | None = None
-    source_logo_url: str | None = None
-    destination_logo_url: str | None = None
-    input_amount: str | None = None
-    input_amount_raw: str | None = None
-    sender_address: str | None = None
-    recipient_address: str | None = None
-    refund_address: str | None = None
-    slippage_bps: int | None = None
-    expires_at: str | None = None
-    transfer_chain: str | None = None
-    transfer_symbol: str | None = None
-    transfer_token_address: str | None = None
-    transfer_decimals: int | None = None
-    transfer_amount: str | None = None
-    transfer_amount_raw: str | None = None
-    transfer_sender: str | None = None
-    transfer_recipient: str | None = None
-    transaction_chain: str | None = None
-    transaction_hash: str | None = None
-    portfolio_chain: str | None = None
-    gas_chain: str | None = None
-    gas_to: str | None = None
-    gas_data: str | None = None
-    asset_chain: str | None = None
-    asset_search: str | None = None
+IntentOutput = RouteDecision
 
 
 def build_application(settings: Settings | None = None) -> Any:
@@ -72,15 +37,33 @@ def build_application(settings: Settings | None = None) -> Any:
     api_key = settings.deepseek_api_key or settings.openai_api_key
     if not api_key:
         raise ValueError("DEEPSEEK_API_KEY or OPENAI_API_KEY is required")
-    model_clients = {
+    base_clients = {
         model_id: ChatOpenAI(
             model=model_id,
             api_key=api_key,
             base_url=settings.openai_base_url,
-        ).with_structured_output(IntentOutput, method="json_mode")
+        )
         for model_id in dict.fromkeys([settings.openai_model, *settings.allowed_model_ids])
     }
-    model_registry = ModelRegistry(model_clients, default_model_id=settings.openai_model)
+    model_clients = {
+        model_id: client.with_structured_output(RouteDecision, method="json_mode")
+        for model_id, client in base_clients.items()
+    }
+    extractors = {
+        "transfer": {
+            model_id: client.with_structured_output(TransferSlotPatch, method="json_mode")
+            for model_id, client in base_clients.items()
+        },
+        "swap": {
+            model_id: client.with_structured_output(SwapSlotPatch, method="json_mode")
+            for model_id, client in base_clients.items()
+        },
+    }
+    model_registry = ModelRegistry(
+        model_clients,
+        default_model_id=settings.openai_model,
+        extractors=extractors,
+    )
     model = ModelRouter(model_registry)
     providers: dict[str, Any] = {}
     transports: list[HttpJsonTransport] = []
