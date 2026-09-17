@@ -367,6 +367,9 @@
       renderPreflight(current.preflight || current.response.preflight);
     }
     if (shouldRender && current?.approval_transaction) renderApproval(current.approval_transaction);
+    if (shouldRender && current?.confirmation_state?.status === 'requested' && current?.response?.kind !== 'confirmation_required') {
+      renderConfirmation(current.confirmation_state, current.selected_quote || current.quote);
+    }
     if (shouldRender && current?.pending_transaction) {
       if (current.response?.kind === 'transfer_prepare') renderTransfer(current.pending_transaction);
       else renderSwap(current.pending_transaction);
@@ -392,6 +395,10 @@
       addTypingMessage(quotes.length
         ? `我找到了 ${quotes.length} 个兑换报价，请比较后选择一个 Provider。`
         : '暂时没有找到可用的兑换报价。');
+    }
+    else if (response.kind === 'confirmation_required') {
+      addTypingMessage('报价已准备好，请确认兑换摘要后继续。');
+      renderConfirmation(response.confirmation, response.quote);
     }
     else if (response.kind === 'transaction_status') {
       const status = typeof response.status === 'object'
@@ -520,6 +527,36 @@
       item.append(provider, details, choose); grid.append(item);
     }
     card.append(grid); addCard('quotes', card);
+  }
+  function renderConfirmation(confirmation, quote = null) {
+    if (!confirmation || confirmation.status !== 'requested') return;
+    const card = document.createElement('div'); card.className = 'card';
+    const title = document.createElement('h3'); title.textContent = '请确认兑换';
+    const summary = confirmation.summary || {};
+    const details = document.createElement('p');
+    const source = summary.source_asset?.symbol || quote?.source_asset?.symbol || '-';
+    const destination = summary.destination_asset?.symbol || quote?.destination_asset?.symbol || '-';
+    details.textContent = `${summary.input_amount || quote?.input_amount || '-'} ${source} → ${summary.expected_output || quote?.expected_output || '-'} ${destination}\nProvider：${summary.provider || quote?.provider || '-'}\n有效期至：${confirmation.expires_at || '未设置'}`;
+    details.style.whiteSpace = 'pre-line';
+    const actions = document.createElement('div'); actions.className = 'card-actions';
+    const approve = document.createElement('button'); approve.dataset.walletAction = 'true'; approve.textContent = '确认兑换';
+    const reject = document.createElement('button'); reject.className = 'secondary'; reject.textContent = '取消';
+    const finish = () => { approve.disabled = true; reject.disabled = true; };
+    approve.onclick = async () => {
+      finish();
+      try {
+        const body = await api(`/v1/swap/${state.sessionId}/confirm`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo', approved: true }) });
+        applyEvent('session', body); addMessage('assistant', '已确认兑换，正在准备钱包交易。');
+      } catch (error) { approve.disabled = false; reject.disabled = false; addMessage('assistant', `确认兑换失败：${error.message}`); }
+    };
+    reject.onclick = async () => {
+      finish();
+      try {
+        const body = await api(`/v1/swap/${state.sessionId}/confirm`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo', approved: false }) });
+        applyEvent('session', body); addMessage('assistant', '已取消本次兑换。');
+      } catch (error) { approve.disabled = false; reject.disabled = false; addMessage('assistant', `取消兑换失败：${error.message}`); }
+    };
+    actions.append(approve, reject); card.append(title, details, actions); addCard('confirmation', card);
   }
   async function selectQuote(reference) {
     if (!state.sessionId) return addMessage('assistant', '当前没有兑换 session。请重新发起兑换。'); state.selectedProviderReference = reference;

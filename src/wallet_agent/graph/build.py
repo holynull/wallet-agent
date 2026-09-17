@@ -8,7 +8,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from .nodes import GraphRuntime, make_nodes
-from .routes import route_after_intent, route_after_resolution, route_after_status
+from .routes import (
+    route_after_confirmation,
+    route_after_intent,
+    route_after_resolution,
+    route_after_status,
+)
 from .state import AgentState
 
 
@@ -20,6 +25,7 @@ def build_graph(
     price_provider: Any | None = None,
     checkpointer: Any | None = None,
     max_poll_attempts: int = 3,
+    confirmation_ttl_seconds: int = 900,
 ) -> Any:
     """Compile a graph with injectable model, providers, chain adapters, and checkpointer."""
     if isinstance(providers, dict):
@@ -46,13 +52,19 @@ def build_graph(
         chains=chain_map,
         price_provider=price_provider,
         max_poll_attempts=max(1, max_poll_attempts),
+        confirmation_ttl_seconds=max(1, confirmation_ttl_seconds),
     )
     n = make_nodes(runtime)
     builder = StateGraph(AgentState)
+    builder.add_node("supervisor", n["supervisor"])
     builder.add_node("intent", n["intent"])
     builder.add_node("resolve_swap", n["resolve_swap"])
     builder.add_node("quote_provider", n["quote_provider"])
     builder.add_node("quote_response", n["quote_response"])
+    builder.add_node("asset_tool_call", n["asset_tool_call"])
+    builder.add_node("asset_tool_result", n["asset_tool_result"])
+    builder.add_node("confirmation_request", n["confirmation_request"])
+    builder.add_node("confirmation_wait", n["confirmation_wait"])
     builder.add_node("wallet_query", n["wallet_query"])
     builder.add_node("wallet_tool_call", n["wallet_tool_call"])
     builder.add_node("wallet_tool_result", n["wallet_tool_result"])
@@ -71,7 +83,8 @@ def build_graph(
     builder.add_node("register_broadcast", n["register_broadcast"])
     builder.add_node("status_poll", n["status_poll"])
     builder.add_node("response", n["response"])
-    builder.add_edge(START, "intent")
+    builder.add_edge(START, "supervisor")
+    builder.add_edge("supervisor", "intent")
     builder.add_conditional_edges(
         "intent",
         route_after_intent,
@@ -83,7 +96,7 @@ def build_graph(
             "transaction_status": "transaction_tool_call",
             "portfolio_query": "portfolio_query",
             "gas_check": "gas_tool_call",
-            "asset_discovery": "asset_discovery",
+            "asset_discovery": "asset_tool_call",
             "swap_resolve": "resolve_swap",
             "swap_resolve_prepare": "resolve_swap",
             "status_poll": "status_poll",
@@ -92,10 +105,20 @@ def build_graph(
         },
     )
     builder.add_conditional_edges(
-        "resolve_swap", route_after_resolution, ["quote_provider", "prepare", "response"]
+        "resolve_swap",
+        route_after_resolution,
+        ["quote_provider", "confirmation_request", "prepare", "response"],
+    )
+    builder.add_edge("confirmation_request", "confirmation_wait")
+    builder.add_conditional_edges(
+        "confirmation_wait",
+        route_after_confirmation,
+        {"prepare": "prepare", "response": "response"},
     )
     builder.add_edge("quote_provider", "quote_response")
     builder.add_edge("quote_response", END)
+    builder.add_edge("asset_tool_call", "asset_tool_result")
+    builder.add_edge("asset_tool_result", END)
     builder.add_edge("wallet_query", END)
     builder.add_edge("wallet_tool_call", "wallet_tool_result")
     builder.add_edge("wallet_tool_result", END)

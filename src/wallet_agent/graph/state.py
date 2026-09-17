@@ -33,6 +33,17 @@ class ConversationState(TypedDict, total=False):
     updated_by: str
 
 
+class ConfirmationState(TypedDict, total=False):
+    """A resumable, expiring approval request owned by the wallet client."""
+
+    action: str
+    status: str
+    requested_at: str
+    expires_at: str
+    summary: dict[str, Any]
+    reason: str | None
+
+
 def _merge_quote_candidates(
     existing: list[dict[str, Any]] | None,
     incoming: list[dict[str, Any]] | None,
@@ -61,6 +72,8 @@ class AgentState(TypedDict, total=False):
     user_id: str
     request: dict[str, Any]
     intent: Intent
+    supervisor_decision: NotRequired[dict[str, Any] | None]
+    supervisor_output: NotRequired[dict[str, Any] | None]
     conversation_state: NotRequired[ConversationState | None]
     task_stage: NotRequired[str | None]
     wallet_context: NotRequired[dict[str, Any] | None]
@@ -89,6 +102,7 @@ class AgentState(TypedDict, total=False):
     swap_session: NotRequired[dict[str, Any] | None]
     pending_transaction: NotRequired[dict[str, Any] | None]
     user_confirmation: NotRequired[dict[str, Any] | None]
+    confirmation_state: NotRequired[ConfirmationState | None]
     broadcast_tx_hash: NotRequired[str | None]
     provider_order_ids: NotRequired[dict[str, str]]
     provider_orders: NotRequired[dict[str, dict[str, Any]]]

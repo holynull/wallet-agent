@@ -49,6 +49,9 @@ rejects the switch, do not sign the transaction.
 2. Read `GET /v1/agent/stream/{run_id}` until `action_required`. The graph
    response/session contains every `quote_candidates` item. Render every quote;
    do not auto-select a provider.
+   Direct conversational swap turns also expose an expiring `confirmation_state`
+   (`status`, `summary`, `requested_at`, `expires_at`) in the session projection;
+   render it as an explicit approval step before signing.
 3. After the user chooses one card, submit its exact `provider_reference` to
    `POST /v1/swap/{session_id}/select-quote`:
 

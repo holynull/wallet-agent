@@ -51,7 +51,8 @@ The default model backend is DeepSeek's official OpenAI-compatible API:
 backend, set `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_BASE_URL` instead.
 
 The HTTP API is rooted at `/v1`: agent turns and SSE streaming, explicit swap
-quote selection (`/swap/{session_id}/select-quote`), allowance/approval gating
+quote selection (`/swap/{session_id}/select-quote`), expiring confirmation state,
+allowance/approval gating
 (`/approve-broadcast` then `/continue`), transfer preparation, token prices, and
 read-only wallet balances, transactions, fee estimates, and transaction status
 lookup (`/transactions/{chain}/{tx_hash}`). Transfer and swap preparation return

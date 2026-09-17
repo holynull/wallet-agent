@@ -24,17 +24,26 @@ from wallet_agent.providers import BridgersProvider, HttpJsonTransport, OmniBrid
 class IntentOutput(BaseModel):
     intent: str
     source_chain: str | None = None
+    source_chain_id: int | str | None = None
     destination_chain: str | None = None
+    destination_chain_id: int | str | None = None
     source_symbol: str | None = None
     destination_symbol: str | None = None
     source_token_address: str | None = None
     destination_token_address: str | None = None
     source_decimals: int | None = None
     destination_decimals: int | None = None
+    source_name: str | None = None
+    destination_name: str | None = None
+    source_logo_url: str | None = None
+    destination_logo_url: str | None = None
     input_amount: str | None = None
     input_amount_raw: str | None = None
     sender_address: str | None = None
     recipient_address: str | None = None
+    refund_address: str | None = None
+    slippage_bps: int | None = None
+    expires_at: str | None = None
     transfer_chain: str | None = None
     transfer_symbol: str | None = None
     transfer_token_address: str | None = None
@@ -134,6 +143,7 @@ def build_application(settings: Settings | None = None) -> Any:
         price_provider=price_provider,
         checkpointer=checkpoint_handle.checkpointer,
         max_poll_attempts=settings.poll_max_attempts,
+        confirmation_ttl_seconds=settings.confirmation_ttl_seconds,
     )
     session_store = SqliteSessionStore(settings.persistence_url)
     application = create_app(

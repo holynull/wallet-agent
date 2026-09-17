@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from langgraph.types import interrupt
 from langchain_core.messages import AIMessage
 from langgraph.prebuilt import ToolNode
+from langgraph.types import interrupt
 
 from wallet_agent.chains._common import receipt_success
 from wallet_agent.domain.models import (
@@ -32,11 +34,38 @@ class GraphRuntime:
     chains: dict[str, Any]
     price_provider: Any | None = None
     max_poll_attempts: int = 3
+    confirmation_ttl_seconds: int = 900
+
+
+_VALID_INTENTS = {
+    "wallet_query",
+    "swap_quote",
+    "swap_prepare",
+    "swap_status",
+    "clarification",
+    "unsupported",
+    "transfer",
+    "swap_select",
+    "swap_allowance",
+    "price_query",
+    "transaction_status",
+    "portfolio_query",
+    "gas_check",
+    "asset_discovery",
+}
 
 
 def _dump(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
+    if isinstance(value, Mapping):
+        return {str(key): _dump(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_dump(item) for item in value]
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
     return value
 
 
@@ -62,7 +91,18 @@ def _quote(value: Any) -> NormalizedQuote:
 
 
 def _request(value: Any) -> SwapQuoteRequest:
-    return value if isinstance(value, SwapQuoteRequest) else SwapQuoteRequest.model_validate(value)
+    return SwapQuoteRequest.model_validate(_dump(value))
+
+
+def _request_json(value: Any) -> dict[str, Any]:
+    """Return the canonical JSON-safe representation used by graph/tool state."""
+    return _request(value).model_dump(mode="json")
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    """Coerce legacy structured input to a plain JSON-safe mapping."""
+    dumped = _dump(value)
+    return dumped if isinstance(dumped, dict) else {}
 
 
 def _error(
@@ -86,6 +126,39 @@ def _parse_model_output(value: Any) -> dict[str, Any] | None:
             return None
         return result if isinstance(result, dict) else None
     return None
+
+
+def _confirmation_snapshot(
+    *,
+    action: str,
+    status: str,
+    summary: dict[str, Any],
+    ttl_seconds: int,
+    reason: str | None = None,
+    requested_at: datetime | None = None,
+) -> dict[str, Any]:
+    now = requested_at or datetime.now(timezone.utc)
+    return {
+        "action": action,
+        "status": status,
+        "requested_at": now.isoformat(),
+        "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat(),
+        "summary": summary,
+        "reason": reason,
+    }
+
+
+def _confirmation_expired(value: dict[str, Any]) -> bool:
+    raw = value.get("expires_at")
+    if not raw:
+        return False
+    try:
+        parsed = datetime.fromisoformat(str(raw))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed <= datetime.now(timezone.utc)
+    except ValueError:
+        return True
 
 
 def _looks_like_swap_message(message: str) -> bool:
@@ -157,11 +230,17 @@ def _merge_swap_slots(existing: dict[str, Any], incoming: dict[str, Any]) -> dic
             merged.pop("source_token_address", None)
         if "source_decimals" not in changed:
             merged.pop("source_decimals", None)
+        for field in ("source_chain_id", "source_name", "source_logo_url"):
+            if field not in changed:
+                merged.pop(field, None)
     if "destination_chain" in changed or "destination_symbol" in changed:
         if "destination_token_address" not in changed:
             merged.pop("destination_token_address", None)
         if "destination_decimals" not in changed:
             merged.pop("destination_decimals", None)
+        for field in ("destination_chain_id", "destination_name", "destination_logo_url"):
+            if field not in changed:
+                merged.pop(field, None)
     if "input_amount" in changed and "input_amount_raw" not in changed:
         merged.pop("input_amount_raw", None)
     return merged
@@ -169,18 +248,25 @@ def _merge_swap_slots(existing: dict[str, Any], incoming: dict[str, Any]) -> dic
 
 def _swap_draft_from_request(request: dict[str, Any] | None) -> dict[str, Any]:
     """Flatten a request so an older checkpoint can re-enter slot filling."""
-    raw = request or {}
+    raw = _dump(request) or {}
+    if not isinstance(raw, dict):
+        return {}
     draft: dict[str, Any] = {
         key: raw.get(key)
         for key in ("input_amount", "input_amount_raw", "sender_address", "recipient_address")
         if raw.get(key) is not None
     }
     for side, asset_key in (("source", "source_asset"), ("destination", "destination_asset")):
-        asset = raw.get(asset_key) or {}
-        for field in ("chain", "symbol", "address", "decimals"):
+        asset = _dump(raw.get(asset_key)) or {}
+        if not isinstance(asset, dict):
+            asset = {}
+        for field in ("chain", "chain_id", "symbol", "address", "decimals", "name", "logo_url"):
             value = asset.get(field)
             if value is not None:
                 draft[f"{side}_{'token_address' if field == 'address' else field}"] = value
+    for field in ("refund_address", "slippage_bps", "expires_at"):
+        if raw.get(field) is not None:
+            draft[field] = raw[field]
     return draft
 
 
@@ -213,24 +299,32 @@ def _clarification_message(
     if message:
         return message
     return (
-        "你好！我可以帮你查询余额、比较兑换报价、发起转账或兑换。"
-        "请告诉我具体的 Token、链和数量。"
+        "你好！我可以帮你查询余额、比较兑换报价、发起转账或兑换。请告诉我具体的 Token、链和数量。"
     )
 
 
 _SWAP_DRAFT_KEYS = (
     "source_chain",
+    "source_chain_id",
     "destination_chain",
+    "destination_chain_id",
     "source_symbol",
     "destination_symbol",
     "source_token_address",
     "destination_token_address",
     "source_decimals",
     "destination_decimals",
+    "source_name",
+    "destination_name",
+    "source_logo_url",
+    "destination_logo_url",
     "input_amount",
     "input_amount_raw",
     "sender_address",
     "recipient_address",
+    "refund_address",
+    "slippage_bps",
+    "expires_at",
 )
 
 _TRANSFER_DRAFT_KEYS = (
@@ -405,9 +499,7 @@ async def _transaction_preflight(
     if hasattr(adapter, "validate_address") and sender:
         try:
             sender_valid = await adapter.validate_address(sender)
-            recipient_valid = (
-                await adapter.validate_address(recipient) if recipient else True
-            )
+            recipient_valid = await adapter.validate_address(recipient) if recipient else True
             if not sender_valid or not recipient_valid:
                 add(
                     "addresses",
@@ -572,21 +664,54 @@ def _swap_draft_request(
     request = {
         "source_asset": {
             "chain": normalized["source_chain"],
+            **(
+                {"chain_id": normalized["source_chain_id"]}
+                if normalized.get("source_chain_id") is not None
+                else {}
+            ),
             "symbol": normalized["source_symbol"],
             "decimals": int(normalized["source_decimals"]),
             "address": normalized["source_token_address"],
+            **(
+                {"name": normalized["source_name"]}
+                if normalized.get("source_name") is not None
+                else {}
+            ),
+            **(
+                {"logo_url": normalized["source_logo_url"]}
+                if normalized.get("source_logo_url") is not None
+                else {}
+            ),
         },
         "destination_asset": {
             "chain": normalized["destination_chain"],
+            **(
+                {"chain_id": normalized["destination_chain_id"]}
+                if normalized.get("destination_chain_id") is not None
+                else {}
+            ),
             "symbol": normalized["destination_symbol"],
             "decimals": int(normalized["destination_decimals"]),
             "address": normalized["destination_token_address"],
+            **(
+                {"name": normalized["destination_name"]}
+                if normalized.get("destination_name") is not None
+                else {}
+            ),
+            **(
+                {"logo_url": normalized["destination_logo_url"]}
+                if normalized.get("destination_logo_url") is not None
+                else {}
+            ),
         },
         "input_amount": str(normalized["input_amount"]),
         "input_amount_raw": normalized["input_amount_raw"],
         "sender_address": normalized["sender_address"],
         "recipient_address": normalized["recipient_address"],
     }
+    for field in ("refund_address", "slippage_bps", "expires_at"):
+        if normalized.get(field) is not None:
+            request[field] = normalized[field]
     try:
         return SwapQuoteRequest.model_validate(request), []
     except Exception:
@@ -672,7 +797,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         """Read a transaction status from the configured chain adapter."""
         adapter = runtime.chains.get(str(chain).upper())
         if adapter is None:
-            return {"ok": False, "code": "CHAIN_CAPABILITY_UNAVAILABLE", "error": f"当前暂不支持 {chain}。"}
+            return {
+                "ok": False,
+                "code": "CHAIN_CAPABILITY_UNAVAILABLE",
+                "error": f"当前暂不支持 {chain}。",
+            }
         try:
             status = await adapter.get_transaction_status(tx_hash)
             value = getattr(status, "value", str(status))
@@ -704,9 +833,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         """Read a network fee estimate without signing or broadcasting."""
         adapter = runtime.chains.get(str(chain).upper())
         if adapter is None:
-            return {"ok": False, "code": "CHAIN_CAPABILITY_UNAVAILABLE", "error": f"当前暂不支持 {chain}。"}
+            return {
+                "ok": False,
+                "code": "CHAIN_CAPABILITY_UNAVAILABLE",
+                "error": f"当前暂不支持 {chain}。",
+            }
         if not hasattr(adapter, "estimate_fee"):
-            return {"ok": False, "code": "GAS_ESTIMATE_UNAVAILABLE", "error": "当前链暂不支持手续费估算。"}
+            return {
+                "ok": False,
+                "code": "GAS_ESTIMATE_UNAVAILABLE",
+                "error": "当前链暂不支持手续费估算。",
+            }
         try:
             fee = await adapter.estimate_fee(to=to, data=data)
             native = await adapter.get_native_balance(address)
@@ -732,8 +869,168 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         except Exception as exc:
             return {"ok": False, "code": "GAS_ESTIMATE_FAILED", "error": str(exc)}
 
+    async def asset_discovery_tool(
+        chain: str | None = None,
+        search: str | None = None,
+        provider_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Read and merge token metadata from configured providers."""
+        try:
+            query = AssetQuery(chain=chain, search=search)
+        except Exception as exc:
+            return {"ok": False, "code": "INVALID_ASSET_QUERY", "error": str(exc)}
+        selected = (
+            {str(provider_name): runtime.providers.get(str(provider_name))}
+            if provider_name
+            else runtime.providers
+        )
+        assets: list[Asset] = []
+        provider_errors: list[dict[str, Any]] = []
+        for name, provider in selected.items():
+            if provider is None or not hasattr(provider, "list_assets"):
+                continue
+            try:
+                assets.extend(await provider.list_assets(query))
+            except Exception as exc:
+                provider_errors.append(
+                    _error(
+                        "ASSET_DISCOVERY_FAILED",
+                        str(exc),
+                        retryable=True,
+                        details={"provider": name},
+                    )
+                )
+        merged: dict[tuple[str, str, str], Asset] = {}
+        for asset in assets:
+            key = (
+                str(asset.chain).upper(),
+                str(asset.symbol).upper(),
+                str(asset.address or "").lower(),
+            )
+            merged[key] = asset
+        return {
+            "ok": True,
+            "query": query.model_dump(mode="json"),
+            "assets": [_dump(asset) for asset in merged.values()],
+            "providers": list(selected),
+            "provider_errors": provider_errors,
+        }
+
+    async def quote_lookup_tool(
+        provider_name: str,
+        swap_request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Read one normalized quote; it never prepares or signs a transaction."""
+        provider = runtime.providers.get(str(provider_name))
+        if provider is None:
+            return {
+                "ok": False,
+                "code": "PROVIDER_UNAVAILABLE",
+                "error": f"Provider {provider_name} is unavailable.",
+            }
+        try:
+            quote = await provider.quote(_request(swap_request))
+            return {"ok": True, "quote": _dump(quote)}
+        except Exception as exc:
+            return {
+                "ok": False,
+                "code": "PROVIDER_QUOTE_FAILED",
+                "error": str(exc),
+                "provider": str(provider_name),
+            }
+
     transaction_tool_node = ToolNode([transaction_status_tool], name="transaction_tools")
     gas_tool_node = ToolNode([gas_estimate_tool], name="gas_tools")
+    asset_tool_node = ToolNode([asset_discovery_tool], name="asset_tools")
+    quote_tool_node = ToolNode([quote_lookup_tool], name="quote_tools")
+
+    async def supervisor(state: dict[str, Any]) -> dict[str, Any]:
+        """Plan one turn; execution remains in the existing graph nodes."""
+        request = _mapping(state.get("request"))
+        forced = state.get("forced_intent")
+        if forced in _VALID_INTENTS:
+            decision = {"intent": forced, "source": "api"}
+        elif (
+            state.get("intent") in _VALID_INTENTS
+            and (
+                not request.get("message")
+                or (state.get("confirmation_state") or {}).get("status") == "requested"
+            )
+        ):
+            decision = {"intent": state["intent"], "source": "graph_resume"}
+        else:
+            # Models receive a JSON-safe view, while the original structured
+            # request remains untouched in checkpoint state for legacy callers.
+            model_request = dict(request)
+            # A legacy API caller may still put a Pydantic SwapQuoteRequest
+            # under request.metadata (or request.swap_request).  Give the
+            # model only JSON values, without mutating the original fields.
+            if "swap_request" in model_request:
+                model_request["swap_request"] = _dump(model_request["swap_request"])
+            model_request["wallet_context"] = state.get("wallet_context")
+            model_request["conversation_state"] = state.get("conversation_state")
+            model_request["swap_draft"] = state.get("swap_draft")
+            model_request["transfer_draft"] = state.get("transfer_draft")
+            model_request["available_capabilities"] = {
+                "read_tools": [
+                    "wallet_balance",
+                    "transaction_status",
+                    "gas_estimate",
+                    "asset_discovery",
+                    "quote_lookup",
+                ],
+                "business_nodes": ["transfer", "swap_allowance", "prepare", "status_poll"],
+            }
+            try:
+                output = (
+                    runtime.model.ainvoke(model_request)
+                    if hasattr(runtime.model, "ainvoke")
+                    else runtime.model.invoke(model_request)
+                )
+                output = await output if hasattr(output, "__await__") else output
+                decision = _parse_model_output(output)
+            except Exception as exc:
+                decision = {
+                    "intent": "clarification",
+                    "error": _error("SUPERVISOR_FAILED", str(exc), retryable=True),
+                }
+            if not decision or decision.get("intent") not in _VALID_INTENTS:
+                decision = {
+                    "intent": "clarification",
+                    "error": _error(
+                        "SUPERVISOR_OUTPUT_INVALID",
+                        "无法判断这次请求应该执行哪项钱包能力。",
+                    ),
+                }
+            else:
+                decision = {**decision, "source": "model"}
+        update: dict[str, Any] = {
+            "intent": decision["intent"],
+            "supervisor_decision": decision,
+            "supervisor_output": decision,
+            # Preserve every legacy request field while making the checkpoint
+            # representation serializable for subsequent resume calls.
+            "request": request,
+        }
+        # Checkpoints created before the Supervisor stored Pydantic requests
+        # directly.  Normalize them at this boundary while retaining the
+        # original request fields for the legacy graph routes.
+        if state.get("swap_request") is not None:
+            try:
+                update["swap_request"] = _request_json(state["swap_request"])
+            except Exception:
+                update["swap_request"] = _dump(state["swap_request"])
+        for field in (
+            "transfer_request",
+            "transaction_query",
+            "portfolio_request",
+            "gas_request",
+            "asset_query",
+            "price_request",
+        ):
+            if state.get(field) is not None:
+                update[field] = _dump(state[field])
+        return update
 
     async def wallet_tool_call(state: dict[str, Any]) -> dict[str, Any]:
         context = state.get("wallet_context") or {}
@@ -776,7 +1073,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "errors": (
                         []
                         if result.get("code") == "WALLET_CONTEXT_REQUIRED"
-                        else [_error(result.get("code", "TOOL_FAILED"), result.get("error", "工具调用失败。"))]
+                        else [
+                            _error(
+                                result.get("code", "TOOL_FAILED"),
+                                result.get("error", "工具调用失败。"),
+                            )
+                        ]
                     ),
                 }
             }
@@ -788,49 +1090,316 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
 
     async def transaction_tool_call(state: dict[str, Any]) -> dict[str, Any]:
         raw = state.get("transaction_query") or {}
-        chain = raw.get("chain") or raw.get("transaction_chain") or state.get("request", {}).get("chain")
+        chain = (
+            raw.get("chain")
+            or raw.get("transaction_chain")
+            or state.get("request", {}).get("chain")
+        )
         tx_hash = raw.get("tx_hash") or raw.get("transaction_hash")
         if not chain or not tx_hash:
-            return {"tool_result": {"ok": False, "code": "TRANSACTION_PARAMETERS_REQUIRED", "error": "请提供交易所在的链和交易哈希。"}}
-        call = {"name": "transaction_status_tool", "args": {"chain": str(chain), "tx_hash": str(tx_hash)}, "id": "transaction-status-1", "type": "tool_call"}
-        result = await transaction_tool_node.ainvoke({"messages": [AIMessage(content="", tool_calls=[call])]})
+            return {
+                "tool_result": {
+                    "ok": False,
+                    "code": "TRANSACTION_PARAMETERS_REQUIRED",
+                    "error": "请提供交易所在的链和交易哈希。",
+                }
+            }
+        call = {
+            "name": "transaction_status_tool",
+            "args": {"chain": str(chain), "tx_hash": str(tx_hash)},
+            "id": "transaction-status-1",
+            "type": "tool_call",
+        }
+        result = await transaction_tool_node.ainvoke(
+            {"messages": [AIMessage(content="", tool_calls=[call])]}
+        )
         try:
             return {"tool_result": json.loads(result["messages"][-1].content)}
         except (TypeError, ValueError):
-            return {"tool_result": {"ok": False, "code": "TOOL_OUTPUT_INVALID", "error": str(result["messages"][-1].content)}}
+            return {
+                "tool_result": {
+                    "ok": False,
+                    "code": "TOOL_OUTPUT_INVALID",
+                    "error": str(result["messages"][-1].content),
+                }
+            }
 
     async def transaction_tool_result(state: dict[str, Any]) -> dict[str, Any]:
         result = state.get("tool_result") or {}
         if not result.get("ok"):
-            return {"response": {"kind": "error", "errors": [_error(result.get("code", "TOOL_FAILED"), result.get("error", "工具调用失败。"))]}}
+            return {
+                "response": {
+                    "kind": "error",
+                    "errors": [
+                        _error(
+                            result.get("code", "TOOL_FAILED"), result.get("error", "工具调用失败。")
+                        )
+                    ],
+                }
+            }
         transaction = result.get("transaction") or {}
-        return {"transaction_status_snapshot": transaction, "response": {"kind": "transaction_status", **transaction}}
+        return {
+            "transaction_status_snapshot": transaction,
+            "response": {"kind": "transaction_status", **transaction},
+        }
 
     async def gas_tool_call(state: dict[str, Any]) -> dict[str, Any]:
         raw = state.get("gas_request") or {}
         chain = raw.get("chain") or raw.get("gas_chain") or state.get("request", {}).get("chain")
         if not chain:
-            return {"tool_result": {"ok": False, "code": "GAS_CHAIN_REQUIRED", "error": "请告诉我需要查询哪条链的 Gas。"}}
-        address = raw.get("address") or raw.get("gas_address") or (state.get("wallet_context") or {}).get("address")
+            return {
+                "tool_result": {
+                    "ok": False,
+                    "code": "GAS_CHAIN_REQUIRED",
+                    "error": "请告诉我需要查询哪条链的 Gas。",
+                }
+            }
+        address = (
+            raw.get("address")
+            or raw.get("gas_address")
+            or (state.get("wallet_context") or {}).get("address")
+        )
         if not address:
-            return {"tool_result": {"ok": False, "code": "WALLET_CONTEXT_REQUIRED", "error": "请先连接钱包，或提供钱包地址。"}}
-        call = {"name": "gas_estimate_tool", "args": {"chain": str(chain), "address": str(address), "to": raw.get("to") or raw.get("gas_to"), "data": raw.get("data") or raw.get("gas_data")}, "id": "gas-estimate-1", "type": "tool_call"}
-        result = await gas_tool_node.ainvoke({"messages": [AIMessage(content="", tool_calls=[call])]})
+            return {
+                "tool_result": {
+                    "ok": False,
+                    "code": "WALLET_CONTEXT_REQUIRED",
+                    "error": "请先连接钱包，或提供钱包地址。",
+                }
+            }
+        call = {
+            "name": "gas_estimate_tool",
+            "args": {
+                "chain": str(chain),
+                "address": str(address),
+                "to": raw.get("to") or raw.get("gas_to"),
+                "data": raw.get("data") or raw.get("gas_data"),
+            },
+            "id": "gas-estimate-1",
+            "type": "tool_call",
+        }
+        result = await gas_tool_node.ainvoke(
+            {"messages": [AIMessage(content="", tool_calls=[call])]}
+        )
         try:
             return {"tool_result": json.loads(result["messages"][-1].content)}
         except (TypeError, ValueError):
-            return {"tool_result": {"ok": False, "code": "TOOL_OUTPUT_INVALID", "error": str(result["messages"][-1].content)}}
+            return {
+                "tool_result": {
+                    "ok": False,
+                    "code": "TOOL_OUTPUT_INVALID",
+                    "error": str(result["messages"][-1].content),
+                }
+            }
 
     async def gas_tool_result(state: dict[str, Any]) -> dict[str, Any]:
         result = state.get("tool_result") or {}
         if not result.get("ok"):
-            return {"response": {"kind": "error", "errors": [_error(result.get("code", "TOOL_FAILED"), result.get("error", "工具调用失败。"))]}}
+            return {
+                "response": {
+                    "kind": "error",
+                    "errors": [
+                        _error(
+                            result.get("code", "TOOL_FAILED"), result.get("error", "工具调用失败。")
+                        )
+                    ],
+                }
+            }
         gas = result.get("gas") or {}
         return {"gas_snapshot": gas, "response": {"kind": "gas_check", **gas}}
 
+    async def confirmation_request(state: dict[str, Any]) -> dict[str, Any]:
+        selected = _dump(state.get("selected_quote"))
+        if not isinstance(selected, dict):
+            selected = None
+        if selected is None:
+            return {
+                "response": {
+                    "kind": "clarification",
+                    "message": "请先选择一个兑换报价。",
+                }
+            }
+        current = state.get("confirmation_state") or {}
+        if current.get("status") == "approved":
+            return {"task_stage": "confirmed"}
+        if current.get("status") == "requested" and not _confirmation_expired(current):
+            return {"task_stage": "awaiting_confirmation"}
+        confirmation = _confirmation_snapshot(
+            action="swap",
+            status="requested",
+            summary={
+                "provider": selected.get("provider"),
+                "provider_reference": selected.get("provider_reference"),
+                "source_asset": selected.get("source_asset"),
+                "destination_asset": selected.get("destination_asset"),
+                "input_amount": selected.get("input_amount"),
+                "expected_output": selected.get("expected_output"),
+            },
+            ttl_seconds=runtime.confirmation_ttl_seconds,
+        )
+        return {
+            "confirmation_state": confirmation,
+            "task_stage": "awaiting_confirmation",
+            "response": {
+                "kind": "confirmation_required",
+                "confirmation": confirmation,
+                "quote": selected,
+            },
+        }
+
+    async def confirmation_wait(state: dict[str, Any]) -> dict[str, Any]:
+        current = state.get("confirmation_state") or {}
+        if current.get("status") == "approved":
+            return {}
+        if _confirmation_expired(current):
+            expired = {
+                **current,
+                "status": "expired",
+                "reason": "confirmation_timeout",
+            }
+            return {
+                "confirmation_state": expired,
+                "task_stage": "confirmation_expired",
+                "response": {
+                    "kind": "error",
+                    "errors": [
+                        _error(
+                            "CONFIRMATION_EXPIRED", "确认已过期，请重新获取报价。", retryable=True
+                        )
+                    ],
+                    "confirmation": expired,
+                },
+            }
+        answer = interrupt(
+            {
+                "kind": "confirmation_required",
+                "confirmation": current,
+                "quote": state.get("selected_quote"),
+            }
+        )
+        approved = isinstance(answer, dict) and bool(answer.get("approved"))
+        if answer is True:
+            approved = True
+        updated = {
+            **current,
+            "status": "approved" if approved else "rejected",
+            "reason": None if approved else "user_rejected",
+        }
+        if not approved:
+            return {
+                "confirmation_state": updated,
+                "user_confirmation": {"approved": False},
+                "task_stage": "cancelled",
+                "response": {
+                    "kind": "cancelled",
+                    "message": "已取消本次兑换。",
+                    "confirmation": updated,
+                },
+            }
+        return {
+            "confirmation_state": updated,
+            "user_confirmation": {"approved": True},
+            "task_stage": "confirmed",
+        }
+
+    async def asset_tool_call(state: dict[str, Any]) -> dict[str, Any]:
+        raw = state.get("asset_query") or {}
+        call = {
+            "name": "asset_discovery_tool",
+            "args": {
+                "chain": raw.get("chain") or raw.get("asset_chain"),
+                "search": raw.get("search") or raw.get("asset_search"),
+            },
+            "id": "asset-discovery-1",
+            "type": "tool_call",
+        }
+        result = await asset_tool_node.ainvoke(
+            {"messages": [AIMessage(content="", tool_calls=[call])]}
+        )
+        try:
+            return {"tool_result": json.loads(result["messages"][-1].content)}
+        except (TypeError, ValueError):
+            return {
+                "tool_result": {
+                    "ok": False,
+                    "code": "TOOL_OUTPUT_INVALID",
+                    "error": str(result["messages"][-1].content),
+                }
+            }
+
+    async def asset_tool_result(state: dict[str, Any]) -> dict[str, Any]:
+        result = state.get("tool_result") or {}
+        if not result.get("ok"):
+            return {
+                "response": {
+                    "kind": "error",
+                    "errors": [
+                        _error(
+                            result.get("code", "TOOL_FAILED"), result.get("error", "资产查询失败。")
+                        )
+                    ],
+                }
+            }
+        snapshot = {
+            "query": result.get("query") or {},
+            "assets": result.get("assets") or [],
+            "providers": result.get("providers") or [],
+            "provider_errors": result.get("provider_errors") or [],
+        }
+        return {
+            "asset_snapshot": snapshot,
+            "response": {"kind": "asset_discovery", **snapshot},
+        }
+
+    async def quote_tool_call(state: dict[str, Any]) -> dict[str, Any]:
+        name = state.get("provider_name") or state.get("request", {}).get("_provider_name")
+        request = state.get("swap_request")
+        if not name or not request:
+            return {
+                "quote_candidates": [],
+                "errors": [_error("QUOTE_PARAMETERS_REQUIRED", "兑换报价参数不完整。")],
+            }
+        try:
+            request_json = _request_json(request)
+        except Exception as exc:
+            return {
+                "quote_candidates": [],
+                "errors": [_error("INVALID_SWAP_PARAMETERS", str(exc))],
+            }
+        call = {
+            "name": "quote_lookup_tool",
+            "args": {"provider_name": str(name), "swap_request": request_json},
+            "id": f"quote-{name}",
+            "type": "tool_call",
+        }
+        result = await quote_tool_node.ainvoke(
+            {"messages": [AIMessage(content="", tool_calls=[call])]}
+        )
+        try:
+            payload = json.loads(result["messages"][-1].content)
+        except (TypeError, ValueError):
+            payload = {
+                "ok": False,
+                "code": "TOOL_OUTPUT_INVALID",
+                "error": str(result["messages"][-1].content),
+            }
+        if not payload.get("ok"):
+            return {
+                "quote_candidates": [],
+                "errors": [
+                    _error(
+                        payload.get("code", "TOOL_FAILED"),
+                        payload.get("error", "报价查询失败。"),
+                        details={"provider": name},
+                    )
+                ],
+            }
+        return {"quote_candidates": [payload["quote"]]}
+
     async def intent(state: dict[str, Any]) -> dict[str, Any]:
         existing = state.get("forced_intent")
-        if existing is None and not state.get("request", {}).get("message"):
+        request = _mapping(state.get("request"))
+        if existing is None and not request.get("message"):
             existing = state.get("intent")
         valid = {
             "wallet_query",
@@ -848,9 +1417,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "gas_check",
             "asset_discovery",
         }
-        if existing in valid:
+        supervisor_source = (state.get("supervisor_output") or {}).get("source")
+        if existing in valid and (
+            not state.get("supervisor_output") or supervisor_source in {"api", "graph_resume"}
+        ):
             return {"route": existing, "max_poll_attempts": runtime.max_poll_attempts}
-        request = state.get("request", {})
         message = str(request.get("message", ""))
         if _looks_like_cancel_message(message) and (
             state.get("conversation_state")
@@ -882,26 +1453,32 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "user_confirmation": None,
                 "response": {"kind": "cancelled", "message": "已取消当前兑换。"},
             }
-        try:
-            model_request = dict(request)
-            model_request["wallet_context"] = state.get("wallet_context")
-            model_request["swap_draft"] = state.get("swap_draft")
-            model_request["transfer_draft"] = state.get("transfer_draft")
-            model_request["conversation_state"] = state.get("conversation_state")
-            output = (
-                runtime.model.ainvoke(model_request)
-                if hasattr(runtime.model, "ainvoke")
-                else runtime.model.invoke(model_request)
-            )
-            output = await output if hasattr(output, "__await__") else output
-        except Exception as exc:  # model failures are user-actionable clarification
-            return {
-                "intent": "clarification",
-                "errors": [_error("MODEL_OUTPUT_INVALID", str(exc))],
-                "route": "clarification",
-                "max_poll_attempts": runtime.max_poll_attempts,
-            }
-        parsed = _parse_model_output(output)
+        parsed = _parse_model_output(state.get("supervisor_output"))
+        if parsed and parsed.get("source") in {"api", "graph_resume"}:
+            # Forced/resumed requests may already contain structured fields;
+            # reconstruct a minimal model output from the preserved request.
+            parsed = {**parsed, "intent": existing or parsed.get("intent")}
+        if not parsed:
+            try:
+                model_request = dict(request)
+                model_request["wallet_context"] = state.get("wallet_context")
+                model_request["swap_draft"] = state.get("swap_draft")
+                model_request["transfer_draft"] = state.get("transfer_draft")
+                model_request["conversation_state"] = state.get("conversation_state")
+                output = (
+                    runtime.model.ainvoke(model_request)
+                    if hasattr(runtime.model, "ainvoke")
+                    else runtime.model.invoke(model_request)
+                )
+                output = await output if hasattr(output, "__await__") else output
+                parsed = _parse_model_output(output)
+            except Exception as exc:  # model failures are user-actionable clarification
+                return {
+                    "intent": "clarification",
+                    "errors": [_error("MODEL_OUTPUT_INVALID", str(exc))],
+                    "route": "clarification",
+                    "max_poll_attempts": runtime.max_poll_attempts,
+                }
         if not parsed or parsed.get("intent") not in valid:
             return {
                 "intent": "clarification",
@@ -924,7 +1501,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     goal="swap",
                     stage="collecting_parameters",
                     slots=state.get("swap_draft") or {},
-                    missing_fields=parsed.get("missing_fields") or state.get("missing_fields") or [],
+                    missing_fields=parsed.get("missing_fields")
+                    or state.get("missing_fields")
+                    or [],
                 )
             return {
                 "intent": "clarification",
@@ -945,16 +1524,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             draft = dict(state.get("swap_draft") or {})
             if not draft and state.get("swap_request"):
                 draft = _swap_draft_from_request(state.get("swap_request"))
-            incoming = {
-                key: parsed[key] for key in _SWAP_DRAFT_KEYS if parsed.get(key) is not None
-            }
+            incoming = {key: parsed[key] for key in _SWAP_DRAFT_KEYS if parsed.get(key) is not None}
             previous_draft = dict(draft)
             draft = _merge_swap_slots(draft, incoming)
             changed = draft != previous_draft
             draft, token_candidates = await _resolve_swap_assets(draft, runtime.providers)
             if token_candidates:
                 descriptions = [
-                    f"{'来源' if item['side'] == 'source' else '目标'} {item['symbol']} ({item['chain']})：{item['address']}"
+                    (
+                        f"{'来源' if item['side'] == 'source' else '目标'} "
+                        f"{item['symbol']} ({item['chain']})：{item['address']}"
+                    )
                     for item in token_candidates
                 ]
                 return {
@@ -1007,7 +1587,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "swap_draft": draft,
                 "missing_fields": [],
                 "swap_request": request_model.model_dump(mode="json"),
-                **({"selected_quote": None, "quote_candidates": [{"__clear__": True}]} if changed else {}),
+                **(
+                    {"selected_quote": None, "quote_candidates": [{"__clear__": True}]}
+                    if changed
+                    else {}
+                ),
                 **_task_update(
                     state.get("conversation_state"),
                     goal="swap",
@@ -1170,7 +1754,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         }
 
     async def resolve_swap(state: dict[str, Any]) -> dict[str, Any]:
-        raw = state.get("swap_request") or state.get("request", {}).get("swap_request")
+        request_context = _mapping(state.get("request"))
+        raw = state.get("swap_request") or request_context.get("swap_request")
+        # Older callers passed SwapQuoteRequest itself as ``request``. Keep
+        # that shape readable while canonicalizing only the graph field.
+        if raw is None and "source_asset" in request_context:
+            raw = request_context
         if raw is None:
             return {
                 "intent": "clarification",
@@ -1204,31 +1793,15 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         }
 
     async def quote_provider(state: dict[str, Any]) -> dict[str, Any]:
-        name = state.get("provider_name") or state.get("request", {}).get("_provider_name")
-        request = state.get("swap_request")
-        provider = runtime.providers.get(str(name))
-        if provider is None or request is None:
-            return {
-                "quote_candidates": [],
-                "errors": [_error("PROVIDER_UNAVAILABLE", f"Provider {name} is unavailable.")],
-            }
-        try:
-            quote = await provider.quote(_request(request))
-            return {"quote_candidates": [_dump(quote)]}
-        except Exception as exc:
-            return {
-                "quote_candidates": [],
-                "errors": [
-                    _error("PROVIDER_QUOTE_FAILED", str(exc), details={"provider": str(name)})
-                ],
-            }
+        return await quote_tool_call(state)
 
     async def quote_response(state: dict[str, Any]) -> dict[str, Any]:
-        quotes = state.get("quote_candidates", [])
+        quotes = [_dump(item) for item in state.get("quote_candidates", [])]
+        quotes = [item for item in quotes if isinstance(item, dict)]
         if not quotes and state.get("errors"):
             return {"response": {"kind": "error", "errors": state["errors"]}}
         # Never silently choose a provider when multiple candidates exist.
-        selected = quotes[0] if len(quotes) == 1 else state.get("selected_quote")
+        selected = quotes[0] if len(quotes) == 1 else _dump(state.get("selected_quote"))
         if runtime.price_provider and quotes:
             assets = []
             for item in quotes:
@@ -1513,7 +2086,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "response": {
                         "stage": "approval_pending" if receipt is None else "approval_failed",
                         "approval_transaction": approval_transaction,
-                    }
+                    },
                 }
             allowance_raw = await adapter.get_allowance(
                 requirement.token, requirement.owner, requirement.spender
@@ -1526,7 +2099,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "response": {
                         "stage": "approval_required",
                         "approval_transaction": approval_transaction,
-                    }
+                    },
                 }
         provider = runtime.providers.get(str(selected.get("provider")))
         if provider is None:
@@ -1552,9 +2125,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     recipient=str(request.get("recipient_address") or ""),
                     amount_raw=str(request.get("input_amount_raw") or "0"),
                     token=(
-                        Asset.model_validate(source_asset)
-                        if source_asset.get("address")
-                        else None
+                        Asset.model_validate(source_asset) if source_asset.get("address") else None
                     ),
                     transaction=prepared,
                     wallet_context=state.get("wallet_context"),
@@ -1581,12 +2152,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "pending_transaction": dumped,
                 "preflight": preflight,
                 "authorization_stage": "swap_ready",
-            "response": {
-                "stage": "swap_ready",
-                "pending_transaction": dumped,
-                **({"preflight": preflight} if preflight is not None else {}),
-            },
-        }
+                "response": {
+                    "stage": "swap_ready",
+                    "pending_transaction": dumped,
+                    **({"preflight": preflight} if preflight is not None else {}),
+                },
+            }
 
     async def wallet_query(state: dict[str, Any]) -> dict[str, Any]:
         request = state.get("request", {})
@@ -1770,9 +2341,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 message = "当前原生币余额不足以支付预计网络手续费。"
             warnings = []
             if context.get("chain") and str(context["chain"]).upper() != chain:
-                warnings.append(
-                    f"当前钱包在 {context['chain']}，签名时需要切换到 {chain}。"
-                )
+                warnings.append(f"当前钱包在 {context['chain']}，签名时需要切换到 {chain}。")
             snapshot = {
                 "address": address,
                 "chain": chain,
@@ -1891,9 +2460,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             }
 
     async def transaction_status(state: dict[str, Any]) -> dict[str, Any]:
-        raw = state.get("transaction_query") or state.get("request", {}).get(
-            "transaction_query"
-        )
+        raw = state.get("transaction_query") or state.get("request", {}).get("transaction_query")
         if not raw:
             return {
                 "response": {
@@ -1903,12 +2470,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             }
         chain = str(raw.get("chain") or raw.get("transaction_chain") or "").upper()
-        tx_hash = str(
-            raw.get("tx_hash")
-            or raw.get("transaction_hash")
-            or raw.get("hash")
-            or ""
-        )
+        tx_hash = str(raw.get("tx_hash") or raw.get("transaction_hash") or raw.get("hash") or "")
         adapter = runtime.chains.get(chain)
         if adapter is None:
             return {
@@ -2019,9 +2581,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     recipient=str(request.get("recipient_address") or ""),
                     amount_raw=str(request.get("input_amount_raw") or "0"),
                     token=(
-                        Asset.model_validate(source_asset)
-                        if source_asset.get("address")
-                        else None
+                        Asset.model_validate(source_asset) if source_asset.get("address") else None
                     ),
                     transaction=prepared_transaction,
                     wallet_context=state.get("wallet_context"),

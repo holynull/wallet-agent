@@ -263,6 +263,7 @@ def create_app(
         current = await session_store.get(session_id)
         if current is None:
             return None
+        state = {str(key): _jsonable(value) for key, value in state.items()}
         changes: dict[str, Any] = {}
         selected = state.get("selected_quote")
         if selected:
@@ -306,11 +307,15 @@ def create_app(
             changes["broadcast_tx_hash"] = str(tx_hash)
         if state.get("authorization_stage") is not None:
             changes["stage"] = state["authorization_stage"]
+        elif state.get("task_stage") is not None:
+            changes["stage"] = state["task_stage"]
         for field in ("approval_transaction", "approval_tx_hash", "allowance_requirement"):
             if state.get(field) is not None:
                 changes[field] = state[field]
         if state.get("preflight") is not None:
             changes["preflight"] = state["preflight"]
+        if state.get("confirmation_state") is not None:
+            changes["confirmation_state"] = _jsonable(state["confirmation_state"])
         if status:
             changes["status"] = status
         if not changes:
@@ -330,6 +335,7 @@ def create_app(
                 result = input_state
                 app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
             else:
+
                 async def get_snapshot() -> Any:
                     if hasattr(app.state.graph, "aget_state"):
                         return await app.state.graph.aget_state(config)
@@ -356,6 +362,10 @@ def create_app(
                     await project_session(session_id, result, status="quoted")
                     result = await execute(
                         {
+                            "request": result.get("request"),
+                            "wallet_context": result.get("wallet_context"),
+                            "conversation_state": result.get("conversation_state"),
+                            "swap_draft": result.get("swap_draft"),
                             "intent": "swap_prepare",
                             "forced_intent": "swap_prepare",
                             "swap_request": result.get("swap_request"),
@@ -381,6 +391,8 @@ def create_app(
                     session_status = (
                         "transfer_ready" if response_kind == "transfer_prepare" else "completed"
                     )
+                    if response_kind == "swap_quote" and not result.get("selected_quote"):
+                        session_status = "quoted"
                     await project_session(session_id, result, status=session_status)
             if app.state.runs[run_id]["status"] == "running":
                 app.state.runs[run_id]["status"] = "complete"
@@ -440,12 +452,9 @@ def create_app(
         )
         run_id = str(uuid.uuid4())
         raw_agent_test_intent = payload.metadata.get("agent_test_intent")
-        if (
-            raw_agent_test_intent is not None
-            and (
-                not isinstance(raw_agent_test_intent, str)
-                or raw_agent_test_intent not in _AGENT_TEST_INTENTS
-            )
+        if raw_agent_test_intent is not None and (
+            not isinstance(raw_agent_test_intent, str)
+            or raw_agent_test_intent not in _AGENT_TEST_INTENTS
         ):
             raise HTTPException(
                 status_code=422,
@@ -590,6 +599,18 @@ def create_app(
         )
         session = await owned_session(session_id, user_id)
         if not payload.approved:
+            graph = app.state.graph
+            if graph is not None:
+                try:
+                    result = await graph.ainvoke(
+                        Command(resume={"approved": False}),
+                        config={"configurable": {"thread_id": session.thread_id}},
+                    )
+                    updated = await project_session(session_id, result, status="cancelled")
+                    if updated is not None:
+                        return _jsonable(updated)
+                except Exception:
+                    pass
             return _jsonable(await session_store.update(session_id, status="cancelled"))
         if session.pending_transaction is not None:
             return _jsonable(session)
@@ -601,7 +622,16 @@ def create_app(
             Command(resume={"approved": True}),
             config=config,
         )
-        status = "prepared" if result.get("pending_transaction") else "confirmed"
+        response = result.get("response") or {}
+        errors = response.get("errors") or []
+        expired = any(item.get("code") == "CONFIRMATION_EXPIRED" for item in errors)
+        status = (
+            "prepared"
+            if result.get("pending_transaction")
+            else "confirmation_expired"
+            if expired
+            else "confirmed"
+        )
         updated = await project_session(session_id, result, status=status)
         return _jsonable(updated or result)
 

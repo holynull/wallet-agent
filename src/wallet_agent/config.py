@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     auth_tokens: dict[str, str] = Field(default_factory=dict)
     poll_interval_seconds: float = Field(default=5, gt=0)
     poll_max_attempts: int = Field(default=20, ge=1, le=1000)
+    confirmation_ttl_seconds: int = Field(default=900, ge=1, le=86_400)
 
     @model_validator(mode="after")
     def require_model_key(self) -> "Settings":
