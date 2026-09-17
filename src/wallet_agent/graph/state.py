@@ -44,6 +44,25 @@ class ConfirmationState(TypedDict, total=False):
     reason: str | None
 
 
+TaskKind = Literal["transfer", "swap"]
+TaskStatus = Literal["collecting", "ready", "awaiting_confirmation", "completed", "cancelled"]
+SlotSource = Literal["user", "wallet", "resolver", "legacy"]
+
+
+class ActiveTask(TypedDict, total=False):
+    """Canonical durable state for one conversational wallet task."""
+
+    task_id: str
+    kind: TaskKind
+    status: TaskStatus
+    stage: str
+    revision: int
+    slots: dict[str, Any]
+    slot_sources: dict[str, SlotSource]
+    missing_fields: list[str]
+    updated_by: str
+
+
 def _merge_quote_candidates(
     existing: list[dict[str, Any]] | None,
     incoming: list[dict[str, Any]] | None,
@@ -72,6 +91,9 @@ class AgentState(TypedDict, total=False):
     user_id: str
     request: dict[str, Any]
     intent: Intent
+    predicted_intent: NotRequired[Intent | None]
+    response_action: NotRequired[str | None]
+    active_task: NotRequired[ActiveTask | None]
     supervisor_decision: NotRequired[dict[str, Any] | None]
     supervisor_output: NotRequired[dict[str, Any] | None]
     conversation_state: NotRequired[ConversationState | None]
