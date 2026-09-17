@@ -50,6 +50,10 @@ async def test_mobile_demo_page_is_served_by_api_app():
     assert "recordDebug" in response.text
     assert "SSE CONNECT" in response.text
     assert "SSE ${event}" in response.text
+    assert "function renderActiveTask" in response.text
+    assert "active_task" in response.text
+    assert "task.revision" in response.text
+    assert "task.missing_fields" in response.text
 
 
 @pytest.mark.asyncio

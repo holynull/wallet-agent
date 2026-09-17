@@ -365,6 +365,7 @@ def create_app(
                             "request": result.get("request"),
                             "wallet_context": result.get("wallet_context"),
                             "conversation_state": result.get("conversation_state"),
+                            "active_task": result.get("active_task"),
                             "swap_draft": result.get("swap_draft"),
                             "intent": "swap_prepare",
                             "forced_intent": "swap_prepare",

@@ -140,6 +140,91 @@ async def test_turn_forwards_public_wallet_context_and_reuses_session_id():
 
 
 @pytest.mark.asyncio
+async def test_automatic_swap_prepare_continuation_preserves_active_task():
+    class QuoteGraph:
+        def __init__(self):
+            self.inputs = []
+            self.values = {}
+
+        async def astream(self, value, *, config, stream_mode):
+            del config, stream_mode
+            self.inputs.append(value)
+            if len(self.inputs) == 1:
+                asset = {
+                    "chain": "BASE",
+                    "chain_id": 8453,
+                    "symbol": "USDC",
+                    "decimals": 6,
+                    "address": "0x" + "3" * 40,
+                }
+                quote = {
+                    "provider": "bridgers",
+                    "source_asset": asset,
+                    "destination_asset": {**asset, "symbol": "USDT", "address": "0x" + "4" * 40},
+                    "input_amount": "1",
+                    "input_amount_raw": "1000000",
+                    "expected_output": "0.99",
+                    "expected_output_raw": "990000",
+                    "provider_reference": "quote-1",
+                }
+                self.values = {
+                    "request": value["request"],
+                    "response": {"kind": "swap_quote", "quotes": [quote]},
+                    "selected_quote": quote,
+                    "quote_candidates": [quote],
+                    "swap_request": {
+                        "source_asset": asset,
+                        "destination_asset": quote["destination_asset"],
+                        "input_amount": "1",
+                        "input_amount_raw": "1000000",
+                        "sender_address": "0x" + "1" * 40,
+                        "recipient_address": "0x" + "1" * 40,
+                    },
+                    "active_task": {
+                        "task_id": "swap-task",
+                        "kind": "swap",
+                        "status": "ready",
+                        "stage": "ready_for_quote",
+                        "revision": 1,
+                        "slots": {"input_amount": "1"},
+                        "slot_sources": {"input_amount": "user"},
+                        "missing_fields": [],
+                    },
+                }
+            else:
+                self.values = {**self.values, "response": {"kind": "confirmation_required"}}
+            yield {"response": self.values["response"]}
+
+        def get_state(self, _config):
+            values = self.values
+
+            class Snapshot:
+                tasks = ()
+                next = ()
+
+            snapshot = Snapshot()
+            snapshot.values = values
+            return snapshot
+
+    graph = QuoteGraph()
+    app, client = await client_for(graph=graph)
+    async with client:
+        response = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "message": "在 Base 用 1 USDC 换 USDT",
+                "address": "0x" + "1" * 40,
+                "chain": "BASE",
+            },
+        )
+        await app.state.runs[response.json()["run_id"]]["task"]
+
+    assert graph.inputs[1]["active_task"]["task_id"] == "swap-task"
+    assert graph.inputs[1]["active_task"]["revision"] == 1
+
+
+@pytest.mark.asyncio
 async def test_unsupported_chain_error_is_stable():
     class Registry:
         def get_adapter(self, chain):

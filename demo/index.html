@@ -362,6 +362,7 @@
     if (shouldRender && current?.session_id) state.sessionId = current.session_id;
     if (shouldRender && Array.isArray(current?.quote_candidates)) { state.quotes = current.quote_candidates; renderQuotes(); }
     if (shouldRender && current?.selected_provider_reference) state.selectedProviderReference = current.selected_provider_reference;
+    if (shouldRender && current?.active_task) renderActiveTask(current.active_task);
     if (shouldRender && current?.response) renderResponse(current.response);
     if (shouldRender && (current?.preflight || current?.response?.preflight)) {
       renderPreflight(current.preflight || current.response.preflight);
@@ -377,6 +378,21 @@
     if (shouldRender && event === 'error') addTypingMessage(current?.error?.message || 'Agent 执行失败。');
     if (shouldRender) updateMeta();
     return current;
+  }
+  function renderActiveTask(task) {
+    const fingerprint = json(task);
+    if (fingerprint === state.lastActiveTask) return;
+    state.lastActiveTask = fingerprint;
+    const slots = Object.entries(task.slots || {})
+      .map(([key, value]) => `${key}: ${value}`)
+      .join(' · ');
+    const missing = (task.missing_fields || []).join('、');
+    const status = `${task.kind || 'wallet'} · ${task.stage || task.status || 'active'} · r${task.revision ?? 0}`;
+    addTypingMessage([
+      `当前任务：${status}`,
+      slots ? `已保留：${slots}` : '',
+      missing ? `还需要：${missing}` : '',
+    ].filter(Boolean).join('\n'));
   }
   function renderResponse(response) {
     const fingerprint = json(response); if (fingerprint === state.lastResponse) return; state.lastResponse = fingerprint;

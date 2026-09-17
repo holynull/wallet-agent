@@ -41,6 +41,13 @@ transaction `chain_id` against the active wallet network before calling
 `wallet_switchEthereumChain` for the source-token chain first. If the user
 rejects the switch, do not sign the transaction.
 
+Agent events may include an `active_task` snapshot. It contains only JSON-safe
+workflow data: task kind, stage, revision, retained slots, and missing fields.
+Existing `swap_draft`, `transfer_draft`, and `conversation_state` fields remain
+available during client migration. A changed task revision invalidates any
+previously displayed quote, confirmation, or unsigned transaction. Confirmation
+is accepted only when its task ID, revision, and payload hash still match.
+
 1. Send `POST /v1/agent/turn` with the user's natural-language swap request,
    public `address`, `chain`, and `metadata.wallet_chain_id`. Retain the
    returned `run_id`, `conversation_id`, and `session_id`.

@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from time import perf_counter
 from typing import Any
 
 from langchain_core.messages import AIMessage
@@ -26,6 +27,7 @@ from wallet_agent.domain.models import (
     TransferRequest,
     UnsignedTransaction,
 )
+from wallet_agent.observability import wallet_event
 
 from .tasks import (
     hydrate_active_task,
@@ -1059,6 +1061,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
 
     async def supervisor(state: dict[str, Any]) -> dict[str, Any]:
         """Plan one turn; execution remains in the existing graph nodes."""
+        started = perf_counter()
         request = _mapping(state.get("request"))
         forced = state.get("forced_intent")
         if _looks_like_cancel_message(str(request.get("message", ""))) and (
@@ -1153,6 +1156,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         ):
             if state.get(field) is not None:
                 update[field] = _dump(state[field])
+        error = decision.get("error") or {}
+        wallet_event(
+            "supervisor",
+            "error" if error else "success",
+            duration_ms=(perf_counter() - started) * 1000,
+            state={
+                **state,
+                "predicted_intent": decision["intent"],
+                "route": decision["intent"],
+            },
+            error_code=error.get("code") if isinstance(error, dict) else None,
+        )
         return update
 
     async def wallet_tool_call(state: dict[str, Any]) -> dict[str, Any]:
@@ -1695,6 +1710,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             merged = merge_task_patch(active_task, _task_patch(task_kind, patch_source))
             active_task = merged.task
             task_update = {"active_task": active_task, **merged.invalidation}
+            wallet_event(
+                "slot_merge",
+                "updated" if merged.changed_slots else "unchanged",
+                duration_ms=0,
+                state={
+                    **state,
+                    "active_task": active_task,
+                    "predicted_intent": parsed["intent"],
+                    "route": task_kind,
+                },
+            )
             intent_value = "transfer" if task_kind == "transfer" else "swap_quote"
         if intent_value == "clarification":
             looks_like_swap = _looks_like_swap_message(message)
