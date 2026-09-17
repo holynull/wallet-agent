@@ -36,6 +36,8 @@
     .quote span { display: block; color: #afbdcf; font-size: 12px; }
     .card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
     .card-actions button { flex: 1; min-width: 150px; }
+    .suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
+    .suggestions button { width: auto; padding: 7px 10px; border-color: #435166; background: #263142; font-size: 12px; }
     .composer { position: fixed; bottom: 0; z-index: 2; width: min(760px, 100%); padding: 10px 12px 14px; border-top: 1px solid #283242; background: rgba(17, 24, 33, .97); }
     .composer-row { display: flex; gap: 8px; align-items: flex-end; }
     textarea { flex: 1; min-height: 42px; max-height: 130px; resize: vertical; padding: 11px; border: 1px solid #3b4b63; border-radius: 9px; outline: none; color: #edf2f7; background: #0d141d; font: inherit; font-size: 14px; }
@@ -404,6 +406,9 @@
       if (Array.isArray(response.token_candidates) && response.token_candidates.length) {
         renderTokenCandidates(response.token_candidates);
       }
+      if (Array.isArray(response.suggestions) && response.suggestions.length) {
+        renderSuggestions(response.suggestions);
+      }
     }
     else if (response.kind === 'error') addTypingMessage((response.errors || []).map((item) => item.message || item.code).join('\n') || '请求失败。');
     else if (response.kind === 'swap_quote') {
@@ -467,6 +472,17 @@
       renderAssets(response);
     }
     else if (response.message) addTypingMessage(response.message);
+  }
+  function renderSuggestions(suggestions) {
+    const actions = document.createElement('div'); actions.className = 'suggestions';
+    suggestions.forEach((suggestion) => {
+      const button = document.createElement('button'); button.type = 'button';
+      button.textContent = suggestion.label || suggestion.message;
+      button.title = suggestion.message;
+      button.onclick = () => { $('composer').value = suggestion.message; sendMessage(); };
+      actions.append(button);
+    });
+    const row = addMessage('assistant', '', actions); row.dataset.suggestions = 'true';
   }
   function renderTokenCandidates(candidates) {
     const card = document.createElement('div'); card.className = 'card';

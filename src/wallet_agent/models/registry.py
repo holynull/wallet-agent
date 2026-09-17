@@ -55,9 +55,14 @@ def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanM
             "destination_token_address、input_amount。只提取本轮用户明确提供或明确修改的值；"
             "未提供的值返回 null，不要重复旧值。input_amount 保留人类可读字符串。"
             "不要猜测 Token 地址、精度、金额或链。"
+            "中文里‘换一些 USDT’、‘兑换一点 USDT’表示目标资产是 USDT，必须写入"
+            "destination_symbol，不是 source_symbol。‘用 USDC 换’表示来源资产是 USDC；"
+            "如果已有任务中保存了目标资产，不要覆盖或反转它。"
             "示例：‘在 Base 用 1 USDC 换 USDT’对应 source_chain=Base、"
             "destination_chain=Base、source_symbol=USDC、destination_symbol=USDT、"
-            "input_amount=1。示例：‘都在 Base 链’只输出两个 chain 字段，其余为 null。"
+            "input_amount=1。示例：‘都在 Base 链’只输出两个 chain 字段；"
+            "‘来源也在 Base 链’只输出 source_chain=Base；‘目标也在 Base 链’只输出"
+            "destination_chain=Base，其余字段为 null。"
         )
     else:
         raise ValueError(f"unsupported task extractor: {task_kind}")

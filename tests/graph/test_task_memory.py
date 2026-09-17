@@ -189,7 +189,7 @@ async def test_ethereum_swap_resolves_provider_metadata_then_quotes_amount_with_
     model = UnderstandingModel(
         ["swap_quote", "clarification", "clarification", "clarification"],
         swap=[
-            SwapSlotPatch(destination_symbol="USDT"),
+            SwapSlotPatch(source_symbol="USDT"),
             SwapSlotPatch(destination_chain="以太坊"),
             SwapSlotPatch(source_chain="以太坊", source_symbol="USDC"),
             SwapSlotPatch(),
@@ -199,7 +199,7 @@ async def test_ethereum_swap_resolves_provider_metadata_then_quotes_amount_with_
     graph = build_graph(model=model, providers=[provider])
     config = {"configurable": {"thread_id": "task-ethereum-catalog"}}
 
-    await graph.ainvoke(
+    first = await graph.ainvoke(
         {
             "conversation_id": "task-ethereum-catalog",
             "user_id": "eval-user",
@@ -207,6 +207,9 @@ async def test_ethereum_swap_resolves_provider_metadata_then_quotes_amount_with_
         },
         config=config,
     )
+    assert first["active_task"]["slots"] == {"destination_symbol": "USDT"}
+    assert "destination_symbol" not in first["response"]["missing_fields"]
+    assert first["response"]["suggestions"][0]["message"] == "用当前网络上的 USDC 换"
     await graph.ainvoke(
         {
             "conversation_id": "task-ethereum-catalog",
@@ -232,6 +235,9 @@ async def test_ethereum_swap_resolves_provider_metadata_then_quotes_amount_with_
 
     assert third["response"]["kind"] == "clarification"
     assert third["response"]["missing_fields"] == ["input_amount"]
+    assert third["response"]["suggestions"] == [
+        {"label": "填写 USDC 数量", "message": "1 USDC"}
+    ]
     assert third["active_task"]["revision"] == 3
     assert third["active_task"]["slots"] == {
         "destination_symbol": "USDT",
@@ -271,6 +277,37 @@ async def test_ethereum_swap_resolves_provider_metadata_then_quotes_amount_with_
     assert fourth["active_task"]["revision"] == 4
     assert fourth["active_task"]["slots"]["input_amount"] == "1"
     assert provider.quote_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_swap_suggests_known_source_chain_instead_of_different_wallet_chain():
+    model = UnderstandingModel(
+        ["swap_quote"],
+        swap=[
+            SwapSlotPatch(
+                source_chain="ETH",
+                source_symbol="USDC",
+                destination_symbol="USDT",
+            )
+        ],
+    )
+    graph = build_graph(model=model, providers=[EthereumCatalogProvider()])
+
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "cross-chain-suggestion",
+            "user_id": "eval-user",
+            "request": {"message": "用 ETH 上的 USDC 换 USDT"},
+            "wallet_context": {"address": WALLET, "chain": "BASE", "chain_id": 8453},
+        },
+        config={"configurable": {"thread_id": "cross-chain-suggestion"}},
+    )
+
+    assert result["response"]["missing_fields"] == ["destination_chain", "input_amount"]
+    assert result["response"]["suggestions"][0] == {
+        "label": "目标也在 ETH 网络",
+        "message": "目标也在 ETH 链",
+    }
 
 
 @pytest.mark.asyncio

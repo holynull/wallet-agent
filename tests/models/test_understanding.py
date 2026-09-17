@@ -105,6 +105,8 @@ async def test_swap_extractor_receives_existing_slots_and_explicit_schema():
     )
     assert "参数不完整时仍然是 swap" in prompt
     assert '"source_symbol": "USDC"' in prompt
+    assert "‘换一些 USDT’" in prompt
+    assert "destination_symbol，不是 source_symbol" in prompt
 
 
 @pytest.mark.asyncio

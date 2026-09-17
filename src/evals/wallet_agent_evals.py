@@ -355,6 +355,31 @@ CASES = (
         },
     ),
     EvalCase(
+        id="swap_target_direction_memory",
+        capability="swap",
+        turns=("我要兑换一些usdt", "用 USDC 换"),
+        offline_outputs=(
+            {"intent": "swap_quote", "source_symbol": "USDT"},
+            {"intent": "swap_quote", "source_symbol": "USDC"},
+        ),
+        expected={
+            "response_kind": "clarification",
+            "equals": {
+                "active_task.slots.source_symbol": "USDC",
+                "active_task.slots.destination_symbol": "USDT",
+                "response.missing_fields": [
+                    "source_chain",
+                    "destination_chain",
+                    "input_amount",
+                ],
+                "response.suggestions.0.message": "都在 BASE 链",
+            },
+            "side_effects": {"quote_calls": 0},
+            "forbid_prepare": True,
+            "forbid_broadcast": True,
+        },
+    ),
+    EvalCase(
         id="swap_followup_clarification_keeps_slots",
         capability="swap",
         turns=("我想用 1 USDC 换 USDT", "都在 Base 链"),

@@ -54,6 +54,9 @@ async def test_mobile_demo_page_is_served_by_api_app():
     assert "active_task" in response.text
     assert "task.revision" in response.text
     assert "task.missing_fields" in response.text
+    assert "function renderSuggestions" in response.text
+    assert "response.suggestions" in response.text
+    assert "suggestion.message; sendMessage()" in response.text
 
 
 @pytest.mark.asyncio

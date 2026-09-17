@@ -3,6 +3,7 @@ from wallet_agent.domain.normalization import (
     canonical_chain,
     canonical_symbol,
     chain_id_for,
+    swap_direction_hints,
     unambiguous_amount,
 )
 
@@ -34,3 +35,27 @@ def test_canonical_amount_removes_a_single_token_unit_without_guessing():
     assert unambiguous_amount("1 USDC") == "1"
     assert unambiguous_amount("0.01") == "0.01"
     assert unambiguous_amount("大约 1 USDC") is None
+
+
+def test_swap_direction_hints_understand_explicit_chinese_swap_grammar():
+    assert swap_direction_hints("我要兑换一些usdt") == {"destination_symbol": "USDT"}
+    assert swap_direction_hints("换一些以太上的 USDT") == {
+        "destination_chain": "ETH",
+        "destination_symbol": "USDT",
+    }
+    assert swap_direction_hints("用以太上的 usdc 换") == {
+        "source_chain": "ETH",
+        "source_symbol": "USDC",
+    }
+    assert swap_direction_hints("换成当前网络上的 USDT") == {"destination_symbol": "USDT"}
+    assert swap_direction_hints("在 Base 用 1 USDC 换 USDT") == {}
+    assert swap_direction_hints("用 Base 上的 USDC 换") == {
+        "source_chain": "BASE",
+        "source_symbol": "USDC",
+    }
+    assert swap_direction_hints("都在 Base 链") == {
+        "source_chain": "BASE",
+        "destination_chain": "BASE",
+    }
+    assert swap_direction_hints("来源也在 BSC 链") == {"source_chain": "BSC"}
+    assert swap_direction_hints("目标也在 ETH 网络") == {"destination_chain": "ETH"}

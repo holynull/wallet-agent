@@ -38,6 +38,47 @@ _AMOUNT_WITH_UNIT = re.compile(
     r"^\s*((?:\d+(?:\.\d*)?|\.\d+))\s*[A-Za-z][A-Za-z0-9()'`\-]*\s*$"
 )
 _AMOUNT_ONLY = re.compile(r"^\s*((?:\d+(?:\.\d*)?|\.\d+))\s*$")
+_TOKEN_SYMBOL = r"([A-Za-z][A-Za-z0-9()'`\-]*)"
+_NETWORK_QUALIFIER = (
+    r"(?:(?:[A-Za-z]+(?:\s+[A-Za-z]+)?|[\u4e00-\u9fff]+)\s*上的)?"
+)
+_TARGET_SWAP_PATTERNS = (
+    re.compile(
+        rf"(?:想要?|要)?(?:兑换|换)(?:一点点|一些|一点|点儿|点)\s*"
+        rf"{_NETWORK_QUALIFIER}\s*{_TOKEN_SYMBOL}\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?:换成|换为|兑换成|兑换为)\s*"
+        rf"{_NETWORK_QUALIFIER}\s*{_TOKEN_SYMBOL}\s*$",
+        re.IGNORECASE,
+    ),
+)
+_SOURCE_SWAP_PATTERN = re.compile(
+    rf"用\s*{_NETWORK_QUALIFIER}\s*{_TOKEN_SYMBOL}(?:\s*来)?\s*(?:兑换|换)",
+    re.IGNORECASE,
+)
+_CHAIN_NAME = (
+    r"(?:Ethereum|ETH|ERC20|Base|BSC|BEP20|Arbitrum(?:\s+One)?|Optimism|Polygon|"
+    r"以太坊主网|以太坊|以太|币安智能链|币安链)"
+)
+_ALL_SWAP_CHAINS_PATTERN = re.compile(
+    rf"都在\s*({_CHAIN_NAME})\s*(?:链|网络)?", re.IGNORECASE
+)
+_SOURCE_CHAIN_PATTERNS = (
+    re.compile(
+        rf"用\s*({_CHAIN_NAME})\s*(?:链|网络)?\s*上(?:的)?", re.IGNORECASE
+    ),
+    re.compile(rf"来源(?:也)?在\s*({_CHAIN_NAME})\s*(?:链|网络)?", re.IGNORECASE),
+)
+_DESTINATION_CHAIN_PATTERNS = (
+    re.compile(
+        rf"(?:换|兑换)(?:一点点|一些|一点|点儿|点)\s*({_CHAIN_NAME})\s*"
+        rf"(?:链|网络)?\s*上(?:的)?",
+        re.IGNORECASE,
+    ),
+    re.compile(rf"目标(?:也)?在\s*({_CHAIN_NAME})\s*(?:链|网络)?", re.IGNORECASE),
+)
 
 
 def canonical_chain(value: str) -> str:
@@ -67,3 +108,33 @@ def unambiguous_amount(value: str) -> str | None:
 
 def chain_id_for(value: str) -> int | None:
     return _CHAIN_IDS.get(canonical_chain(value))
+
+
+def swap_direction_hints(value: str) -> dict[str, str]:
+    """Extract only swap directions made explicit by stable Chinese grammar."""
+    message = str(value).strip()
+    hints: dict[str, str] = {}
+    all_chains_match = _ALL_SWAP_CHAINS_PATTERN.search(message)
+    if all_chains_match:
+        chain = canonical_chain(all_chains_match.group(1))
+        hints.update(source_chain=chain, destination_chain=chain)
+    else:
+        for pattern in _SOURCE_CHAIN_PATTERNS:
+            source_chain_match = pattern.search(message)
+            if source_chain_match:
+                hints["source_chain"] = canonical_chain(source_chain_match.group(1))
+                break
+        for pattern in _DESTINATION_CHAIN_PATTERNS:
+            destination_chain_match = pattern.search(message)
+            if destination_chain_match:
+                hints["destination_chain"] = canonical_chain(destination_chain_match.group(1))
+                break
+    source_match = _SOURCE_SWAP_PATTERN.search(message)
+    if source_match:
+        hints["source_symbol"] = canonical_symbol(source_match.group(1))
+    for pattern in _TARGET_SWAP_PATTERNS:
+        target_match = pattern.search(message)
+        if target_match:
+            hints["destination_symbol"] = canonical_symbol(target_match.group(1))
+            break
+    return hints

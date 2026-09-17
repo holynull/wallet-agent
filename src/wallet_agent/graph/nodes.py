@@ -31,6 +31,7 @@ from wallet_agent.domain.normalization import (
     canonical_chain,
     canonical_symbol,
     chain_id_for,
+    swap_direction_hints,
     unambiguous_amount,
 )
 from wallet_agent.observability import wallet_event
@@ -429,6 +430,58 @@ def _clarification_message(
     return (
         "你好！我可以帮你查询余额、比较兑换报价、发起转账或兑换。请告诉我具体的 Token、链和数量。"
     )
+
+
+def _swap_suggestions(
+    draft: Mapping[str, Any],
+    missing: list[str],
+    wallet_context: Mapping[str, Any] | None,
+) -> list[dict[str, str]]:
+    """Offer explicit replies that fill slots without taking an action for the user."""
+    suggestions: list[dict[str, str]] = []
+    source_symbol = str(draft.get("source_symbol") or "").strip()
+    destination_symbol = str(draft.get("destination_symbol") or "").strip()
+    source_chain = str(draft.get("source_chain") or "").strip()
+    destination_chain = str(draft.get("destination_chain") or "").strip()
+    wallet_chain = str((wallet_context or {}).get("chain") or "").strip()
+
+    if wallet_chain and all(field in missing for field in ("source_chain", "destination_chain")):
+        suggestions.append(
+            {"label": f"都在 {wallet_chain} 网络", "message": f"都在 {wallet_chain} 链"}
+        )
+    elif "source_chain" in missing and destination_chain:
+        suggestions.append(
+            {
+                "label": f"来源也在 {destination_chain} 网络",
+                "message": f"来源也在 {destination_chain} 链",
+            }
+        )
+    elif "destination_chain" in missing and source_chain:
+        suggestions.append(
+            {
+                "label": f"目标也在 {source_chain} 网络",
+                "message": f"目标也在 {source_chain} 链",
+            }
+        )
+    if "source_symbol" in missing and destination_symbol:
+        suggestions.append(
+            {
+                "label": f"示例：用 USDC 换 {destination_symbol}",
+                "message": "用当前网络上的 USDC 换",
+            }
+        )
+    if "destination_symbol" in missing and source_symbol:
+        suggestions.append(
+            {
+                "label": f"示例：把 {source_symbol} 换成 USDT",
+                "message": "换成当前网络上的 USDT",
+            }
+        )
+    if "input_amount" in missing and source_symbol:
+        suggestions.append(
+            {"label": f"填写 {source_symbol} 数量", "message": f"1 {source_symbol}"}
+        )
+    return suggestions[:3]
 
 
 _SWAP_DRAFT_KEYS = (
@@ -1757,6 +1810,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         "max_poll_attempts": runtime.max_poll_attempts,
                     }
             task_patch = _task_patch(task_kind, patch_source)
+            if task_kind == "swap":
+                direction_hints = swap_direction_hints(message)
+                for key, value in direction_hints.items():
+                    if key in {"source_symbol", "destination_symbol"}:
+                        opposite = (
+                            "destination_symbol" if key == "source_symbol" else "source_symbol"
+                        )
+                        if canonical_symbol(str(task_patch.get(opposite) or "")) == value:
+                            task_patch.pop(opposite, None)
+                    task_patch[key] = value
             amount_key = "amount" if task_kind == "transfer" else "input_amount"
             if amount_key not in task_patch:
                 fallback_amount = unambiguous_amount(message)
@@ -1896,6 +1959,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             "kind": "clarification",
                             "message": _clarification_message(missing=user_missing, swap=True),
                             "missing_fields": user_missing,
+                            "suggestions": _swap_suggestions(
+                                draft, user_missing, state.get("wallet_context")
+                            ),
                         },
                     }
                 errors = resolution_errors or [
