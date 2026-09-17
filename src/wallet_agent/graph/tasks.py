@@ -170,9 +170,11 @@ def _clear_derived_slots(
         if changed & {f"{side}_chain", f"{side}_symbol"}:
             if f"{side}_token_address" not in patch:
                 slots.pop(f"{side}_token_address", None)
-            slots.pop(f"{side}_decimals", None)
-            slots.pop(f"{side}_chain_id", None)
-        elif f"{side}_token_address" in changed:
+            if f"{side}_decimals" not in patch:
+                slots.pop(f"{side}_decimals", None)
+            if f"{side}_chain_id" not in patch:
+                slots.pop(f"{side}_chain_id", None)
+        elif f"{side}_token_address" in changed and f"{side}_decimals" not in patch:
             slots.pop(f"{side}_decimals", None)
     if "input_amount" in changed and "input_amount_raw" not in patch:
         slots.pop("input_amount_raw", None)

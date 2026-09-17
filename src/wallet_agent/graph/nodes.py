@@ -26,6 +26,13 @@ from wallet_agent.domain.models import (
     UnsignedTransaction,
 )
 
+from .tasks import (
+    hydrate_active_task,
+    merge_task_patch,
+    new_active_task,
+    project_legacy_draft,
+)
+
 
 @dataclass(frozen=True)
 class GraphRuntime:
@@ -53,6 +60,58 @@ _VALID_INTENTS = {
     "gas_check",
     "asset_discovery",
 }
+
+_TRANSFER_CANONICAL_KEYS = {
+    "transfer_chain": "chain",
+    "transfer_symbol": "symbol",
+    "transfer_token_address": "token_address",
+    "transfer_decimals": "decimals",
+    "transfer_amount": "amount",
+    "transfer_amount_raw": "amount_raw",
+    "transfer_sender": "sender",
+    "transfer_recipient": "recipient",
+}
+
+
+def _task_patch(kind: str, value: Any) -> dict[str, Any]:
+    dumped = _dump(value)
+    if not isinstance(dumped, dict):
+        return {}
+    if kind == "transfer":
+        result: dict[str, Any] = {}
+        for key, item in dumped.items():
+            canonical = _TRANSFER_CANONICAL_KEYS.get(key, key)
+            if canonical in _TRANSFER_CANONICAL_KEYS.values() and item is not None:
+                result[canonical] = item
+        return result
+    return {key: dumped[key] for key in _SWAP_DRAFT_KEYS if dumped.get(key) is not None}
+
+
+def _resolved_task(task: dict[str, Any], slots: dict[str, Any]) -> dict[str, Any]:
+    updated = {**task, "slots": dict(slots)}
+    sources = dict(task.get("slot_sources") or {})
+    for key in slots:
+        if key not in sources:
+            sources[key] = "resolver"
+    updated["slot_sources"] = sources
+    return updated
+
+
+def _task_progress(
+    task: dict[str, Any],
+    *,
+    slots: dict[str, Any],
+    status: str,
+    stage: str,
+    missing_fields: list[str],
+) -> dict[str, Any]:
+    return {
+        **_resolved_task(task, slots),
+        "status": status,
+        "stage": stage,
+        "missing_fields": list(missing_fields),
+        "updated_by": "system",
+    }
 
 
 def _dump(value: Any) -> Any:
@@ -948,7 +1007,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         """Plan one turn; execution remains in the existing graph nodes."""
         request = _mapping(state.get("request"))
         forced = state.get("forced_intent")
-        if forced in _VALID_INTENTS:
+        if _looks_like_cancel_message(str(request.get("message", ""))) and (
+            state.get("active_task")
+            or state.get("conversation_state")
+            or state.get("swap_draft")
+            or state.get("transfer_draft")
+        ):
+            decision = {"intent": "clarification", "source": "command_guard"}
+        elif forced in _VALID_INTENTS:
             decision = {"intent": forced, "source": "api"}
         elif (
             state.get("intent") in _VALID_INTENTS
@@ -969,6 +1035,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 model_request["swap_request"] = _dump(model_request["swap_request"])
             model_request["wallet_context"] = state.get("wallet_context")
             model_request["conversation_state"] = state.get("conversation_state")
+            model_request["active_task"] = state.get("active_task")
             model_request["swap_draft"] = state.get("swap_draft")
             model_request["transfer_draft"] = state.get("transfer_draft")
             model_request["available_capabilities"] = {
@@ -982,11 +1049,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "business_nodes": ["transfer", "swap_allowance", "prepare", "status_poll"],
             }
             try:
-                output = (
-                    runtime.model.ainvoke(model_request)
-                    if hasattr(runtime.model, "ainvoke")
-                    else runtime.model.invoke(model_request)
-                )
+                if hasattr(runtime.model, "classify"):
+                    output = runtime.model.classify(model_request)
+                elif hasattr(runtime.model, "ainvoke"):
+                    output = runtime.model.ainvoke(model_request)
+                else:
+                    output = runtime.model.invoke(model_request)
                 output = await output if hasattr(output, "__await__") else output
                 decision = _parse_model_output(output)
             except Exception as exc:
@@ -1006,6 +1074,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 decision = {**decision, "source": "model"}
         update: dict[str, Any] = {
             "intent": decision["intent"],
+            "predicted_intent": decision["intent"],
             "supervisor_decision": decision,
             "supervisor_output": decision,
             # Preserve every legacy request field while making the checkpoint
@@ -1399,6 +1468,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
     async def intent(state: dict[str, Any]) -> dict[str, Any]:
         existing = state.get("forced_intent")
         request = _mapping(state.get("request"))
+        message = str(request.get("message", ""))
+        active_task = hydrate_active_task(state)
         if existing is None and not request.get("message"):
             existing = state.get("intent")
         valid = {
@@ -1417,42 +1488,57 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "gas_check",
             "asset_discovery",
         }
-        supervisor_source = (state.get("supervisor_output") or {}).get("source")
-        if existing in valid and (
-            not state.get("supervisor_output") or supervisor_source in {"api", "graph_resume"}
-        ):
-            return {"route": existing, "max_poll_attempts": runtime.max_poll_attempts}
-        message = str(request.get("message", ""))
         if _looks_like_cancel_message(message) and (
-            state.get("conversation_state")
+            active_task
+            or state.get("conversation_state")
             or state.get("swap_draft")
+            or state.get("transfer_draft")
             or state.get("swap_request")
             or state.get("selected_quote")
         ):
+            kind = str((active_task or {}).get("kind") or "swap")
+            if active_task:
+                active_task = {
+                    **active_task,
+                    "status": "cancelled",
+                    "stage": "cancelled",
+                    "missing_fields": [],
+                    "updated_by": "user",
+                }
             cancelled = _task_state(
                 state.get("conversation_state"),
-                goal="swap",
+                goal=kind,
                 stage="cancelled",
-                slots={},
+                slots=(active_task or {}).get("slots") or {},
                 missing_fields=[],
                 status="cancelled",
                 updated_by="user",
             )
             return {
                 "intent": "clarification",
+                "response_action": "cancelled",
                 "forced_intent": None,
                 "route": "response",
+                "active_task": active_task,
                 "conversation_state": cancelled,
                 "task_stage": "cancelled",
-                "swap_draft": {},
+                "swap_draft": {} if kind == "swap" else state.get("swap_draft"),
+                "transfer_draft": {} if kind == "transfer" else state.get("transfer_draft"),
                 "swap_request": None,
+                "transfer_request": None,
                 "token_candidates": [],
                 "quote_candidates": [{"__clear__": True}],
                 "selected_quote": None,
+                "confirmation_state": None,
                 "pending_transaction": None,
                 "user_confirmation": None,
-                "response": {"kind": "cancelled", "message": "已取消当前兑换。"},
+                "response": {"kind": "cancelled", "message": f"已取消当前{kind}任务。"},
             }
+        supervisor_source = (state.get("supervisor_output") or {}).get("source")
+        if existing in valid and (
+            not state.get("supervisor_output") or supervisor_source in {"api", "graph_resume"}
+        ):
+            return {"route": existing, "max_poll_attempts": runtime.max_poll_attempts}
         parsed = _parse_model_output(state.get("supervisor_output"))
         if parsed and parsed.get("source") in {"api", "graph_resume"}:
             # Forced/resumed requests may already contain structured fields;
@@ -1462,6 +1548,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             try:
                 model_request = dict(request)
                 model_request["wallet_context"] = state.get("wallet_context")
+                model_request["active_task"] = active_task
                 model_request["swap_draft"] = state.get("swap_draft")
                 model_request["transfer_draft"] = state.get("transfer_draft")
                 model_request["conversation_state"] = state.get("conversation_state")
@@ -1492,6 +1579,49 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "max_poll_attempts": runtime.max_poll_attempts,
             }
         intent_value = parsed["intent"]
+        explicit_task_kind = {
+            "transfer": "transfer",
+            "swap_quote": "swap",
+        }.get(intent_value)
+        task_kind = explicit_task_kind
+        if task_kind is None and intent_value == "clarification" and active_task:
+            task_kind = active_task.get("kind")
+        task_update: dict[str, Any] = {}
+        if task_kind in {"transfer", "swap"}:
+            if (
+                not active_task
+                or active_task.get("kind") != task_kind
+                or active_task.get("status") in {"completed", "cancelled"}
+            ):
+                active_task = new_active_task(task_kind)
+            patch_source: Any = parsed
+            if hasattr(runtime.model, "extract"):
+                extraction_request = dict(request)
+                extraction_request["wallet_context"] = state.get("wallet_context")
+                extraction_request["active_task"] = active_task
+                extraction_request["conversation_state"] = state.get("conversation_state")
+                try:
+                    patch_source = runtime.model.extract(task_kind, extraction_request)
+                    patch_source = (
+                        await patch_source if hasattr(patch_source, "__await__") else patch_source
+                    )
+                except Exception as exc:
+                    return {
+                        "intent": "clarification",
+                        "route": "clarification",
+                        "active_task": active_task,
+                        "errors": [_error("SLOT_EXTRACTION_FAILED", str(exc), retryable=True)],
+                        "response": {
+                            "kind": "clarification",
+                            "message": "我没有可靠地识别出本轮参数，请换一种说法。",
+                            "missing_fields": active_task.get("missing_fields") or [],
+                        },
+                        "max_poll_attempts": runtime.max_poll_attempts,
+                    }
+            merged = merge_task_patch(active_task, _task_patch(task_kind, patch_source))
+            active_task = merged.task
+            task_update = {"active_task": active_task, **merged.invalidation}
+            intent_value = "transfer" if task_kind == "transfer" else "swap_quote"
         if intent_value == "clarification":
             looks_like_swap = _looks_like_swap_message(message)
             state_update = {}
@@ -1508,6 +1638,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             return {
                 "intent": "clarification",
                 "route": "clarification",
+                "active_task": active_task,
+                "response_action": "clarification",
                 "max_poll_attempts": runtime.max_poll_attempts,
                 **state_update,
                 "response": {
@@ -1521,14 +1653,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 },
             }
         if intent_value == "swap_quote":
-            draft = dict(state.get("swap_draft") or {})
+            draft = (
+                project_legacy_draft(active_task)
+                if active_task and active_task.get("kind") == "swap"
+                else dict(state.get("swap_draft") or {})
+            )
             if not draft and state.get("swap_request"):
                 draft = _swap_draft_from_request(state.get("swap_request"))
-            incoming = {key: parsed[key] for key in _SWAP_DRAFT_KEYS if parsed.get(key) is not None}
-            previous_draft = dict(draft)
-            draft = _merge_swap_slots(draft, incoming)
-            changed = draft != previous_draft
             draft, token_candidates = await _resolve_swap_assets(draft, runtime.providers)
+            if active_task:
+                active_task = _resolved_task(active_task, draft)
+                task_update["active_task"] = active_task
             if token_candidates:
                 descriptions = [
                     (
@@ -1541,6 +1676,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "intent": "clarification",
                     "route": "clarification",
                     "swap_draft": draft,
+                    **task_update,
+                    "active_task": _task_progress(
+                        active_task,
+                        slots=draft,
+                        status="collecting",
+                        stage="selecting_token",
+                        missing_fields=[],
+                    ),
                     "token_candidates": token_candidates,
                     "missing_fields": [],
                     **_task_update(
@@ -1562,10 +1705,19 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             request_model, missing = _swap_draft_request(draft, state.get("wallet_context"))
             if request_model is None:
+                active_task = _task_progress(
+                    active_task,
+                    slots=draft,
+                    status="collecting",
+                    stage="collecting_parameters",
+                    missing_fields=missing,
+                )
                 return {
                     "intent": "clarification",
                     "route": "clarification",
                     "swap_draft": draft,
+                    **task_update,
+                    "active_task": active_task,
                     "missing_fields": missing,
                     **_task_update(
                         state.get("conversation_state"),
@@ -1581,17 +1733,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         "missing_fields": missing,
                     },
                 }
+            active_task = _task_progress(
+                active_task,
+                slots=draft,
+                status="ready",
+                stage="ready_for_quote",
+                missing_fields=[],
+            )
             return {
                 "intent": intent_value,
                 "route": intent_value,
                 "swap_draft": draft,
+                **task_update,
+                "active_task": active_task,
                 "missing_fields": [],
                 "swap_request": request_model.model_dump(mode="json"),
-                **(
-                    {"selected_quote": None, "quote_candidates": [{"__clear__": True}]}
-                    if changed
-                    else {}
-                ),
                 **_task_update(
                     state.get("conversation_state"),
                     goal="swap",
@@ -1602,17 +1758,28 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "max_poll_attempts": runtime.max_poll_attempts,
             }
         if intent_value == "transfer":
-            draft = dict(state.get("transfer_draft") or {})
-            draft.update(
-                {key: parsed[key] for key in _TRANSFER_DRAFT_KEYS if parsed.get(key) is not None}
+            draft = (
+                project_legacy_draft(active_task)
+                if active_task and active_task.get("kind") == "transfer"
+                else dict(state.get("transfer_draft") or {})
             )
             request_model, missing = _transfer_draft_request(draft, state.get("wallet_context"))
             if request_model is None:
                 labels = ", ".join(missing)
+                canonical_slots = dict((active_task or {}).get("slots") or {})
+                active_task = _task_progress(
+                    active_task,
+                    slots=canonical_slots,
+                    status="collecting",
+                    stage="collecting_parameters",
+                    missing_fields=missing,
+                )
                 return {
                     "intent": "clarification",
                     "route": "clarification",
                     "transfer_draft": draft,
+                    **task_update,
+                    "active_task": active_task,
                     "missing_fields": missing,
                     **_task_update(
                         state.get("conversation_state"),
@@ -1628,10 +1795,19 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         "missing_fields": missing,
                     },
                 }
+            active_task = _task_progress(
+                active_task,
+                slots=dict((active_task or {}).get("slots") or {}),
+                status="ready",
+                stage="ready_for_prepare",
+                missing_fields=[],
+            )
             return {
                 "intent": intent_value,
                 "route": intent_value,
                 "transfer_draft": draft,
+                **task_update,
+                "active_task": active_task,
                 "missing_fields": [],
                 "transfer_request": request_model.model_dump(mode="json"),
                 **_task_update(
