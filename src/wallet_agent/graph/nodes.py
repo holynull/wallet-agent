@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -195,16 +196,69 @@ def _confirmation_snapshot(
     ttl_seconds: int,
     reason: str | None = None,
     requested_at: datetime | None = None,
+    task_id: str | None = None,
+    task_revision: int | None = None,
 ) -> dict[str, Any]:
     now = requested_at or datetime.now(timezone.utc)
-    return {
+    snapshot = {
         "action": action,
         "status": status,
         "requested_at": now.isoformat(),
         "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat(),
         "summary": summary,
         "reason": reason,
+        "payload_hash": confirmation_payload_hash(summary),
     }
+    if task_id is not None:
+        snapshot["task_id"] = task_id
+    if task_revision is not None:
+        snapshot["task_revision"] = task_revision
+    return snapshot
+
+
+def confirmation_payload_hash(summary: Mapping[str, Any]) -> str:
+    """Hash a JSON-safe confirmation summary independently of dictionary order."""
+    canonical = json.dumps(
+        _dump(summary),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _swap_confirmation_summary(selected: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "provider": selected.get("provider"),
+        "provider_reference": selected.get("provider_reference"),
+        "source_asset": selected.get("source_asset"),
+        "destination_asset": selected.get("destination_asset"),
+        "input_amount": selected.get("input_amount"),
+        "expected_output": selected.get("expected_output"),
+    }
+
+
+def _confirmation_stale(state: Mapping[str, Any], confirmation: Mapping[str, Any]) -> bool:
+    """Return false for legacy confirmations and strictly validate versioned ones."""
+    if not all(key in confirmation for key in ("task_id", "task_revision", "payload_hash")):
+        return False
+    task = hydrate_active_task(state)
+    if task is None:
+        expected_task_id = f"legacy:{state.get('conversation_id') or 'conversation'}:swap"
+        expected_revision = 0
+    else:
+        expected_task_id = str(task.get("task_id"))
+        expected_revision = int(task.get("revision") or 0)
+    if confirmation.get("task_id") != expected_task_id:
+        return True
+    if int(confirmation.get("task_revision") or 0) != expected_revision:
+        return True
+    selected = _dump(state.get("selected_quote"))
+    if not isinstance(selected, Mapping):
+        return True
+    return confirmation.get("payload_hash") != confirmation_payload_hash(
+        _swap_confirmation_summary(selected)
+    )
 
 
 def _confirmation_expired(value: dict[str, Any]) -> bool:
@@ -1293,18 +1347,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             return {"task_stage": "confirmed"}
         if current.get("status") == "requested" and not _confirmation_expired(current):
             return {"task_stage": "awaiting_confirmation"}
+        task = hydrate_active_task(state)
+        task_id = (
+            str(task.get("task_id"))
+            if task is not None
+            else f"legacy:{state.get('conversation_id') or 'conversation'}:swap"
+        )
+        task_revision = int(task.get("revision") or 0) if task is not None else 0
+        summary = _swap_confirmation_summary(selected)
         confirmation = _confirmation_snapshot(
             action="swap",
             status="requested",
-            summary={
-                "provider": selected.get("provider"),
-                "provider_reference": selected.get("provider_reference"),
-                "source_asset": selected.get("source_asset"),
-                "destination_asset": selected.get("destination_asset"),
-                "input_amount": selected.get("input_amount"),
-                "expected_output": selected.get("expected_output"),
-            },
+            summary=summary,
             ttl_seconds=runtime.confirmation_ttl_seconds,
+            task_id=task_id,
+            task_revision=task_revision,
         )
         return {
             "confirmation_state": confirmation,
@@ -1318,6 +1375,23 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
 
     async def confirmation_wait(state: dict[str, Any]) -> dict[str, Any]:
         current = state.get("confirmation_state") or {}
+        if _confirmation_stale(state, current):
+            stale = {**current, "status": "stale", "reason": "task_revision_changed"}
+            return {
+                "confirmation_state": stale,
+                "task_stage": "confirmation_stale",
+                "response": {
+                    "kind": "error",
+                    "errors": [
+                        _error(
+                            "CONFIRMATION_STALE",
+                            "任务参数已变化，请重新确认最新交易。",
+                            retryable=True,
+                        )
+                    ],
+                    "confirmation": stale,
+                },
+            }
         if current.get("status") == "approved":
             return {}
         if _confirmation_expired(current):
@@ -2714,6 +2788,20 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             }
         if state.get("pending_transaction"):
             return {}
+        confirmation_state = state.get("confirmation_state") or {}
+        if confirmation_state and _confirmation_stale(state, confirmation_state):
+            return {
+                "response": {
+                    "kind": "error",
+                    "errors": [
+                        _error(
+                            "CONFIRMATION_STALE",
+                            "任务参数已变化，请重新确认最新交易。",
+                            retryable=True,
+                        )
+                    ],
+                }
+            }
         confirmation = state.get("user_confirmation")
         if confirmation is None:
             answer = interrupt({"kind": "confirmation_required", "quote": selected})

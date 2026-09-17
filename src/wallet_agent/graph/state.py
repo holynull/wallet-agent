@@ -42,6 +42,9 @@ class ConfirmationState(TypedDict, total=False):
     expires_at: str
     summary: dict[str, Any]
     reason: str | None
+    task_id: str
+    task_revision: int
+    payload_hash: str
 
 
 TaskKind = Literal["transfer", "swap"]

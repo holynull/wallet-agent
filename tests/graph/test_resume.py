@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -9,6 +10,7 @@ from wallet_agent.domain.models import (
     UnsignedTransaction,
 )
 from wallet_agent.graph.build import build_graph
+from wallet_agent.graph.nodes import confirmation_payload_hash
 
 
 class PrepareProvider:
@@ -42,6 +44,68 @@ def selected_quote():
         expected_output_raw="1000000",
         provider_reference="ref",
     ).model_dump(mode="json")
+
+
+def test_confirmation_payload_hash_is_stable_across_key_order():
+    assert confirmation_payload_hash({"provider": "bridgers", "input_amount": "1"}) == (
+        confirmation_payload_hash({"input_amount": "1", "provider": "bridgers"})
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_task_revision_is_rejected_before_prepare():
+    provider = PrepareProvider()
+    graph = build_graph(model=object(), providers=[provider])
+    quote = selected_quote()
+    summary = {
+        "provider": quote["provider"],
+        "provider_reference": quote["provider_reference"],
+        "source_asset": quote["source_asset"],
+        "destination_asset": quote["destination_asset"],
+        "input_amount": quote["input_amount"],
+        "expected_output": quote["expected_output"],
+    }
+    now = datetime.now(timezone.utc)
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "stale-confirmation",
+            "intent": "swap_prepare",
+            "active_task": {
+                "task_id": "swap-task",
+                "kind": "swap",
+                "status": "ready",
+                "stage": "ready_for_prepare",
+                "revision": 2,
+                "slots": {},
+                "slot_sources": {},
+                "missing_fields": [],
+            },
+            "selected_quote": quote,
+            "swap_request": {
+                "source_asset": quote["source_asset"],
+                "destination_asset": quote["destination_asset"],
+                "input_amount": "1",
+                "input_amount_raw": "1000000",
+                "sender_address": "0x1",
+                "recipient_address": "0x2",
+            },
+            "confirmation_state": {
+                "action": "swap",
+                "status": "requested",
+                "requested_at": now.isoformat(),
+                "expires_at": (now + timedelta(minutes=5)).isoformat(),
+                "summary": summary,
+                "reason": None,
+                "task_id": "swap-task",
+                "task_revision": 1,
+                "payload_hash": confirmation_payload_hash(summary),
+            },
+        },
+        config={"configurable": {"thread_id": "stale-confirmation"}},
+    )
+
+    assert result["response"]["errors"][0]["code"] == "CONFIRMATION_STALE"
+    assert provider.prepare_calls == 0
 
 
 @pytest.mark.asyncio
