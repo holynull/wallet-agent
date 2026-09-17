@@ -27,6 +27,12 @@ from wallet_agent.domain.models import (
     TransferRequest,
     UnsignedTransaction,
 )
+from wallet_agent.domain.normalization import (
+    canonical_chain,
+    canonical_symbol,
+    chain_id_for,
+    unambiguous_amount,
+)
 from wallet_agent.observability import wallet_event
 
 from .tasks import (
@@ -74,6 +80,17 @@ _TRANSFER_CANONICAL_KEYS = {
     "transfer_sender": "sender",
     "transfer_recipient": "recipient",
 }
+_USER_SWAP_FIELDS = frozenset(
+    {
+        "source_chain",
+        "destination_chain",
+        "source_symbol",
+        "destination_symbol",
+        "input_amount",
+        "sender_address",
+        "recipient_address",
+    }
+)
 
 
 def _task_patch(kind: str, value: Any) -> dict[str, Any]:
@@ -406,11 +423,7 @@ def _clarification_message(
     }
     if swap and missing:
         readable = [labels.get(item, item) for item in missing]
-        return (
-            "可以帮你兑换。"
-            f"还需要确认：{'、'.join(readable)}。"
-            "请告诉我来源 Token 和链、目标 Token 和链；如果已连接钱包，钱包地址会自动使用。"
-        )
+        return f"可以帮你兑换。还需要确认：{'、'.join(readable)}。"
     if message:
         return message
     return (
@@ -835,10 +848,25 @@ def _swap_draft_request(
 
 async def _resolve_swap_assets(
     draft: dict[str, Any], providers: dict[str, Any]
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     """Fill token metadata when a provider has exactly one matching asset."""
     resolved = dict(draft)
     candidates: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    asset_providers = {
+        name: provider for name, provider in providers.items() if hasattr(provider, "list_assets")
+    }
+    resolvable_sides = [
+        side
+        for side in ("source", "destination")
+        if resolved.get(f"{side}_chain") and resolved.get(f"{side}_symbol")
+    ]
+    if resolvable_sides and not asset_providers:
+        return (
+            resolved,
+            candidates,
+            [_error("ASSET_PROVIDER_UNAVAILABLE", "没有可用的 Token 元数据源。")],
+        )
     for side in ("source", "destination"):
         chain = resolved.get(f"{side}_chain")
         symbol = resolved.get(f"{side}_symbol")
@@ -847,24 +875,37 @@ async def _resolve_swap_assets(
         if resolved.get(f"{side}_token_address") and resolved.get(f"{side}_decimals") is not None:
             continue
         matches: list[Asset] = []
-        query = AssetQuery(chain=str(chain), search=str(symbol))
-        for provider in providers.values():
-            if hasattr(provider, "list_assets"):
-                try:
-                    matches.extend(await provider.list_assets(query))
-                except Exception:
-                    continue
+        query = AssetQuery(chain=canonical_chain(str(chain)), search=canonical_symbol(str(symbol)))
+        for provider_name, provider in asset_providers.items():
+            try:
+                matches.extend(await provider.list_assets(query))
+            except Exception as exc:
+                errors.append(
+                    _error(
+                        "ASSET_DISCOVERY_FAILED",
+                        str(exc),
+                        retryable=True,
+                        details={"provider": provider_name, "side": side},
+                    )
+                )
         unique = {
             (str(asset.address).lower(), int(asset.decimals)): asset
             for asset in matches
             if asset.address
-            and str(asset.chain).upper() == str(chain).upper()
-            and str(asset.symbol).upper() == str(symbol).upper()
+            and canonical_chain(str(asset.chain)) == canonical_chain(str(chain))
+            and canonical_symbol(str(asset.symbol)) == canonical_symbol(str(symbol))
         }
         if len(unique) == 1:
             asset = next(iter(unique.values()))
             resolved[f"{side}_token_address"] = asset.address
             resolved[f"{side}_decimals"] = asset.decimals
+            chain_id = asset.chain_id or chain_id_for(str(chain))
+            if chain_id is not None:
+                resolved[f"{side}_chain_id"] = chain_id
+            if asset.name:
+                resolved[f"{side}_name"] = asset.name
+            if asset.logo_url:
+                resolved[f"{side}_logo_url"] = asset.logo_url
         elif len(unique) > 1:
             candidates.extend(
                 {
@@ -876,7 +917,15 @@ async def _resolve_swap_assets(
                 }
                 for asset in unique.values()
             )
-    return resolved, candidates
+        else:
+            errors.append(
+                _error(
+                    "ASSET_NOT_FOUND",
+                    f"没有找到 {chain} 上的 {symbol}。",
+                    details={"side": side, "chain": str(chain), "symbol": str(symbol)},
+                )
+            )
+    return resolved, candidates, errors
 
 
 def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
@@ -1707,7 +1756,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         },
                         "max_poll_attempts": runtime.max_poll_attempts,
                     }
-            merged = merge_task_patch(active_task, _task_patch(task_kind, patch_source))
+            task_patch = _task_patch(task_kind, patch_source)
+            amount_key = "amount" if task_kind == "transfer" else "input_amount"
+            if amount_key not in task_patch:
+                fallback_amount = unambiguous_amount(message)
+                if fallback_amount is not None:
+                    task_patch[amount_key] = fallback_amount
+            merged = merge_task_patch(active_task, task_patch)
             active_task = merged.task
             task_update = {"active_task": active_task, **merged.invalidation}
             wallet_event(
@@ -1760,7 +1815,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             )
             if not draft and state.get("swap_request"):
                 draft = _swap_draft_from_request(state.get("swap_request"))
-            draft, token_candidates = await _resolve_swap_assets(draft, runtime.providers)
+            draft, token_candidates, resolution_errors = await _resolve_swap_assets(
+                draft, runtime.providers
+            )
             if active_task:
                 active_task = _resolved_task(active_task, draft)
                 task_update["active_task"] = active_task
@@ -1805,32 +1862,54 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             request_model, missing = _swap_draft_request(draft, state.get("wallet_context"))
             if request_model is None:
+                user_missing = [field for field in missing if field in _USER_SWAP_FIELDS]
+                if "input_amount_raw" in missing and "input_amount" not in user_missing:
+                    user_missing.append("input_amount")
+                stage = "collecting_parameters" if user_missing else "resolving_assets"
                 active_task = _task_progress(
                     active_task,
                     slots=draft,
                     status="collecting",
-                    stage="collecting_parameters",
-                    missing_fields=missing,
+                    stage=stage,
+                    missing_fields=user_missing,
                 )
-                return {
+                common_update = {
                     "intent": "clarification",
                     "route": "clarification",
                     "swap_draft": draft,
                     **task_update,
                     "active_task": active_task,
-                    "missing_fields": missing,
+                    "missing_fields": user_missing,
                     **_task_update(
                         state.get("conversation_state"),
                         goal="swap",
-                        stage="collecting_parameters",
+                        stage=stage,
                         slots=draft,
-                        missing_fields=missing,
+                        missing_fields=user_missing,
                     ),
                     "max_poll_attempts": runtime.max_poll_attempts,
+                }
+                if user_missing:
+                    return {
+                        **common_update,
+                        "response": {
+                            "kind": "clarification",
+                            "message": _clarification_message(missing=user_missing, swap=True),
+                            "missing_fields": user_missing,
+                        },
+                    }
+                errors = resolution_errors or [
+                    _error(
+                        "ASSET_RESOLUTION_FAILED",
+                        "无法从已配置的兑换服务确认 Token 元数据。",
+                    )
+                ]
+                return {
+                    **common_update,
                     "response": {
-                        "kind": "clarification",
-                        "message": _clarification_message(missing=missing, swap=True),
-                        "missing_fields": missing,
+                        "kind": "error",
+                        "message": "无法确认兑换资产，请检查 Token 和网络是否受支持。",
+                        "errors": errors,
                     },
                 }
             active_task = _task_progress(

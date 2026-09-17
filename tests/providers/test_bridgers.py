@@ -4,7 +4,7 @@ from typing import Any
 import httpx
 import pytest
 
-from wallet_agent.domain.models import Asset, ProviderOrder, SwapQuoteRequest
+from wallet_agent.domain.models import Asset, AssetQuery, ProviderOrder, SwapQuoteRequest
 from wallet_agent.providers.bridgers import BridgersProvider
 from wallet_agent.providers.http import HttpJsonTransport, ProviderResponseError
 
@@ -23,6 +23,37 @@ class FakeTransport:
     ) -> dict[str, Any]:
         self.calls.append({"path": path, "payload": payload, "idempotency_key": idempotency_key})
         return self.responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_bridgers_list_assets_normalizes_chain_and_filters_search():
+    transport = FakeTransport(
+        {
+            "resCode": "100",
+            "data": {
+                "tokens": [
+                    {
+                        "chain": "ETH",
+                        "symbol": "USDC",
+                        "decimals": 6,
+                        "address": "0x0000000000000000000000000000000000000011",
+                    },
+                    {
+                        "chain": "ETH",
+                        "symbol": "USDT(ERC20)",
+                        "decimals": 6,
+                        "address": "0x0000000000000000000000000000000000000022",
+                    },
+                ]
+            },
+        }
+    )
+    provider = BridgersProvider.from_transport(transport)
+
+    assets = await provider.list_assets(AssetQuery(chain="Ethereum", search="USDT"))
+
+    assert [asset.symbol for asset in assets] == ["USDT(ERC20)"]
+    assert transport.calls[0]["payload"] == {"chain": "ETH"}
 
 
 @pytest.mark.asyncio

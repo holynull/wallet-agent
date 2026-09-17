@@ -66,6 +66,31 @@ class Provider:
         )
 
 
+class EthereumCatalogProvider(Provider):
+    async def list_assets(self, query: AssetQuery):
+        assert query.chain == "ETH"
+        assets = {
+            "USDC": Asset(
+                chain="ETH",
+                symbol="USDC",
+                decimals=6,
+                address=USDC,
+                name="USD Coin",
+                logo_url="https://example.invalid/usdc.png",
+            ),
+            "USDT": Asset(
+                chain="ETH",
+                symbol="USDT(ERC20)",
+                decimals=6,
+                address=USDT,
+                name="Tether",
+                logo_url="https://example.invalid/usdt.png",
+            ),
+        }
+        asset = assets.get(str(query.search).upper())
+        return [asset] if asset else []
+
+
 class Chain:
     async def validate_address(self, address):
         return address.startswith("0x") and len(address) == 42
@@ -157,6 +182,95 @@ async def test_swap_follow_up_classified_as_clarification_still_merges_chain_pat
     assert second["active_task"]["slots"]["source_symbol"] == "USDC"
     assert provider.quote_calls == 1
     assert model.extracted_kinds == ["swap", "swap"]
+
+
+@pytest.mark.asyncio
+async def test_ethereum_swap_resolves_provider_metadata_then_quotes_amount_with_unit():
+    model = UnderstandingModel(
+        ["swap_quote", "clarification", "clarification", "clarification"],
+        swap=[
+            SwapSlotPatch(destination_symbol="USDT"),
+            SwapSlotPatch(destination_chain="以太坊"),
+            SwapSlotPatch(source_chain="以太坊", source_symbol="USDC"),
+            SwapSlotPatch(),
+        ],
+    )
+    provider = EthereumCatalogProvider()
+    graph = build_graph(model=model, providers=[provider])
+    config = {"configurable": {"thread_id": "task-ethereum-catalog"}}
+
+    await graph.ainvoke(
+        {
+            "conversation_id": "task-ethereum-catalog",
+            "user_id": "eval-user",
+            "request": {"message": "换一些 USDT"},
+        },
+        config=config,
+    )
+    await graph.ainvoke(
+        {
+            "conversation_id": "task-ethereum-catalog",
+            "user_id": "eval-user",
+            "request": {"message": "换一些以太上的 USDT"},
+        },
+        config=config,
+    )
+    third = await graph.ainvoke(
+        {
+            "conversation_id": "task-ethereum-catalog",
+            "user_id": "eval-user",
+            "request": {"message": "用以太上的 USDC"},
+            "wallet_context": {
+                "address": WALLET,
+                "chain": "ETH",
+                "chain_id": 1,
+                "native_symbol": "ETH",
+            },
+        },
+        config=config,
+    )
+
+    assert third["response"]["kind"] == "clarification"
+    assert third["response"]["missing_fields"] == ["input_amount"]
+    assert third["active_task"]["revision"] == 3
+    assert third["active_task"]["slots"] == {
+        "destination_symbol": "USDT",
+        "source_chain": "ETH",
+        "destination_chain": "ETH",
+        "source_symbol": "USDC",
+        "source_token_address": USDC,
+        "source_decimals": 6,
+        "source_chain_id": 1,
+        "source_name": "USD Coin",
+        "source_logo_url": "https://example.invalid/usdc.png",
+        "destination_token_address": USDT,
+        "destination_decimals": 6,
+        "destination_chain_id": 1,
+        "destination_name": "Tether",
+        "destination_logo_url": "https://example.invalid/usdt.png",
+    }
+    assert third["active_task"]["slot_sources"]["source_token_address"] == "resolver"
+    assert third["active_task"]["slot_sources"]["destination_token_address"] == "resolver"
+
+    fourth = await graph.ainvoke(
+        {
+            "conversation_id": "task-ethereum-catalog",
+            "user_id": "eval-user",
+            "request": {"message": "1 USDC"},
+            "wallet_context": {
+                "address": WALLET,
+                "chain": "ETH",
+                "chain_id": 1,
+                "native_symbol": "ETH",
+            },
+        },
+        config=config,
+    )
+
+    assert fourth["response"]["kind"] == "swap_quote"
+    assert fourth["active_task"]["revision"] == 4
+    assert fourth["active_task"]["slots"]["input_amount"] == "1"
+    assert provider.quote_calls == 1
 
 
 @pytest.mark.asyncio

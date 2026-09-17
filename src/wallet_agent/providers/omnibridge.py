@@ -18,6 +18,7 @@ from wallet_agent.domain.models import (
     ProviderOrder,
     SwapQuoteRequest,
 )
+from wallet_agent.domain.normalization import canonical_chain, canonical_symbol
 
 from .http import ProviderResponseError
 
@@ -67,8 +68,10 @@ class OmniBridgeProvider:
 
     async def list_assets(self, query: AssetQuery) -> list[Asset]:
         payload = {"sourceFlag": self.source_flag}
-        if query.chain:
-            payload["mainNetwork"] = query.chain
+        chain_filter = canonical_chain(query.chain) if query.chain else None
+        search_filter = canonical_symbol(query.search) if query.search else None
+        if chain_filter:
+            payload["mainNetwork"] = chain_filter
         data = _success(await self.transport.post("/api/v1/queryCoinList", payload))
         if isinstance(data, list):
             items = data
@@ -76,8 +79,6 @@ class OmniBridgeProvider:
             items = data.get("list", data.get("coins", []))
         else:
             items = []
-        chain_filter = query.chain.casefold() if query.chain else None
-        search_filter = query.search.casefold() if query.search else None
         return [
             Asset(
                 chain=str(x.get("mainNetwork", x.get("chain", ""))),
@@ -91,12 +92,14 @@ class OmniBridgeProvider:
             if isinstance(x, dict)
             and (
                 chain_filter is None
-                or str(x.get("mainNetwork", x.get("chain", ""))).casefold() == chain_filter
+                or canonical_chain(str(x.get("mainNetwork", x.get("chain", ""))))
+                == chain_filter
             )
             and (
                 search_filter is None
-                or search_filter in str(x.get("coinCode", x.get("symbol", ""))).casefold()
-                or search_filter in str(x.get("coinName", x.get("name", ""))).casefold()
+                or search_filter
+                in canonical_symbol(str(x.get("coinCode", x.get("symbol", ""))))
+                or search_filter in canonical_symbol(str(x.get("coinName", x.get("name", ""))))
             )
         ]
 

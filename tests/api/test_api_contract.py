@@ -1,5 +1,6 @@
 import httpx
 import pytest
+from langgraph.types import Interrupt
 
 from wallet_agent.api import create_app
 from wallet_agent.domain.errors import ChainCapabilityUnavailable
@@ -56,6 +57,32 @@ async def test_sse_completion_and_missing_run_contract():
     assert "event: complete" in stream.text
     assert "RUN_NOT_FOUND" in missing.text
     assert "run not found" in missing.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_sse_serializes_langgraph_interrupt_payload():
+    app, client = await client_for()
+    app.state.runs["interrupt-run"] = {
+        "status": "awaiting_confirmation",
+        "events": [
+            {
+                "event": "action_required",
+                "state": {
+                    "__interrupt__": (
+                        Interrupt(value={"action": "swap", "status": "requested"}, id="i-1"),
+                    )
+                },
+            }
+        ],
+    }
+
+    async with client:
+        stream = await client.get("/v1/agent/stream/interrupt-run")
+
+    assert stream.status_code == 200
+    assert "event: action_required" in stream.text
+    assert '"id": "i-1"' in stream.text
+    assert '"action": "swap"' in stream.text
 
 
 @pytest.mark.asyncio

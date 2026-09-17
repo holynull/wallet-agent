@@ -6,6 +6,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -137,6 +138,11 @@ class TransferPrepareRequest(BaseModel):
 def _jsonable(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _jsonable(getattr(value, field.name))
+            for field in fields(value)
+        }
     if isinstance(value, Mapping):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):

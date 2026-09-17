@@ -65,16 +65,16 @@ def test_task_patch_normalizes_chain_and_symbol_noise():
     result = merge_task_patch(
         task,
         {
-            "source_chain": "Base",
-            "destination_chain": " base ",
+            "source_chain": "Ethereum",
+            "destination_chain": " ERC20 ",
             "source_symbol": "usdc",
             "destination_symbol": "usd't",
         },
     )
 
     assert result.task["slots"] == {
-        "source_chain": "BASE",
-        "destination_chain": "BASE",
+        "source_chain": "ETH",
+        "destination_chain": "ETH",
         "source_symbol": "USDC",
         "destination_symbol": "USDT",
     }
@@ -90,6 +90,14 @@ def test_normalized_equivalent_patch_does_not_increment_revision():
 
     assert result.task["revision"] == 1
     assert result.changed_slots == frozenset()
+
+
+def test_task_patch_normalizes_amount_with_token_unit():
+    task = new_active_task("swap", task_id="swap-1")
+
+    result = merge_task_patch(task, {"input_amount": "1 USDC"})
+
+    assert result.task["slots"]["input_amount"] == "1"
 
 
 def test_swap_chain_correction_clears_resolved_asset_metadata():

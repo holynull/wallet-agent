@@ -79,7 +79,7 @@ async def test_omnibridge_list_assets_maps_documented_array_shape_and_filters():
     )
     provider = OmniBridgeProvider.from_transport(transport, source_flag="wallet-agent")
 
-    assets = await provider.list_assets(AssetQuery(chain="eth", search="usdt"))
+    assets = await provider.list_assets(AssetQuery(chain="Ethereum", search="usdt"))
 
     assert assets == [
         Asset(
@@ -92,7 +92,7 @@ async def test_omnibridge_list_assets_maps_documented_array_shape_and_filters():
     ]
     assert transport.calls[0]["payload"] == {
         "sourceFlag": "wallet-agent",
-        "mainNetwork": "eth",
+        "mainNetwork": "ETH",
     }
 
 

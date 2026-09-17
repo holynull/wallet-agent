@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
+
+from wallet_agent.domain.normalization import canonical_amount, canonical_chain, canonical_symbol
 
 from .state import ActiveTask, SlotSource, TaskKind
 
@@ -23,7 +24,7 @@ _TRANSFER_TO_LEGACY = {
 _TRANSFER_FROM_LEGACY = {legacy: canonical for canonical, legacy in _TRANSFER_TO_LEGACY.items()}
 _CHAIN_SLOT_KEYS = frozenset({"chain", "source_chain", "destination_chain"})
 _SYMBOL_SLOT_KEYS = frozenset({"symbol", "source_symbol", "destination_symbol"})
-_SYMBOL_NOISE = re.compile(r"[\s'\-`\u2018\u2019]+")
+_AMOUNT_SLOT_KEYS = frozenset({"amount", "input_amount"})
 
 
 @dataclass(frozen=True)
@@ -161,9 +162,11 @@ def _normalize_slot_value(key: str, value: Any) -> Any:
     if not isinstance(value, str):
         return value
     if key in _CHAIN_SLOT_KEYS:
-        return value.strip().upper()
+        return canonical_chain(value)
     if key in _SYMBOL_SLOT_KEYS:
-        return _SYMBOL_NOISE.sub("", value).upper()
+        return canonical_symbol(value)
+    if key in _AMOUNT_SLOT_KEYS:
+        return canonical_amount(value)
     return value
 
 

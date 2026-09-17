@@ -184,7 +184,7 @@ async def test_greeting_returns_a_helpful_clarification_message():
 
 
 @pytest.mark.asyncio
-async def test_conversational_swap_returns_missing_fields_without_calling_provider():
+async def test_conversational_swap_reports_missing_asset_catalog_without_calling_quote():
     provider = FakeProvider("bridgers")
     graph = build_graph(
         model=SwapExtractionModel(
@@ -208,8 +208,9 @@ async def test_conversational_swap_returns_missing_fields_without_calling_provid
         },
         config={"configurable": {"thread_id": "chat-1"}},
     )
-    assert result["response"]["kind"] == "clarification"
-    assert "source_token_address" in result["response"]["missing_fields"]
+    assert result["response"]["kind"] == "error"
+    assert result["response"]["errors"][0]["code"] == "ASSET_PROVIDER_UNAVAILABLE"
+    assert result["missing_fields"] == []
     assert provider.calls == []
 
 
@@ -299,7 +300,8 @@ async def test_conversational_swap_merges_draft_across_turns():
         config=config,
     )
 
-    assert first["response"]["kind"] == "clarification"
+    assert first["response"]["kind"] == "error"
+    assert first["response"]["errors"][0]["code"] == "ASSET_PROVIDER_UNAVAILABLE"
     assert second["response"]["kind"] == "swap_quote"
     assert second["swap_draft"]["source_symbol"] == "USDC"
     assert second["swap_request"]["source_asset"]["address"] == "0x" + "2" * 40

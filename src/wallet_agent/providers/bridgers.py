@@ -18,6 +18,7 @@ from wallet_agent.domain.models import (
     SwapQuoteRequest,
     UnsignedTransaction,
 )
+from wallet_agent.domain.normalization import canonical_chain, canonical_symbol
 
 from .http import ProviderResponseError
 
@@ -81,21 +82,27 @@ class BridgersProvider:
         return cls(transport, **kwargs)
 
     async def list_assets(self, query: AssetQuery) -> list[Asset]:
-        payload = {"chain": query.chain} if query.chain else {}
+        chain_filter = canonical_chain(query.chain) if query.chain else None
+        search_filter = canonical_symbol(query.search) if query.search else None
+        payload = {"chain": chain_filter} if chain_filter else {}
         data = _ensure_success(await self.transport.post("/api/exchangeRecord/getToken", payload))
         assets: list[Asset] = []
         for item in data.get("tokens", []):
             if isinstance(item, dict):
-                assets.append(
-                    Asset(
-                        chain=str(item.get("chain", "")),
-                        symbol=str(item.get("symbol", "")),
-                        name=item.get("name"),
-                        address=item.get("address"),
-                        decimals=int(item.get("decimals", 0)),
-                        logo_url=item.get("logoURI"),
-                    )
+                asset = Asset(
+                    chain=str(item.get("chain", "")),
+                    symbol=str(item.get("symbol", "")),
+                    name=item.get("name"),
+                    address=item.get("address"),
+                    decimals=int(item.get("decimals", 0)),
+                    logo_url=item.get("logoURI"),
                 )
+                if chain_filter and canonical_chain(asset.chain) != chain_filter:
+                    continue
+                searchable = (canonical_symbol(asset.symbol), canonical_symbol(asset.name or ""))
+                if search_filter and not any(search_filter in value for value in searchable):
+                    continue
+                assets.append(asset)
         return assets
 
     async def quote(self, request: SwapQuoteRequest) -> NormalizedQuote:
