@@ -173,7 +173,24 @@ class EVMChainAdapter:
         except Exception:
             priority_fee = gas_price
         priority_fee = min(priority_fee, gas_price)
-        total = gas * gas_price
+        # ``eth_gasPrice`` is not guaranteed to be an EIP-1559 max fee.  Some
+        # RPCs return a cached value which can already be below the latest
+        # block's base fee; passing that value to eth_sendTransaction makes
+        # wallets reject the transaction before it is broadcast.  When the
+        # chain exposes a base fee, reserve room for the next base-fee jump
+        # while keeping the priority fee explicit.  Legacy chains/RPCs that
+        # do not expose baseFeePerGas retain the previous gas-price behavior.
+        max_fee = gas_price
+        try:
+            latest_block = await rpc_call(
+                self.transport, "eth_getBlockByNumber", ["latest", False]
+            )
+            if isinstance(latest_block, dict) and latest_block.get("baseFeePerGas") is not None:
+                base_fee = quantity(latest_block["baseFeePerGas"])
+                max_fee = max(gas_price, base_fee * 2 + priority_fee)
+        except Exception:
+            pass
+        total = gas * max_fee
         return FeeEstimate(
             chain=self.chain,
             chain_id=self.chain_id,
@@ -181,7 +198,7 @@ class EVMChainAdapter:
             amount=token_balance(self.native_asset, total).amount,
             amount_raw=str(total),
             gas_limit=str(gas),
-            max_fee_per_gas=str(gas_price),
+            max_fee_per_gas=str(max_fee),
             max_priority_fee_per_gas=str(priority_fee),
         )
 
