@@ -2821,6 +2821,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "approval_transaction": approval_transaction,
                     "approval_tx_hash": approval_tx_hash,
                     "allowance_requirement": requirement.model_dump(mode="json"),
+                    "authorization_stage": "approval_pending"
+                    if receipt is None
+                    else "approval_failed",
                     "response": {
                         "stage": "approval_pending" if receipt is None else "approval_failed",
                         "approval_transaction": approval_transaction,
@@ -2834,6 +2837,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "approval_transaction": approval_transaction,
                     "approval_tx_hash": approval_tx_hash,
                     "allowance_requirement": requirement.model_dump(mode="json"),
+                    "authorization_stage": "approval_required",
                     "response": {
                         "stage": "approval_required",
                         "approval_transaction": approval_transaction,

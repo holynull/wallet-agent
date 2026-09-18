@@ -894,14 +894,36 @@ def create_app(
         session = await owned_session(session_id, user_id)
         if app.state.graph is None:
             return _jsonable(session)
-        result = await app.state.graph.ainvoke(
-            Command(resume={"approve_tx_hash": session.approval_tx_hash}),
-            config={"configurable": {"thread_id": session.thread_id}},
+        graph = app.state.graph
+        config = {"configurable": {"thread_id": session.thread_id}}
+        snapshot = None
+        if hasattr(graph, "aget_state"):
+            snapshot = await graph.aget_state(config)
+        elif hasattr(graph, "get_state"):
+            snapshot = graph.get_state(config)
+        has_pending_interrupt = bool(getattr(snapshot, "tasks", ())) and bool(
+            getattr(snapshot, "next", ())
         )
-        return _jsonable(
-            await project_session(
-                session_id, result, status=result.get("authorization_stage", "swap_ready")
+        if has_pending_interrupt:
+            result = await graph.ainvoke(
+                Command(resume={"approve_tx_hash": session.approval_tx_hash}),
+                config=config,
             )
+        else:
+            selected_quote = session.quote.model_dump(mode="json") if session.quote else None
+            result = await graph.ainvoke(
+                {
+                    "intent": "swap_allowance",
+                    "forced_intent": "swap_allowance",
+                    "selected_quote": selected_quote,
+                    "approval_tx_hash": session.approval_tx_hash,
+                },
+                config=config,
+            )
+        response = result.get("response") or {}
+        stage = result.get("authorization_stage") or response.get("stage") or "swap_ready"
+        return _jsonable(
+            await project_session(session_id, result, status=stage)
         )
 
     @app.post("/v1/transfer/{session_id}/prepare")

@@ -107,3 +107,77 @@ async def test_select_quote_returns_approval_and_continue_prepares_swap():
     assert continued.status_code == 200
     assert continued.json()["pending_transaction"]["data"] == "0xabc"
     assert provider.prepare_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_continue_rechecks_pending_approval_until_receipt_confirms():
+    token = Asset(chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x" + "3" * 40)
+    requirement = AllowanceRequirement(
+        token=token,
+        owner="0x" + "1" * 40,
+        spender="0x" + "4" * 40,
+        required_amount_raw="100",
+        current_allowance_raw="0",
+    )
+    quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=token,
+        destination_asset=Asset(chain="BSC", symbol="USDT", decimals=6, address="0x" + "5" * 40),
+        input_amount=Decimal("1"),
+        input_amount_raw="100",
+        expected_output=Decimal("1"),
+        expected_output_raw="100",
+        provider_reference="ref-pending",
+        allowance_requirement=requirement,
+    )
+
+    class PollingAdapter(Adapter):
+        def __init__(self):
+            super().__init__()
+            self.receipt = None
+
+        async def get_transaction_receipt(self, _hash):
+            return self.receipt
+
+    adapter = PollingAdapter()
+    provider = Provider()
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-pending",
+            user_id="alice",
+            thread_id="t-pending",
+            quote_candidates=[quote],
+        )
+    )
+    graph = build_graph(model=Model(), providers=[provider], chains={"BASE": adapter})
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        chain_registry=ChainAdapterRegistry({"BASE": adapter}),
+        store=store,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        selected = await client.post(
+            "/v1/swap/s-pending/select-quote",
+            json={"user_id": "alice", "provider_reference": "ref-pending"},
+        )
+        assert selected.status_code == 200
+        await client.post(
+            "/v1/swap/s-pending/approve-broadcast",
+            json={"user_id": "alice", "chain": "BASE", "approve_tx_hash": "0x" + "a" * 64},
+        )
+        pending = await client.post("/v1/swap/s-pending/continue", json={"user_id": "alice"})
+        assert pending.status_code == 200
+        assert pending.json()["stage"] == "approval_pending"
+
+        adapter.receipt = {"status": "0x1"}
+        adapter.allowance = "100"
+        continued = await client.post(
+            "/v1/swap/s-pending/continue", json={"user_id": "alice"}
+        )
+
+    assert continued.status_code == 200
+    assert continued.json()["pending_transaction"]["data"] == "0xabc"

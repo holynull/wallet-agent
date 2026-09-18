@@ -40,6 +40,13 @@
     .suggestions button { width: auto; padding: 7px 10px; border-color: #435166; background: #263142; font-size: 12px; }
     .composer { position: fixed; bottom: 0; z-index: 2; width: min(760px, 100%); padding: 10px 12px 14px; border-top: 1px solid #283242; background: rgba(17, 24, 33, .97); }
     .composer-row { display: flex; gap: 8px; align-items: flex-end; }
+    .request-controls { display: flex; align-items: center; gap: 8px; min-height: 25px; margin-bottom: 5px; color: #9aa8bb; font-size: 12px; }
+    .request-status { display: inline-flex; align-items: center; gap: 7px; }
+    .request-status.loading::before { width: 11px; height: 11px; border: 2px solid #435166; border-top-color: #75a0ff; border-radius: 50%; content: ''; animation: request-spin .8s linear infinite; }
+    .request-status.error { color: #f0a6aa; }
+    @keyframes request-spin { to { transform: rotate(360deg); } }
+    .request-controls button { margin-left: auto; padding: 5px 9px; font-size: 11px; }
+    .request-controls button + button { margin-left: 0; }
     textarea { flex: 1; min-height: 42px; max-height: 130px; resize: vertical; padding: 11px; border: 1px solid #3b4b63; border-radius: 9px; outline: none; color: #edf2f7; background: #0d141d; font: inherit; font-size: 14px; }
     textarea:focus { border-color: #5c85e8; }
     .meta { display: flex; gap: 8px; margin-top: 7px; color: #8493a7; font-size: 11px; }
@@ -98,6 +105,11 @@
   <section id="messages" aria-live="polite"></section>
 
   <section class="composer">
+    <div class="request-controls" aria-live="polite">
+      <span id="requestStatus" class="request-status" hidden></span>
+      <button id="cancelRequestButton" class="secondary" type="button" hidden>取消请求</button>
+      <button id="retryButton" class="secondary" type="button" hidden>重试</button>
+    </div>
     <div class="composer-row">
       <textarea id="composer" placeholder="例如：把 1 USDC 从 Base 换成 BSC 上的 USDT" aria-label="消息"></textarea>
       <button id="sendButton">发送</button>
@@ -112,6 +124,7 @@
   const state = {
     provider: null, providerInfo: null, address: null, chainId: null, chain: null,
     conversationId: null, sessionId: null, runId: null, streamAbort: null,
+    requestBusy: false, requestCancelled: false, lastUserMessage: null,
     quotes: [], selectedProviderReference: null, lastResponse: null, boundProvider: null,
     debugLog: [], agentTestResults: {}, typingQueue: Promise.resolve()
   };
@@ -172,10 +185,35 @@
   function disableWalletActions() {
     messages.querySelectorAll('[data-wallet-action="true"]').forEach((button) => { button.disabled = true; });
   }
+  function setRetryVisible(visible) {
+    $('retryButton').hidden = !visible || !state.lastUserMessage;
+  }
+  function setRequestBusy(busy, status = '') {
+    state.requestBusy = busy;
+    const statusNode = $('requestStatus');
+    statusNode.hidden = !busy && !status;
+    statusNode.textContent = status;
+    statusNode.className = `request-status${busy ? ' loading' : status ? ' error' : ''}`;
+    $('cancelRequestButton').hidden = !busy;
+    $('sendButton').disabled = busy;
+    $('composer').disabled = busy;
+    if (busy) setRetryVisible(false);
+  }
+  function cancelActiveRequest() {
+    if (!state.requestBusy || !state.streamAbort) return;
+    state.requestCancelled = true;
+    state.streamAbort.abort();
+  }
+  async function retryLastMessage() {
+    if (!state.lastUserMessage || state.requestBusy) return;
+    await sendMessage({ message: state.lastUserMessage, addUserMessage: false });
+  }
   function resetWalletSession() {
     state.conversationId = null; state.sessionId = null; state.runId = null;
     state.quotes = []; state.selectedProviderReference = null; state.lastResponse = null;
     if (state.streamAbort) state.streamAbort.abort();
+    state.requestBusy = false; state.requestCancelled = false; state.lastUserMessage = null;
+    setRequestBusy(false); setRetryVisible(false);
     disableWalletActions(); updateMeta();
   }
   function authHeaders() {
@@ -369,7 +407,11 @@
     if (shouldRender && (current?.preflight || current?.response?.preflight)) {
       renderPreflight(current.preflight || current.response.preflight);
     }
-    if (shouldRender && current?.approval_transaction) renderApproval(current.approval_transaction);
+    const approvalStage = current?.stage || current?.authorization_stage || current?.response?.stage;
+    if (shouldRender && current?.approval_transaction && !current?.pending_transaction
+      && !['approval_submitted', 'approval_pending', 'swap_ready'].includes(approvalStage)) {
+      renderApproval(current.approval_transaction);
+    }
     if (shouldRender && current?.confirmation_state?.status === 'requested' && current?.response?.kind !== 'confirmation_required') {
       renderConfirmation(current.confirmation_state, current.selected_quote || current.quote);
     }
@@ -646,9 +688,23 @@
     await ensureWalletChain(transaction);
     return state.provider.request({ method: 'eth_sendTransaction', params: [{ from: state.address, to: transaction.to, data: transaction.data || '0x', value: transactionValue(transaction.value) }] });
   }
+  async function waitForApprovalConfirmation(approveTxHash, maxAttempts = 60, intervalMs = 2000) {
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const body = await api(`/v1/swap/${state.sessionId}/continue`, {
+        method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo' })
+      });
+      applyEvent('session', body);
+      if (body?.pending_transaction) return body;
+      const stage = body?.stage || body?.authorization_stage || body?.response?.stage;
+      if (stage === 'approval_failed') throw new Error(`Approve 交易执行失败：${approveTxHash}`);
+      if (!['approval_submitted', 'approval_pending'].includes(stage)) return body;
+      if (attempt + 1 < maxAttempts) await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    throw new Error('Approve 交易等待确认超时，请稍后重试');
+  }
   function renderApproval(transaction) {
     const card = document.createElement('div'); card.className = 'card'; const title = document.createElement('h3'); title.textContent = '需要 Approve 授权'; const text = document.createElement('p'); text.textContent = '请确认授权额度，浏览器钱包会在本地弹窗签名。'; const pre = document.createElement('pre'); pre.textContent = json(transaction); const actions = document.createElement('div'); actions.className = 'card-actions';
-    const sign = document.createElement('button'); sign.dataset.walletAction = 'true'; sign.textContent = '钱包签名并广播 Approve'; sign.onclick = async () => { sign.disabled = true; try { const hash = await sendUnsignedTransaction(transaction); await api(`/v1/swap/${state.sessionId}/approve-broadcast`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo', chain: transaction.chain, approve_tx_hash: hash }) }); const body = await api(`/v1/swap/${state.sessionId}/continue`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo' }) }); applyEvent('session', body); addMessage('assistant', `Approve 已广播：${hash}。正在等待链上确认。`); } catch (error) { sign.disabled = false; addMessage('assistant', `Approve 失败：${error.message}`); } };
+    const sign = document.createElement('button'); sign.dataset.walletAction = 'true'; sign.textContent = '钱包签名并广播 Approve'; sign.onclick = async () => { sign.disabled = true; try { const hash = await sendUnsignedTransaction(transaction); await api(`/v1/swap/${state.sessionId}/approve-broadcast`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo', chain: transaction.chain, approve_tx_hash: hash }) }); addMessage('assistant', `Approve 已广播：${hash}，正在等待链上确认。`); await waitForApprovalConfirmation(hash); addMessage('assistant', 'Approve 已确认，兑换交易已准备好，请继续签名。'); } catch (error) { sign.disabled = false; addMessage('assistant', `Approve 失败：${error.message}`); } };
     actions.append(sign); card.append(title, text, pre, actions); addCard('approval', card);
   }
   function renderSwap(transaction) {
@@ -684,7 +740,15 @@
     actions.append(sign, status); card.append(title, text, pre, actions); addCard('transfer', card);
   }
   async function sendMessage() {
-    const input = $('composer'); const message = input.value.trim(); if (!message) return; addMessage('user', message); input.value = ''; $('sendButton').disabled = true;
+    const input = $('composer');
+    const options = arguments[0] || {};
+    const message = (options.message ?? input.value).trim();
+    const addUserMessage = options.addUserMessage !== false;
+    if (!message || state.requestBusy) return;
+    if (addUserMessage) { addMessage('user', message); state.lastUserMessage = message; input.value = ''; }
+    setRetryVisible(false); setRequestBusy(true, '正在请求 Agent…');
+    const controller = new AbortController();
+    state.streamAbort = controller; state.requestCancelled = false;
     if (/^(取消|停止|退出)(兑换|交易)?$/.test(message)) {
       if (state.sessionId) {
         try {
@@ -692,17 +756,27 @@
           addTypingMessage('已取消当前兑换。你可以随时重新发起新的兑换。');
         } catch (error) { addTypingMessage(`取消兑换失败：${error.message}`); }
       } else addTypingMessage('当前没有进行中的兑换。');
-      $('sendButton').disabled = false; input.focus(); return;
+      setRequestBusy(false); input.focus(); return;
     }
     if (/^(选|选择)(第)?一|1号|第一个/.test(message) && state.quotes.length) {
       const quote = state.quotes[0];
       await selectQuote(quote.provider_reference);
-      $('sendButton').disabled = false; input.focus(); return;
+      setRequestBusy(false); input.focus(); return;
     }
     try {
       const body = { user_id: 'browser-demo', conversation_id: state.conversationId || undefined, session_id: state.sessionId || undefined, message, address: state.address || undefined, chain: state.chain || undefined, metadata: walletMetadata() };
-      const turn = await api('/v1/agent/turn', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(body) }); state.runId = turn.run_id; state.conversationId = turn.conversation_id; state.sessionId = turn.session_id || state.sessionId; updateMeta(); state.streamAbort = new AbortController(); await readSse(state.runId);
-    } catch (error) { addMessage('assistant', `请求失败：${error.message}`); } finally { $('sendButton').disabled = false; input.focus(); }
+      const turn = await api('/v1/agent/turn', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(body), signal: controller.signal }); state.runId = turn.run_id; state.conversationId = turn.conversation_id; state.sessionId = turn.session_id || state.sessionId; updateMeta(); setRequestBusy(true, '正在读取 Agent 响应…'); await readSse(state.runId, { signal: controller.signal });
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        addSystem(state.requestCancelled ? '已取消本次请求。' : '请求已中断。');
+      } else {
+        addMessage('assistant', `请求失败：${error.message}`);
+        setRequestBusy(false, '请求失败，可重试'); setRetryVisible(true);
+      }
+    } finally {
+      if (state.streamAbort === controller) state.streamAbort = null;
+      setRequestBusy(false); input.focus();
+    }
   }
   async function refreshSession() {
     if (!state.sessionId) return addSystem('当前没有可刷新的兑换 session。');
@@ -1014,6 +1088,7 @@
   }
   renderAgentTestList(); updateAgentTestSummary();
   $('connectButton').onclick = connectWallet; $('refreshButton').onclick = refreshSession; $('sendButton').onclick = sendMessage;
+  $('cancelRequestButton').onclick = cancelActiveRequest; $('retryButton').onclick = retryLastMessage;
   $('debugSmokeButton').onclick = runDebugSmoke; $('debugClearButton').onclick = clearDebug;
   $('runAgentTestsButton').onclick = runAgentTests;
   $('composer').addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); } });

@@ -72,4 +72,5 @@ async def test_mobile_demo_documents_quote_selection_and_approval_flow():
     assert "approve-broadcast" in html
     assert "provider_reference" in html
     assert "/continue" in html
+    assert "waitForApprovalConfirmation" in html
     assert "private key" in html.lower()
