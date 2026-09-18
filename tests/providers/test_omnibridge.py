@@ -38,6 +38,22 @@ def valid_quote_request(amount: str = "1.5") -> SwapQuoteRequest:
     )
 
 
+def erc20_quote_request() -> SwapQuoteRequest:
+    return SwapQuoteRequest(
+        source_asset=Asset(
+            chain="ETH", chain_id=1, symbol="USDC", decimals=6,
+            address="0x0000000000000000000000000000000000000011",
+        ),
+        destination_asset=Asset(
+            chain="ETH", chain_id=1, symbol="USDT(ERC20)", decimals=6,
+            address="0x0000000000000000000000000000000000000022",
+        ),
+        input_amount=Decimal("1"), input_amount_raw="1000000",
+        sender_address="0x1234567890abcdef1234567890abcdef12345678",
+        recipient_address="0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+    )
+
+
 def quote_response(**overrides: Any) -> dict[str, Any]:
     data = {
         "chainFee": "0.001",
@@ -169,6 +185,26 @@ async def test_omnibridge_rejects_non_800_response():
 
     assert exc_info.value.code == "801"
     assert not exc_info.value.retryable
+
+
+@pytest.mark.asyncio
+async def test_omnibridge_reverse_quote_uses_erc20_codes_and_verifies_forward_output():
+    transport = FakeTransport(
+        quote_response(
+            instantRate="1.00069", depositCoinFeeRate="0.003", chainFee="0.3897"
+        ),
+        quote_response(
+            instantRate="1.00069", depositCoinFeeRate="0.003", chainFee="0.3897"
+        ),
+    )
+    provider = OmniBridgeProvider.from_transport(transport)
+
+    quote = await provider.reverse_quote(erc20_quote_request(), Decimal("5"))
+
+    assert quote.expected_output >= Decimal("5")
+    assert transport.calls[0]["payload"]["depositCoinCode"] == "USDC"
+    assert transport.calls[0]["payload"]["receiveCoinCode"] == "USDT(ERC20)"
+    assert transport.calls[1]["payload"]["depositCoinAmt"] != "0"
 
 
 @pytest.mark.asyncio

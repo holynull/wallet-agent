@@ -65,6 +65,22 @@ class Provider:
             provider_reference=f"quote-{self.quote_calls}",
         )
 
+    async def reverse_quote(self, request, output_amount):
+        self.quote_calls += 1
+        input_amount = output_amount * 2
+        return NormalizedQuote(
+            provider="bridgers",
+            source_asset=request.source_asset,
+            destination_asset=request.destination_asset,
+            input_amount=input_amount,
+            input_amount_raw=str(int(input_amount * Decimal(10**request.source_asset.decimals))),
+            expected_output=output_amount,
+            expected_output_raw=str(
+                int(output_amount * Decimal(10**request.destination_asset.decimals))
+            ),
+            provider_reference=f"reverse-{self.quote_calls}",
+        )
+
 
 class EthereumCatalogProvider(Provider):
     async def list_assets(self, query: AssetQuery):
@@ -236,7 +252,7 @@ async def test_ethereum_swap_resolves_provider_metadata_then_quotes_amount_with_
     assert third["response"]["kind"] == "clarification"
     assert third["response"]["missing_fields"] == ["input_amount"]
     assert third["response"]["suggestions"] == [
-        {"label": "填写 USDC 数量", "message": "1 USDC"}
+        {"label": "填写 USDC 数量", "message": "请输入 USDC 数量"}
     ]
     assert third["active_task"]["revision"] == 3
     assert third["active_task"]["slots"] == {
@@ -356,7 +372,7 @@ async def test_swap_correction_replaces_previous_quote():
 
 
 @pytest.mark.asyncio
-async def test_target_token_amount_is_not_silently_used_as_source_amount():
+async def test_target_token_amount_is_preserved_as_exact_output():
     model = UnderstandingModel(
         ["swap_quote", "clarification"],
         swap=[
@@ -366,9 +382,7 @@ async def test_target_token_amount_is_not_silently_used_as_source_amount():
                 source_symbol="USDC",
                 destination_symbol="USDT",
             ),
-            # Simulate the model's historical mistake: treating the desired
-            # USDT amount as the source USDC amount.
-            SwapSlotPatch(input_amount="5"),
+            SwapSlotPatch(output_amount="5", amount_mode="exact_out"),
         ],
     )
     provider = Provider()
@@ -379,10 +393,13 @@ async def test_target_token_amount_is_not_silently_used_as_source_amount():
     assert first["response"]["kind"] == "clarification"
     second = await graph.ainvoke(turn("我想换 5USDT"), config=config)
 
-    assert second["response"]["kind"] == "clarification"
-    assert second["response"]["missing_fields"] == ["input_amount"]
-    assert second.get("swap_request") is None
-    assert provider.quote_calls == 0
+    assert second["response"]["kind"] == "swap_quote"
+    assert second["active_task"]["slots"]["output_amount"] == "5"
+    assert second["active_task"]["slots"]["amount_mode"] == "exact_out"
+    assert "input_amount" not in second["active_task"]["slots"]
+    assert second["swap_request"]["amount_mode"] == "exact_out"
+    assert second["response"]["quotes"][0]["expected_output"] == "5"
+    assert provider.quote_calls == 1
 
 
 @pytest.mark.asyncio

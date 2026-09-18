@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
 from wallet_agent.domain.models import (
@@ -38,6 +38,30 @@ def _success(response: dict[str, Any]) -> Any:
 
 def _raw(amount: Decimal, decimals: int) -> str:
     return str(int(amount * (Decimal(10) ** decimals)))
+
+
+def _raw_up(amount: Decimal, decimals: int) -> str:
+    return str(int((amount * (Decimal(10) ** decimals)).to_integral_value(rounding=ROUND_CEILING)))
+
+
+def _coin_code(asset: Asset) -> str:
+    """Return Omni's catalog coin code, not our normalized chain label."""
+    symbol = str(asset.symbol)
+    if not asset.address:
+        return (
+            symbol.split("(", 1)[0]
+            if asset.chain == "ETH"
+            else f"{symbol}({asset.chain})"
+        )
+    if symbol.endswith("(ERC20)"):
+        return symbol
+    # Omni's Ethereum catalog uses a bare USDC code but explicitly marks
+    # Tether as the ERC-20 variant. Preserve provider-supplied suffixes.
+    if asset.chain == "ETH" and symbol.upper() == "USDT":
+        return "USDT(ERC20)"
+    if asset.chain == "ETH":
+        return symbol
+    return f"{symbol}({asset.chain})"
 
 
 class OmniBridgeProvider:
@@ -104,12 +128,8 @@ class OmniBridgeProvider:
         ]
 
     async def quote(self, request: SwapQuoteRequest) -> NormalizedQuote:
-        deposit_code = (
-            request.source_asset.symbol
-            if request.source_asset.chain == "ETH" and not request.source_asset.address
-            else f"{request.source_asset.symbol}({request.source_asset.chain})"
-        )
-        receive_code = f"{request.destination_asset.symbol}({request.destination_asset.chain})"
+        deposit_code = _coin_code(request.source_asset)
+        receive_code = _coin_code(request.destination_asset)
         payload = {
             "depositCoinCode": deposit_code,
             "receiveCoinCode": receive_code,
@@ -117,6 +137,7 @@ class OmniBridgeProvider:
             "sourceFlag": self.source_flag,
         }
         data = _success(await self.transport.post("/api/v1/getBaseInfo", payload))
+        self.minimum_source_amount = str(data.get("depositMin", "0"))
         rate = Decimal(str(data.get("instantRate", "0")))
         fee_rate = Decimal(str(data.get("depositCoinFeeRate", "0")))
         network_fee = Decimal(str(data.get("chainFee", "0")))
@@ -182,6 +203,46 @@ class OmniBridgeProvider:
             allowance_requirement=allowance,
         )
 
+    async def reverse_quote(
+        self, request: SwapQuoteRequest, output_amount: Decimal
+    ) -> NormalizedQuote:
+        """Invert Omni's quote formula, then verify with a forward quote."""
+        if output_amount <= 0:
+            raise ValueError("target output amount must be greater than zero")
+        probe_payload = {
+            "depositCoinCode": _coin_code(request.source_asset),
+            "receiveCoinCode": _coin_code(request.destination_asset),
+            "depositCoinAmt": str(request.input_amount),
+            "sourceFlag": self.source_flag,
+        }
+        data = _success(await self.transport.post("/api/v1/getBaseInfo", probe_payload))
+        rate = Decimal(str(data.get("instantRate", "0")))
+        fee_rate = Decimal(str(data.get("depositCoinFeeRate", "0")))
+        network_fee = Decimal(str(data.get("chainFee", "0")))
+        denominator = (Decimal(1) - fee_rate) * rate
+        if denominator <= 0:
+            raise ValueError("Omni quote has no usable exchange rate")
+        input_amount = (output_amount + network_fee) / denominator
+        minimum = Decimal(str(data.get("depositMin", "0")))
+        maximum = Decimal(str(data.get("depositMax", "Infinity")))
+        if input_amount < minimum or input_amount > maximum:
+            raise ValueError(
+                f"required source amount {input_amount} is outside Omni bounds {minimum}..{maximum}"
+            )
+        raw = _raw_up(input_amount, request.source_asset.decimals)
+        input_amount = Decimal(raw) / (Decimal(10) ** request.source_asset.decimals)
+        if input_amount > maximum:
+            raise ValueError(
+                f"required source amount {input_amount} is outside Omni bounds {minimum}..{maximum}"
+            )
+        forward = request.model_copy(update={"input_amount": input_amount, "input_amount_raw": raw})
+        quote = await self.quote(forward)
+        if quote.expected_output < output_amount:
+            raise ValueError(
+                f"Omni verified output {quote.expected_output} is below requested {output_amount}"
+            )
+        return quote
+
     async def prepare(self, quote: NormalizedQuote) -> DepositOrder:
         meta = self._quotes.get(quote.provider_reference) or quote.provider_payload
         qdata = meta.get("quote_data", {})
@@ -201,15 +262,11 @@ class OmniBridgeProvider:
             raise ValueError(f"deposit amount must be between {minimum} and {maximum}")
         request = dict(meta.get("request", {}))
         if not request:
-            deposit_code = (
-                quote.source_asset.symbol
-                if quote.source_asset.chain == "ETH" and not quote.source_asset.address
-                else f"{quote.source_asset.symbol}({quote.source_asset.chain})"
-            )
+            deposit_code = _coin_code(quote.source_asset)
             request = {
                 "depositCoinCode": deposit_code,
                 "receiveCoinCode": (
-                    f"{quote.destination_asset.symbol}({quote.destination_asset.chain})"
+                    _coin_code(quote.destination_asset)
                 ),
                 "depositCoinAmt": str(quote.input_amount),
                 "sourceFlag": meta.get("source_flag", self.source_flag),

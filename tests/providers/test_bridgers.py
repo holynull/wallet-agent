@@ -25,6 +25,27 @@ class FakeTransport:
         return self.responses.pop(0)
 
 
+class DynamicQuoteTransport:
+    def __init__(self):
+        self.calls = []
+
+    async def post(self, path, payload, *, idempotency_key=None):
+        self.calls.append(payload)
+        raw = int(payload["fromTokenAmount"])
+        amount = Decimal(raw) / Decimal(10**6)
+        output = amount * Decimal("0.8")
+        tx = {
+            "toTokenAmount": str(output),
+            "amountOutMin": str(int(output * Decimal(10**6))),
+            "toTokenDecimal": 6,
+            "depositMin": "1",
+            "depositMax": "100",
+            "fee": "0",
+            "chainFee": "0",
+        }
+        return {"resCode": 100, "resMsg": "success", "data": {"txData": tx}}
+
+
 @pytest.mark.asyncio
 async def test_bridgers_list_assets_normalizes_chain_and_filters_search():
     transport = FakeTransport(
@@ -260,6 +281,18 @@ async def test_bridgers_quote_converts_units_and_preserves_raw_amounts():
             "idempotency_key": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_bridgers_reverse_quote_binary_searches_source_amount():
+    transport = DynamicQuoteTransport()
+    provider = BridgersProvider.from_transport(transport)
+
+    quote = await provider.reverse_quote(valid_quote_request(), Decimal("4"))
+
+    assert quote.input_amount == Decimal("5")
+    assert quote.expected_output == Decimal("4")
+    assert len(transport.calls) < 40
 
 
 @pytest.mark.asyncio

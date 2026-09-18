@@ -122,6 +122,7 @@ class BridgersProvider:
         tx = data.get("txData", {})
         if not isinstance(tx, dict):
             raise ProviderResponseError("100", "Missing txData", category="client")
+        self.minimum_source_amount = str(tx.get("depositMin", "0"))
         reference = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         to_decimals = int(tx.get("toTokenDecimal", request.destination_asset.decimals))
         expected = Decimal(str(tx.get("toTokenAmount", "0")))
@@ -183,6 +184,71 @@ class BridgersProvider:
             provider_payload=provider_payload,
             allowance_requirement=allowance,
         )
+
+    async def reverse_quote(
+        self, request: SwapQuoteRequest, output_amount: Decimal
+    ) -> NormalizedQuote:
+        """Find the smallest source amount whose forward quote meets a target."""
+        if output_amount <= 0:
+            raise ValueError("target output amount must be greater than zero")
+        decimals = request.source_asset.decimals
+        quantum = Decimal(1) / (Decimal(10) ** decimals)
+        probe_amount = max(quantum, Decimal("1"))
+        probe = request.model_copy(
+            update={
+                "input_amount": probe_amount,
+                "input_amount_raw": _raw_decimal(probe_amount, decimals),
+            }
+        )
+        probe_quote = await self.quote(probe)
+        meta = self._quotes.get(probe_quote.provider_reference, {})
+        tx = meta.get("tx_data", {}) if isinstance(meta, dict) else {}
+        minimum = Decimal(str(tx.get("depositMin", "0")))
+        maximum = Decimal(str(tx.get("depositMax", "0")))
+        if maximum <= 0:
+            maximum = probe_amount * Decimal("1000000")
+        lower = max(minimum, quantum)
+        upper = maximum
+        if lower > upper:
+            raise ValueError(f"Bridgers source bounds are invalid: {lower}..{upper}")
+        high_request = request.model_copy(
+            update={
+                "input_amount": upper,
+                "input_amount_raw": _raw_decimal(upper, decimals),
+            }
+        )
+        high_quote = await self.quote(high_request)
+        if high_quote.expected_output < output_amount:
+            raise ValueError(
+                f"Bridgers cannot reach requested output {output_amount} within source bounds"
+            )
+        # Search in raw units so every candidate is representable on-chain.
+        lo_raw = int(_raw_decimal(lower, decimals))
+        hi_raw = int(_raw_decimal(upper, decimals))
+        while lo_raw < hi_raw:
+            mid_raw = (lo_raw + hi_raw) // 2
+            mid = request.model_copy(
+                update={
+                    "input_amount": Decimal(mid_raw) / (Decimal(10) ** decimals),
+                    "input_amount_raw": str(mid_raw),
+                }
+            )
+            mid_quote = await self.quote(mid)
+            if mid_quote.expected_output >= output_amount:
+                hi_raw = mid_raw
+            else:
+                lo_raw = mid_raw + 1
+        final_amount = Decimal(lo_raw) / (Decimal(10) ** decimals)
+        final_request = request.model_copy(
+            update={
+                "input_amount": final_amount,
+                "input_amount_raw": str(lo_raw),
+            }
+        )
+        final_quote = await self.quote(final_request)
+        if final_quote.expected_output < output_amount:
+            raise ValueError("Bridgers reverse quote verification fell below target output")
+        return final_quote
 
     async def prepare(self, quote: NormalizedQuote) -> UnsignedTransaction:
         meta = self._quotes.get(quote.provider_reference) or quote.provider_payload

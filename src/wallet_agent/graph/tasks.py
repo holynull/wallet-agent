@@ -24,7 +24,7 @@ _TRANSFER_TO_LEGACY = {
 _TRANSFER_FROM_LEGACY = {legacy: canonical for canonical, legacy in _TRANSFER_TO_LEGACY.items()}
 _CHAIN_SLOT_KEYS = frozenset({"chain", "source_chain", "destination_chain"})
 _SYMBOL_SLOT_KEYS = frozenset({"symbol", "source_symbol", "destination_symbol"})
-_AMOUNT_SLOT_KEYS = frozenset({"amount", "input_amount"})
+_AMOUNT_SLOT_KEYS = frozenset({"amount", "input_amount", "output_amount"})
 
 
 @dataclass(frozen=True)
@@ -204,3 +204,9 @@ def _clear_derived_slots(
             slots.pop(f"{side}_decimals", None)
     if "input_amount" in changed and "input_amount_raw" not in patch:
         slots.pop("input_amount_raw", None)
+    if "output_amount" in changed and "output_amount_raw" not in patch:
+        slots.pop("output_amount_raw", None)
+    if "input_amount" in changed:
+        slots.pop("output_amount", None)
+    if "output_amount" in changed:
+        slots.pop("input_amount", None)

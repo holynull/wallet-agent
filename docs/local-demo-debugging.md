@@ -348,6 +348,15 @@ quoted
 
 approve 交易广播成功不等于已经上链确认。只有 `/continue` 完成 receipt 和 Allowance 检查后，才可以使用 `pending_transaction`。
 
+### 指定换出或到账数量
+
+聊天兑换支持两种数量表达：
+
+- `用 8 USDC 换 USDT`：精确指定换出的 USDC 数量。
+- `换到 5 USDT`：精确指定期望到账数量，系统会分别向支持的 Provider 反向计算所需 USDC，再展示普通报价。
+
+反向询价只读，不会创建订单、签名或广播；用户仍需选择报价并经过原有确认流程。如果 Provider 不支持反向询价，系统会要求明确填写换出数量。Provider 返回过最低换出限制后，界面会使用该动态最低值，不再建议固定的 `1 USDC`。
+
 ## 7. 使用 Docker 启动
 
 Docker Compose 会读取项目根目录的 `.env`，因此必须先完成配置：

@@ -89,6 +89,7 @@ _USER_SWAP_FIELDS = frozenset(
         "source_symbol",
         "destination_symbol",
         "input_amount",
+        "output_amount",
         "sender_address",
         "recipient_address",
     }
@@ -172,7 +173,12 @@ def _quote(value: Any) -> NormalizedQuote:
 
 
 def _request(value: Any) -> SwapQuoteRequest:
-    return SwapQuoteRequest.model_validate(_dump(value))
+    payload = _dump(value)
+    if isinstance(payload, dict):
+        payload = dict(payload)
+        payload.pop("output_amount", None)
+        payload.pop("amount_mode", None)
+    return SwapQuoteRequest.model_validate(payload)
 
 
 def _request_json(value: Any) -> dict[str, Any]:
@@ -401,7 +407,14 @@ def _swap_draft_from_request(request: dict[str, Any] | None) -> dict[str, Any]:
         return {}
     draft: dict[str, Any] = {
         key: raw.get(key)
-        for key in ("input_amount", "input_amount_raw", "sender_address", "recipient_address")
+        for key in (
+            "input_amount",
+            "input_amount_raw",
+            "output_amount",
+            "amount_mode",
+            "sender_address",
+            "recipient_address",
+        )
         if raw.get(key) is not None
     }
     for side, asset_key in (("source", "source_asset"), ("destination", "destination_asset")):
@@ -434,6 +447,7 @@ def _clarification_message(
         "source_decimals": "来源 Token 精度",
         "destination_decimals": "目标 Token 精度",
         "input_amount": "兑换数量",
+        "output_amount": "目标到账数量",
         "sender_address": "钱包地址",
         "recipient_address": "接收地址",
     }
@@ -451,6 +465,7 @@ def _swap_suggestions(
     draft: Mapping[str, Any],
     missing: list[str],
     wallet_context: Mapping[str, Any] | None,
+    providers: Mapping[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     """Offer explicit replies that fill slots without taking an action for the user."""
     suggestions: list[dict[str, str]] = []
@@ -493,8 +508,21 @@ def _swap_suggestions(
             }
         )
     if "input_amount" in missing and source_symbol:
+        minimums = []
+        for provider in (providers or {}).values():
+            value = getattr(provider, "minimum_source_amount", None)
+            if value is None:
+                value = getattr(provider, "deposit_min", None)
+            if value not in (None, ""):
+                minimums.append(str(value))
+        if minimums:
+            message = f"{minimums[0]} {source_symbol}"
+            label = f"最低 {message}"
+        else:
+            message = f"请输入 {source_symbol} 数量"
+            label = f"填写 {source_symbol} 数量"
         suggestions.append(
-            {"label": f"填写 {source_symbol} 数量", "message": f"1 {source_symbol}"}
+            {"label": label, "message": message}
         )
     return suggestions[:3]
 
@@ -515,6 +543,8 @@ _SWAP_DRAFT_KEYS = (
     "source_logo_url",
     "destination_logo_url",
     "input_amount",
+    "output_amount",
+    "amount_mode",
     "input_amount_raw",
     "sender_address",
     "recipient_address",
@@ -840,13 +870,28 @@ def _swap_draft_request(
         "destination_token_address",
         "source_decimals",
         "destination_decimals",
-        "input_amount",
         "sender_address",
         "recipient_address",
     )
+    exact_out = normalized.get("output_amount") not in (None, "") and not normalized.get(
+        "input_amount"
+    )
+    if not exact_out:
+        required = (*required, "input_amount")
     missing = [field for field in required if normalized.get(field) in (None, "")]
     if missing:
         return None, missing
+    if exact_out:
+        try:
+            target = Decimal(str(normalized["output_amount"]))
+            if target <= 0:
+                raise ValueError
+            # Reverse-capable providers replace this provisional amount before
+            # forwarding the quote; it only lets the domain model carry assets.
+            normalized["input_amount"] = "1"
+            normalized["input_amount_raw"] = "1"
+        except Exception:
+            return None, ["output_amount"]
     if not normalized.get("input_amount_raw"):
         try:
             amount = Decimal(str(normalized["input_amount"]))
@@ -1168,7 +1213,22 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "error": f"Provider {provider_name} is unavailable.",
             }
         try:
-            quote = await provider.quote(_request(swap_request))
+            raw_request = dict(swap_request)
+            output_amount = raw_request.pop("output_amount", None)
+            amount_mode = raw_request.pop("amount_mode", None)
+            request_model = _request(raw_request)
+            if amount_mode == "exact_out" and output_amount is not None:
+                reverse = getattr(provider, "reverse_quote", None)
+                if not callable(reverse):
+                    return {
+                        "ok": False,
+                        "code": "REVERSE_QUOTE_UNAVAILABLE",
+                        "error": f"Provider {provider_name} does not support exact-output quotes.",
+                        "provider": str(provider_name),
+                    }
+                quote = await reverse(request_model, Decimal(str(output_amount)))
+            else:
+                quote = await provider.quote(request_model)
             return {"ok": True, "quote": _dump(quote)}
         except Exception as exc:
             return {
@@ -1658,7 +1718,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "errors": [_error("QUOTE_PARAMETERS_REQUIRED", "兑换报价参数不完整。")],
             }
         try:
-            request_json = _request_json(request)
+            request_json = _dump(request)
+            if not isinstance(request_json, dict):
+                raise ValueError("swap request must be an object")
         except Exception as exc:
             return {
                 "quote_candidates": [],
@@ -1878,18 +1940,23 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         or ""
                     )
                 )
-                # A token-qualified amount is only safe to use when it names
-                # the source asset.  ``5 USDT`` in a USDC -> USDT task
-                # describes desired output, which cannot be reversed here.
+                # A token-qualified amount selects its named side.  A
+                # destination amount is an exact-output request and must be
+                # preserved for provider reverse quoting.
                 if explicit_unit == known_destination and explicit_unit != known_source:
                     task_patch.pop("input_amount", None)
                     task_patch.pop("input_amount_raw", None)
+                    task_patch["output_amount"] = explicit_value
+                    task_patch["amount_mode"] = "exact_out"
                 elif explicit_unit == known_source and explicit_unit != known_destination:
                     task_patch[amount_key] = explicit_value
+                    task_patch["amount_mode"] = "exact_in"
             elif amount_key not in task_patch and parsed_amount is not None:
                 fallback_amount, amount_unit = parsed_amount
                 if task_kind == "transfer" or amount_unit is None:
                     task_patch[amount_key] = fallback_amount
+                    if task_kind == "swap":
+                        task_patch["amount_mode"] = "exact_in"
             merged = merge_task_patch(active_task, task_patch)
             active_task = merged.task
             task_update = {"active_task": active_task, **merged.invalidation}
@@ -2049,7 +2116,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             "message": _clarification_message(missing=user_missing, swap=True),
                             "missing_fields": user_missing,
                             "suggestions": _swap_suggestions(
-                                draft, user_missing, state.get("wallet_context")
+                                draft, user_missing, state.get("wallet_context"), runtime.providers
                             ),
                         },
                     }
@@ -2074,6 +2141,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 stage="ready_for_quote",
                 missing_fields=[],
             )
+            request_payload = request_model.model_dump(mode="json")
+            if draft.get("output_amount"):
+                request_payload.update(
+                    {
+                        "output_amount": str(draft["output_amount"]),
+                        "amount_mode": "exact_out",
+                    }
+                )
             return {
                 "intent": intent_value,
                 "route": intent_value,
@@ -2081,7 +2156,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 **task_update,
                 "active_task": active_task,
                 "missing_fields": [],
-                "swap_request": request_model.model_dump(mode="json"),
+                "swap_request": request_payload,
                 **_task_update(
                     state.get("conversation_state"),
                     goal="swap",
@@ -2298,10 +2373,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     ],
                 },
             }
+        request_payload = request.model_dump(mode="json")
+        if isinstance(raw, Mapping) and raw.get("amount_mode") == "exact_out":
+            request_payload.update(
+                {
+                    "amount_mode": "exact_out",
+                    "output_amount": str(raw.get("output_amount")),
+                }
+            )
         selected = state.get("selected_quote")
         if state.get("intent") == "swap_quote" and not runtime.providers:
             return {
-                "swap_request": request.model_dump(mode="json"),
+                "swap_request": request_payload,
                 "available_providers": [],
                 "selected_quote": selected,
                 "response": None,
@@ -2314,7 +2397,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 ],
             }
         return {
-            "swap_request": request.model_dump(mode="json"),
+            "swap_request": request_payload,
             "available_providers": list(runtime.providers),
             "selected_quote": selected,
             "response": None,
@@ -2327,6 +2410,22 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         quotes = [_dump(item) for item in state.get("quote_candidates", [])]
         quotes = [item for item in quotes if isinstance(item, dict)]
         if not quotes and state.get("errors"):
+            reverse_errors = [
+                item for item in state["errors"] if item.get("code") == "REVERSE_QUOTE_UNAVAILABLE"
+            ]
+            if reverse_errors:
+                return {
+                    "selected_quote": None,
+                    "response": {
+                        "kind": "clarification",
+                        "message": (
+                            "当前兑换服务不能按目标到账数量反向询价，"
+                            "请直接提供要换出的数量。"
+                        ),
+                        "missing_fields": ["input_amount"],
+                        "errors": state["errors"],
+                    },
+                }
             return {
                 "selected_quote": None,
                 "response": {"kind": "error", "errors": state["errors"]},

@@ -75,3 +75,9 @@ class SwapSlotPatch(UnderstandingModel):
     input_amount: str | None = Field(
         default=None, description="人类可读换出数量，不要换算为 raw amount"
     )
+    output_amount: str | None = Field(
+        default=None, description="人类可读换入数量（精确输出），不要换算为 raw amount"
+    )
+    amount_mode: Literal["exact_in", "exact_out"] | None = Field(
+        default=None, description="数量模式：exact_in 表示指定换出，exact_out 表示指定换入"
+    )
