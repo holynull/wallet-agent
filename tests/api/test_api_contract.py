@@ -291,6 +291,45 @@ async def test_automatic_swap_prepare_continuation_preserves_active_task():
 
 
 @pytest.mark.asyncio
+async def test_failed_swap_quote_session_is_not_marked_completed():
+    class FailedQuoteGraph:
+        async def astream(self, value, *, config, stream_mode):
+            del config, stream_mode
+            self.value = value
+            yield {"response": {"kind": "error"}}
+
+        def get_state(self, _config):
+            class Snapshot:
+                values = {
+                    "intent": "swap_quote",
+                    "response": {
+                        "kind": "error",
+                        "errors": [{"code": "INVALID_QUOTE", "message": "quote failed"}],
+                    },
+                    "selected_quote": None,
+                }
+                tasks = ()
+                next = ()
+
+            return Snapshot()
+
+    graph = FailedQuoteGraph()
+    app, client = await client_for(graph=graph)
+    async with client:
+        response = await client.post(
+            "/v1/agent/turn",
+            json={"user_id": "alice", "message": "我想换 5USDT"},
+        )
+        await app.state.runs[response.json()["run_id"]]["task"]
+        session = await client.get(
+            f"/v1/swap/{response.json()['session_id']}", params={"user_id": "alice"}
+        )
+
+    assert session.status_code == 200
+    assert session.json()["status"] == "quote_failed"
+
+
+@pytest.mark.asyncio
 async def test_unsupported_chain_error_is_stable():
     class Registry:
         def get_adapter(self, chain):

@@ -35,7 +35,11 @@ _CHAIN_IDS = {
 _SYMBOL_NOISE = re.compile(r"[\s'\-`\u2018\u2019]+")
 _PROVIDER_NETWORK_SUFFIX = re.compile(r"\((?:ERC20|BEP20|TRC20)\)$")
 _AMOUNT_WITH_UNIT = re.compile(
-    r"^\s*((?:\d+(?:\.\d*)?|\.\d+))\s*[A-Za-z][A-Za-z0-9()'`\-]*\s*$"
+    r"^\s*((?:\d+(?:\.\d*)?|\.\d+))\s*([A-Za-z][A-Za-z0-9()'`\-]*)\s*$"
+)
+_AMOUNT_WITH_UNIT_MENTION = re.compile(
+    r"(?<![A-Za-z0-9_.])((?:\d+(?:\.\d*)?|\.\d+))\s*"
+    r"([A-Za-z][A-Za-z0-9()'`\-]*)"
 )
 _AMOUNT_ONLY = re.compile(r"^\s*((?:\d+(?:\.\d*)?|\.\d+))\s*$")
 _TOKEN_SYMBOL = r"([A-Za-z][A-Za-z0-9()'`\-]*)"
@@ -104,6 +108,32 @@ def unambiguous_amount(value: str) -> str | None:
     raw = str(value)
     match = _AMOUNT_ONLY.fullmatch(raw) or _AMOUNT_WITH_UNIT.fullmatch(raw)
     return match.group(1) if match else None
+
+
+def unambiguous_amount_with_unit(value: str) -> tuple[str, str | None] | None:
+    """Extract a complete numeric amount and its optional token unit.
+
+    Keeping the unit lets callers distinguish ``5 USDC`` (a source amount)
+    from ``5 USDT`` (a desired destination amount) instead of silently
+    assigning either one to the input amount slot.
+    """
+    raw = str(value)
+    amount_only = _AMOUNT_ONLY.fullmatch(raw)
+    if amount_only:
+        return amount_only.group(1), None
+    with_unit = _AMOUNT_WITH_UNIT.fullmatch(raw)
+    if with_unit:
+        return with_unit.group(1), canonical_symbol(with_unit.group(2))
+    return None
+
+
+def mentioned_amount_with_unit(value: str) -> tuple[str, str] | None:
+    """Extract one explicit token-qualified amount from a natural-language message."""
+    matches = list(_AMOUNT_WITH_UNIT_MENTION.finditer(str(value)))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    return match.group(1), canonical_symbol(match.group(2))
 
 
 def chain_id_for(value: str) -> int | None:

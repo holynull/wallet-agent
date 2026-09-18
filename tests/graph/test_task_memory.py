@@ -356,6 +356,36 @@ async def test_swap_correction_replaces_previous_quote():
 
 
 @pytest.mark.asyncio
+async def test_target_token_amount_is_not_silently_used_as_source_amount():
+    model = UnderstandingModel(
+        ["swap_quote", "clarification"],
+        swap=[
+            SwapSlotPatch(
+                source_chain="BASE",
+                destination_chain="BASE",
+                source_symbol="USDC",
+                destination_symbol="USDT",
+            ),
+            # Simulate the model's historical mistake: treating the desired
+            # USDT amount as the source USDC amount.
+            SwapSlotPatch(input_amount="5"),
+        ],
+    )
+    provider = Provider()
+    graph = build_graph(model=model, providers=[provider])
+    config = {"configurable": {"thread_id": "task-target-amount"}}
+
+    first = await graph.ainvoke(turn("在 Base 用 USDC 换 USDT"), config=config)
+    assert first["response"]["kind"] == "clarification"
+    second = await graph.ainvoke(turn("我想换 5USDT"), config=config)
+
+    assert second["response"]["kind"] == "clarification"
+    assert second["response"]["missing_fields"] == ["input_amount"]
+    assert second.get("swap_request") is None
+    assert provider.quote_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_cancel_marks_active_task_cancelled_and_is_idempotent():
     model = UnderstandingModel(
         ["swap_quote"],

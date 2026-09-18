@@ -414,7 +414,12 @@ def create_app(
                     session_status = (
                         "transfer_ready" if response_kind == "transfer_prepare" else "completed"
                     )
-                    if response_kind == "swap_quote" and not result.get("selected_quote"):
+                    if response_kind == "error" and (
+                        result.get("intent") == "swap_quote"
+                        or (result.get("active_task") or {}).get("kind") == "swap"
+                    ):
+                        session_status = "quote_failed"
+                    elif response_kind == "swap_quote" and not result.get("selected_quote"):
                         session_status = "quoted"
                     await project_session(session_id, result, status=session_status)
             if app.state.runs[run_id]["status"] == "running":

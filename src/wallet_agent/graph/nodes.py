@@ -31,8 +31,9 @@ from wallet_agent.domain.normalization import (
     canonical_chain,
     canonical_symbol,
     chain_id_for,
+    mentioned_amount_with_unit,
     swap_direction_hints,
-    unambiguous_amount,
+    unambiguous_amount_with_unit,
 )
 from wallet_agent.observability import wallet_event
 
@@ -1858,9 +1859,36 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             task_patch.pop(opposite, None)
                     task_patch[key] = value
             amount_key = "amount" if task_kind == "transfer" else "input_amount"
-            if amount_key not in task_patch:
-                fallback_amount = unambiguous_amount(message)
-                if fallback_amount is not None:
+            explicit_amount = mentioned_amount_with_unit(message)
+            parsed_amount = unambiguous_amount_with_unit(message)
+            if task_kind == "swap" and explicit_amount is not None:
+                explicit_value, explicit_unit = explicit_amount
+                prior_slots = active_task.get("slots", {})
+                known_source = canonical_symbol(
+                    str(
+                        task_patch.get("source_symbol")
+                        or prior_slots.get("source_symbol")
+                        or ""
+                    )
+                )
+                known_destination = canonical_symbol(
+                    str(
+                        task_patch.get("destination_symbol")
+                        or prior_slots.get("destination_symbol")
+                        or ""
+                    )
+                )
+                # A token-qualified amount is only safe to use when it names
+                # the source asset.  ``5 USDT`` in a USDC -> USDT task
+                # describes desired output, which cannot be reversed here.
+                if explicit_unit == known_destination and explicit_unit != known_source:
+                    task_patch.pop("input_amount", None)
+                    task_patch.pop("input_amount_raw", None)
+                elif explicit_unit == known_source and explicit_unit != known_destination:
+                    task_patch[amount_key] = explicit_value
+            elif amount_key not in task_patch and parsed_amount is not None:
+                fallback_amount, amount_unit = parsed_amount
+                if task_kind == "transfer" or amount_unit is None:
                     task_patch[amount_key] = fallback_amount
             merged = merge_task_patch(active_task, task_patch)
             active_task = merged.task

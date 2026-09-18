@@ -3,8 +3,10 @@ from wallet_agent.domain.normalization import (
     canonical_chain,
     canonical_symbol,
     chain_id_for,
+    mentioned_amount_with_unit,
     swap_direction_hints,
     unambiguous_amount,
+    unambiguous_amount_with_unit,
 )
 
 
@@ -35,6 +37,15 @@ def test_canonical_amount_removes_a_single_token_unit_without_guessing():
     assert unambiguous_amount("1 USDC") == "1"
     assert unambiguous_amount("0.01") == "0.01"
     assert unambiguous_amount("大约 1 USDC") is None
+
+
+def test_unambiguous_amount_with_unit_preserves_token_semantics():
+    assert unambiguous_amount_with_unit("5USDT") == ("5", "USDT")
+    assert unambiguous_amount_with_unit("1 USDC") == ("1", "USDC")
+    assert unambiguous_amount_with_unit("0.01") == ("0.01", None)
+    assert unambiguous_amount_with_unit("大约 1 USDC") is None
+    assert mentioned_amount_with_unit("我想换 5USDT") == ("5", "USDT")
+    assert mentioned_amount_with_unit("在 Base 用 1 USDC 换 USDT") == ("1", "USDC")
 
 
 def test_swap_direction_hints_understand_explicit_chinese_swap_grammar():
