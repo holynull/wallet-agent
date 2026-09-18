@@ -179,6 +179,20 @@ def _request_json(value: Any) -> dict[str, Any]:
     return _request(value).model_dump(mode="json")
 
 
+def _same_swap_asset(request: SwapQuoteRequest) -> bool:
+    """Return whether both sides identify the same token on the same chain."""
+    source = request.source_asset
+    destination = request.destination_asset
+    source_address = str(source.address or "").strip().lower()
+    destination_address = str(destination.address or "").strip().lower()
+    return bool(
+        source_address
+        and destination_address
+        and canonical_chain(source.chain) == canonical_chain(destination.chain)
+        and source_address == destination_address
+    )
+
+
 def _mapping(value: Any) -> dict[str, Any]:
     """Coerce legacy structured input to a plain JSON-safe mapping."""
     dumped = _dump(value)
@@ -842,6 +856,13 @@ def _swap_draft_request(
             normalized["input_amount_raw"] = str(int(raw))
         except Exception:
             return None, ["input_amount_raw"]
+    if (
+        canonical_chain(str(normalized["source_chain"]))
+        == canonical_chain(str(normalized["destination_chain"]))
+        and str(normalized["source_token_address"]).strip().lower()
+        == str(normalized["destination_token_address"]).strip().lower()
+    ):
+        return None, ["source_equals_destination"]
     request = {
         "source_asset": {
             "chain": normalized["source_chain"],
@@ -1177,10 +1198,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             decision = {"intent": forced, "source": "api"}
         elif (
             state.get("intent") in _VALID_INTENTS
-            and (
-                not request.get("message")
-                or (state.get("confirmation_state") or {}).get("status") == "requested"
-            )
+            and not request.get("message")
         ):
             decision = {"intent": state["intent"], "source": "graph_resume"}
         else:
@@ -1236,6 +1254,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "predicted_intent": decision["intent"],
             "supervisor_decision": decision,
             "supervisor_output": decision,
+            "response_action": None,
             # Preserve every legacy request field while making the checkpoint
             # representation serializable for subsequent resume calls.
             "request": request,
@@ -1537,6 +1556,24 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "quote": state.get("selected_quote"),
             }
         )
+        if isinstance(answer, dict) and ("request" in answer or "message" in answer):
+            incoming = answer.get("request")
+            if not isinstance(incoming, Mapping):
+                incoming = {"message": answer.get("message")}
+            update: dict[str, Any] = {
+                "request": _mapping(incoming),
+                "forced_intent": None,
+                "confirmation_state": None,
+                "selected_quote": None,
+                "quote_candidates": [{"__clear__": True}],
+                "swap_request": None,
+                "pending_transaction": None,
+                "user_confirmation": None,
+                "response_action": "reparse",
+            }
+            if isinstance(answer.get("wallet_context"), Mapping):
+                update["wallet_context"] = _mapping(answer["wallet_context"])
+            return update
         approved = isinstance(answer, dict) and bool(answer.get("approved"))
         if answer is True:
             approved = True
@@ -1925,6 +1962,30 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             request_model, missing = _swap_draft_request(draft, state.get("wallet_context"))
             if request_model is None:
+                if missing == ["source_equals_destination"]:
+                    return {
+                        "intent": "clarification",
+                        "route": "response",
+                        "swap_draft": draft,
+                        **task_update,
+                        "active_task": _task_progress(
+                            active_task,
+                            slots=draft,
+                            status="collecting",
+                            stage="collecting_parameters",
+                            missing_fields=[],
+                        ),
+                        "missing_fields": [],
+                        "response": {
+                            "kind": "error",
+                            "errors": [
+                                _error(
+                                    "SOURCE_EQUALS_DESTINATION",
+                                    "来源 Token 和目标 Token 不能是同一资产。",
+                                )
+                            ],
+                        },
+                    }
                 user_missing = [field for field in missing if field in _USER_SWAP_FIELDS]
                 if "input_amount_raw" in missing and "input_amount" not in user_missing:
                     user_missing.append("input_amount")
@@ -2192,6 +2253,22 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             return {
                 "intent": "clarification",
                 "errors": [_error("INVALID_SWAP_PARAMETERS", str(exc))],
+            }
+        if _same_swap_asset(request):
+            return {
+                "swap_request": request.model_dump(mode="json"),
+                "available_providers": [],
+                "selected_quote": None,
+                "quote_candidates": [{"__clear__": True}],
+                "response": {
+                    "kind": "error",
+                    "errors": [
+                        _error(
+                            "SOURCE_EQUALS_DESTINATION",
+                            "来源 Token 和目标 Token 不能是同一资产。",
+                        )
+                    ],
+                },
             }
         selected = state.get("selected_quote")
         if state.get("intent") == "swap_quote" and not runtime.providers:

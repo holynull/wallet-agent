@@ -78,6 +78,8 @@ def route_after_quote_provider(state: dict[str, Any]) -> str:
 
 
 def route_after_confirmation(state: dict[str, Any]) -> str:
+    if state.get("response_action") == "reparse":
+        return "supervisor"
     confirmation = state.get("confirmation_state") or {}
     if confirmation.get("status") == "approved":
         return "prepare"

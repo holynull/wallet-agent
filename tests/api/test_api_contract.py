@@ -1,6 +1,6 @@
 import httpx
 import pytest
-from langgraph.types import Interrupt
+from langgraph.types import Command, Interrupt
 
 from wallet_agent.api import create_app
 from wallet_agent.domain.errors import ChainCapabilityUnavailable
@@ -112,6 +112,45 @@ async def test_run_graph_uses_async_state_snapshot_when_available():
 
     assert "event: complete" in stream.text
     assert "event: error" not in stream.text
+
+
+@pytest.mark.asyncio
+async def test_new_message_resumes_pending_graph_interrupt_with_request_context():
+    class PendingGraph:
+        def __init__(self):
+            self.inputs = []
+
+        async def astream(self, value, *, config, stream_mode):
+            del config, stream_mode
+            self.inputs.append(value)
+            yield {"response": {"kind": "clarification"}}
+
+        async def aget_state(self, _config):
+            class Snapshot:
+                values = {"response": {"kind": "clarification"}}
+                tasks = ()
+                next = ()
+
+            if not self.inputs:
+                Snapshot.tasks = (object(),)
+                Snapshot.next = ("confirmation_wait",)
+            return Snapshot()
+
+    graph = PendingGraph()
+    app, client = await client_for(graph=graph)
+    async with client:
+        turn = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "conversation_id": "pending-thread",
+                "message": "改成 1 USDC 换 USDT",
+            },
+        )
+        await app.state.runs[turn.json()["run_id"]]["task"]
+
+    assert isinstance(graph.inputs[0], Command)
+    assert graph.inputs[0].resume["request"]["message"] == "改成 1 USDC 换 USDT"
 
 
 @pytest.mark.asyncio

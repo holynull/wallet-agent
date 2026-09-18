@@ -31,6 +31,46 @@ class PrepareProvider:
         )
 
 
+class ReparseModel:
+    def __init__(self):
+        self.classify_calls = 0
+        self.extract_calls = 0
+
+    async def classify(self, _request):
+        self.classify_calls += 1
+        return {"intent": "swap_quote"}
+
+    async def extract(self, _kind, _request):
+        self.extract_calls += 1
+        return {
+            "source_chain": "BASE",
+            "destination_chain": "BASE",
+            "source_symbol": "USDC",
+            "destination_symbol": "USDT",
+            "source_token_address": "0x1",
+            "destination_token_address": "0x2",
+            "source_decimals": 6,
+            "destination_decimals": 6,
+            "input_amount": "1",
+        }
+
+
+class ReparseProvider:
+    provider_name = "bridgers"
+
+    async def quote(self, request):
+        return NormalizedQuote(
+            provider="bridgers",
+            source_asset=request.source_asset,
+            destination_asset=request.destination_asset,
+            input_amount=request.input_amount,
+            input_amount_raw=request.input_amount_raw,
+            expected_output=Decimal("1"),
+            expected_output_raw="1000000",
+            provider_reference="reparsed",
+        )
+
+
 def selected_quote():
     asset = Asset(chain="BASE", symbol="USDC", decimals=6, address="0x1")
     dest = Asset(chain="BSC", symbol="USDT", decimals=6, address="0x2")
@@ -81,6 +121,7 @@ async def test_stale_task_revision_is_rejected_before_prepare():
                 "missing_fields": [],
             },
             "selected_quote": quote,
+            "wallet_context": {"address": "0x1", "chain": "BASE"},
             "swap_request": {
                 "source_asset": quote["source_asset"],
                 "destination_asset": quote["destination_asset"],
@@ -139,3 +180,46 @@ async def test_prepare_interrupt_resume_calls_provider_once():
     assert provider.prepare_calls == 1
     await graph.ainvoke(Command(resume={"approved": True}), config=config)
     assert provider.prepare_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_new_message_during_confirmation_reparses_and_invalidates_old_confirmation():
+    model = ReparseModel()
+    graph = build_graph(model=model, providers=[ReparseProvider()])
+    quote = selected_quote()
+    config = {"configurable": {"thread_id": "reparse-after-confirmation"}}
+
+    paused = await graph.ainvoke(
+        {
+            "conversation_id": "reparse-after-confirmation",
+            "intent": "swap_prepare",
+            "forced_intent": "swap_prepare",
+            "selected_quote": quote,
+            "swap_request": {
+                "source_asset": quote["source_asset"],
+                "destination_asset": quote["destination_asset"],
+                "input_amount": "1",
+                "input_amount_raw": "1000000",
+                "sender_address": "0x1",
+                "recipient_address": "0x2",
+            },
+        },
+        config=config,
+    )
+    assert paused["__interrupt__"]
+
+    result = await graph.ainvoke(
+        Command(
+            resume={
+                "request": {"message": "改成 1 USDC 换 USDT"},
+                "wallet_context": {"address": "0x1", "chain": "BASE"},
+            }
+        ),
+        config=config,
+    )
+
+    assert model.classify_calls == 1
+    assert model.extract_calls == 1
+    assert result["response"]["kind"] == "swap_quote"
+    assert result["swap_request"]["source_asset"]["symbol"] == "USDC"
+    assert result["confirmation_state"] is None

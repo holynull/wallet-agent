@@ -348,10 +348,26 @@ def create_app(
                     return app.state.graph.get_state(config)
 
                 async def execute(graph_input: dict[str, Any]) -> dict[str, Any]:
+                    snapshot = await get_snapshot()
+                    request = (
+                        graph_input.get("request")
+                        if isinstance(graph_input, Mapping)
+                        else None
+                    )
+                    message = request.get("message") if isinstance(request, Mapping) else None
+                    if (
+                        isinstance(graph_input, dict)
+                        and getattr(snapshot, "tasks", ())
+                        and getattr(snapshot, "next", ())
+                        and message
+                    ):
+                        graph_input = Command(resume=graph_input)
                     async for event in app.state.graph.astream(
                         graph_input, config=config, stream_mode="updates"
                     ):
-                        app.state.runs[run_id]["events"].append({"event": "update", "data": event})
+                        app.state.runs[run_id]["events"].append(
+                            {"event": "update", "data": event}
+                        )
                     snapshot = await get_snapshot()
                     return dict(snapshot.values)
 

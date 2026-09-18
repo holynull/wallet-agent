@@ -144,6 +144,29 @@ async def test_quote_path_rejects_zero_output_quote_before_confirmation():
 
 
 @pytest.mark.asyncio
+async def test_quote_path_rejects_same_asset_before_calling_provider():
+    provider = FakeProvider("bridgers")
+    request = quote_request()
+    same_asset = request.source_asset.model_copy()
+    same_request = request.model_copy(update={"destination_asset": same_asset})
+    graph = build_graph(model=FakeModel(), providers=[provider])
+
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "c-same-asset",
+            "user_id": "u1",
+            "intent": "swap_quote",
+            "swap_request": same_request,
+        },
+        config={"configurable": {"thread_id": "t-same-asset"}},
+    )
+
+    assert result["response"]["kind"] == "error"
+    assert result["response"]["errors"][0]["code"] == "SOURCE_EQUALS_DESTINATION"
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
 async def test_quote_path_filters_invalid_provider_without_losing_valid_candidate():
     graph = build_graph(
         model=FakeModel(),

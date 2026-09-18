@@ -115,7 +115,7 @@ def build_graph(
     builder.add_conditional_edges(
         "confirmation_wait",
         route_after_confirmation,
-        {"prepare": "prepare", "response": "response"},
+        {"prepare": "prepare", "response": "response", "supervisor": "supervisor"},
     )
     builder.add_edge("quote_provider", "quote_response")
     builder.add_edge("quote_response", END)
