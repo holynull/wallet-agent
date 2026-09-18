@@ -369,6 +369,8 @@ class FeeEstimate(DomainModel):
     amount: Decimal = Field(ge=0)
     amount_raw: RawInteger
     gas_limit: RawInteger | None = None
+    max_fee_per_gas: RawInteger | None = None
+    max_priority_fee_per_gas: RawInteger | None = None
     expires_at: datetime | None = None
 
 

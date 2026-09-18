@@ -159,7 +159,15 @@ def _fee_dump(value: Any) -> dict[str, Any]:
         return dumped
     result = {
         key: getattr(value, key)
-        for key in ("chain", "chain_id", "amount_raw", "gas_limit", "expires_at")
+        for key in (
+            "chain",
+            "chain_id",
+            "amount_raw",
+            "gas_limit",
+            "max_fee_per_gas",
+            "max_priority_fee_per_gas",
+            "expires_at",
+        )
         if hasattr(value, key)
     }
     if hasattr(value, "amount"):
@@ -168,6 +176,18 @@ def _fee_dump(value: Any) -> dict[str, Any]:
         asset = _dump(value.asset)
         result["asset"] = asset if isinstance(asset, dict) else str(asset)
     return result
+
+
+def _apply_fee_estimate(transaction: Any, fee: Mapping[str, Any] | None) -> Any:
+    """Copy the exact preflight gas fields onto the wallet transaction payload."""
+    if not isinstance(transaction, UnsignedTransaction) or not isinstance(fee, Mapping):
+        return transaction
+    updates = {
+        key: fee[key]
+        for key in ("gas_limit", "max_fee_per_gas", "max_priority_fee_per_gas")
+        if fee.get(key) is not None
+    }
+    return transaction.model_copy(update=updates) if updates else transaction
 
 
 def _quote(value: Any) -> NormalizedQuote:
@@ -791,7 +811,15 @@ async def _transaction_preflight(
     fee = None
     if hasattr(adapter, "estimate_fee"):
         try:
-            fee = await adapter.estimate_fee(to=transaction.to, data=transaction.data)
+            try:
+                fee = await adapter.estimate_fee(
+                    to=transaction.to,
+                    data=transaction.data,
+                    from_address=sender or None,
+                    value=getattr(transaction, "value", None),
+                )
+            except TypeError:
+                fee = await adapter.estimate_fee(to=transaction.to, data=transaction.data)
             add("network_fee", "passed", "已获取网络手续费估算。")
         except Exception as exc:
             add(
@@ -1165,7 +1193,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "error": "当前链暂不支持手续费估算。",
             }
         try:
-            fee = await adapter.estimate_fee(to=to, data=data)
+            try:
+                fee = await adapter.estimate_fee(to=to, data=data, from_address=address)
+            except TypeError:
+                fee = await adapter.estimate_fee(to=to, data=data)
             native = await adapter.get_native_balance(address)
             balance_raw = int(native.amount_raw)
             fee_raw = int(fee.amount_raw)
@@ -2674,6 +2705,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         "preflight": preflight,
                     },
                 }
+            tx = _apply_fee_estimate(tx, preflight.get("fee_estimate"))
             return {
                 "preflight": preflight,
                 "pending_transaction": tx.model_dump(mode="json"),
@@ -2750,6 +2782,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                                 "preflight": preflight,
                             },
                         }
+            prepared = _apply_fee_estimate(
+                prepared, preflight.get("fee_estimate") if preflight else None
+            )
+            dumped = _dump(prepared)
             return {
                 "pending_transaction": dumped,
                 "preflight": preflight,
@@ -2863,8 +2899,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 preflight = await _transaction_preflight(
                     adapter=adapter,
                     chain=source_chain,
-                    sender=str(request.get("sender_address") or ""),
-                    recipient=str(request.get("recipient_address") or ""),
+                    sender=str(request.get("sender_address") or requirement.owner),
+                    recipient=str(request.get("recipient_address") or requirement.owner),
                     amount_raw=str(request.get("input_amount_raw") or "0"),
                     token=(
                         Asset.model_validate(source_asset) if source_asset.get("address") else None
@@ -2887,6 +2923,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             "preflight": preflight,
                         },
                     }
+            prepared = _apply_fee_estimate(
+                prepared, preflight.get("fee_estimate") if preflight else None
+            )
+            dumped = _dump(prepared)
             return {
                 "approval_transaction": approval_transaction,
                 "approval_tx_hash": approval_tx_hash,

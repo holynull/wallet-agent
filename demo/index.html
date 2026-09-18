@@ -686,7 +686,16 @@
   async function sendUnsignedTransaction(transaction) {
     if (!state.provider || !state.address) throw new Error('请先连接浏览器钱包');
     await ensureWalletChain(transaction);
-    return state.provider.request({ method: 'eth_sendTransaction', params: [{ from: state.address, to: transaction.to, data: transaction.data || '0x', value: transactionValue(transaction.value) }] });
+    const request = {
+      from: state.address,
+      to: transaction.to,
+      data: transaction.data || '0x',
+      value: transactionValue(transaction.value)
+    };
+    if (transaction.gas_limit != null) request.gas = transactionValue(transaction.gas_limit);
+    if (transaction.max_fee_per_gas != null) request.maxFeePerGas = transactionValue(transaction.max_fee_per_gas);
+    if (transaction.max_priority_fee_per_gas != null) request.maxPriorityFeePerGas = transactionValue(transaction.max_priority_fee_per_gas);
+    return state.provider.request({ method: 'eth_sendTransaction', params: [request] });
   }
   async function waitForApprovalConfirmation(approveTxHash, maxAttempts = 60, intervalMs = 2000) {
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {

@@ -1179,7 +1179,10 @@ def create_app(
                 if hasattr(registry, "get_adapter")
                 else registry.get(chain)
             )
-            fee = await adapter.estimate_fee(to=to, data=data)
+            try:
+                fee = await adapter.estimate_fee(to=to, data=data, from_address=address)
+            except TypeError:
+                fee = await adapter.estimate_fee(to=to, data=data)
             native = await adapter.get_native_balance(address)
             fee_raw = int(fee.amount_raw)
             balance_raw = int(native.amount_raw)

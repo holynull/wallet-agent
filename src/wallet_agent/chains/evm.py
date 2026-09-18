@@ -147,14 +147,32 @@ class EVMChainAdapter:
             return []
         return [self._record(item) for item in value if isinstance(item, dict)][:limit]
 
-    async def estimate_fee(self, *, to: str | None = None, data: str | None = None) -> FeeEstimate:
+    async def estimate_fee(
+        self,
+        *,
+        to: str | None = None,
+        data: str | None = None,
+        from_address: str | None = None,
+        value: str | None = None,
+    ) -> FeeEstimate:
         tx: dict[str, str] = {}
+        if from_address:
+            tx["from"] = validate_evm_address(from_address)
         if to:
             tx["to"] = to
         if data:
             tx["data"] = data
+        if value not in (None, ""):
+            tx["value"] = value if str(value).startswith("0x") else hex(int(str(value)))
         gas = quantity(await rpc_call(self.transport, "eth_estimateGas", [tx]))
         gas_price = quantity(await rpc_call(self.transport, "eth_gasPrice", []))
+        try:
+            priority_fee = quantity(
+                await rpc_call(self.transport, "eth_maxPriorityFeePerGas", [])
+            )
+        except Exception:
+            priority_fee = gas_price
+        priority_fee = min(priority_fee, gas_price)
         total = gas * gas_price
         return FeeEstimate(
             chain=self.chain,
@@ -163,6 +181,8 @@ class EVMChainAdapter:
             amount=token_balance(self.native_asset, total).amount,
             amount_raw=str(total),
             gas_limit=str(gas),
+            max_fee_per_gas=str(gas_price),
+            max_priority_fee_per_gas=str(priority_fee),
         )
 
     async def get_transaction_status(self, tx_hash: str) -> TransactionStatus:

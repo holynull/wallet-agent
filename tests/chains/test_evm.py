@@ -196,3 +196,30 @@ async def test_evm_read_only_methods_and_units():
     ].status == TransactionStatus.CONFIRMED
     assert (await adapter.estimate_fee()).amount_raw == str(21000 * 1_000_000_000)
     assert await adapter.get_transaction_status("0xabc") == TransactionStatus.CONFIRMED
+
+
+async def test_evm_fee_estimate_uses_transaction_context_and_returns_wallet_gas_fields():
+    rpc = RecordingRpc(
+        {
+            "eth_estimateGas": "0x7530",
+            "eth_gasPrice": "0x5f5e100",
+            "eth_maxPriorityFeePerGas": "0x1e8480",
+        }
+    )
+    adapter = EVMChainAdapter(rpc, chain="ETH", chain_id=1)
+
+    fee = await adapter.estimate_fee(
+        to=RECIPIENT,
+        data="0xabc",
+        from_address=OWNER,
+        value="0",
+    )
+
+    assert rpc.calls[0] == (
+        "eth_estimateGas",
+        [{"from": OWNER, "to": RECIPIENT, "data": "0xabc", "value": "0x0"}],
+    )
+    assert fee.gas_limit == "30000"
+    assert fee.max_fee_per_gas == "100000000"
+    assert fee.max_priority_fee_per_gas == "2000000"
+    assert fee.amount_raw == str(30000 * 100000000)

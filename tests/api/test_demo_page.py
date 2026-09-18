@@ -57,6 +57,12 @@ async def test_mobile_demo_page_is_served_by_api_app():
     assert "function renderSuggestions" in response.text
     assert "response.suggestions" in response.text
     assert "suggestion.message; sendMessage()" in response.text
+    assert "request.gas = transactionValue(transaction.gas_limit)" in response.text
+    assert "request.maxFeePerGas = transactionValue(transaction.max_fee_per_gas)" in response.text
+    assert (
+        "request.maxPriorityFeePerGas = transactionValue(transaction.max_priority_fee_per_gas)"
+        in response.text
+    )
 
 
 @pytest.mark.asyncio
