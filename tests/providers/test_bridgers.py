@@ -308,6 +308,27 @@ async def test_bridgers_evm_quote_exposes_allowance_requirement():
 
 
 @pytest.mark.asyncio
+async def test_bridgers_ethereum_erc20_quote_exposes_allowance_requirement():
+    transport = FakeTransport(quote_response())
+    provider = BridgersProvider.from_transport(transport, source_flag="wallet-agent")
+    request = valid_quote_request().model_copy(
+        update={
+            "source_asset": valid_quote_request().source_asset.model_copy(
+                update={"chain": "ETH", "chain_id": 1}
+            ),
+            "destination_asset": valid_quote_request().destination_asset.model_copy(
+                update={"chain": "ETH", "chain_id": 1}
+            ),
+        }
+    )
+
+    quote = await provider.quote(request)
+
+    assert quote.allowance_requirement is not None
+    assert quote.allowance_requirement.spender == "0x0000000000000000000000000000000000000033"
+
+
+@pytest.mark.asyncio
 async def test_bridgers_quote_payload_contains_only_normalized_resume_metadata():
     transport = FakeTransport(
         quote_response(),

@@ -130,6 +130,10 @@ class EVMChainAdapter:
         receipt = await rpc_call(self.transport, "eth_getTransactionReceipt", [tx_hash])
         return receipt if isinstance(receipt, dict) else None
 
+    async def get_transaction(self, tx_hash: str) -> dict[str, Any] | None:
+        transaction = await rpc_call(self.transport, "eth_getTransactionByHash", [tx_hash])
+        return transaction if isinstance(transaction, dict) else None
+
     async def get_transaction_history(
         self, address: str, *, limit: int = 20
     ) -> list[TransactionRecord]:

@@ -208,6 +208,19 @@ async def test_omnibridge_reverse_quote_uses_erc20_codes_and_verifies_forward_ou
 
 
 @pytest.mark.asyncio
+async def test_omnibridge_ethereum_erc20_quote_exposes_allowance_requirement():
+    spender = "0x0000000000000000000000000000000000000033"
+    provider = OmniBridgeProvider.from_transport(
+        FakeTransport(quote_response(spender=spender)), source_flag="wallet-agent"
+    )
+
+    quote = await provider.quote(erc20_quote_request())
+
+    assert quote.allowance_requirement is not None
+    assert quote.allowance_requirement.spender == spender
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("amount", "minimum", "maximum"),
     [("0.03", "0.038603", "14"), ("15", "0.038603", "14")],

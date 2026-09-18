@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from wallet_agent.chains._common import receipt_success
 from wallet_agent.domain.errors import ChainCapabilityUnavailable
 from wallet_agent.domain.models import (
     AgentError,
@@ -700,11 +701,59 @@ def create_app(
         provider = app.state.providers.get(session.quote.provider if session.quote else "")
         if provider is None or session.quote is None:
             raise HTTPException(status_code=409, detail="swap provider or quote unavailable")
+
+        broadcast_status = "broadcasted"
+        registry = app.state.chain_registry
+        if registry is not None:
+            try:
+                adapter = (
+                    registry.get_adapter(payload.chain)
+                    if hasattr(registry, "get_adapter")
+                    else registry.get(payload.chain)
+                )
+            except Exception:
+                adapter = None
+            if adapter is not None and hasattr(adapter, "get_transaction_receipt"):
+                try:
+                    receipt = await adapter.get_transaction_receipt(payload.tx_hash)
+                    if receipt is not None:
+                        if receipt_success(receipt) is False:
+                            raise HTTPException(
+                                status_code=409,
+                                detail={
+                                    "code": "TRANSACTION_FAILED",
+                                    "message": "链上交易已确认失败，请检查钱包和交易参数。",
+                                    "details": {"tx_hash": payload.tx_hash},
+                                },
+                            )
+                    elif hasattr(adapter, "get_transaction"):
+                        transaction = await adapter.get_transaction(payload.tx_hash)
+                        if transaction is None:
+                            raise HTTPException(
+                                status_code=409,
+                                detail={
+                                    "code": "TRANSACTION_NOT_FOUND",
+                                    "message": "链上节点尚未看到这笔交易，请确认钱包广播是否成功。",
+                                    "details": {"tx_hash": payload.tx_hash},
+                                },
+                            )
+                        broadcast_status = "broadcast_pending"
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "code": "TRANSACTION_STATUS_UNAVAILABLE",
+                            "message": "暂时无法验证交易是否已广播，请稍后重试。",
+                            "details": {"error": str(exc)},
+                        },
+                    ) from exc
         reference = session.quote.provider_reference
         order = await provider.register_broadcast(reference, payload.tx_hash)
         updated = await session_store.update(
             session_id,
-            status="broadcasted",
+            status=broadcast_status,
             broadcast_tx_hash=payload.tx_hash,
             provider_order=order,
         )

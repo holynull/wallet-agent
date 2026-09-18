@@ -176,7 +176,6 @@ class OmniBridgeProvider:
         if (
             spender
             and request.source_asset.address
-            and request.source_asset.chain.upper() not in {"ETH", "EVM_NATIVE"}
         ):
             try:
                 allowance = AllowanceRequirement(

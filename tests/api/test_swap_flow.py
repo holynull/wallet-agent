@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from wallet_agent.api import create_app
+from wallet_agent.chains.registry import ChainAdapterRegistry
 from wallet_agent.domain.models import (
     Asset,
     NormalizedOrderStatus,
@@ -148,6 +149,36 @@ async def test_broadcast_is_idempotent_and_conflicting_hash_is_rejected():
         assert second.status_code == 200
         assert conflict.status_code == 409
         assert provider.broadcast_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_broadcast_rejects_hash_missing_from_chain_before_provider_registration():
+    class BroadcastAdapter:
+        async def get_transaction_receipt(self, _tx_hash):
+            return None
+
+        async def get_transaction(self, _tx_hash):
+            return None
+
+    app, client, provider = await make_client()
+    app.state.chain_registry = ChainAdapterRegistry({"BASE": BroadcastAdapter()})
+    async with client:
+        response = await client.post("/v1/agent/turn", json=request_payload())
+        body = response.json()
+        await app.state.runs[body["run_id"]]["task"]
+        session_id = body["session_id"]
+        await client.post(
+            f"/v1/swap/{session_id}/confirm", json={"user_id": "alice", "approved": True}
+        )
+        tx_hash = "0x" + "b" * 64
+        broadcast = await client.post(
+            f"/v1/swap/{session_id}/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": tx_hash},
+        )
+
+    assert broadcast.status_code == 409
+    assert broadcast.json()["code"] == "TRANSACTION_NOT_FOUND"
+    assert provider.broadcast_calls == 0
 
 
 @pytest.mark.asyncio
