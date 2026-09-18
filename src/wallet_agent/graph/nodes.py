@@ -2199,6 +2199,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "swap_request": request.model_dump(mode="json"),
                 "available_providers": [],
                 "selected_quote": selected,
+                "response": None,
                 "errors": [
                     _error(
                         "PROVIDER_UNAVAILABLE",
@@ -2211,6 +2212,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "swap_request": request.model_dump(mode="json"),
             "available_providers": list(runtime.providers),
             "selected_quote": selected,
+            "response": None,
         }
 
     async def quote_provider(state: dict[str, Any]) -> dict[str, Any]:
@@ -2220,7 +2222,49 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         quotes = [_dump(item) for item in state.get("quote_candidates", [])]
         quotes = [item for item in quotes if isinstance(item, dict)]
         if not quotes and state.get("errors"):
-            return {"response": {"kind": "error", "errors": state["errors"]}}
+            return {
+                "selected_quote": None,
+                "response": {"kind": "error", "errors": state["errors"]},
+            }
+        invalid_quotes: list[dict[str, Any]] = []
+        valid_quotes: list[dict[str, Any]] = []
+        for quote in quotes:
+            try:
+                expected_output = Decimal(str(quote.get("expected_output", "0")))
+                minimum_output = quote.get("minimum_output")
+                minimum_value = (
+                    Decimal(str(minimum_output)) if minimum_output is not None else None
+                )
+            except (ArithmeticError, TypeError, ValueError):
+                expected_output = Decimal("0")
+                minimum_value = Decimal("0")
+            if expected_output <= 0 or (minimum_value is not None and minimum_value <= 0):
+                invalid_quotes.append(
+                    _error(
+                        "INVALID_QUOTE",
+                        "Provider 返回了无效报价：预期到账数量必须大于 0。",
+                        retryable=True,
+                        details={
+                            "provider": quote.get("provider"),
+                            "provider_reference": quote.get("provider_reference"),
+                            "expected_output": quote.get("expected_output"),
+                            "minimum_output": quote.get("minimum_output"),
+                        },
+                    )
+                )
+                continue
+            valid_quotes.append(quote)
+        quotes = valid_quotes
+        if not quotes:
+            return {
+                "selected_quote": None,
+                "quote_candidates": [{"__clear__": True}],
+                "response": {
+                    "kind": "error",
+                    "errors": invalid_quotes
+                    or [_error("NO_VALID_QUOTES", "暂时没有可用的有效兑换报价。", retryable=True)],
+                },
+            }
         # Never silently choose a provider when multiple candidates exist.
         selected = quotes[0] if len(quotes) == 1 else _dump(state.get("selected_quote"))
         if runtime.price_provider and quotes:
@@ -2286,7 +2330,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         )
         return {
             "selected_quote": selected,
-            "quote_candidates": quotes,
+            "quote_candidates": [{"__clear__": True}, *quotes],
             **task_update,
             "response": {
                 "kind": "swap_quote",

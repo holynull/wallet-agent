@@ -16,11 +16,11 @@ cp .env.example .env
 
 ```dotenv
 DEEPSEEK_API_KEY=你的-DeepSeek-API-Key
-OPENAI_MODEL=deepseek-chat
+OPENAI_MODEL=deepseek-v4-pro
 OPENAI_BASE_URL=https://api.deepseek.com
 ```
 
-`OPENAI_MODEL` 必须包含在 `ALLOWED_MODEL_IDS` 中。默认配置已经包含 `deepseek-chat` 和 `deepseek-reasoner`。
+`OPENAI_MODEL` 必须包含在 `ALLOWED_MODEL_IDS` 中。默认模型是 `deepseek-v4-pro`，同时保留 `deepseek-chat` 和 `deepseek-reasoner` 兼容选项。
 
 ### 配置 EVM RPC
 

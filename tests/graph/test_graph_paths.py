@@ -12,6 +12,7 @@ from wallet_agent.domain.models import (
     UnsignedTransaction,
 )
 from wallet_agent.graph.build import build_graph
+from wallet_agent.graph.nodes import GraphRuntime, make_nodes
 
 
 class FakeModel:
@@ -67,6 +68,14 @@ class FakeProvider:
         )
 
 
+class ZeroOutputProvider(FakeProvider):
+    async def quote(self, request):
+        quote = await super().quote(request)
+        return quote.model_copy(
+            update={"expected_output": Decimal("0"), "expected_output_raw": "0"}
+        )
+
+
 def quote_request():
     return SwapQuoteRequest(
         source_asset=Asset(chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x1"),
@@ -111,6 +120,64 @@ async def test_quote_path_reports_missing_provider_instead_of_empty_success():
     )
     assert result["response"]["kind"] == "error"
     assert result["response"]["errors"][0]["code"] == "PROVIDER_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_quote_path_rejects_zero_output_quote_before_confirmation():
+    graph = build_graph(
+        model=FakeModel(),
+        providers=[ZeroOutputProvider("bridgers")],
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "c-zero-output",
+            "user_id": "u1",
+            "intent": "swap_quote",
+            "swap_request": quote_request(),
+        },
+        config={"configurable": {"thread_id": "t-zero-output"}},
+    )
+    assert result["response"]["kind"] == "error"
+    assert result["response"]["errors"][0]["code"] == "INVALID_QUOTE"
+    assert result["quote_candidates"] == []
+    assert result["selected_quote"] is None
+
+
+@pytest.mark.asyncio
+async def test_quote_path_filters_invalid_provider_without_losing_valid_candidate():
+    graph = build_graph(
+        model=FakeModel(),
+        providers=[ZeroOutputProvider("bridgers"), FakeProvider("omnibridge")],
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "c-mixed-quotes",
+            "user_id": "u1",
+            "intent": "swap_quote",
+            "swap_request": quote_request(),
+        },
+        config={"configurable": {"thread_id": "t-mixed-quotes"}},
+    )
+    assert result["response"]["kind"] == "swap_quote"
+    assert [quote["provider"] for quote in result["quote_candidates"]] == ["omnibridge"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_swap_clears_stale_response_before_quote_fanout():
+    provider = FakeProvider("bridgers")
+    runtime = GraphRuntime(model=FakeModel(), providers={"bridgers": provider}, chains={})
+    resolve_swap = make_nodes(runtime)["resolve_swap"]
+    result = await resolve_swap(
+        {
+            "intent": "swap_quote",
+            "swap_request": quote_request().model_dump(mode="json"),
+            "response": {
+                "kind": "clarification",
+                "message": "还需要确认来源链和目标链。",
+            },
+        }
+    )
+    assert result["response"] is None
 
 
 @pytest.mark.asyncio

@@ -60,7 +60,9 @@ def build_graph(
     builder.add_node("intent", n["intent"])
     builder.add_node("resolve_swap", n["resolve_swap"])
     builder.add_node("quote_provider", n["quote_provider"])
-    builder.add_node("quote_response", n["quote_response"])
+    # Provider quotes fan out via Send; defer the reducer until every branch
+    # has completed so one invalid provider cannot overwrite valid candidates.
+    builder.add_node("quote_response", n["quote_response"], defer=True)
     builder.add_node("asset_tool_call", n["asset_tool_call"])
     builder.add_node("asset_tool_result", n["asset_tool_result"])
     builder.add_node("confirmation_request", n["confirmation_request"])

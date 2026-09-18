@@ -14,7 +14,7 @@ async def test_deepseek_smoke():
     from langchain_openai import ChatOpenAI
 
     response = await ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL", "deepseek-chat"),
+        model=os.getenv("OPENAI_MODEL", "deepseek-v4-pro"),
         api_key=os.environ["DEEPSEEK_API_KEY"],
         base_url=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com"),
     ).ainvoke("Reply with the single word: ok")

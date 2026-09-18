@@ -47,7 +47,7 @@ python scripts/smoke_test.py --base-url http://localhost:8000
 ```
 
 The default model backend is DeepSeek's official OpenAI-compatible API:
-`https://api.deepseek.com` with `deepseek-chat`. To use another compatible
+`https://api.deepseek.com` with `deepseek-v4-pro`. To use another compatible
 backend, set `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_BASE_URL` instead.
 
 The HTTP API is rooted at `/v1`: agent turns and SSE streaming, explicit swap

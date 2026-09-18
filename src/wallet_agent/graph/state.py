@@ -71,10 +71,14 @@ def _merge_quote_candidates(
     incoming: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
     """Append fan-out results while replacing entries enriched by later nodes."""
-    if any(item.get("__clear__") for item in (incoming or [])):
-        return []
+    incoming_items = [item for item in (incoming or []) if not item.get("__clear__")]
+    base = (
+        []
+        if any(item.get("__clear__") for item in (incoming or []))
+        else (existing or [])
+    )
     merged: dict[str, dict[str, Any]] = {}
-    for item in [*(existing or []), *(incoming or [])]:
+    for item in [*base, *incoming_items]:
         key = str(item.get("provider_reference") or item.get("provider") or len(merged))
         merged[key] = item
     return list(merged.values())
