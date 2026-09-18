@@ -40,6 +40,7 @@ class SwapSessionRecord(DomainModel):
     allowance_requirement: dict | None = None
     preflight: dict | None = None
     confirmation_state: dict | None = None
+    gas_estimate: dict | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

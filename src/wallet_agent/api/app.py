@@ -322,6 +322,8 @@ def create_app(
             changes["preflight"] = state["preflight"]
         if state.get("confirmation_state") is not None:
             changes["confirmation_state"] = _jsonable(state["confirmation_state"])
+        if state.get("swap_gas_estimate") is not None:
+            changes["gas_estimate"] = _jsonable(state["swap_gas_estimate"])
         if status:
             changes["status"] = status
         if not changes:

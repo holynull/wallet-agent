@@ -128,6 +128,7 @@ def task_invalidation(kind: TaskKind, changed_slots: frozenset[str]) -> dict[str
         return {}
     common = {
         "confirmation_state": None,
+        "swap_gas_estimate": None,
         "pending_transaction": None,
         "preflight": None,
     }

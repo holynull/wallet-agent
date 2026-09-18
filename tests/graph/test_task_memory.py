@@ -39,6 +39,7 @@ class Provider:
 
     def __init__(self):
         self.quote_calls = 0
+        self.last_slippage_bps = None
 
     async def list_assets(self, query: AssetQuery):
         assets = {
@@ -54,6 +55,7 @@ class Provider:
 
     async def quote(self, request):
         self.quote_calls += 1
+        self.last_slippage_bps = request.slippage_bps
         return NormalizedQuote(
             provider="bridgers",
             source_asset=request.source_asset,
@@ -369,6 +371,34 @@ async def test_swap_correction_replaces_previous_quote():
     assert [item["provider_reference"] for item in second["response"]["quotes"]] == ["quote-2"]
     assert second["active_task"]["revision"] == 2
     assert second["swap_request"]["input_amount"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_swap_accepts_user_slippage_and_passes_it_to_quote():
+    model = UnderstandingModel(
+        ["swap_quote"],
+        swap=[
+            SwapSlotPatch(
+                source_chain="BASE",
+                destination_chain="BASE",
+                source_symbol="USDC",
+                destination_symbol="USDT",
+                input_amount="1",
+                slippage_bps=250,
+            )
+        ],
+    )
+    provider = Provider()
+    graph = build_graph(model=model, providers=[provider])
+
+    result = await graph.ainvoke(
+        turn("在 Base 用 1 USDC 换 USDT，滑点 2.5%"),
+        config={"configurable": {"thread_id": "task-swap-slippage"}},
+    )
+
+    assert result["swap_request"]["slippage_bps"] == 250
+    assert result["active_task"]["slots"]["slippage_bps"] == 250
+    assert provider.last_slippage_bps == 250
 
 
 @pytest.mark.asyncio

@@ -144,6 +144,44 @@ async def test_quote_path_rejects_zero_output_quote_before_confirmation():
 
 
 @pytest.mark.asyncio
+async def test_confirmation_includes_slippage_and_read_only_gas_estimate():
+    class GasAdapter:
+        async def estimate_fee(self, *, to=None, data=None):
+            del to, data
+            return FeeEstimate(
+                chain="BASE",
+                chain_id=8453,
+                asset=Asset(chain="BASE", chain_id=8453, symbol="ETH", decimals=18),
+                amount=Decimal("0.001"),
+                amount_raw="1000000000000000",
+                gas_limit="21000",
+            )
+
+    quote = FakeProvider("bridgers")
+    selected = (await quote.quote(quote_request())).model_dump(mode="json")
+    nodes = make_nodes(
+        GraphRuntime(model=FakeModel(), providers={}, chains={"BASE": GasAdapter()})
+    )
+
+    result = await nodes["confirmation_request"](
+        {
+            "conversation_id": "gas-confirmation",
+            "selected_quote": selected,
+            "active_task": {
+                "task_id": "task-1",
+                "kind": "swap",
+                "revision": 1,
+                "slots": {"slippage_bps": 100},
+            },
+        }
+    )
+
+    assert result["response"]["kind"] == "confirmation_required"
+    assert result["response"]["gas_estimate"]["amount_raw"] == "1000000000000000"
+    assert result["response"]["confirmation"]["summary"]["slippage_bps"] == 100
+
+
+@pytest.mark.asyncio
 async def test_quote_path_rejects_same_asset_before_calling_provider():
     provider = FakeProvider("bridgers")
     request = quote_request()

@@ -132,6 +132,7 @@ class AgentState(TypedDict, total=False):
     pending_transaction: NotRequired[dict[str, Any] | None]
     user_confirmation: NotRequired[dict[str, Any] | None]
     confirmation_state: NotRequired[ConfirmationState | None]
+    swap_gas_estimate: NotRequired[dict[str, Any] | None]
     broadcast_tx_hash: NotRequired[str | None]
     provider_order_ids: NotRequired[dict[str, str]]
     provider_orders: NotRequired[dict[str, dict[str, Any]]]

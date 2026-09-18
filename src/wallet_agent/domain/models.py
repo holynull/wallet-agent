@@ -174,7 +174,7 @@ class SwapQuoteRequest(DomainModel):
     sender_address: str
     recipient_address: str
     refund_address: str | None = None
-    slippage_bps: int = Field(default=50, ge=0, le=10_000)
+    slippage_bps: int = Field(default=100, ge=0, le=10_000)
     expires_at: datetime | None = None
 
 
@@ -265,6 +265,7 @@ class NormalizedQuote(DomainModel):
     # the graph normalizes both forms for the app response.
     price_snapshots: list[TokenPrice] | dict[str, Any] = Field(default_factory=list)
     allowance_requirement: AllowanceRequirement | None = None
+    slippage_bps: int = Field(default=100, ge=0, le=10_000)
 
 
 class UnsignedTransaction(DomainModel):

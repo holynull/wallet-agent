@@ -201,6 +201,7 @@ class OmniBridgeProvider:
             provider_reference=reference,
             provider_payload=provider_payload,
             allowance_requirement=allowance,
+            slippage_bps=request.slippage_bps,
         )
 
     async def reverse_quote(
@@ -279,7 +280,7 @@ class OmniBridgeProvider:
                 "equipmentNo": meta.get("equipment_no", ""),
                 "sourceType": meta.get("source_type", self.source_type),
                 "sourceFlag": meta.get("source_flag", self.source_flag),
-                "slippage": str(Decimal(str(meta.get("slippage_bps", 200))) / Decimal(10000)),
+                "slippage": str(Decimal(str(meta.get("slippage_bps", 100))) / Decimal(10000)),
             }
         )
         data = _success(

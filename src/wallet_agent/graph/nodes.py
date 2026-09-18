@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -92,6 +93,7 @@ _USER_SWAP_FIELDS = frozenset(
         "output_amount",
         "sender_address",
         "recipient_address",
+        "slippage_bps",
     }
 )
 
@@ -268,7 +270,9 @@ def confirmation_payload_hash(summary: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _swap_confirmation_summary(selected: Mapping[str, Any]) -> dict[str, Any]:
+def _swap_confirmation_summary(
+    selected: Mapping[str, Any], *, slippage_bps: int | None = None
+) -> dict[str, Any]:
     return {
         "provider": selected.get("provider"),
         "provider_reference": selected.get("provider_reference"),
@@ -276,6 +280,15 @@ def _swap_confirmation_summary(selected: Mapping[str, Any]) -> dict[str, Any]:
         "destination_asset": selected.get("destination_asset"),
         "input_amount": selected.get("input_amount"),
         "expected_output": selected.get("expected_output"),
+        "slippage_bps": (
+            slippage_bps
+            if slippage_bps is not None
+            else (
+                selected.get("slippage_bps")
+                if selected.get("slippage_bps") is not None
+                else 100
+            )
+        ),
     }
 
 
@@ -297,8 +310,9 @@ def _confirmation_stale(state: Mapping[str, Any], confirmation: Mapping[str, Any
     selected = _dump(state.get("selected_quote"))
     if not isinstance(selected, Mapping):
         return True
+    task_slippage = ((task or {}).get("slots") or {}).get("slippage_bps")
     return confirmation.get("payload_hash") != confirmation_payload_hash(
-        _swap_confirmation_summary(selected)
+        _swap_confirmation_summary(selected, slippage_bps=task_slippage)
     )
 
 
@@ -318,6 +332,27 @@ def _confirmation_expired(value: dict[str, Any]) -> bool:
 def _looks_like_swap_message(message: str) -> bool:
     text = message.lower()
     return any(token in text for token in ("swap", "exchange", "兑换", "换成", "换"))
+
+
+def _parse_slippage_bps(message: str) -> int | None:
+    """Parse an explicitly stated percentage or basis-point slippage value."""
+    match = re.search(
+        r"(?:滑点|slippage)\s*(?:设为|设置为|调整为|为|=|:)??\s*"
+        r"([0-9]+(?:\.[0-9]+)?)\s*(%|百分比|bps?|基点)?",
+        str(message),
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    try:
+        value = Decimal(match.group(1))
+        unit = (match.group(2) or "%").lower()
+        bps = value if unit in {"bps", "bp", "基点"} else value * Decimal(100)
+        if bps != bps.to_integral_value() or bps < 0 or bps > 10_000:
+            return None
+        return int(bps)
+    except (ArithmeticError, ValueError):
+        return None
 
 
 def _looks_like_cancel_message(message: str) -> bool:
@@ -859,6 +894,7 @@ def _swap_draft_request(
 ) -> tuple[SwapQuoteRequest | None, list[str]]:
     context = wallet_context or {}
     normalized = dict(draft)
+    normalized.setdefault("slippage_bps", 100)
     normalized.setdefault("sender_address", context.get("address"))
     normalized.setdefault("recipient_address", context.get("address"))
     required = (
@@ -1528,6 +1564,31 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         gas = result.get("gas") or {}
         return {"gas_snapshot": gas, "response": {"kind": "gas_check", **gas}}
 
+    async def baseline_swap_gas_estimate(selected: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Estimate a read-only source-chain baseline without preparing a provider order."""
+        source_asset = selected.get("source_asset")
+        source_chain = source_asset.get("chain") if isinstance(source_asset, Mapping) else None
+        if not source_chain:
+            return None
+        adapter = runtime.chains.get(str(source_chain).upper())
+        if adapter is None:
+            adapter = runtime.chains.get(canonical_chain(str(source_chain)).upper())
+        if adapter is None or not hasattr(adapter, "estimate_fee"):
+            return None
+        try:
+            fee = await adapter.estimate_fee(to=None, data=None)
+        except Exception:
+            return None
+        estimate = _fee_dump(fee)
+        estimate.update(
+            {
+                "estimate_type": "baseline",
+                "exact": False,
+                "note": "确认后准备交易时会刷新为精确 gas 预估。",
+            }
+        )
+        return estimate
+
     async def confirmation_request(state: dict[str, Any]) -> dict[str, Any]:
         selected = _dump(state.get("selected_quote"))
         if not isinstance(selected, dict):
@@ -1551,7 +1612,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             else f"legacy:{state.get('conversation_id') or 'conversation'}:swap"
         )
         task_revision = int(task.get("revision") or 0) if task is not None else 0
-        summary = _swap_confirmation_summary(selected)
+        task_slippage = ((task or {}).get("slots") or {}).get("slippage_bps")
+        summary = _swap_confirmation_summary(selected, slippage_bps=task_slippage)
+        gas_estimate = await baseline_swap_gas_estimate(selected)
         confirmation = _confirmation_snapshot(
             action="swap",
             status="requested",
@@ -1563,10 +1626,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         return {
             "confirmation_state": confirmation,
             "task_stage": "awaiting_confirmation",
+            "swap_gas_estimate": gas_estimate,
             "response": {
                 "kind": "confirmation_required",
                 "confirmation": confirmation,
                 "quote": selected,
+                "gas_estimate": gas_estimate,
             },
         }
 
@@ -1615,6 +1680,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "kind": "confirmation_required",
                 "confirmation": current,
                 "quote": state.get("selected_quote"),
+                "gas_estimate": state.get("swap_gas_estimate"),
             }
         )
         if isinstance(answer, dict) and ("request" in answer or "message" in answer):
@@ -1911,6 +1977,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     }
             task_patch = _task_patch(task_kind, patch_source)
             if task_kind == "swap":
+                explicit_slippage = _parse_slippage_bps(message)
+                if explicit_slippage is not None:
+                    task_patch["slippage_bps"] = explicit_slippage
                 direction_hints = swap_direction_hints(message)
                 for key, value in direction_hints.items():
                     if key in {"source_symbol", "destination_symbol"}:

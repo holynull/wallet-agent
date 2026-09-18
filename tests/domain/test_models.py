@@ -57,6 +57,7 @@ def test_quote_models_preserve_human_and_raw_amounts_as_serializable_values():
     )
 
     assert request.model_dump(mode="json")["input_amount"] == "1.25"
+    assert request.slippage_bps == 100
     assert quote.model_dump(mode="json")["minimum_output_raw"] == "490000000000000"
 
 

@@ -183,6 +183,7 @@ class BridgersProvider:
             provider_reference=reference,
             provider_payload=provider_payload,
             allowance_requirement=allowance,
+            slippage_bps=request.slippage_bps,
         )
 
     async def reverse_quote(
@@ -274,7 +275,7 @@ class BridgersProvider:
                 ),
                 "toAddress": meta.get("to_address", meta.get("recipient_address", "")),
                 "amountOutMin": quote.minimum_output_raw,
-                "slippage": str(Decimal(str(meta.get("slippage_bps", 0))) / Decimal(10000)),
+                "slippage": str(Decimal(str(meta.get("slippage_bps", 100))) / Decimal(10000)),
             }
         )
         data = _ensure_success(await self.transport.post("/api/sswap/swap", request))

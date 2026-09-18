@@ -138,6 +138,7 @@ def test_swap_amount_correction_invalidates_transaction_artifacts():
         "selected_quote": None,
         "quote_candidates": [{"__clear__": True}],
         "confirmation_state": None,
+        "swap_gas_estimate": None,
         "pending_transaction": None,
         "preflight": None,
         "swap_request": None,

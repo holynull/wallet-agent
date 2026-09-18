@@ -81,3 +81,9 @@ class SwapSlotPatch(UnderstandingModel):
     amount_mode: Literal["exact_in", "exact_out"] | None = Field(
         default=None, description="数量模式：exact_in 表示指定换出，exact_out 表示指定换入"
     )
+    slippage_bps: int | None = Field(
+        default=None,
+        ge=0,
+        le=10_000,
+        description="用户设置的滑点，使用基点；1% = 100 bps",
+    )
