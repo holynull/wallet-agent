@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -862,6 +863,52 @@ async def test_restart_uses_only_public_session_projection():
     assert operations.index("client_restart") < operations.index("continue")
 
 
+@pytest.mark.asyncio
+async def test_restart_waits_for_approval_receipt_before_swap_preparation():
+    runtime = await build_scenario_runtime(SCENARIOS["approval_pending_restart_resume"])
+    try:
+        report = await drive_scenario(runtime)
+    finally:
+        await runtime.http.aclose()
+
+    approval_hash = "0x" + "d" * 64
+    continue_steps = [step for step in report.steps if step.operation == "continue"]
+    assert [step.stage_after for step in continue_steps] == [
+        "approval_pending",
+        "approval_pending",
+        "swap_ready",
+    ]
+    restart_index = next(
+        index
+        for index, step in enumerate(report.steps)
+        if step.operation == "client_restart"
+    )
+    continue_indices = [
+        index for index, step in enumerate(report.steps) if step.operation == "continue"
+    ]
+    assert len(continue_indices) <= 3
+    assert all(restart_index < index for index in continue_indices)
+
+    prepare_sequence = next(
+        event["sequence"]
+        for event in runtime.ledger.events
+        if event.get("actor") == "provider" and event.get("operation") == "prepare"
+    )
+    approval_receipts = [
+        event
+        for event in runtime.ledger.events
+        if event.get("actor") == "chain"
+        and event.get("operation") == "get_transaction_receipt"
+        and event.get("sequence", prepare_sequence) < prepare_sequence
+    ]
+    assert [event["tx_hash"] for event in approval_receipts] == [approval_hash] * 3
+    assert [event["outcome"]["kind"] for event in approval_receipts] == [
+        "not_found",
+        "pending",
+        "confirmed",
+    ]
+
+
 @pytest.mark.parametrize("scenario_id", ["wallet_rejects_approval", "wallet_rejects_swap"])
 @pytest.mark.asyncio
 async def test_wallet_rejection_never_registers_provider_order(scenario_id):
@@ -873,6 +920,136 @@ async def test_wallet_rejection_never_registers_provider_order(scenario_id):
         if call["operation"] == "register_broadcast"
     ] == []
     assert "wallet_rejected" in [step.error_code for step in report.steps]
+
+
+@pytest.mark.asyncio
+async def test_real_approval_rejection_is_the_only_valid_no_prepare_exemption():
+    report = await run_scenario("wallet_rejects_approval")
+
+    selection = next(
+        result
+        for result in report.invariants
+        if result.name == "explicit_quote_selection"
+    )
+    assert selection.passed
+    assert report.status == "passed"
+
+
+@pytest.mark.parametrize("operation", ["wallet_swap", "unrelated"])
+def test_no_prepare_exemption_rejects_unrelated_code_4001(operation):
+    approval_transaction = {
+        "from": "0x" + "1" * 40,
+        "to": "0x" + "3" * 40,
+        "data": "0x095ea7b3",
+        "value": "0x0",
+    }
+    events = (
+        _selection_request(1, "selection-approval", "quote-a"),
+        _request_result(2, "selection-approval", 200),
+        {
+            "sequence": 3,
+            "actor": "wallet",
+            "operation": "eth_sendTransaction",
+            "method": "eth_sendTransaction",
+            "params": [approval_transaction],
+        },
+    )
+    steps = (
+        LifecycleStep(
+            "select_quote",
+            "selecting_quote",
+            "confirmation_required",
+            200,
+            None,
+            {},
+        ),
+        LifecycleStep(
+            "confirm",
+            "confirmation_required",
+            "approval_required",
+            200,
+            None,
+            {},
+        ),
+        LifecycleStep(
+            operation,
+            "approval_required",
+            "approval_required",
+            None,
+            "wallet_rejected",
+            {
+                "code": 4001,
+                "method": "eth_sendTransaction",
+                "transaction": approval_transaction,
+            },
+        ),
+    )
+
+    result = _invariant(
+        "explicit_quote_selection",
+        events=events,
+        steps=steps,
+        session={"quote_candidates": [{}, {}]},
+    )
+
+    assert not result.passed
+
+
+@pytest.mark.asyncio
+async def test_swap_rejection_without_prepare_fails_invariant_and_report():
+    runtime = await build_scenario_runtime(SCENARIOS["wallet_rejects_swap"])
+    original_record = runtime.ledger.record
+
+    def record_without_prepare(actor, operation, **evidence):
+        if actor == "provider" and operation == "prepare":
+            return {"actor": actor, "operation": operation, **evidence}
+        return original_record(actor, operation, **evidence)
+
+    runtime.ledger.record = record_without_prepare
+    try:
+        report = await drive_scenario(runtime)
+    finally:
+        await runtime.http.aclose()
+
+    selection = next(
+        result
+        for result in report.invariants
+        if result.name == "explicit_quote_selection"
+    )
+    assert report.failures == ()
+    assert not selection.passed
+    assert report.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_pending_recovery_rejects_completed_session_with_changed_hash(monkeypatch):
+    runtime = await build_scenario_runtime(SCENARIOS["swap_temporarily_not_visible"])
+    original_session = runtime.client.session
+    changed_hash = "0x" + "8" * 64
+
+    async def session_with_changed_completed_hash():
+        result = await original_session()
+        if result.get("stage") == "completed":
+            result = {**result, "broadcast_tx_hash": changed_hash}
+            runtime.client.steps[-1] = replace(
+                runtime.client.steps[-1], evidence=result
+            )
+        return result
+
+    monkeypatch.setattr(runtime.client, "session", session_with_changed_completed_hash)
+    try:
+        report = await drive_scenario(runtime)
+    finally:
+        await runtime.http.aclose()
+
+    pending = next(
+        result
+        for result in report.invariants
+        if result.name == "pending_is_recoverable"
+    )
+    assert report.failures == ()
+    assert not pending.passed
+    assert report.status == "failed"
 
 
 @pytest.mark.asyncio

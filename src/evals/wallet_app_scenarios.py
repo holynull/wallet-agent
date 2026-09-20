@@ -112,6 +112,7 @@ SCENARIOS = {
         fault_plan=FaultPlan(
             allowances=(
                 FaultOutcome("insufficient", "0"),
+                FaultOutcome("insufficient", "0"),
                 FaultOutcome("sufficient", "10000000"),
             ),
             chain_receipts=(
@@ -1076,10 +1077,82 @@ def _lifecycle_invariants(
             and body.get("provider_reference") == prepare.get("provider_reference")
         )
 
-    valid_rejection_without_prepare = not prepare_events and any(
-        step.error_code == "wallet_rejected" and step.evidence.get("code") == 4001
+    wallet_send_events = [
+        event
+        for event in events
+        if event.get("actor") == "wallet"
+        and event.get("operation") == "eth_sendTransaction"
+    ]
+    hash_submission_steps = [
+        step
         for step in steps
-    ) and bool(successful_selection_pairs)
+        if step.operation in {"approve_broadcast", "broadcast"}
+    ]
+    hash_submission_requests = [
+        event
+        for event in public_requests
+        if str(event.get("path", "")).endswith(
+            ("/approve-broadcast", "/broadcast")
+        )
+    ]
+
+    def valid_approval_rejection_without_prepare() -> bool:
+        approval_rejections = [
+            (index, step)
+            for index, step in enumerate(steps)
+            if step.operation == "wallet_approval"
+            and step.error_code == "wallet_rejected"
+            and step.evidence.get("code") == 4001
+            and step.stage_before == "approval_required"
+            and step.stage_after == "approval_required"
+        ]
+        if len(approval_rejections) != 1:
+            return False
+        rejection_index, rejection = approval_rejections[0]
+        selection_indices = [
+            index
+            for index, step in enumerate(steps[:rejection_index])
+            if step.operation == "select_quote"
+        ]
+        confirmation_indices = [
+            index
+            for index, step in enumerate(steps[:rejection_index])
+            if step.operation == "confirm"
+            and step.stage_after == "approval_required"
+        ]
+        transaction = rejection.evidence.get("transaction")
+        matching_wallet_events = [
+            event
+            for event in wallet_send_events
+            if event.get("method") == "eth_sendTransaction"
+            and isinstance(event.get("params"), list)
+            and event["params"]
+            and event["params"][0] == transaction
+        ]
+        latest_selection_result_sequence = max(
+            (result["sequence"] for _, result in successful_selection_pairs),
+            default=None,
+        )
+        return (
+            not prepare_events
+            and bool(successful_selection_pairs)
+            and bool(selection_indices)
+            and bool(confirmation_indices)
+            and max(selection_indices) < max(confirmation_indices) < rejection_index
+            and rejection.evidence.get("method") == "eth_sendTransaction"
+            and isinstance(transaction, Mapping)
+            and len(matching_wallet_events) == 1
+            and isinstance(latest_selection_result_sequence, int)
+            and matching_wallet_events[0].get("sequence", 0)
+            > latest_selection_result_sequence
+            and session.get("stage") == "approval_required"
+            and not hash_submission_steps
+            and not hash_submission_requests
+            and not wallet_results
+            and not register_events
+        )
+
+    valid_rejection_without_prepare = valid_approval_rejection_without_prepare()
     quote_selection_safe = (
         len(session.get("quote_candidates", [])) > 1
         and bool(selection_requests)
@@ -1120,18 +1193,56 @@ def _lifecycle_invariants(
     def pending_broadcast_recovers(index: int, step: LifecycleStep) -> bool:
         tx_hash = step.evidence.get("broadcast_tx_hash")
         later_steps = steps[index + 1 :]
+        later_sessions = [
+            (later_index, later)
+            for later_index, later in enumerate(steps[index + 1 :], start=index + 1)
+            if later.operation == "session"
+        ]
+        status_indices = [
+            later_index
+            for later_index, later in enumerate(steps[index + 1 :], start=index + 1)
+            if later.operation == "status_turn"
+        ]
+
+        def status_has_matching_session(status_index: int) -> bool:
+            next_status = next(
+                (
+                    candidate
+                    for candidate in status_indices
+                    if candidate > status_index
+                ),
+                len(steps),
+            )
+            return any(
+                status_index < session_index < next_status
+                and session_step.evidence.get("broadcast_tx_hash") == tx_hash
+                for session_index, session_step in later_sessions
+            )
+
+        advanced_sessions = [
+            later
+            for _, later in later_sessions
+            if later.stage_after not in {None, "broadcast_pending"}
+        ]
         return (
             isinstance(tx_hash, str)
             and bool(tx_hash)
-            and any(
-                later.operation == "session"
-                and later.evidence.get("broadcast_tx_hash") == tx_hash
-                for later in later_steps
+            and bool(later_sessions)
+            and all(
+                later.evidence.get("broadcast_tx_hash") == tx_hash
+                for _, later in later_sessions
             )
-            and any(
-                later.operation in {"status_turn", "session"}
-                and later.stage_after not in {None, "broadcast_pending"}
-                for later in later_steps
+            and bool(advanced_sessions)
+            and all(
+                later.evidence.get("broadcast_tx_hash") == tx_hash
+                for later in advanced_sessions
+            )
+            and bool(status_indices)
+            and all(status_has_matching_session(item) for item in status_indices)
+            and all(event.get("tx_hash") == tx_hash for event in register_events)
+            and (
+                session.get("stage") in {None, "broadcast_pending"}
+                or session.get("broadcast_tx_hash") == tx_hash
             )
             and len([item for item in steps if item.operation == "wallet_swap"]) == 1
             and not any(
@@ -1261,7 +1372,10 @@ def wallet_transaction(unsigned: Mapping[str, Any], from_address: str) -> dict[s
 
 
 def _record_wallet_rejection(
-    client: WalletAppClient, operation: str, error: Eip1193Error
+    client: WalletAppClient,
+    operation: str,
+    error: Eip1193Error,
+    transaction: Mapping[str, Any],
 ) -> None:
     client.steps.append(
         LifecycleStep(
@@ -1270,7 +1384,14 @@ def _record_wallet_rejection(
             stage_after=client.stage,
             http_status=None,
             error_code="wallet_rejected",
-            evidence={"code": error.code, "message": str(error)},
+            evidence=sanitize_evidence(
+                {
+                    "code": error.code,
+                    "message": str(error),
+                    "method": "eth_sendTransaction",
+                    "transaction": transaction,
+                }
+            ),
         )
     )
 
@@ -1319,7 +1440,9 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
             except Eip1193Error as exc:
                 if exc.code != 4001:
                     raise
-                _record_wallet_rejection(client, "wallet_approval", exc)
+                _record_wallet_rejection(
+                    client, "wallet_approval", exc, approval_tx
+                )
                 wallet_rejected = True
             if not wallet_rejected:
                 runtime.ledger.record(
@@ -1383,7 +1506,7 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
             except Eip1193Error as exc:
                 if exc.code != 4001:
                     raise
-                _record_wallet_rejection(client, "wallet_swap", exc)
+                _record_wallet_rejection(client, "wallet_swap", exc, swap_tx)
                 wallet_rejected = True
             if wallet_rejected:
                 session = await client.session()
