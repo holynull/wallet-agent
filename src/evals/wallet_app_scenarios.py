@@ -85,6 +85,7 @@ class ScenarioDefinition:
     expected_register_attempts: int
     restart_after_approval: bool = False
     driver_actions: tuple[str, ...] = ("broadcast", "status")
+    expected_swap_transaction: tuple[tuple[str, str], ...] = ()
     dimensions: tuple[str, ...] = ("wallet_api_contract", "safety")
 
 
@@ -268,6 +269,21 @@ SCENARIOS = {
         expected_final_stage="completed",
         expected_wallet_sends=1,
         expected_register_attempts=1,
+        expected_swap_transaction=(
+            ("to", USDC_ADDRESS),
+            (
+                "data",
+                "0xa9059cbb"
+                + "0" * 24
+                + "4" * 40
+                + "0" * 58
+                + "90f560",
+            ),
+            ("value", "0x0"),
+            ("gas", "0x5208"),
+            ("maxFeePerGas", "0x4a817c800"),
+            ("maxPriorityFeePerGas", "0x3b9aca00"),
+        ),
         dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
     ),
 }
@@ -1040,6 +1056,9 @@ def _lifecycle_invariants(
     session: Mapping[str, Any],
     max_attempts: int,
     final_stage: str | None = None,
+    expected_swap_transaction: Mapping[str, str] | None = None,
+    actual_swap_transaction: Mapping[str, str] | None = None,
+    attempt_limit_exhausted: bool = False,
 ) -> tuple[InvariantResult, ...]:
     public_requests = [
         event
@@ -1433,6 +1452,28 @@ def _lifecycle_invariants(
             for event in successful_registrations
         )
     )
+    expected_transaction = dict(expected_swap_transaction or {})
+    omni_transaction_field_matches = {
+        field: actual_swap_transaction is not None
+        and actual_swap_transaction.get(field) == expected
+        for field, expected in expected_transaction.items()
+    }
+    omni_transaction_safe = not expected_transaction or (
+        actual_swap_transaction is not None
+        and all(omni_transaction_field_matches.values())
+    )
+    continue_attempts = len(
+        [step for step in steps if step.operation == "continue"]
+    )
+    status_attempts = len(
+        [step for step in steps if step.operation == "status_turn"]
+    )
+    bounded_progress_safe = (
+        not attempt_limit_exhausted
+        and continue_attempts <= max_attempts
+        and status_attempts <= max_attempts
+        and len(register_events) <= max_attempts
+    )
     sanitized_public_requests, _ = _sanitize_public_value(public_requests)
     return (
         InvariantResult(
@@ -1445,13 +1486,22 @@ def _lifecycle_invariants(
         InvariantResult("explicit_quote_selection", quote_selection_safe),
         InvariantResult(
             "bounded_progress",
-            len([step for step in steps if step.operation == "continue"]) <= max_attempts
-            and len([step for step in steps if step.operation == "status_turn"])
-            <= max_attempts
-            and len(register_events) <= max_attempts,
+            bounded_progress_safe,
+            {
+                "max_attempts": max_attempts,
+                "continue_attempts": continue_attempts,
+                "status_attempts": status_attempts,
+                "provider_register_attempts": len(register_events),
+                "attempt_limit_exhausted": attempt_limit_exhausted,
+            },
         ),
         InvariantResult("same_hash_is_idempotent", same_hash_safe),
         InvariantResult("conflicting_hash_is_rejected", conflicting_hash_safe),
+        InvariantResult(
+            "omni_deposit_transaction_is_exact",
+            omni_transaction_safe,
+            {"field_matches": omni_transaction_field_matches},
+        ),
         InvariantResult("rejection_stops_side_effects", rejection_safe),
         InvariantResult("reverted_is_not_success", reverted_safe),
         InvariantResult("pending_is_recoverable", pending_safe),
@@ -1590,6 +1640,8 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
     definition = runtime.definition
     client = runtime.client
     failures: list[str] = []
+    actual_swap_transaction: dict[str, str] | None = None
+    attempt_limit_exhausted = False
     try:
         await client.turn("Swap 10 USDC to USDT on Ethereum")
         session = await client.session()
@@ -1686,6 +1738,7 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
                     "Omni ERC-20 deposit transaction did not include fixed fee fields"
                 )
             swap_tx = wallet_transaction(prepared, WALLET_ADDRESS)
+            actual_swap_transaction = swap_tx
             try:
                 swap_hash = await runtime.wallet.request("eth_sendTransaction", [swap_tx])
             except Eip1193Error as exc:
@@ -1708,6 +1761,7 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
                     "wallet_swap",
                     {"method": "eth_sendTransaction", "transaction": swap_tx},
                 )
+                broadcast_attempts = 0
                 for action in definition.driver_actions:
                     if action == "status":
                         for _attempt in range(max_attempts):
@@ -1719,6 +1773,19 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
                                 break
                         continue
 
+                    if broadcast_attempts >= max_attempts:
+                        attempt_limit_exhausted = True
+                        failures.append(
+                            "provider registration retry attempt limit exhausted"
+                            if action == "broadcast_retry"
+                            else "broadcast attempt limit exhausted"
+                        )
+                        session = await client.session()
+                        final_stage = str(
+                            session.get("stage") or client.stage or ""
+                        )
+                        break
+                    broadcast_attempts += 1
                     submitted_hash = (
                         "0x" + "e" * 64
                         if action == "broadcast_conflict"
@@ -1796,6 +1863,9 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
         session=session if "session" in locals() else {},
         max_attempts=max_attempts,
         final_stage=final_stage,
+        expected_swap_transaction=dict(definition.expected_swap_transaction),
+        actual_swap_transaction=actual_swap_transaction,
+        attempt_limit_exhausted=attempt_limit_exhausted,
     )
     if final_stage != definition.expected_final_stage:
         failures.append(

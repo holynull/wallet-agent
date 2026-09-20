@@ -1199,6 +1199,27 @@ async def test_provider_timeout_retry_commits_one_order_for_same_wallet_hash():
 
 
 @pytest.mark.asyncio
+async def test_provider_retry_attempt_limit_stops_before_second_request():
+    report = await run_scenario(
+        "provider_register_timeout_then_retry", max_attempts=1
+    )
+    attempts = [
+        call
+        for call in report.provider_calls
+        if call["operation"] == "register_broadcast"
+    ]
+    bounded = next(
+        result for result in report.invariants if result.name == "bounded_progress"
+    )
+
+    assert len(attempts) == 1
+    assert attempts[0]["outcome"] == "timeout"
+    assert report.status == "failed"
+    assert not bounded.passed
+    assert "provider registration retry attempt limit exhausted" in report.failures
+
+
+@pytest.mark.asyncio
 async def test_omni_erc20_deposit_uses_order_reference_and_token_transfer():
     report = await run_scenario("omnibridge_erc20_deposit_order")
     wallet_send = next(
@@ -1214,5 +1235,81 @@ async def test_omni_erc20_deposit_uses_order_reference_and_token_transfer():
 
     assert wallet_send["params"][0]["to"] == "0x" + "3" * 40
     assert wallet_send["params"][0]["data"]["selector"] == "0xa9059cbb"
+    assert wallet_send["params"][0]["value"] == "0x0"
+    assert wallet_send["params"][0]["gas"] == "0x5208"
+    assert wallet_send["params"][0]["maxFeePerGas"] == "0x4a817c800"
+    assert wallet_send["params"][0]["maxPriorityFeePerGas"] == "0x3b9aca00"
     assert registration["provider_reference"] == "omni-deposit-order-1"
     assert registration["provider_reference"] != "omni-quote-1"
+
+
+@pytest.mark.asyncio
+async def test_wrong_omni_transfer_returned_by_confirm_fails_invariant(monkeypatch):
+    runtime = await build_scenario_runtime(
+        SCENARIOS["omnibridge_erc20_deposit_order"]
+    )
+    recording_transport = runtime.http._transport
+    asgi_transport = recording_transport._transport
+    original_handle = asgi_transport.handle_async_request
+
+    async def corrupt_confirm_transaction(request):
+        response = await original_handle(request)
+        if request.url.path.endswith("/confirm"):
+            await response.aread()
+            body = json.loads(response.content)
+            body["pending_transaction"].update(
+                {
+                    "to": "0x" + "6" * 40,
+                    "data": "0xa9059cbb" + "0" * 128,
+                    "value": "7",
+                    "gas_limit": "1",
+                    "max_fee_per_gas": "1",
+                    "max_priority_fee_per_gas": "1",
+                }
+            )
+            return httpx.Response(
+                response.status_code,
+                json=body,
+                headers={"content-type": "application/json"},
+                request=request,
+            )
+        return response
+
+    monkeypatch.setattr(
+        asgi_transport, "handle_async_request", corrupt_confirm_transaction
+    )
+    try:
+        report = await drive_scenario(runtime)
+    finally:
+        await runtime.http.aclose()
+
+    wallet_send = next(
+        call
+        for call in report.wallet_calls
+        if call["method"] == "eth_sendTransaction"
+    )
+
+    assert wallet_send["params"][0] == {
+        "from": "0x" + "1" * 40,
+        "to": "0x" + "6" * 40,
+        "data": {"selector": "0xa9059cbb", "length": 138},
+        "value": "0x7",
+        "gas": "0x1",
+        "maxFeePerGas": "0x1",
+        "maxPriorityFeePerGas": "0x1",
+    }
+    assert report.status == "failed"
+    transaction_invariant = next(
+        result
+        for result in report.invariants
+        if result.name == "omni_deposit_transaction_is_exact"
+    )
+    assert not transaction_invariant.passed
+    assert transaction_invariant.evidence["field_matches"] == {
+        "to": False,
+        "data": False,
+        "value": False,
+        "gas": False,
+        "maxFeePerGas": False,
+        "maxPriorityFeePerGas": False,
+    }
