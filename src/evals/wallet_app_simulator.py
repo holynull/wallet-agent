@@ -247,7 +247,7 @@ def _public_stage(value: Any) -> str | None:
             if found is not None:
                 return found
     elif isinstance(value, (list, tuple)):
-        for nested in value:
+        for nested in reversed(value):
             found = _public_stage(nested)
             if found is not None:
                 return found
@@ -345,7 +345,9 @@ class WalletAppClient:
         **request_kwargs: Any,
     ) -> dict[str, Any]:
         stage_before = self.stage
-        response = await self.http.request(method, path, **request_kwargs)
+        response = await self.http.request(
+            method, path, follow_redirects=False, **request_kwargs
+        )
         try:
             body = await _response_json(response, operation)
         except EvaluationHttpError as exc:
@@ -369,6 +371,7 @@ class WalletAppClient:
         turn_stage_before = self.stage
         response = await self.http.post(
             "/v1/agent/turn",
+            follow_redirects=False,
             json={
                 "user_id": self.user_id,
                 "conversation_id": self.conversation_id,
@@ -398,7 +401,9 @@ class WalletAppClient:
 
         stream_stage_before = self.stage
         async with self.http.stream(
-            "GET", f"/v1/agent/stream/{self.run_id}"
+            "GET",
+            f"/v1/agent/stream/{self.run_id}",
+            follow_redirects=False,
         ) as stream:
             if not stream.is_success:
                 await stream.aread()

@@ -429,6 +429,167 @@ async def test_wallet_app_client_wraps_non_object_json_http_errors():
 
 
 @pytest.mark.asyncio
+async def test_wallet_app_client_records_rest_redirect_with_following_http_client():
+    requested_paths = []
+
+    async def handler(request):
+        requested_paths.append(request.url.path)
+        if request.url.path == "/v1/swap/session-1":
+            return httpx.Response(
+                307,
+                json={
+                    "code": "SESSION_REDIRECTED",
+                    "message": "session moved",
+                    "details": {"authorization": "secret"},
+                },
+                headers={"location": "/redirected/session"},
+            )
+        if request.url.path == "/redirected/session":
+            return httpx.Response(
+                200,
+                json={"session_id": "session-1", "stage": "selecting_quote"},
+            )
+        raise AssertionError(request.url.path)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://test",
+        follow_redirects=True,
+    ) as http:
+        client = WalletAppClient.restore(
+            http,
+            user_id="alice",
+            address="0x" + "1" * 40,
+            chain="ETH",
+            conversation_id="conversation-1",
+            session_id="session-1",
+        )
+        with pytest.raises(EvaluationHttpError) as raised:
+            await client.session()
+
+    assert requested_paths == ["/v1/swap/session-1"]
+    assert raised.value.code == "SESSION_REDIRECTED"
+    assert raised.value.status_code == 307
+    assert client.steps[0].operation == "session"
+    assert client.steps[0].http_status == 307
+    assert client.steps[0].evidence == {"authorization": "[REDACTED]"}
+
+
+@pytest.mark.asyncio
+async def test_wallet_app_client_records_turn_redirect_and_keeps_metadata():
+    requested_paths = []
+
+    async def handler(request):
+        requested_paths.append(request.url.path)
+        if request.url.path == "/v1/agent/turn":
+            return httpx.Response(
+                307,
+                json={
+                    "code": "TURN_REDIRECTED",
+                    "message": "turn moved",
+                    "details": {"password": "secret"},
+                },
+                headers={"location": "/redirected/turn"},
+            )
+        if request.url.path == "/redirected/turn":
+            return httpx.Response(
+                200,
+                json={
+                    "run_id": "run-1",
+                    "conversation_id": "conversation-1",
+                    "session_id": "session-1",
+                    "status": "running",
+                },
+            )
+        if request.url.path == "/v1/agent/stream/run-1":
+            return httpx.Response(
+                200,
+                content=b'event: done\ndata: {"stage":"complete"}\n\n',
+                headers={"content-type": "text/event-stream"},
+            )
+        raise AssertionError(request.url.path)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://test",
+        follow_redirects=True,
+    ) as http:
+        client = WalletAppClient(
+            http,
+            user_id="alice",
+            address="0x" + "1" * 40,
+            chain="ETH",
+            turn_metadata={"swap_request": {"amount": "1"}},
+        )
+        with pytest.raises(EvaluationHttpError) as raised:
+            await client.turn("swap")
+
+    assert requested_paths == ["/v1/agent/turn"]
+    assert raised.value.code == "TURN_REDIRECTED"
+    assert raised.value.status_code == 307
+    assert client.turn_metadata == {"swap_request": {"amount": "1"}}
+    assert client.steps[0].operation == "turn"
+    assert client.steps[0].http_status == 307
+    assert client.steps[0].evidence == {"password": "[REDACTED]"}
+
+
+@pytest.mark.asyncio
+async def test_wallet_app_client_records_stream_redirect_with_following_http_client():
+    requested_paths = []
+
+    async def handler(request):
+        requested_paths.append(request.url.path)
+        if request.url.path == "/v1/agent/turn":
+            return httpx.Response(
+                200,
+                json={
+                    "run_id": "run-1",
+                    "conversation_id": "conversation-1",
+                    "session_id": "session-1",
+                    "status": "running",
+                },
+            )
+        if request.url.path == "/v1/agent/stream/run-1":
+            return httpx.Response(
+                307,
+                json={
+                    "code": "STREAM_REDIRECTED",
+                    "message": "stream moved",
+                    "details": {"client_secret": "secret"},
+                },
+                headers={"location": "/redirected/stream"},
+            )
+        if request.url.path == "/redirected/stream":
+            return httpx.Response(
+                200,
+                content=b'event: done\ndata: {"stage":"complete"}\n\n',
+                headers={"content-type": "text/event-stream"},
+            )
+        raise AssertionError(request.url.path)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://test",
+        follow_redirects=True,
+    ) as http:
+        client = WalletAppClient(
+            http,
+            user_id="alice",
+            address="0x" + "1" * 40,
+            chain="ETH",
+        )
+        with pytest.raises(EvaluationHttpError) as raised:
+            await client.turn("swap")
+
+    assert requested_paths == ["/v1/agent/turn", "/v1/agent/stream/run-1"]
+    assert raised.value.code == "STREAM_REDIRECTED"
+    assert raised.value.status_code == 307
+    assert [step.operation for step in client.steps] == ["turn", "stream"]
+    assert client.steps[1].http_status == 307
+    assert client.steps[1].evidence == {"client_secret": "[REDACTED]"}
+
+
+@pytest.mark.asyncio
 async def test_wallet_app_client_maps_every_public_json_operation_and_records_steps():
     requests = []
     responses = {
@@ -627,6 +788,55 @@ async def test_wallet_app_client_turn_metadata_is_one_shot():
         "stream",
     ]
     assert client.stage == "stage-2"
+
+
+@pytest.mark.asyncio
+async def test_wallet_app_client_uses_last_applicable_sse_stage_for_next_step():
+    async def handler(request):
+        if request.url.path == "/v1/agent/turn":
+            return httpx.Response(
+                200,
+                json={
+                    "run_id": "run-1",
+                    "conversation_id": "conversation-1",
+                    "session_id": "session-1",
+                    "status": "running",
+                },
+            )
+        if request.url.path == "/v1/agent/stream/run-1":
+            return httpx.Response(
+                200,
+                content=(
+                    b'event: update\ndata: {"data":{"stage":"selecting_quote"}}\n\n'
+                    b'event: progress\ndata: {"message":"checking quotes"}\n\n'
+                    b'event: update\ndata: {"data":{"stage":"awaiting_confirmation"}}\n\n'
+                    b'event: done\ndata: {"status":"complete"}\n\n'
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+        if request.url.path == "/v1/swap/session-1":
+            return httpx.Response(
+                200,
+                json={"session_id": "session-1", "stage": "awaiting_confirmation"},
+            )
+        raise AssertionError(request.url.path)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as http:
+        client = WalletAppClient(
+            http,
+            user_id="alice",
+            address="0x" + "1" * 40,
+            chain="ETH",
+        )
+        await client.turn("swap")
+        stage_after_stream = client.stage
+        await client.session()
+
+    assert stage_after_stream == "awaiting_confirmation"
+    assert client.steps[1].stage_after == "awaiting_confirmation"
+    assert client.steps[2].stage_before == "awaiting_confirmation"
 
 
 @pytest.mark.asyncio
