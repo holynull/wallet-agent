@@ -300,6 +300,65 @@ async def test_selecting_different_quote_invalidates_stale_confirmation():
     assert provider.prepare_calls == 0
 
 
+@pytest.mark.asyncio
+async def test_reselecting_after_approval_clears_old_approval_before_confirming_new_quote():
+    first_quote = authorization_quote("ref-approval-a")
+    second_quote = authorization_quote("ref-approval-b")
+    second_quote = second_quote.model_copy(
+        update={
+            "allowance_requirement": second_quote.allowance_requirement.model_copy(
+                update={"required_amount_raw": "200"}
+            )
+        }
+    )
+    adapter = Adapter()
+    provider = Provider()
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-reselect-approval",
+            user_id="alice",
+            thread_id="t-reselect-approval",
+            quote_candidates=[first_quote, second_quote],
+        )
+    )
+    graph = build_graph(model=Model(), providers=[provider], chains={"BASE": adapter})
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        chain_registry=ChainAdapterRegistry({"BASE": adapter}),
+        store=store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        confirmed_a = await select_and_confirm(
+            client, "s-reselect-approval", first_quote.provider_reference
+        )
+        assert confirmed_a.status_code == 200
+        assert confirmed_a.json()["status"] == "approval_required"
+        assert confirmed_a.json()["approval_transaction"]["amount_raw"] == "100"
+
+        selected_b = await client.post(
+            "/v1/swap/s-reselect-approval/select-quote",
+            json={"user_id": "alice", "provider_reference": second_quote.provider_reference},
+        )
+        assert selected_b.status_code == 200
+        assert selected_b.json()["status"] == "awaiting_confirmation"
+        assert selected_b.json()["approval_transaction"] is None
+        assert selected_b.json()["allowance_requirement"] is None
+
+        confirmed_b = await client.post(
+            "/v1/swap/s-reselect-approval/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+
+    assert confirmed_b.status_code == 200
+    assert confirmed_b.json()["status"] == "approval_required"
+    assert confirmed_b.json()["approval_transaction"]["amount_raw"] == "200"
+
+
 async def select_and_confirm(client, session_id: str, provider_reference: str):
     selected = await client.post(
         f"/v1/swap/{session_id}/select-quote",

@@ -1087,6 +1087,10 @@ def create_app(
                     session_id,
                     stage="quote_selected",
                     selected_provider_reference=payload.provider_reference,
+                    pending_transaction=None,
+                    approval_transaction=None,
+                    approval_tx_hash=None,
+                    allowance_requirement=None,
                 )
             )
         async with graph_lock(session.thread_id):
@@ -1100,6 +1104,14 @@ def create_app(
                     # previously approved confirmation checkpoint.
                     "confirmation_state": None,
                     "user_confirmation": None,
+                    # A new quote invalidates all actionable authorization
+                    # state from the previously selected quote in the
+                    # checkpoint.  Keep public quote data untouched.
+                    "pending_transaction": None,
+                    "approval_transaction": None,
+                    "approval_tx_hash": None,
+                    "allowance_requirement": None,
+                    "authorization_stage": None,
                 },
                 config={"configurable": {"thread_id": session.thread_id}},
             )
@@ -1110,6 +1122,13 @@ def create_app(
                 status="awaiting_confirmation",
                 stage="confirmation_required",
                 selected_provider_reference=payload.provider_reference,
+                # ``project_session`` intentionally treats graph state as a
+                # sparse patch.  Explicit reselection clears the old
+                # actionable projection without erasing unrelated quote data.
+                pending_transaction=None,
+                approval_transaction=None,
+                approval_tx_hash=None,
+                allowance_requirement=None,
             )
         return _jsonable(updated or result)
 

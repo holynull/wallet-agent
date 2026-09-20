@@ -179,6 +179,73 @@ async def test_select_quote_requires_confirmation_before_no_approval_prepare():
 
 
 @pytest.mark.asyncio
+async def test_reselecting_after_prepared_swap_clears_old_pending_before_confirming_new_quote():
+    provider = FakeProvider()
+    first_quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=Asset(
+            chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x" + "1" * 40
+        ),
+        destination_asset=Asset(
+            chain="BSC", chain_id=56, symbol="USDT", decimals=6, address="0x" + "2" * 40
+        ),
+        input_amount=Decimal("10"),
+        input_amount_raw="10000000",
+        expected_output=Decimal("9"),
+        expected_output_raw="9000000",
+        provider_reference="quote-a",
+    )
+    second_quote = first_quote.model_copy(
+        update={"provider_reference": "quote-b", "input_amount_raw": "20000000"}
+    )
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-reselect-prepared",
+            user_id="alice",
+            thread_id="t-reselect-prepared",
+            quote_candidates=[first_quote, second_quote],
+        )
+    )
+    graph = build_graph(model=FakeModel(), providers=[provider])
+    app = create_app(graph=graph, providers={"bridgers": provider}, store=store)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        selected_a = await client.post(
+            "/v1/swap/s-reselect-prepared/select-quote",
+            json={"user_id": "alice", "provider_reference": first_quote.provider_reference},
+        )
+        assert selected_a.status_code == 200
+        assert selected_a.json()["status"] == "awaiting_confirmation"
+        confirmed_a = await client.post(
+            "/v1/swap/s-reselect-prepared/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+        assert confirmed_a.status_code == 200
+        assert confirmed_a.json()["pending_transaction"]["provider_reference"] == "quote-a"
+
+        selected_b = await client.post(
+            "/v1/swap/s-reselect-prepared/select-quote",
+            json={"user_id": "alice", "provider_reference": second_quote.provider_reference},
+        )
+        assert selected_b.status_code == 200
+        assert selected_b.json()["status"] == "awaiting_confirmation"
+        assert selected_b.json()["pending_transaction"] is None
+
+        confirmed_b = await client.post(
+            "/v1/swap/s-reselect-prepared/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+
+    assert confirmed_b.status_code == 200
+    assert confirmed_b.json()["stage"] == "swap_ready"
+    assert confirmed_b.json()["pending_transaction"]["provider_reference"] == "quote-b"
+    assert provider.prepare_calls == 2
+
+
+@pytest.mark.asyncio
 async def test_broadcast_is_idempotent_and_conflicting_hash_is_rejected():
     app, client, provider = await make_client()
     async with client:
