@@ -719,11 +719,18 @@ _COMMON_TRANSFER_ASSETS: dict[tuple[str, str], Asset] = {
 
 
 async def _resolve_transfer_asset(
-    draft: dict[str, Any], providers: Mapping[str, Any]
+    draft: dict[str, Any],
+    providers: Mapping[str, Any],
+    wallet_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fill transfer token metadata from trusted common assets or providers."""
     resolved = dict(draft)
-    chain = resolved.get("transfer_chain") or resolved.get("chain")
+    context = wallet_context or {}
+    chain = (
+        resolved.get("transfer_chain")
+        or resolved.get("chain")
+        or context.get("chain")
+    )
     symbol = resolved.get("transfer_symbol") or resolved.get("symbol")
     if not chain or not symbol:
         return resolved
@@ -2397,7 +2404,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 if active_task and active_task.get("kind") == "transfer"
                 else dict(state.get("transfer_draft") or {})
             )
-            draft = await _resolve_transfer_asset(draft, runtime.providers)
+            draft = await _resolve_transfer_asset(
+                draft, runtime.providers, state.get("wallet_context")
+            )
             request_model, missing = _transfer_draft_request(draft, state.get("wallet_context"))
             if request_model is None:
                 labels = ", ".join(missing)

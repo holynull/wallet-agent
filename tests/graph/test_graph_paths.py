@@ -545,7 +545,6 @@ async def test_conversational_eth_usdc_transfer_resolves_common_token_metadata()
         model=SwapExtractionModel(
             {
                 "intent": "transfer",
-                "transfer_chain": "ETH",
                 "transfer_symbol": "USDC",
                 "transfer_amount": "1",
                 "transfer_recipient": "0x" + "2" * 40,
