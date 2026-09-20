@@ -240,6 +240,35 @@ POST /v1/swap/{session_id}/broadcast
 自动签名、广播或提交 Approve hash。真实交易仍需在下方聊天流程中明确点击
 钱包操作按钮。
 
+### 自动化 Wallet App 评测
+
+本地一键评测使用 fake chain/provider 后端覆盖钱包能力链路，不读取私钥、
+助记词、signer 或生产 secret，不签名，也不广播任何主网交易。默认命令
+适合作为 Phase 1 的确定性回归检查：
+
+```bash
+uv sync
+.venv/bin/playwright install chromium
+.venv/bin/python -m evals.wallet_agent_evals
+.venv/bin/pytest -q tests/browser -m browser
+```
+
+`.venv/bin/python -m evals.wallet_agent_evals` 应覆盖确定性的 15 个
+Wallet Agent 用例，包括 clarification、wallet 查询、资产发现、转账、
+兑换报价、报价选择、allowance、prepare、取消和多轮记忆。浏览器命令只
+运行带 `browser` marker 的 Demo 自动化测试，验证页面 follow、pause 和
+resume 等行为。
+
+需要评估已配置模型时，可以显式追加 `--online`：
+
+```bash
+.venv/bin/python -m evals.wallet_agent_evals --online
+```
+
+`--online` 只会调用当前配置的语言模型；钱包、链和 Provider 后端仍然使用
+模拟实现。它不代表 Phase 2 的完整钱包生命周期模拟，也不代表 Phase 3 的
+线上或对抗评测覆盖已经完成。
+
 同样的链路也可以用命令行复现：
 
 ```bash

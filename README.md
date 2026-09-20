@@ -89,9 +89,11 @@ reports. `/v1/swap/{session_id}/broadcast` accepts only a hash and chain.
 .venv/bin/pytest -q
 .venv/bin/ruff check src tests
 python3 -m compileall src
+.venv/bin/python -m evals.wallet_agent_evals
+.venv/bin/pytest -q tests/browser -m browser
 ```
 
-Core wallet capability evals use simulated chains and providers, so they never
+Core wallet capability evals use fake chain/provider backends, so they never
 sign or broadcast transactions:
 
 ```bash
@@ -99,7 +101,8 @@ sign or broadcast transactions:
 .venv/bin/python -m evals.wallet_agent_evals --online
 ```
 
-The first command runs the deterministic 13-case CI suite. The opt-in online
-mode evaluates the configured model's Chinese intent extraction, slot
-normalization, corrections, cancellation, and multi-turn retention. See
-[evals/README.md](evals/README.md) for the case coverage and safety boundary.
+The first command runs the deterministic Phase 1 15-case CI suite. The opt-in
+online mode invokes the configured language model for Chinese intent extraction,
+slot normalization, corrections, cancellation, and multi-turn retention, while
+wallet backends remain simulated. See [evals/README.md](evals/README.md) for
+the case coverage and safety boundary.
