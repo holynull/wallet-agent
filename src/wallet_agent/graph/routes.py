@@ -20,6 +20,16 @@ def _jsonable(value: Any) -> Any:
 
 def route_after_intent(state: dict[str, Any]) -> str:
     intent = state.get("intent", "clarification")
+    confirmation = state.get("confirmation_state") or {}
+    if confirmation.get("status") == "rejected" and intent in {
+        "swap_allowance",
+        "swap_prepare",
+        "swap_status",
+    }:
+        # A rejected confirmation is a terminal authorization boundary for
+        # this selected quote. Only a fresh quote selection/new swap may clear
+        # it and create another confirmation cycle.
+        return "response"
     if state.get("broadcast_tx_hash") and intent in {"swap_status", "swap_prepare"}:
         return "register_broadcast"
     if (
@@ -33,7 +43,9 @@ def route_after_intent(state: dict[str, Any]) -> str:
         return "wallet_query"
     if intent == "transfer":
         return "transfer"
-    if intent in {"swap_select", "swap_allowance"}:
+    if intent == "swap_select":
+        return "confirmation_request"
+    if intent == "swap_allowance":
         return "swap_allowance"
     if intent == "price_query":
         return "price_query"
@@ -89,7 +101,7 @@ def route_after_confirmation(state: dict[str, Any]) -> str:
         return "supervisor"
     confirmation = state.get("confirmation_state") or {}
     if confirmation.get("status") == "approved":
-        return "prepare"
+        return "swap_allowance"
     return "response"
 
 

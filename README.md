@@ -90,8 +90,15 @@ reports. `/v1/swap/{session_id}/broadcast` accepts only a hash and chain.
 .venv/bin/ruff check src tests
 python3 -m compileall src
 .venv/bin/python -m evals.wallet_agent_evals
+.venv/bin/python -m evals.wallet_app_evals
+.venv/bin/python -m evals.wallet_app_evals --scenario approval_pending_restart_resume
 .venv/bin/pytest -q tests/browser -m browser
 ```
+
+`wallet_app_evals` drives the real FastAPI REST/SSE interface and compiled
+LangGraph lifecycle with deterministic wallet, provider, and chain simulators.
+It runs fully offline: it does not load production credentials, sign a
+transaction, contact a real Provider/RPC endpoint, or broadcast on-chain.
 
 Core wallet capability evals use fake chain/provider backends, so they never
 sign or broadcast transactions:

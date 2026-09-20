@@ -17,7 +17,7 @@ from wallet_agent.domain.models import (
 )
 from wallet_agent.graph.build import build_graph
 from wallet_agent.graph.nodes import _deposit_order_to_transaction
-from wallet_agent.persistence import InMemorySessionStore
+from wallet_agent.persistence import InMemorySessionStore, SwapSessionRecord
 
 
 class FakeModel:
@@ -122,6 +122,127 @@ async def test_turn_quote_interrupt_confirm_prepare_and_session_projection():
         assert confirmed.status_code == 200
         assert confirmed.json()["pending_transaction"]["to"] == "0xrouter"
         assert provider.prepare_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_select_quote_requires_confirmation_before_no_approval_prepare():
+    provider = FakeProvider()
+    quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=Asset(
+            chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x" + "1" * 40
+        ),
+        destination_asset=Asset(
+            chain="BSC", chain_id=56, symbol="USDT", decimals=6, address="0x" + "2" * 40
+        ),
+        input_amount=Decimal("10"),
+        input_amount_raw="10000000",
+        expected_output=Decimal("9"),
+        expected_output_raw="9000000",
+        provider_reference="quote-confirm-first",
+    )
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-no-approval-confirm",
+            user_id="alice",
+            thread_id="t-no-approval-confirm",
+            quote_candidates=[quote],
+        )
+    )
+    graph = build_graph(model=FakeModel(), providers=[provider])
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        store=store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        selected = await client.post(
+            "/v1/swap/s-no-approval-confirm/select-quote",
+            json={"user_id": "alice", "provider_reference": quote.provider_reference},
+        )
+        assert selected.status_code == 200
+        assert selected.json()["status"] == "awaiting_confirmation"
+        assert provider.prepare_calls == 0
+
+        confirmed = await client.post(
+            "/v1/swap/s-no-approval-confirm/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+
+    assert confirmed.status_code == 200
+    assert confirmed.json()["stage"] == "swap_ready"
+    assert provider.prepare_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reselecting_after_prepared_swap_clears_old_pending_before_confirming_new_quote():
+    provider = FakeProvider()
+    first_quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=Asset(
+            chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x" + "1" * 40
+        ),
+        destination_asset=Asset(
+            chain="BSC", chain_id=56, symbol="USDT", decimals=6, address="0x" + "2" * 40
+        ),
+        input_amount=Decimal("10"),
+        input_amount_raw="10000000",
+        expected_output=Decimal("9"),
+        expected_output_raw="9000000",
+        provider_reference="quote-a",
+    )
+    second_quote = first_quote.model_copy(
+        update={"provider_reference": "quote-b", "input_amount_raw": "20000000"}
+    )
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-reselect-prepared",
+            user_id="alice",
+            thread_id="t-reselect-prepared",
+            quote_candidates=[first_quote, second_quote],
+        )
+    )
+    graph = build_graph(model=FakeModel(), providers=[provider])
+    app = create_app(graph=graph, providers={"bridgers": provider}, store=store)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        selected_a = await client.post(
+            "/v1/swap/s-reselect-prepared/select-quote",
+            json={"user_id": "alice", "provider_reference": first_quote.provider_reference},
+        )
+        assert selected_a.status_code == 200
+        assert selected_a.json()["status"] == "awaiting_confirmation"
+        confirmed_a = await client.post(
+            "/v1/swap/s-reselect-prepared/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+        assert confirmed_a.status_code == 200
+        assert confirmed_a.json()["pending_transaction"]["provider_reference"] == "quote-a"
+
+        selected_b = await client.post(
+            "/v1/swap/s-reselect-prepared/select-quote",
+            json={"user_id": "alice", "provider_reference": second_quote.provider_reference},
+        )
+        assert selected_b.status_code == 200
+        assert selected_b.json()["status"] == "awaiting_confirmation"
+        assert selected_b.json()["pending_transaction"] is None
+
+        confirmed_b = await client.post(
+            "/v1/swap/s-reselect-prepared/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+
+    assert confirmed_b.status_code == 200
+    assert confirmed_b.json()["stage"] == "swap_ready"
+    assert confirmed_b.json()["pending_transaction"]["provider_reference"] == "quote-b"
+    assert provider.prepare_calls == 2
 
 
 @pytest.mark.asyncio
@@ -437,3 +558,67 @@ async def test_swap_session_is_owner_scoped():
             f"/v1/swap/{body['session_id']}", params={"user_id": "mallory"}
         )
         assert denied.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_provider_registration_timeout_allows_same_hash_retry_without_duplicate_order():
+    class FlakyProvider(FakeProvider):
+        def __init__(self):
+            super().__init__()
+            self.register_attempts = 0
+            self.created_orders = 0
+
+        async def register_broadcast(self, provider_reference, tx_hash):
+            self.register_attempts += 1
+            if self.register_attempts == 1:
+                raise TimeoutError("provider timed out")
+            self.created_orders += 1
+            return ProviderOrder(
+                provider="bridgers",
+                provider_order_id="order-after-retry",
+                provider_reference=provider_reference,
+                tx_hash=tx_hash,
+            )
+
+    provider = FlakyProvider()
+    graph = build_graph(model=FakeModel(), providers=[provider])
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        store=InMemorySessionStore(),
+    )
+    tx_hash = "0x" + "f" * 64
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        turn = await client.post("/v1/agent/turn", json=request_payload())
+        await app.state.runs[turn.json()["run_id"]]["task"]
+        session_id = turn.json()["session_id"]
+        await client.post(
+            f"/v1/swap/{session_id}/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+        first = await client.post(
+            f"/v1/swap/{session_id}/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": tx_hash},
+        )
+        second = await client.post(
+            f"/v1/swap/{session_id}/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": tx_hash},
+        )
+        duplicate = await client.post(
+            f"/v1/swap/{session_id}/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": tx_hash},
+        )
+
+    assert first.status_code == 503
+    assert first.json() == {
+        "code": "PROVIDER_REGISTRATION_FAILED",
+        "message": "兑换服务暂时无法登记交易，请使用同一交易哈希重试。",
+        "details": {"provider": "bridgers", "tx_hash": tx_hash, "retryable": True},
+    }
+    assert second.status_code == 200
+    assert duplicate.status_code == 200
+    assert second.json()["broadcast_tx_hash"] == tx_hash
+    assert provider.register_attempts == 2
+    assert provider.created_orders == 1
