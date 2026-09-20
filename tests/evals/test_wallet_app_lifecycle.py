@@ -830,3 +830,60 @@ async def test_status_turn_label_uses_turn_start_index(monkeypatch):
 
     assert [step.operation for step in report.steps].count("status_turn") == 1
     assert "intervening" in [step.operation for step in report.steps]
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "final_stage"),
+    [
+        ("approval_pending_restart_resume", "completed"),
+        ("wallet_rejects_approval", "approval_required"),
+        ("wallet_rejects_swap", "swap_ready"),
+        ("swap_temporarily_not_visible", "completed"),
+        ("swap_reverted", "failed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recovery_and_failure_scenarios_are_safe(scenario_id, final_stage):
+    report = await run_scenario(scenario_id)
+
+    assert report.status == "passed"
+    assert report.final_stage == final_stage
+    assert all(result.passed for result in report.invariants)
+
+
+@pytest.mark.asyncio
+async def test_restart_uses_only_public_session_projection():
+    report = await run_scenario("approval_pending_restart_resume")
+    operations = [step.operation for step in report.steps]
+
+    assert "client_restart" in operations
+    restart = next(step for step in report.steps if step.operation == "client_restart")
+    assert set(restart.evidence) == {"conversation_id", "session_id"}
+    assert operations.index("client_restart") < operations.index("continue")
+
+
+@pytest.mark.parametrize("scenario_id", ["wallet_rejects_approval", "wallet_rejects_swap"])
+@pytest.mark.asyncio
+async def test_wallet_rejection_never_registers_provider_order(scenario_id):
+    report = await run_scenario(scenario_id)
+
+    assert [
+        call
+        for call in report.provider_calls
+        if call["operation"] == "register_broadcast"
+    ] == []
+    assert "wallet_rejected" in [step.error_code for step in report.steps]
+
+
+@pytest.mark.asyncio
+async def test_reverted_swap_is_not_registered_or_reported_successful():
+    report = await run_scenario("swap_reverted")
+
+    broadcast = next(step for step in report.steps if step.operation == "broadcast")
+    assert broadcast.http_status == 409
+    assert broadcast.error_code == "TRANSACTION_FAILED"
+    assert [
+        call
+        for call in report.provider_calls
+        if call["operation"] == "register_broadcast"
+    ] == []

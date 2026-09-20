@@ -38,7 +38,9 @@ from wallet_agent.graph import build_graph
 from wallet_agent.persistence import InMemorySessionStore
 
 from .wallet_app_simulator import (
+    Eip1193Error,
     Eip1193WalletSimulator,
+    EvaluationHttpError,
     EvidenceLedger,
     FaultOutcome,
     FaultPlan,
@@ -103,6 +105,103 @@ SCENARIOS = {
         expected_register_attempts=1,
         dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
     ),
+    "approval_pending_restart_resume": ScenarioDefinition(
+        id="approval_pending_restart_resume",
+        provider="bridgers",
+        allowance_required=True,
+        fault_plan=FaultPlan(
+            allowances=(
+                FaultOutcome("insufficient", "0"),
+                FaultOutcome("sufficient", "10000000"),
+            ),
+            chain_receipts=(
+                FaultOutcome("not_found"),
+                FaultOutcome("pending"),
+                FaultOutcome("confirmed", {"status": "0x1"}),
+            ),
+            provider_register=(FaultOutcome("success", "order-restart"),),
+            provider_status=(FaultOutcome("completed"),),
+        ),
+        wallet_hashes=("0x" + "d" * 64, "0x" + "e" * 64),
+        expected_final_stage="completed",
+        expected_wallet_sends=2,
+        expected_register_attempts=1,
+        restart_after_approval=True,
+        dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
+    ),
+    "wallet_rejects_approval": ScenarioDefinition(
+        id="wallet_rejects_approval",
+        provider="bridgers",
+        allowance_required=True,
+        fault_plan=FaultPlan(
+            allowances=(FaultOutcome("insufficient", "0"),),
+            wallet_send=(
+                FaultOutcome("reject", code=4001, message="User rejected approval"),
+            ),
+        ),
+        wallet_hashes=(),
+        expected_final_stage="approval_required",
+        expected_wallet_sends=1,
+        expected_register_attempts=0,
+    ),
+    "wallet_rejects_swap": ScenarioDefinition(
+        id="wallet_rejects_swap",
+        provider="bridgers",
+        allowance_required=False,
+        fault_plan=FaultPlan(
+            allowances=(FaultOutcome("sufficient", "10000000"),),
+            wallet_send=(
+                FaultOutcome("reject", code=4001, message="User rejected swap"),
+            ),
+        ),
+        wallet_hashes=(),
+        expected_final_stage="swap_ready",
+        expected_wallet_sends=1,
+        expected_register_attempts=0,
+    ),
+    "swap_temporarily_not_visible": ScenarioDefinition(
+        id="swap_temporarily_not_visible",
+        provider="bridgers",
+        allowance_required=False,
+        fault_plan=FaultPlan(
+            allowances=(FaultOutcome("sufficient", "10000000"),),
+            chain_receipts=(
+                FaultOutcome("not_found"),
+                FaultOutcome("not_found"),
+                FaultOutcome("not_found"),
+                FaultOutcome("confirmed", {"status": "0x1"}),
+            ),
+            chain_transactions=(
+                FaultOutcome("not_found"),
+                FaultOutcome("not_found"),
+                FaultOutcome("not_found"),
+            ),
+            provider_register=(FaultOutcome("success", "order-pending"),),
+            provider_status=(
+                FaultOutcome("processing"),
+                FaultOutcome("completed"),
+            ),
+        ),
+        wallet_hashes=("0x" + "f" * 64,),
+        expected_final_stage="completed",
+        expected_wallet_sends=1,
+        expected_register_attempts=1,
+        dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
+    ),
+    "swap_reverted": ScenarioDefinition(
+        id="swap_reverted",
+        provider="bridgers",
+        allowance_required=False,
+        fault_plan=FaultPlan(
+            allowances=(FaultOutcome("sufficient", "10000000"),),
+            chain_receipts=(FaultOutcome("reverted", {"status": "0x0"}),),
+        ),
+        wallet_hashes=("0x" + "9" * 64,),
+        expected_final_stage="failed",
+        expected_wallet_sends=1,
+        expected_register_attempts=0,
+        dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
+    ),
 }
 
 
@@ -153,7 +252,11 @@ def _dump(value: Any) -> Any:
 
 
 def _sequence(outcomes: Sequence[FaultOutcome], *, fallback: FaultOutcome) -> FaultSequence:
-    return FaultSequence(outcomes=tuple(outcomes), fallback=fallback)
+    planned = tuple(outcomes)
+    return FaultSequence(
+        outcomes=planned,
+        fallback=planned[-1] if planned else fallback,
+    )
 
 
 class RecordingChainAdapter:
@@ -813,6 +916,7 @@ def _lifecycle_invariants(
     construction_manifest: Mapping[str, Any],
     session: Mapping[str, Any],
     max_attempts: int,
+    final_stage: str | None = None,
 ) -> tuple[InvariantResult, ...]:
     public_requests = [
         event
@@ -972,12 +1076,82 @@ def _lifecycle_invariants(
             and body.get("provider_reference") == prepare.get("provider_reference")
         )
 
+    valid_rejection_without_prepare = not prepare_events and any(
+        step.error_code == "wallet_rejected" and step.evidence.get("code") == 4001
+        for step in steps
+    ) and bool(successful_selection_pairs)
     quote_selection_safe = (
         len(session.get("quote_candidates", [])) > 1
         and bool(selection_requests)
         and selection_pairs_valid
-        and bool(prepare_events)
-        and all(prepare_matches_latest_selection(prepare) for prepare in prepare_events)
+        and (
+            (
+                bool(prepare_events)
+                and all(prepare_matches_latest_selection(prepare) for prepare in prepare_events)
+            )
+            or valid_rejection_without_prepare
+        )
+    )
+    rejection_indices = [
+        index for index, step in enumerate(steps) if step.error_code == "wallet_rejected"
+    ]
+    rejection_safe = all(
+        not any(
+            later.operation in {"approve_broadcast", "broadcast"}
+            for later in steps[index + 1 :]
+        )
+        for index in rejection_indices
+    ) and (not rejection_indices or not register_events)
+    reverted_broadcasts = [
+        step
+        for step in steps
+        if step.operation == "broadcast" and step.error_code == "TRANSACTION_FAILED"
+    ]
+    reverted_safe = not reverted_broadcasts or (
+        not register_events and final_stage == "failed"
+    )
+
+    pending_broadcasts = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.operation == "broadcast" and step.stage_after == "broadcast_pending"
+    ]
+
+    def pending_broadcast_recovers(index: int, step: LifecycleStep) -> bool:
+        tx_hash = step.evidence.get("broadcast_tx_hash")
+        later_steps = steps[index + 1 :]
+        return (
+            isinstance(tx_hash, str)
+            and bool(tx_hash)
+            and any(
+                later.operation == "session"
+                and later.evidence.get("broadcast_tx_hash") == tx_hash
+                for later in later_steps
+            )
+            and any(
+                later.operation in {"status_turn", "session"}
+                and later.stage_after not in {None, "broadcast_pending"}
+                for later in later_steps
+            )
+            and len([item for item in steps if item.operation == "wallet_swap"]) == 1
+            and not any(
+                later.operation in {"wallet_approval", "wallet_swap"}
+                for later in later_steps
+            )
+        )
+
+    pending_safe = all(
+        pending_broadcast_recovers(index, step) for index, step in pending_broadcasts
+    )
+    restart_indices = [
+        index for index, step in enumerate(steps) if step.operation == "client_restart"
+    ]
+    restart_safe = all(
+        set(steps[index].evidence) == {"conversation_id", "session_id"}
+        and all(steps[index].evidence.values())
+        and index + 1 < len(steps)
+        and steps[index + 1].operation in {"session", "continue"}
+        for index in restart_indices
     )
     sanitized_public_requests, _ = _sanitize_public_value(public_requests)
     return (
@@ -991,8 +1165,14 @@ def _lifecycle_invariants(
         InvariantResult("explicit_quote_selection", quote_selection_safe),
         InvariantResult(
             "bounded_progress",
-            len([step for step in steps if step.operation == "continue"]) <= max_attempts,
+            len([step for step in steps if step.operation == "continue"]) <= max_attempts
+            and len([step for step in steps if step.operation == "status_turn"])
+            <= max_attempts,
         ),
+        InvariantResult("rejection_stops_side_effects", rejection_safe),
+        InvariantResult("reverted_is_not_success", reverted_safe),
+        InvariantResult("pending_is_recoverable", pending_safe),
+        InvariantResult("restart_uses_public_state", restart_safe),
     )
 
 
@@ -1021,13 +1201,20 @@ async def build_scenario_runtime(definition: ScenarioDefinition) -> ScenarioRunt
         transport=_RecordingASGITransport(app, ledger),
         base_url="http://wallet.test",
     )
+    wallet_send_outcomes = definition.fault_plan.wallet_send or tuple(
+        FaultOutcome("success", value) for value in definition.wallet_hashes
+    )
     wallet = Eip1193WalletSimulator(
         chain_id="0x1",
         accounts=(WALLET_ADDRESS,),
         ledger=ledger,
         send_outcomes=FaultSequence(
-            outcomes=tuple(FaultOutcome("success", value) for value in definition.wallet_hashes),
-            fallback=FaultOutcome("rpc_error", message="unexpected wallet send"),
+            outcomes=wallet_send_outcomes,
+            fallback=(
+                wallet_send_outcomes[-1]
+                if wallet_send_outcomes
+                else FaultOutcome("rpc_error", message="unexpected wallet send")
+            ),
         ),
     )
     client = WalletAppClient(
@@ -1073,6 +1260,37 @@ def wallet_transaction(unsigned: Mapping[str, Any], from_address: str) -> dict[s
     return transaction
 
 
+def _record_wallet_rejection(
+    client: WalletAppClient, operation: str, error: Eip1193Error
+) -> None:
+    client.steps.append(
+        LifecycleStep(
+            operation=operation,
+            stage_before=client.stage,
+            stage_after=client.stage,
+            http_status=None,
+            error_code="wallet_rejected",
+            evidence={"code": error.code, "message": str(error)},
+        )
+    )
+
+
+async def _status_turn(client: WalletAppClient) -> dict[str, Any]:
+    status_turn_index = len(client.steps)
+    await client.turn("Check the swap status")
+    if client.steps[status_turn_index].operation == "turn":
+        status_turn = client.steps[status_turn_index]
+        client.steps[status_turn_index] = LifecycleStep(
+            operation="status_turn",
+            stage_before=status_turn.stage_before,
+            stage_after=status_turn.stage_after,
+            http_status=status_turn.http_status,
+            error_code=status_turn.error_code,
+            evidence=status_turn.evidence,
+        )
+    return await client.session()
+
+
 async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> LifecycleReport:
     definition = runtime.definition
     client = runtime.client
@@ -1088,60 +1306,118 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
         )
         await client.select_quote(primary_reference)
         confirmed = await client.confirm(True)
+        wallet_rejected = False
         if definition.allowance_required:
             approval = confirmed.get("approval_transaction")
             if not approval:
                 raise AssertionError("approval transaction was not projected after confirmation")
             approval_tx = wallet_transaction(approval, WALLET_ADDRESS)
-            approval_hash = await runtime.wallet.request("eth_sendTransaction", [approval_tx])
-            runtime.ledger.record(
-                "wallet",
-                "eth_sendTransaction_result",
-                result=approval_hash,
-                success=True,
-            )
-            _step(
-                client,
-                "wallet_approval",
-                {"method": "eth_sendTransaction", "transaction": approval_tx},
-            )
-            await client.submit_approval_hash("ETH", str(approval_hash))
-            prepared: dict[str, Any] | None = None
-            for _attempt in range(max_attempts):
-                continued = await client.continue_swap()
-                prepared = continued.get("pending_transaction")
-                if prepared:
-                    break
-            if not prepared:
-                raise AssertionError("approval continuation did not produce a swap transaction")
+            try:
+                approval_hash = await runtime.wallet.request(
+                    "eth_sendTransaction", [approval_tx]
+                )
+            except Eip1193Error as exc:
+                if exc.code != 4001:
+                    raise
+                _record_wallet_rejection(client, "wallet_approval", exc)
+                wallet_rejected = True
+            if not wallet_rejected:
+                runtime.ledger.record(
+                    "wallet",
+                    "eth_sendTransaction_result",
+                    result=approval_hash,
+                    success=True,
+                )
+                _step(
+                    client,
+                    "wallet_approval",
+                    {"method": "eth_sendTransaction", "transaction": approval_tx},
+                )
+                await client.submit_approval_hash("ETH", str(approval_hash))
+                if definition.restart_after_approval:
+                    old = client
+                    _step(
+                        old,
+                        "client_restart",
+                        {
+                            "conversation_id": old.conversation_id,
+                            "session_id": old.session_id,
+                        },
+                    )
+                    runtime.client = WalletAppClient.restore(
+                        runtime.http,
+                        user_id=old.user_id,
+                        address=old.address,
+                        chain=old.chain,
+                        conversation_id=old.conversation_id,
+                        session_id=old.session_id,
+                    )
+                    runtime.client.steps = old.steps
+                    client = runtime.client
+                    session = await client.session()
+                prepared: dict[str, Any] | None = None
+                for _attempt in range(max_attempts):
+                    continued = await client.continue_swap()
+                    prepared = continued.get("pending_transaction")
+                    if prepared:
+                        break
+                    if continued.get("stage") != "approval_pending":
+                        raise AssertionError(
+                            "approval continuation left its recoverable pending stage"
+                        )
+                if not prepared:
+                    raise AssertionError(
+                        "approval continuation did not produce a swap transaction"
+                    )
         else:
             prepared = confirmed.get("pending_transaction")
             if not prepared:
                 raise AssertionError("confirmation did not produce a swap transaction")
-        swap_tx = wallet_transaction(prepared, WALLET_ADDRESS)
-        swap_hash = await runtime.wallet.request("eth_sendTransaction", [swap_tx])
-        runtime.ledger.record(
-            "wallet",
-            "eth_sendTransaction_result",
-            result=swap_hash,
-            success=True,
-        )
-        _step(client, "wallet_swap", {"method": "eth_sendTransaction", "transaction": swap_tx})
-        await client.submit_swap_hash("ETH", str(swap_hash))
-        status_turn_index = len(client.steps)
-        await client.turn("Check the swap status")
-        if client.steps[status_turn_index].operation == "turn":
-            status_turn = client.steps[status_turn_index]
-            client.steps[status_turn_index] = LifecycleStep(
-                operation="status_turn",
-                stage_before=status_turn.stage_before,
-                stage_after=status_turn.stage_after,
-                http_status=status_turn.http_status,
-                error_code=status_turn.error_code,
-                evidence=status_turn.evidence,
-            )
-        final_session = await client.session()
-        final_stage = str(final_session.get("stage") or client.stage or "")
+        if wallet_rejected:
+            session = await client.session()
+            final_stage = str(session.get("stage") or client.stage or "")
+        else:
+            swap_tx = wallet_transaction(prepared, WALLET_ADDRESS)
+            try:
+                swap_hash = await runtime.wallet.request("eth_sendTransaction", [swap_tx])
+            except Eip1193Error as exc:
+                if exc.code != 4001:
+                    raise
+                _record_wallet_rejection(client, "wallet_swap", exc)
+                wallet_rejected = True
+            if wallet_rejected:
+                session = await client.session()
+                final_stage = str(session.get("stage") or client.stage or "")
+            else:
+                runtime.ledger.record(
+                    "wallet",
+                    "eth_sendTransaction_result",
+                    result=swap_hash,
+                    success=True,
+                )
+                _step(
+                    client,
+                    "wallet_swap",
+                    {"method": "eth_sendTransaction", "transaction": swap_tx},
+                )
+                try:
+                    broadcast = await client.submit_swap_hash("ETH", str(swap_hash))
+                except EvaluationHttpError as exc:
+                    if exc.code != "TRANSACTION_FAILED":
+                        raise
+                    final_stage = "failed"
+                else:
+                    if broadcast.get("status") == "broadcast_pending":
+                        submitted_hash = broadcast.get("broadcast_tx_hash")
+                        if submitted_hash != swap_hash:
+                            raise AssertionError(
+                                "broadcast pending did not retain the submitted hash"
+                            )
+                    for _attempt in range(max_attempts):
+                        session = await _status_turn(client)
+                        final_stage = str(session.get("stage") or client.stage or "")
+                        if final_stage == "completed":
+                            break
     except Exception as exc:  # reports preserve evidence while keeping test assertions simple
         failures.append(str(exc))
         final_stage = str(client.stage or "failed")
@@ -1166,6 +1442,7 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
         construction_manifest=runtime.construction_manifest,
         session=session if "session" in locals() else {},
         max_attempts=max_attempts,
+        final_stage=final_stage,
     )
     if final_stage != definition.expected_final_stage:
         failures.append(
