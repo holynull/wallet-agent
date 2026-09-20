@@ -37,6 +37,23 @@ async def test_sse_parser_handles_split_and_multiple_events_and_final_buffer():
     ]
 
 
+@pytest.mark.asyncio
+async def test_sse_parser_handles_utf8_code_point_split_across_chunks():
+    payload = 'data: {"label":"钱包"}'.encode()
+    split_at = payload.index("钱".encode()) + 1
+
+    events = [
+        event
+        async for event in parse_sse(
+            chunks(payload[:split_at], payload[split_at:])
+        )
+    ]
+
+    assert [(event.name, event.data) for event in events] == [
+        ("message", {"label": "钱包"})
+    ]
+
+
 def test_fault_sequence_consumes_order_then_uses_explicit_fallback():
     sequence = FaultSequence(
         outcomes=(FaultOutcome("not_found"), FaultOutcome("confirmed", {"status": "0x1"})),
@@ -55,7 +72,11 @@ def test_evidence_redaction_is_recursive_without_hiding_erc20_token_metadata():
         {
             "authorization": "Bearer secret",
             "metadata": {"private_key": "0xdead", "apiKey": "provider-secret"},
-            "token": {"symbol": "USDC", "address": "0x" + "3" * 40},
+            "token": {
+                "symbol": "USDC",
+                "address": "0x" + "3" * 40,
+                "raw": {"source": "asset-registry"},
+            },
             "data": "0x1234567890abcdef",
         }
     )
@@ -63,7 +84,11 @@ def test_evidence_redaction_is_recursive_without_hiding_erc20_token_metadata():
     assert evidence == {
         "authorization": "[REDACTED]",
         "metadata": {"private_key": "[REDACTED]", "apiKey": "[REDACTED]"},
-        "token": {"symbol": "USDC", "address": "0x" + "3" * 40},
+        "token": {
+            "symbol": "USDC",
+            "address": "0x" + "3" * 40,
+            "raw": {"source": "asset-registry"},
+        },
         "data": {"selector": "0x12345678", "length": 18},
     }
     assert "provider-secret" not in json.dumps(evidence)
@@ -96,6 +121,62 @@ async def test_wallet_switches_chain_and_returns_configured_unsigned_transaction
 
 
 @pytest.mark.asyncio
+async def test_wallet_switch_exhaustion_fails_without_changing_chain():
+    wallet = Eip1193WalletSimulator(
+        chain_id="0x1",
+        accounts=("0x" + "1" * 40,),
+        switch_outcomes=FaultSequence(),
+    )
+
+    with pytest.raises(Eip1193Error, match="fault sequence exhausted") as exhausted:
+        await wallet.request("wallet_switchEthereumChain", [{"chainId": "0x38"}])
+
+    assert exhausted.value.code == -32603
+    assert wallet.chain_id == "0x1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        FaultOutcome("reject", code=4001, message="User denied chain switch"),
+        FaultOutcome("rpc_error", code=-32000, message="Switch RPC failed"),
+    ],
+)
+async def test_wallet_switch_preserves_configured_failure_without_changing_chain(
+    outcome,
+):
+    wallet = Eip1193WalletSimulator(
+        chain_id="0x1",
+        accounts=("0x" + "1" * 40,),
+        switch_outcomes=FaultSequence(outcomes=(outcome,)),
+    )
+
+    with pytest.raises(Eip1193Error, match=outcome.message) as failed:
+        await wallet.request("wallet_switchEthereumChain", [{"chainId": "0x38"}])
+
+    assert failed.value.code == outcome.code
+    assert wallet.chain_id == "0x1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested_chain_id", ["56", "0x038"])
+async def test_wallet_canonicalizes_chain_id_after_successful_switch(
+    requested_chain_id,
+):
+    wallet = Eip1193WalletSimulator(
+        chain_id="0x1",
+        accounts=("0x" + "1" * 40,),
+    )
+
+    await wallet.request(
+        "wallet_switchEthereumChain", [{"chainId": requested_chain_id}]
+    )
+
+    assert wallet.chain_id == "0x38"
+
+
+@pytest.mark.asyncio
 async def test_wallet_rejects_signing_material_and_reports_eip1193_user_rejection():
     wallet = Eip1193WalletSimulator(
         chain_id="0x1",
@@ -109,8 +190,16 @@ async def test_wallet_rejects_signing_material_and_reports_eip1193_user_rejectio
     with pytest.raises(ValueError, match="signed transaction material"):
         await wallet.request(
             "eth_sendTransaction",
-            [{"from": "0x" + "1" * 40, "to": "0x" + "2" * 40, "rawTransaction": "0xsigned"}],
+            [
+                {
+                    "from": "0x" + "1" * 40,
+                    "to": "0x" + "2" * 40,
+                    "raw": "0xsigned-secret",
+                }
+            ],
         )
+    assert wallet.calls[0]["params"][0]["raw"] == "[REDACTED]"
+    assert "0xsigned-secret" not in json.dumps(wallet.ledger.events)
     with pytest.raises(Eip1193Error) as rejected:
         await wallet.request(
             "eth_sendTransaction",
@@ -156,3 +245,23 @@ async def test_wallet_models_switch_failure_and_account_or_chain_change_before_s
             [{"from": "0x" + "9" * 40, "to": "0x" + "2" * 40, "data": "0x"}],
         )
     assert await wallet.request("eth_chainId") == "0x38"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_chain_id", ["56", "0x038"])
+async def test_wallet_canonicalizes_configured_chain_change(changed_chain_id):
+    wallet = Eip1193WalletSimulator(
+        chain_id="0x1",
+        accounts=("0x" + "1" * 40,),
+        send_outcomes=FaultSequence(
+            outcomes=(FaultOutcome("chain_change", changed_chain_id),),
+        ),
+    )
+
+    with pytest.raises(Eip1193Error, match="chain changed"):
+        await wallet.request(
+            "eth_sendTransaction",
+            [{"from": "0x" + "1" * 40, "to": "0x" + "2" * 40, "data": "0x"}],
+        )
+
+    assert wallet.chain_id == "0x38"

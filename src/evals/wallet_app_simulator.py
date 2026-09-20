@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import json
 from collections.abc import AsyncIterable, AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -121,6 +122,10 @@ def _canonical_key(key: Any) -> str:
     return "".join(character for character in str(key).lower() if character.isalnum())
 
 
+def _normalize_chain_id(chain_id: str) -> str:
+    return hex(int(chain_id, 0))
+
+
 def sanitize_evidence(value: Any) -> Any:
     if isinstance(value, Mapping):
         sanitized: dict[Any, Any] = {}
@@ -146,6 +151,7 @@ def sanitize_evidence(value: Any) -> Any:
 
 async def parse_sse(chunks: AsyncIterable[bytes]) -> AsyncIterator[SseEvent]:
     buffer = ""
+    decoder = codecs.getincrementaldecoder("utf-8")()
 
     async def decode(block: str) -> SseEvent | None:
         name = "message"
@@ -168,7 +174,7 @@ async def parse_sse(chunks: AsyncIterable[bytes]) -> AsyncIterator[SseEvent]:
         )
 
     async for chunk in chunks:
-        buffer += chunk.decode("utf-8")
+        buffer += decoder.decode(chunk)
         normalized = buffer.replace("\r\n", "\n")
         while "\n\n" in normalized:
             block, normalized = normalized.split("\n\n", 1)
@@ -176,6 +182,7 @@ async def parse_sse(chunks: AsyncIterable[bytes]) -> AsyncIterator[SseEvent]:
             if event is not None:
                 yield event
         buffer = normalized
+    buffer += decoder.decode(b"", final=True)
     if buffer.strip():
         event = await decode(buffer)
         if event is not None:
@@ -198,7 +205,7 @@ class Eip1193WalletSimulator:
         send_outcomes: FaultSequence | None = None,
         ledger: EvidenceLedger | None = None,
     ) -> None:
-        self.chain_id = hex(int(chain_id, 0))
+        self.chain_id = _normalize_chain_id(chain_id)
         self.accounts = tuple(accounts)
         self.switch_outcomes = switch_outcomes or FaultSequence(
             fallback=FaultOutcome("success")
@@ -225,11 +232,21 @@ class Eip1193WalletSimulator:
         if method == "wallet_switchEthereumChain":
             outcome = self.switch_outcomes.next()
             self._record(method, params or [])
-            if outcome.kind == "switch_error":
-                raise Eip1193Error(
-                    outcome.code or 4902, outcome.message or "chain switch failed"
+            if outcome.kind != "success":
+                default_code = (
+                    4902
+                    if outcome.kind == "switch_error"
+                    else 4001
+                    if outcome.kind == "reject"
+                    else -32603
                 )
-            self.chain_id = str((params or [])[0]["chainId"]).lower()
+                raise Eip1193Error(
+                    outcome.code if outcome.code is not None else default_code,
+                    outcome.message
+                    if outcome.message is not None
+                    else "chain switch failed",
+                )
+            self.chain_id = _normalize_chain_id(str((params or [])[0]["chainId"]))
             return None
         if method == "wallet_addEthereumChain":
             self._record(method, params or [])
@@ -250,7 +267,11 @@ class Eip1193WalletSimulator:
             in forbidden
             for key in transaction
         ):
-            self._record(method, [transaction])
+            redacted_transaction = {
+                key: "[REDACTED]" if _canonical_key(key) in forbidden else value
+                for key, value in transaction.items()
+            }
+            self._record(method, [redacted_transaction])
             raise ValueError("signed transaction material is forbidden")
         self._record(method, [transaction])
         outcome = self.send_outcomes.next()
@@ -260,6 +281,6 @@ class Eip1193WalletSimulator:
             self.accounts = (str(outcome.value),)
             raise Eip1193Error(4100, "wallet account changed before signing")
         if outcome.kind == "chain_change":
-            self.chain_id = str(outcome.value).lower()
+            self.chain_id = _normalize_chain_id(str(outcome.value))
             raise Eip1193Error(4901, "wallet chain changed before signing")
         raise Eip1193Error(outcome.code or 4001, outcome.message or outcome.kind)
