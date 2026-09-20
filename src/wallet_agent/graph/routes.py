@@ -87,10 +87,7 @@ def route_after_confirmation(state: dict[str, Any]) -> str:
 
 
 def route_after_status(state: dict[str, Any]) -> str:
-    snapshot = state.get("status_snapshot") or {}
-    status = snapshot.get("status")
-    if status in {"completed", "failed", "refunded", "timed_out", "kyc_required", "cancelled"}:
-        return "response"
-    if state.get("poll_attempts", 0) >= state.get("max_poll_attempts", 3):
-        return "response"
-    return "status_poll"
+    # One conversational status request performs one provider lookup. Repeated
+    # polling in a single graph run can block the response and turn an ordinary
+    # processing state into a synthetic timeout.
+    return "response"

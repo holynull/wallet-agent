@@ -345,6 +345,18 @@ def create_app(
             changes["stage"] = state["authorization_stage"]
         elif state.get("task_stage") is not None:
             changes["stage"] = state["task_stage"]
+        response = state.get("response") or {}
+        if response.get("kind") == "swap_status":
+            raw_status = response.get("status")
+            order_state = (
+                raw_status.get("status") if isinstance(raw_status, Mapping) else raw_status
+            )
+            if order_state:
+                changes["stage"] = str(order_state)
+            # Once a swap has been broadcast, old checkpoint values are no
+            # longer actionable and must not make clients render signing cards.
+            changes["approval_transaction"] = None
+            changes["pending_transaction"] = None
         for field in ("approval_transaction", "approval_tx_hash", "allowance_requirement"):
             if state.get(field) is not None:
                 changes[field] = state[field]
@@ -443,9 +455,16 @@ def create_app(
                     app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
                     app.state.runs[run_id]["status"] = "complete"
                     response_kind = (result.get("response") or {}).get("kind")
-                    session_status = (
-                        "transfer_ready" if response_kind == "transfer_prepare" else "completed"
-                    )
+                    session_status = None
+                    if response_kind == "transfer_prepare":
+                        session_status = "transfer_ready"
+                    elif response_kind == "swap_status":
+                        raw_status = (result.get("response") or {}).get("status")
+                        session_status = (
+                            raw_status.get("status")
+                            if isinstance(raw_status, Mapping)
+                            else raw_status
+                        )
                     if response_kind == "error" and (
                         result.get("intent") == "swap_quote"
                         or (result.get("active_task") or {}).get("kind") == "swap"
@@ -569,7 +588,30 @@ def create_app(
             "model_id": selected_model_id,
             "request": payload.model_dump(mode="json"),
             "messages": [{"role": "user", "content": payload.message}],
+            # API-forced intents are turn-scoped. Explicitly overwrite any
+            # value left in the LangGraph checkpoint by select/continue APIs.
+            "forced_intent": None,
         }
+        if existing_session is not None and existing_session.provider_order is not None:
+            order = existing_session.provider_order
+            input_state.update(
+                {
+                    "provider_orders": {
+                        str(order.provider): order.model_dump(mode="json")
+                    },
+                    "provider_order_ids": {
+                        str(order.provider): order.provider_order_id
+                    },
+                    "broadcast_tx_hash": existing_session.broadcast_tx_hash,
+                    "poll_attempts": 0,
+                    "status_snapshot": None,
+                    # A registered provider order proves signing is finished.
+                    # Clear stale checkpoint actions from the next SSE state.
+                    "approval_transaction": None,
+                    "pending_transaction": None,
+                    "authorization_stage": None,
+                }
+            )
         if wallet_context:
             input_state["wallet_context"] = wallet_context
         if raw_swap_request is not None:
@@ -775,6 +817,7 @@ def create_app(
         updated = await session_store.update(
             session_id,
             status=broadcast_status,
+            stage=broadcast_status,
             broadcast_tx_hash=payload.tx_hash,
             provider_order=order,
         )

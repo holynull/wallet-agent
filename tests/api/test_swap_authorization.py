@@ -9,7 +9,9 @@ from wallet_agent.domain.models import (
     AllowanceRequirement,
     Asset,
     FeeEstimate,
+    NormalizedOrderStatus,
     NormalizedQuote,
+    ProviderOrder,
     UnsignedTransaction,
 )
 from wallet_agent.graph.build import build_graph
@@ -43,12 +45,33 @@ class Adapter:
 
 class Provider:
     provider_name = "bridgers"
-    prepare_calls = 0
+
+    def __init__(self):
+        self.prepare_calls = 0
+        self.status_calls = 0
 
     async def prepare(self, quote):
         self.prepare_calls += 1
         return UnsignedTransaction(
             chain=quote.source_asset.chain, to="0x" + "4" * 40, data="0xabc", value="0"
+        )
+
+    async def register_broadcast(self, provider_reference, tx_hash):
+        return ProviderOrder(
+            provider="bridgers",
+            provider_order_id="order-1",
+            provider_reference=provider_reference,
+            tx_hash=tx_hash,
+        )
+
+    async def get_status(self, order):
+        self.status_calls += 1
+        return NormalizedOrderStatus(
+            provider="bridgers",
+            provider_order_id=order.provider_order_id,
+            provider_reference=order.provider_reference,
+            status="processing",
+            tx_hash=order.tx_hash,
         )
 
 
@@ -261,3 +284,107 @@ async def test_swap_transaction_includes_contextual_gas_estimate():
     assert transaction["gas_limit"] == "30000"
     assert transaction["max_fee_per_gas"] == "100000000"
     assert transaction["max_priority_fee_per_gas"] == "2000000"
+
+
+@pytest.mark.asyncio
+async def test_status_turn_after_broadcast_polls_order_without_reopening_approval():
+    class StatusModel(Model):
+        async def ainvoke(self, value):
+            if value.get("message") == "怎么样了？":
+                return {"intent": "swap_status"}
+            return await super().ainvoke(value)
+
+    token = Asset(
+        chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x" + "3" * 40
+    )
+    requirement = AllowanceRequirement(
+        token=token,
+        owner="0x" + "1" * 40,
+        spender="0x" + "4" * 40,
+        required_amount_raw="100",
+        current_allowance_raw="0",
+    )
+    quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=token,
+        destination_asset=Asset(
+            chain="BSC", symbol="USDT", decimals=6, address="0x" + "5" * 40
+        ),
+        input_amount=Decimal("1"),
+        input_amount_raw="100",
+        expected_output=Decimal("1"),
+        expected_output_raw="100",
+        provider_reference="ref-status",
+        allowance_requirement=requirement,
+    )
+    adapter = Adapter()
+    provider = Provider()
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-status",
+            user_id="alice",
+            thread_id="t-status",
+            quote_candidates=[quote],
+        )
+    )
+    graph = build_graph(model=StatusModel(), providers=[provider], chains={"BASE": adapter})
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        chain_registry=ChainAdapterRegistry({"BASE": adapter}),
+        store=store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(
+            "/v1/swap/s-status/select-quote",
+            json={"user_id": "alice", "provider_reference": "ref-status"},
+        )
+        await client.post(
+            "/v1/swap/s-status/approve-broadcast",
+            json={
+                "user_id": "alice",
+                "chain": "BASE",
+                "approve_tx_hash": "0x" + "a" * 64,
+            },
+        )
+        adapter.allowance = "100"
+        await client.post("/v1/swap/s-status/continue", json={"user_id": "alice"})
+        broadcast = await client.post(
+            "/v1/swap/s-status/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": "0x" + "b" * 64},
+        )
+        turn = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "conversation_id": "t-status",
+                "session_id": "s-status",
+                "message": "怎么样了？",
+            },
+        )
+        await app.state.runs[turn.json()["run_id"]]["task"]
+
+    run = app.state.runs[turn.json()["run_id"]]
+    final_state = next(
+        event["state"]
+        for event in reversed(run["events"])
+        if event["event"] == "complete"
+    )
+    session = await store.get("s-status")
+
+    assert broadcast.status_code == 200
+    assert broadcast.json()["stage"] == "broadcasted"
+    assert provider.status_calls == 1
+    assert final_state["response"]["kind"] == "swap_status"
+    assert final_state["response"]["status"]["status"] == "processing"
+    assert final_state.get("approval_transaction") is None
+    assert final_state.get("pending_transaction") is None
+    assert session is not None
+    assert session.status == "processing"
+    assert session.stage == "processing"
+    assert session.order_status is not None
+    assert session.order_status.status == "processing"
