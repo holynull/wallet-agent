@@ -216,6 +216,28 @@ def test_exit_codes_distinguish_success_failure_blocked_and_usage_error(capsys):
     assert body["code"] == "UNKNOWN_SCENARIO"
 
 
+def test_evaluator_error_does_not_leak_exception_details(monkeypatch, capsys):
+    async def raise_with_secrets(_scenario_id=None):
+        raise RuntimeError("private_key=LEAKED; apiKey=LEAKED2")
+
+    monkeypatch.setattr("evals.wallet_app_evals.run_wallet_app_evals", raise_with_secrets)
+
+    assert main([]) == 2
+    output = capsys.readouterr().out
+    body = json.loads(output)
+    assert body["code"] == "EVALUATOR_ERROR"
+    assert "LEAKED" not in output
+    assert "private_key" not in output
+    assert "apiKey" not in output
+
+
+def test_help_is_machine_readable_usage_error(capsys):
+    assert main(["--help"]) == 2
+    output = capsys.readouterr().out
+    body = json.loads(output)
+    assert body["code"] == "USAGE_ERROR"
+
+
 @pytest.mark.asyncio
 async def test_deliberate_failed_expectation_returns_nonzero_exit_code():
     definition = replace(

@@ -109,7 +109,11 @@ def exit_code(report: Mapping[str, Any]) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the offline suite and emit exactly one JSON document on stdout."""
 
-    parser = argparse.ArgumentParser(description=__doc__)
+    # Keep every invocation machine-readable, including ``--help``.  The
+    # default argparse help action writes human-oriented text and exits before
+    # this function can emit its single JSON document.
+    parser = argparse.ArgumentParser(description=__doc__, add_help=False)
+    parser.add_argument("--help", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--scenario")
     try:
         args = parser.parse_args(argv)
@@ -126,6 +130,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
+    if args.help:
+        print(
+            json.dumps(
+                {"code": "USAGE_ERROR", "message": "--help is not supported"},
+                ensure_ascii=False,
+            )
+        )
+        return 2
+
     try:
         report = asyncio.run(run_wallet_app_evals(args.scenario))
     except UnknownScenarioError as exc:
@@ -136,12 +149,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 2
-    except Exception as exc:  # evaluator setup/configuration errors
+    except Exception:  # evaluator setup/configuration errors
         print(
             json.dumps(
                 {
                     "code": "EVALUATOR_ERROR",
-                    "message": f"{type(exc).__name__}: {exc}",
+                    # Exception text can contain credentials or other secrets;
+                    # never expose it through this machine-facing CLI.
+                    "message": "evaluator execution failed",
                 },
                 ensure_ascii=False,
             )
