@@ -67,6 +67,21 @@ async def test_mobile_demo_page_is_served_by_api_app():
 
 
 @pytest.mark.asyncio
+async def test_mobile_demo_follows_new_output_when_view_is_at_bottom():
+    app = create_app()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        html = (await client.get("/demo/")).text
+
+    assert "scrollMessagesToBottom" in html
+    assert "messages.addEventListener('scroll'" in html
+    assert "messageFollowEnabled" in html
+    assert "requestAnimationFrame" in html
+    assert "window.addEventListener('resize'" in html
+
+
+@pytest.mark.asyncio
 async def test_mobile_demo_documents_quote_selection_and_approval_flow():
     app = create_app()
     async with httpx.AsyncClient(

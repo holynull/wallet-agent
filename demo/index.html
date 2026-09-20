@@ -126,7 +126,7 @@
     conversationId: null, sessionId: null, runId: null, streamAbort: null,
     requestBusy: false, requestCancelled: false, lastUserMessage: null,
     quotes: [], selectedProviderReference: null, lastResponse: null, boundProvider: null,
-    debugLog: [], agentTestResults: {}, typingQueue: Promise.resolve()
+    debugLog: [], agentTestResults: {}, typingQueue: Promise.resolve(), messageFollowEnabled: true
   };
   const $ = (id) => document.getElementById(id);
   const messages = $('messages');
@@ -134,8 +134,22 @@
     '0x1': 'ETH', '0x38': 'BSC', '0x89': 'POLYGON',
     '0xa': 'OPTIMISM', '0x2105': 'BASE', '0xa4b1': 'ARBITRUM'
   };
+  const MESSAGE_BOTTOM_THRESHOLD = 48;
 
   function json(value) { return JSON.stringify(value, null, 2); }
+  function isMessagesNearBottom() {
+    return messages.scrollHeight - messages.scrollTop - messages.clientHeight <= MESSAGE_BOTTOM_THRESHOLD;
+  }
+  function scrollMessagesToBottom(force = false) {
+    if (!force && !state.messageFollowEnabled) return;
+    requestAnimationFrame(() => {
+      if (force || state.messageFollowEnabled) messages.scrollTop = messages.scrollHeight;
+    });
+  }
+  messages.addEventListener('scroll', () => {
+    state.messageFollowEnabled = isMessagesNearBottom();
+  }, { passive: true });
+  window.addEventListener('resize', () => scrollMessagesToBottom());
   function recordDebug(type, data) {
     state.debugLog.push({
       time: new Date().toISOString(),
@@ -159,7 +173,7 @@
     const row = document.createElement('div'); row.className = `message ${role}`;
     const bubble = document.createElement('div'); bubble.className = 'bubble';
     if (content) bubble.append(content); else bubble.textContent = text == null ? '' : String(text);
-    row.append(bubble); messages.append(row); messages.scrollTop = messages.scrollHeight; return row;
+    row.append(bubble); messages.append(row); scrollMessagesToBottom(role === 'user'); return row;
   }
   function addTypingMessage(text) {
     const row = addMessage('assistant', '');
@@ -168,7 +182,7 @@
     state.typingQueue = state.typingQueue.catch(() => {}).then(async () => {
       for (const character of value) {
         bubble.textContent += character;
-        messages.scrollTop = messages.scrollHeight;
+        scrollMessagesToBottom();
         await new Promise((resolve) => setTimeout(resolve, 15));
       }
     });
@@ -180,7 +194,7 @@
     const row = document.createElement('div'); row.className = 'message assistant'; row.dataset.cardKey = key;
     const bubble = document.createElement('div'); bubble.className = 'bubble'; bubble.append(card); row.append(bubble);
     if (existing) existing.replaceWith(row); else messages.append(row);
-    messages.scrollTop = messages.scrollHeight;
+    scrollMessagesToBottom();
   }
   function disableWalletActions() {
     messages.querySelectorAll('[data-wallet-action="true"]').forEach((button) => { button.disabled = true; });
