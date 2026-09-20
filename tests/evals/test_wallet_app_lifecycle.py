@@ -41,6 +41,7 @@ def _selection_request(sequence, request_id, reference):
         "actor": "public_http",
         "operation": "request",
         "request_id": request_id,
+        "method": "POST",
         "path": "/v1/swap/s/select-quote",
         "body": {"provider_reference": reference},
     }
@@ -52,6 +53,8 @@ def _request_result(sequence, request_id, status):
         "actor": "public_http",
         "operation": "request_result",
         "request_id": request_id,
+        "method": "POST",
+        "path": "/v1/swap/s/select-quote",
         "http_status": status,
     }
 
@@ -242,6 +245,125 @@ async def test_public_request_capture_accepts_ordinary_erc20_token_metadata():
     assert _invariant(
         "no_signing_material_to_server", events=ledger.events
     ).passed
+
+
+@pytest.mark.parametrize(
+    "header_name",
+    [
+        "X-Access-Token",
+        "X-Api-Key",
+        "X-Client-Secret",
+        "X-Auth",
+        "X-Auth-Secret",
+        "X-Custom-Auth-Token",
+    ],
+)
+@pytest.mark.asyncio
+async def test_public_request_capture_redacts_credential_header_aliases(header_name):
+    sentinel = "CREDENTIAL_HEADER_SENTINEL"
+    ledger = EvidenceLedger()
+    request = httpx.Request(
+        "POST",
+        "http://wallet.test/v1/agent/turn",
+        headers={header_name: sentinel},
+    )
+
+    await _public_request_recorder(ledger)(request)
+
+    event = ledger.events[0]
+    report = _invariant("no_signing_material_to_server", events=ledger.events)
+    assert event["private_material_detected"] is True
+    assert sentinel not in json.dumps(event)
+    assert sentinel not in json.dumps(report.evidence)
+    assert not report.passed
+
+
+@pytest.mark.asyncio
+async def test_public_request_capture_summarizes_unknown_headers_without_flagging_them():
+    sentinel = "UNKNOWN_HEADER_SENTINEL"
+    ledger = EvidenceLedger()
+    request = httpx.Request(
+        "POST",
+        "http://wallet.test/v1/agent/turn",
+        headers={"X-Request-Context": sentinel},
+    )
+
+    await _public_request_recorder(ledger)(request)
+
+    event = ledger.events[0]
+    assert event["private_material_detected"] is False
+    assert event["headers"]["x-request-context"] == {
+        "omitted": True,
+        "length": len(sentinel),
+    }
+    assert sentinel not in json.dumps(event)
+
+
+@pytest.mark.asyncio
+async def test_public_request_capture_decodes_twice_encoded_json_strings():
+    sentinel = "TWICE_ENCODED_PRIVATE_KEY_SENTINEL"
+    nested = json.dumps(json.dumps({"private_key": sentinel}))
+    ledger = EvidenceLedger()
+    request = httpx.Request(
+        "POST",
+        "http://wallet.test/v1/agent/turn",
+        json={"metadata": nested},
+    )
+
+    await _public_request_recorder(ledger)(request)
+
+    event = ledger.events[0]
+    report = _invariant("no_signing_material_to_server", events=ledger.events)
+    assert event["private_material_detected"] is True
+    assert event["body"]["metadata"] == {"private_key": "[REDACTED]"}
+    assert sentinel not in json.dumps(event)
+    assert sentinel not in json.dumps(report.evidence)
+    assert not report.passed
+
+
+@pytest.mark.asyncio
+async def test_public_request_capture_bounds_nested_json_string_decoding():
+    sentinel = "DEPTH_LIMIT_SENTINEL"
+    nested = sentinel
+    for _ in range(12):
+        nested = json.dumps(nested)
+    ledger = EvidenceLedger()
+    request = httpx.Request(
+        "POST",
+        "http://wallet.test/v1/agent/turn",
+        json={"metadata": nested},
+    )
+
+    await _public_request_recorder(ledger)(request)
+
+    event = ledger.events[0]
+    report = _invariant("no_signing_material_to_server", events=ledger.events)
+    assert event["private_material_detected"] is True
+    assert event["body"]["metadata"]["omitted"] is True
+    assert sentinel not in json.dumps(event)
+    assert sentinel not in json.dumps(report.evidence)
+    assert not report.passed
+
+
+@pytest.mark.asyncio
+async def test_public_request_capture_omits_oversized_json_before_recording_values():
+    sentinel = "OVERSIZED_BODY_SENTINEL"
+    ledger = EvidenceLedger()
+    request = httpx.Request(
+        "POST",
+        "http://wallet.test/v1/agent/turn",
+        json={"metadata": ["public-value"] * 8_000 + [sentinel]},
+    )
+
+    await _public_request_recorder(ledger)(request)
+
+    event = ledger.events[0]
+    report = _invariant("no_signing_material_to_server", events=ledger.events)
+    assert event["private_material_detected"] is True
+    assert event["body"]["omitted"] is True
+    assert sentinel not in json.dumps(event)
+    assert sentinel not in json.dumps(report.evidence)
+    assert not report.passed
 
 
 @pytest.mark.parametrize(
@@ -469,6 +591,79 @@ def test_quote_selection_invariant_accepts_latest_mixed_successful_selection():
     )
 
     assert _invariant(
+        "explicit_quote_selection",
+        events=events,
+        session={"quote_candidates": [{}, {}]},
+    ).passed
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        (
+            {
+                "sequence": 1,
+                "actor": "public_http",
+                "operation": "request",
+                "request_id": "shared-id",
+                "method": "GET",
+                "path": "/v1/session/s",
+            },
+            _selection_request(2, "shared-id", "quote-a"),
+            _request_result(3, "shared-id", 200),
+            _prepare(4, "quote-a"),
+        ),
+        (
+            _request_result(1, "selection-before", 200),
+            _selection_request(2, "selection-before", "quote-a"),
+            _prepare(3, "quote-a"),
+        ),
+        (
+            _selection_request(1, "selection-equal", "quote-a"),
+            _request_result(1, "selection-equal", 200),
+            _prepare(2, "quote-a"),
+        ),
+        (
+            _selection_request(1, "selection-wrong-path", "quote-a"),
+            {
+                **_request_result(2, "selection-wrong-path", 200),
+                "path": "/v1/session/s",
+            },
+            _prepare(3, "quote-a"),
+        ),
+        (
+            _selection_request(1, "selection-wrong-method", "quote-a"),
+            {
+                **_request_result(2, "selection-wrong-method", 200),
+                "method": "GET",
+            },
+            _prepare(3, "quote-a"),
+        ),
+        (
+            _selection_request(1, "selection-public-sequence", "quote-a"),
+            _request_result(2, "selection-public-sequence", 200),
+            {
+                "sequence": 2,
+                "actor": "public_http",
+                "operation": "request_result",
+                "request_id": "unrelated-result",
+                "method": "GET",
+                "path": "/v1/session/s",
+                "http_status": 200,
+            },
+            _prepare(3, "quote-a"),
+        ),
+        (
+            {
+                **_selection_request("1", "selection-string-sequence", "quote-a"),
+            },
+            _request_result(2, "selection-string-sequence", 200),
+            _prepare(3, "quote-a"),
+        ),
+    ],
+)
+def test_quote_selection_invariant_rejects_ambiguous_public_request_correlation(events):
+    assert not _invariant(
         "explicit_quote_selection",
         events=events,
         session={"quote_candidates": [{}, {}]},

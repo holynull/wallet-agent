@@ -12,7 +12,6 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
-from hashlib import sha256
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -535,18 +534,79 @@ _FORBIDDEN_PUBLIC_KEYS = {
     "xapikey",
     "xauthtoken",
 }
+_CREDENTIAL_HEADER_ALIASES = {
+    "accesstoken",
+    "apikey",
+    "auth",
+    "authentication",
+    "authorization",
+    "authtoken",
+    "clientsecret",
+    "credential",
+    "refreshtoken",
+}
+_SAFE_PUBLIC_HEADER_VALUES = {
+    "accept",
+    "acceptencoding",
+    "connection",
+    "contentlength",
+    "contenttype",
+    "host",
+    "useragent",
+}
+_MAX_PUBLIC_EVIDENCE_DEPTH = 16
+_MAX_JSON_STRING_DEPTH = 8
+_MAX_PUBLIC_STRING_BYTES = 65_536
+_MAX_PUBLIC_BODY_BYTES = 65_536
 
 
 def _canonical(value: Any) -> str:
     return "".join(character for character in str(value).lower() if character.isalnum())
 
 
+def _x_credential_alias(canonical: str) -> bool:
+    if not canonical.startswith("x"):
+        return False
+    alias = canonical[1:]
+    return (
+        alias in _CREDENTIAL_HEADER_ALIASES
+        or "auth" in alias
+        or any(
+            marker in alias
+            for marker in (
+                "accesstoken",
+                "apikey",
+                "clientsecret",
+                "credential",
+                "refreshtoken",
+            )
+        )
+    )
+
+
 def _forbidden_public_key(key: Any) -> bool:
     canonical = _canonical(key)
-    return canonical in _FORBIDDEN_PUBLIC_KEYS or canonical.endswith("apikey")
+    return (
+        canonical in _FORBIDDEN_PUBLIC_KEYS
+        or canonical.endswith("apikey")
+        or _x_credential_alias(canonical)
+    )
 
 
-def _sanitize_public_value(value: Any) -> tuple[Any, bool]:
+def _omitted_value(*, length: int | None = None) -> dict[str, Any]:
+    summary: dict[str, Any] = {"omitted": True}
+    if length is not None:
+        summary["length"] = length
+    return summary
+
+
+def _sanitize_public_value(
+    value: Any, *, _depth: int = 0, _json_depth: int = 0
+) -> tuple[Any, bool]:
+    if _depth >= _MAX_PUBLIC_EVIDENCE_DEPTH:
+        if isinstance(value, str):
+            return _omitted_value(length=len(value.encode("utf-8"))), True
+        return _omitted_value(), True
     if isinstance(value, Mapping):
         sanitized: dict[Any, Any] = {}
         detected = False
@@ -555,7 +615,11 @@ def _sanitize_public_value(value: Any) -> tuple[Any, bool]:
                 sanitized[key] = "[REDACTED]"
                 detected = detected or item != "[REDACTED]"
                 continue
-            sanitized_item, item_detected = _sanitize_public_value(item)
+            sanitized_item, item_detected = _sanitize_public_value(
+                item,
+                _depth=_depth + 1,
+                _json_depth=_json_depth,
+            )
             sanitized[key] = sanitized_item
             detected = detected or item_detected
         return sanitized, detected
@@ -563,30 +627,56 @@ def _sanitize_public_value(value: Any) -> tuple[Any, bool]:
         sanitized_items = []
         detected = False
         for item in value:
-            sanitized_item, item_detected = _sanitize_public_value(item)
+            sanitized_item, item_detected = _sanitize_public_value(
+                item,
+                _depth=_depth + 1,
+                _json_depth=_json_depth,
+            )
             sanitized_items.append(sanitized_item)
             detected = detected or item_detected
         return sanitized_items, detected
     if isinstance(value, str) and value != "[REDACTED]":
+        encoded = value.encode("utf-8")
+        if len(encoded) > _MAX_PUBLIC_STRING_BYTES:
+            return _omitted_value(length=len(encoded)), True
         stripped = value.strip()
-        if stripped.startswith(("{", "[")):
+        if stripped.startswith(("{", "[", '"')):
+            if _json_depth >= _MAX_JSON_STRING_DEPTH:
+                return _omitted_value(length=len(encoded)), True
             try:
                 decoded = json.loads(stripped)
             except (TypeError, ValueError):
-                encoded = value.encode("utf-8")
-                return (
-                    {
-                        "omitted": True,
-                        "length": len(encoded),
-                        "sha256": sha256(encoded).hexdigest(),
-                    },
-                    True,
-                )
-            else:
-                return _sanitize_public_value(decoded)
+                return _omitted_value(length=len(encoded)), True
+            return _sanitize_public_value(
+                decoded,
+                _depth=_depth + 1,
+                _json_depth=_json_depth + 1,
+            )
         if _canonical(value) in _FORBIDDEN_PUBLIC_KEYS:
             return "[REDACTED]", True
     return value, False
+
+
+def _credential_header(header_name: str) -> bool:
+    canonical = _canonical(header_name)
+    if _forbidden_public_key(canonical):
+        return True
+    return canonical in _CREDENTIAL_HEADER_ALIASES
+
+
+def _request_header_evidence(headers: httpx.Headers) -> tuple[dict[str, Any], bool]:
+    sanitized: dict[str, Any] = {}
+    private_material_detected = False
+    for name, value in headers.items():
+        canonical = _canonical(name)
+        if _credential_header(name):
+            sanitized[name] = "[REDACTED]"
+            private_material_detected = private_material_detected or value != "[REDACTED]"
+        elif canonical in _SAFE_PUBLIC_HEADER_VALUES:
+            sanitized[name] = value
+        else:
+            sanitized[name] = _omitted_value(length=len(value.encode("utf-8")))
+    return sanitized, private_material_detected
 
 
 def _safe_evidence(value: Any) -> bool:
@@ -598,6 +688,8 @@ def _request_body_evidence(request: httpx.Request) -> tuple[Any, bool]:
     content = request.content
     if not content:
         return None, False
+    if len(content) > _MAX_PUBLIC_BODY_BYTES:
+        return _omitted_value(length=len(content)), True
     content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
     try:
         text = content.decode("utf-8")
@@ -611,26 +703,16 @@ def _request_body_evidence(request: httpx.Request) -> tuple[Any, bool]:
         else:
             if isinstance(decoded, (Mapping, list)):
                 return _sanitize_public_value(decoded)
-            return (
-                {
-                    "omitted": True,
-                    "length": len(content),
-                    "sha256": sha256(content).hexdigest(),
-                },
-                True,
-            )
+            return _omitted_value(length=len(content)), True
         if content_type == "application/x-www-form-urlencoded":
             return _sanitize_public_value(parse_qs(text, keep_blank_values=True))
-    return (
-        {"omitted": True, "length": len(content), "sha256": sha256(content).hexdigest()},
-        True,
-    )
+    return _omitted_value(length=len(content)), True
 
 
 def _record_public_request(
     ledger: EvidenceLedger, request: httpx.Request, *, request_id: str
 ) -> None:
-    headers, headers_detected = _sanitize_public_value(dict(request.headers))
+    headers, headers_detected = _request_header_evidence(request.headers)
     query, query_detected = _sanitize_public_value(
         {key: request.url.params.get_list(key) for key in request.url.params}
     )
@@ -737,6 +819,12 @@ def _lifecycle_invariants(
         for event in events
         if event.get("actor") == "public_http" and event.get("operation") == "request"
     ]
+    public_results = [
+        event
+        for event in events
+        if event.get("actor") == "public_http"
+        and event.get("operation") == "request_result"
+    ]
     signing_material_safe = (
         all(_safe_evidence(event) for event in events)
         and all(_safe_evidence(step.evidence) for step in steps)
@@ -789,46 +877,58 @@ def _lifecycle_invariants(
         if str(event.get("path", "")).endswith("/select-quote")
         and isinstance(event.get("body"), Mapping)
     ]
-    selection_results = [
-        event
-        for event in events
-        if event.get("actor") == "public_http"
-        and event.get("operation") == "request_result"
-        and event.get("request_id")
-        in {request.get("request_id") for request in selection_requests}
+    public_request_ids = [request.get("request_id") for request in public_requests]
+    public_sequences = [
+        event.get("sequence") for event in (*public_requests, *public_results)
     ]
-    selection_request_ids = [request.get("request_id") for request in selection_requests]
-    selection_request_sequences = [request.get("sequence") for request in selection_requests]
-    selection_result_sequences = [result.get("sequence") for result in selection_results]
-    selection_pairs_valid = (
-        all(isinstance(request_id, str) and request_id for request_id in selection_request_ids)
-        and len(selection_request_ids) == len(set(selection_request_ids))
-        and all(type(sequence) is int for sequence in selection_request_sequences)
-        and len(selection_request_sequences) == len(set(selection_request_sequences))
-        and all(type(sequence) is int for sequence in selection_result_sequences)
-        and len(selection_result_sequences) == len(set(selection_result_sequences))
-        and all(
-            len(
-                matching_results := [
-                    result
-                    for result in selection_results
-                    if result.get("request_id") == request_id
-                ]
-            )
-            == 1
-            and isinstance(matching_results[0].get("http_status"), int)
-            for request_id in selection_request_ids
-        )
+    public_correlation_valid = (
+        all(isinstance(request_id, str) and request_id for request_id in public_request_ids)
+        and len(public_request_ids) == len(set(public_request_ids))
+        and all(type(sequence) is int for sequence in public_sequences)
+        and len(public_sequences) == len(set(public_sequences))
     )
-    successful_selections = [
-        request
+
+    def matching_selection_result(
+        request: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        matching = [
+            result
+            for result in public_results
+            if result.get("request_id") == request.get("request_id")
+        ]
+        if len(matching) != 1:
+            return None
+        result = matching[0]
+        request_sequence = request.get("sequence")
+        result_sequence = result.get("sequence")
+        if (
+            type(request_sequence) is not int
+            or type(result_sequence) is not int
+            or request_sequence >= result_sequence
+            or type(result.get("http_status")) is not int
+        ):
+            return None
+        if result.get("method") is not None and (
+            request.get("method") is None
+            or str(result["method"]).upper() != str(request["method"]).upper()
+        ):
+            return None
+        if result.get("path") is not None and result.get("path") != request.get("path"):
+            return None
+        return result
+
+    selection_pairs = [
+        (request, result)
         for request in selection_requests
-        if any(
-            result.get("request_id") == request.get("request_id")
-            and isinstance(result.get("http_status"), int)
-            and 200 <= result["http_status"] < 300
-            for result in selection_results
-        )
+        if (result := matching_selection_result(request)) is not None
+    ]
+    selection_pairs_valid = (
+        public_correlation_valid and len(selection_pairs) == len(selection_requests)
+    )
+    successful_selection_pairs = [
+        (request, result)
+        for request, result in selection_pairs
+        if 200 <= result["http_status"] < 300
     ]
     prepare_events = [
         event
@@ -837,24 +937,23 @@ def _lifecycle_invariants(
     ]
 
     def prepare_matches_latest_selection(prepare: Mapping[str, Any]) -> bool:
-        prior_selections = [
-            selection
-            for selection in successful_selections
-            if int(selection.get("sequence", 0)) < int(prepare.get("sequence", 0))
-        ]
-        if not prior_selections:
+        prepare_sequence = prepare.get("sequence")
+        if type(prepare_sequence) is not int:
             return False
-        latest = max(prior_selections, key=lambda selection: int(selection["sequence"]))
-        correlated_result = next(
-            result
-            for result in selection_results
-            if result.get("request_id") == latest.get("request_id")
+        prior_pairs = [
+            pair
+            for pair in successful_selection_pairs
+            if pair[0]["sequence"] < prepare_sequence
+        ]
+        if not prior_pairs:
+            return False
+        latest_request, correlated_result = max(
+            prior_pairs, key=lambda pair: pair[0]["sequence"]
         )
-        body = latest.get("body")
+        body = latest_request.get("body")
         return (
-            int(correlated_result["sequence"]) < int(prepare.get("sequence", 0))
-            and
-            isinstance(body, Mapping)
+            correlated_result["sequence"] < prepare_sequence
+            and isinstance(body, Mapping)
             and body.get("provider_reference") == prepare.get("provider_reference")
         )
 
@@ -865,11 +964,12 @@ def _lifecycle_invariants(
         and bool(prepare_events)
         and all(prepare_matches_latest_selection(prepare) for prepare in prepare_events)
     )
+    sanitized_public_requests, _ = _sanitize_public_value(public_requests)
     return (
         InvariantResult(
             "no_signing_material_to_server",
             signing_material_safe,
-            {"public_requests": public_requests},
+            {"public_requests": sanitized_public_requests},
         ),
         InvariantResult("no_server_wallet_actions", server_wallet_actions_safe),
         InvariantResult("no_register_before_wallet_hash", registration_safe),
