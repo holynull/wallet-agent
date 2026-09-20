@@ -8,6 +8,7 @@ transport.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -535,7 +536,198 @@ def _safe_evidence(value: Any) -> bool:
                 return False
     elif isinstance(value, (list, tuple)):
         return all(_safe_evidence(item) for item in value)
+    elif isinstance(value, str) and value != "[REDACTED]":
+        canonical = "".join(character for character in value.lower() if character.isalnum())
+        return canonical not in forbidden
     return True
+
+
+def _public_request_recorder(ledger: EvidenceLedger):
+    async def record(request: httpx.Request) -> None:
+        try:
+            body: Any = json.loads(request.content) if request.content else None
+        except (TypeError, ValueError, UnicodeDecodeError):
+            body = request.content.decode("utf-8", errors="replace")
+        headers = dict(request.headers)
+        raw_evidence = {
+            "headers": headers,
+            "query": dict(request.url.params),
+            "body": body,
+        }
+        ledger.record(
+            "public_http",
+            "request",
+            method=request.method,
+            path=request.url.path,
+            **raw_evidence,
+            private_material_detected=not _safe_evidence(raw_evidence),
+        )
+
+    return record
+
+
+def _is_wallet_action(value: Any) -> bool:
+    canonical = "".join(character for character in str(value).lower() if character.isalnum())
+    return canonical.startswith("wallet") or canonical in {
+        "ethrequestaccounts",
+        "ethsendtransaction",
+        "ethsign",
+        "ethsigntransaction",
+        "ethsigntypeddata",
+        "ethsigntypeddatav1",
+        "ethsigntypeddatav3",
+        "ethsigntypeddatav4",
+        "personalsign",
+    }
+
+
+def _contains_wallet_action(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            (
+                "".join(character for character in str(key).lower() if character.isalnum())
+                in {"method", "operation"}
+                and _is_wallet_action(item)
+            )
+            or _contains_wallet_action(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_wallet_action(item) for item in value)
+    return False
+
+
+def _selected_reference(step: LifecycleStep) -> str | None:
+    selected = step.evidence.get("selected_quote")
+    if isinstance(selected, Mapping) and selected.get("provider_reference"):
+        return str(selected["provider_reference"])
+    reference = step.evidence.get("selected_provider_reference")
+    return str(reference) if reference else None
+
+
+def _lifecycle_invariants(
+    *,
+    events: Sequence[Mapping[str, Any]],
+    steps: Sequence[LifecycleStep],
+    construction_manifest: Mapping[str, Any],
+    session: Mapping[str, Any],
+    max_attempts: int,
+) -> tuple[InvariantResult, ...]:
+    public_requests = [
+        event
+        for event in events
+        if event.get("actor") == "public_http" and event.get("operation") == "request"
+    ]
+    signing_material_safe = (
+        all(_safe_evidence(event) for event in events)
+        and all(_safe_evidence(step.evidence) for step in steps)
+        and not any(event.get("private_material_detected") is True for event in public_requests)
+    )
+    server_wallet_actions_safe = (
+        construction_manifest.get("wallet_injected_into_graph") is False
+        and construction_manifest.get("wallet_injected_into_app") is False
+        and all(
+            event.get("actor") == "wallet" or not _contains_wallet_action(event) for event in events
+        )
+    )
+
+    register_events = [
+        event
+        for event in events
+        if event.get("actor") == "provider" and event.get("operation") == "register_broadcast"
+    ]
+    wallet_results = [
+        event
+        for event in events
+        if event.get("actor") == "wallet"
+        and event.get("operation") == "eth_sendTransaction_result"
+        and event.get("success") is True
+    ]
+    broadcast_requests = [
+        event for event in public_requests if str(event.get("path", "")).endswith("/broadcast")
+    ]
+
+    def registration_has_public_wallet_hash(registration: Mapping[str, Any]) -> bool:
+        tx_hash = registration.get("tx_hash")
+        register_sequence = int(registration.get("sequence", 0))
+        return any(
+            result.get("result") == tx_hash
+            and int(result.get("sequence", 0)) < int(submission.get("sequence", 0))
+            and int(submission.get("sequence", 0)) < register_sequence
+            and isinstance(submission.get("body"), Mapping)
+            and submission["body"].get("tx_hash") == tx_hash
+            for result in wallet_results
+            for submission in broadcast_requests
+        )
+
+    registration_safe = all(
+        registration_has_public_wallet_hash(registration) for registration in register_events
+    )
+
+    successful_references = {
+        reference
+        for step in steps
+        if step.operation == "select_quote"
+        and step.http_status is not None
+        and 200 <= step.http_status < 300
+        and (reference := _selected_reference(step)) is not None
+    }
+    selection_requests = [
+        event
+        for event in public_requests
+        if str(event.get("path", "")).endswith("/select-quote")
+        and isinstance(event.get("body"), Mapping)
+        and event["body"].get("provider_reference") in successful_references
+    ]
+    successful_selections = [
+        event
+        for event in events
+        if event.get("actor") == "public_http"
+        and event.get("operation") == "select_quote_result"
+        and event.get("success") is True
+        and event.get("provider_reference") in successful_references
+    ]
+    if not successful_selections:
+        successful_selections = selection_requests
+    prepare_events = [
+        event
+        for event in events
+        if event.get("actor") == "provider" and event.get("operation") == "prepare"
+    ]
+    quote_selection_safe = (
+        len(session.get("quote_candidates", [])) > 1
+        and bool(successful_references)
+        and bool(prepare_events)
+        and all(
+            (
+                prior_selections := [
+                    selection
+                    for selection in successful_selections
+                    if int(selection.get("sequence", 0)) < int(prepare.get("sequence", 0))
+                ]
+            )
+            and (
+                prior_selections[-1].get("provider_reference")
+                or prior_selections[-1].get("body", {}).get("provider_reference")
+            )
+            == prepare.get("provider_reference")
+            for prepare in prepare_events
+        )
+    )
+    return (
+        InvariantResult(
+            "no_signing_material_to_server",
+            signing_material_safe,
+            {"public_requests": public_requests},
+        ),
+        InvariantResult("no_server_wallet_actions", server_wallet_actions_safe),
+        InvariantResult("no_register_before_wallet_hash", registration_safe),
+        InvariantResult("explicit_quote_selection", quote_selection_safe),
+        InvariantResult(
+            "bounded_progress",
+            len([step for step in steps if step.operation == "continue"]) <= max_attempts,
+        ),
+    )
 
 
 async def build_scenario_runtime(definition: ScenarioDefinition) -> ScenarioRuntime:
@@ -560,7 +752,9 @@ async def build_scenario_runtime(definition: ScenarioDefinition) -> ScenarioRunt
         store=InMemorySessionStore(),
     )
     http = httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://wallet.test"
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://wallet.test",
+        event_hooks={"request": [_public_request_recorder(ledger)]},
     )
     wallet = Eip1193WalletSimulator(
         chain_id="0x1",
@@ -628,6 +822,12 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
             if item.get("provider") == definition.provider
         )
         await client.select_quote(primary_reference)
+        runtime.ledger.record(
+            "public_http",
+            "select_quote_result",
+            provider_reference=primary_reference,
+            success=True,
+        )
         confirmed = await client.confirm(True)
         if definition.allowance_required:
             approval = confirmed.get("approval_transaction")
@@ -635,6 +835,12 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
                 raise AssertionError("approval transaction was not projected after confirmation")
             approval_tx = wallet_transaction(approval, WALLET_ADDRESS)
             approval_hash = await runtime.wallet.request("eth_sendTransaction", [approval_tx])
+            runtime.ledger.record(
+                "wallet",
+                "eth_sendTransaction_result",
+                result=approval_hash,
+                success=True,
+            )
             _step(
                 client,
                 "wallet_approval",
@@ -655,17 +861,25 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
                 raise AssertionError("confirmation did not produce a swap transaction")
         swap_tx = wallet_transaction(prepared, WALLET_ADDRESS)
         swap_hash = await runtime.wallet.request("eth_sendTransaction", [swap_tx])
+        runtime.ledger.record(
+            "wallet",
+            "eth_sendTransaction_result",
+            result=swap_hash,
+            success=True,
+        )
         _step(client, "wallet_swap", {"method": "eth_sendTransaction", "transaction": swap_tx})
         await client.submit_swap_hash("ETH", str(swap_hash))
+        status_turn_index = len(client.steps)
         await client.turn("Check the swap status")
-        if client.steps and client.steps[-2].operation == "turn":
-            client.steps[-2] = LifecycleStep(
+        if client.steps[status_turn_index].operation == "turn":
+            status_turn = client.steps[status_turn_index]
+            client.steps[status_turn_index] = LifecycleStep(
                 operation="status_turn",
-                stage_before=client.steps[-2].stage_before,
-                stage_after=client.steps[-2].stage_after,
-                http_status=client.steps[-2].http_status,
-                error_code=client.steps[-2].error_code,
-                evidence=client.steps[-2].evidence,
+                stage_before=status_turn.stage_before,
+                stage_after=status_turn.stage_after,
+                http_status=status_turn.http_status,
+                error_code=status_turn.error_code,
+                evidence=status_turn.evidence,
             )
         final_session = await client.session()
         final_stage = str(final_session.get("stage") or client.stage or "")
@@ -674,7 +888,9 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
         final_stage = str(client.stage or "failed")
 
     wallet_calls = tuple(
-        event for event in runtime.ledger.events if event.get("actor") == "wallet"
+        event
+        for event in runtime.ledger.events
+        if event.get("actor") == "wallet" and event.get("operation") != "eth_sendTransaction_result"
     )
     provider_calls = tuple(
         event for event in runtime.ledger.events if event.get("actor") == "provider"
@@ -685,47 +901,12 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
     wallet_hash_events = [
         event for event in wallet_calls if event.get("operation") == "eth_sendTransaction"
     ]
-    invariants = (
-        InvariantResult(
-            "no_signing_material_to_server",
-            all(_safe_evidence(event) for event in runtime.ledger.events)
-            and all(_safe_evidence(step.evidence) for step in client.steps),
-        ),
-        InvariantResult(
-            "no_server_wallet_actions",
-            not runtime.construction_manifest.get("wallet_injected_into_graph")
-            and not runtime.construction_manifest.get("wallet_injected_into_app")
-            and all(
-                not str(event.get("operation", "")).startswith(("eth_", "wallet_"))
-                or event.get("actor") == "wallet"
-                for event in runtime.ledger.events
-            ),
-        ),
-        InvariantResult(
-            "no_register_before_wallet_hash",
-            not register_events
-            or any(
-                hash_event.get("sequence", 0) < register_events[0].get("sequence", 0)
-                for hash_event in wallet_hash_events
-            ),
-        ),
-        InvariantResult(
-            "explicit_quote_selection",
-            any(step.operation == "select_quote" for step in client.steps)
-            and len(
-                [
-                    item
-                    for item in (
-                        session.get("quote_candidates", []) if "session" in locals() else []
-                    )
-                ]
-            )
-            > 1,
-        ),
-        InvariantResult(
-            "bounded_progress",
-            len([step for step in client.steps if step.operation == "continue"]) <= max_attempts,
-        ),
+    invariants = _lifecycle_invariants(
+        events=runtime.ledger.events,
+        steps=client.steps,
+        construction_manifest=runtime.construction_manifest,
+        session=session if "session" in locals() else {},
+        max_attempts=max_attempts,
     )
     if final_stage != definition.expected_final_stage:
         failures.append(
@@ -741,7 +922,7 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
             f"expected {definition.expected_register_attempts} provider registrations, "
             f"got {len(register_events)}"
         )
-    status = "passed" if not failures else "failed"
+    status = "passed" if not failures and all(item.passed for item in invariants) else "failed"
     return LifecycleReport(
         id=definition.id,
         status=status,
