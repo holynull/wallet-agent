@@ -12,7 +12,12 @@ from wallet_agent.domain.models import (
     UnsignedTransaction,
 )
 from wallet_agent.graph.build import build_graph
-from wallet_agent.graph.nodes import GraphRuntime, make_nodes
+from wallet_agent.graph.nodes import (
+    GraphRuntime,
+    _resolve_swap_assets,
+    _swap_draft_request,
+    make_nodes,
+)
 
 
 class FakeModel:
@@ -239,6 +244,84 @@ async def test_resolve_swap_clears_stale_response_before_quote_fanout():
         }
     )
     assert result["response"] is None
+
+
+@pytest.mark.asyncio
+async def test_swap_asset_resolution_accepts_native_destination_without_contract_address():
+    resolved, candidates, errors = await _resolve_swap_assets(
+        {
+            "source_chain": "ETH",
+            "source_symbol": "USDT",
+            "source_token_address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "source_decimals": 6,
+            "destination_chain": "BSC",
+            "destination_symbol": "BNB",
+            "input_amount": "10",
+        },
+        {},
+    )
+
+    assert candidates == []
+    assert errors == []
+    assert resolved["destination_decimals"] == 18
+    assert resolved["destination_chain_id"] == 56
+    assert resolved.get("destination_token_address") is None
+
+    request, missing = _swap_draft_request(
+        resolved,
+        {"address": "0x" + "1" * 40, "chain": "ETH", "chain_id": 1},
+    )
+    assert missing == []
+    assert request is not None
+    assert request.destination_asset.symbol == "BNB"
+    assert request.destination_asset.address is None
+
+
+@pytest.mark.asyncio
+async def test_swap_asset_resolution_accepts_native_source_without_contract_address():
+    resolved, candidates, errors = await _resolve_swap_assets(
+        {
+            "source_chain": "BSC",
+            "source_symbol": "BNB",
+            "destination_chain": "ETH",
+            "destination_symbol": "USDT",
+            "destination_token_address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "destination_decimals": 6,
+            "input_amount": "0.1",
+        },
+        {},
+    )
+
+    assert candidates == []
+    assert errors == []
+    assert resolved["source_decimals"] == 18
+    assert resolved["source_chain_id"] == 56
+    request, missing = _swap_draft_request(
+        resolved,
+        {"address": "0x" + "1" * 40, "chain": "BSC", "chain_id": 56},
+    )
+    assert missing == []
+    assert request is not None
+    assert request.input_amount_raw == "100000000000000000"
+    assert request.source_asset.address is None
+
+
+@pytest.mark.asyncio
+async def test_swap_asset_resolution_does_not_treat_unknown_symbol_as_native():
+    resolved, candidates, errors = await _resolve_swap_assets(
+        {
+            "source_chain": "BSC",
+            "source_symbol": "NOTBNB",
+            "destination_chain": "BSC",
+            "destination_symbol": "BNB",
+            "input_amount": "1",
+        },
+        {},
+    )
+
+    assert resolved["destination_decimals"] == 18
+    assert candidates == []
+    assert errors[0]["code"] == "ASSET_PROVIDER_UNAVAILABLE"
 
 
 @pytest.mark.asyncio

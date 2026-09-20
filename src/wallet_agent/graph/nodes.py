@@ -698,6 +698,35 @@ def _native_symbol(chain: str, wallet_context: dict[str, Any] | None) -> str | N
     }.get(chain.upper())
 
 
+_NATIVE_ASSET_DECIMALS = {
+    "ETH": 18,
+    "BASE": 18,
+    "ARBITRUM": 18,
+    "OPTIMISM": 18,
+    "BSC": 18,
+    "POLYGON": 18,
+    "TRON": 6,
+    "SOLANA": 9,
+}
+
+
+def _native_swap_asset(chain: str, symbol: str) -> Asset | None:
+    canonical_chain_name = canonical_chain(chain)
+    canonical_symbol_name = canonical_symbol(symbol)
+    if _native_symbol(canonical_chain_name, None) != canonical_symbol_name:
+        return None
+    decimals = _NATIVE_ASSET_DECIMALS.get(canonical_chain_name)
+    if decimals is None:
+        return None
+    return Asset(
+        chain=canonical_chain_name,
+        chain_id=chain_id_for(canonical_chain_name),
+        symbol=canonical_symbol_name,
+        decimals=decimals,
+        address=None,
+    )
+
+
 _COMMON_TRANSFER_ASSETS: dict[tuple[str, str], Asset] = {
     ("ETH", "USDC"): Asset(
         chain="ETH",
@@ -1057,23 +1086,26 @@ def _swap_draft_request(
     normalized.setdefault("slippage_bps", 100)
     normalized.setdefault("sender_address", context.get("address"))
     normalized.setdefault("recipient_address", context.get("address"))
-    required = (
+    required = [
         "source_chain",
         "destination_chain",
         "source_symbol",
         "destination_symbol",
-        "source_token_address",
-        "destination_token_address",
         "source_decimals",
         "destination_decimals",
         "sender_address",
         "recipient_address",
-    )
+    ]
+    for side in ("source", "destination"):
+        chain = normalized.get(f"{side}_chain")
+        symbol = normalized.get(f"{side}_symbol")
+        if chain and symbol and _native_swap_asset(str(chain), str(symbol)) is None:
+            required.append(f"{side}_token_address")
     exact_out = normalized.get("output_amount") not in (None, "") and not normalized.get(
         "input_amount"
     )
     if not exact_out:
-        required = (*required, "input_amount")
+        required.append("input_amount")
     missing = [field for field in required if normalized.get(field) in (None, "")]
     if missing:
         return None, missing
@@ -1098,12 +1130,33 @@ def _swap_draft_request(
             normalized["input_amount_raw"] = str(int(raw))
         except Exception:
             return None, ["input_amount_raw"]
-    if (
-        canonical_chain(str(normalized["source_chain"]))
-        == canonical_chain(str(normalized["destination_chain"]))
-        and str(normalized["source_token_address"]).strip().lower()
-        == str(normalized["destination_token_address"]).strip().lower()
-    ):
+    source_native = _native_swap_asset(
+        str(normalized["source_chain"]), str(normalized["source_symbol"])
+    )
+    destination_native = _native_swap_asset(
+        str(normalized["destination_chain"]), str(normalized["destination_symbol"])
+    )
+    same_chain = canonical_chain(str(normalized["source_chain"])) == canonical_chain(
+        str(normalized["destination_chain"])
+    )
+    same_native_asset = (
+        same_chain
+        and source_native is not None
+        and destination_native is not None
+        and canonical_symbol(str(normalized["source_symbol"]))
+        == canonical_symbol(str(normalized["destination_symbol"]))
+    )
+    source_address = normalized.get("source_token_address")
+    destination_address = normalized.get("destination_token_address")
+    same_contract_asset = (
+        same_chain
+        and source_native is None
+        and destination_native is None
+        and source_address not in (None, "")
+        and destination_address not in (None, "")
+        and str(source_address).strip().lower() == str(destination_address).strip().lower()
+    )
+    if same_native_asset or same_contract_asset:
         return None, ["source_equals_destination"]
     request = {
         "source_asset": {
@@ -1115,7 +1168,7 @@ def _swap_draft_request(
             ),
             "symbol": normalized["source_symbol"],
             "decimals": int(normalized["source_decimals"]),
-            "address": normalized["source_token_address"],
+            "address": normalized.get("source_token_address"),
             **(
                 {"name": normalized["source_name"]}
                 if normalized.get("source_name") is not None
@@ -1136,7 +1189,7 @@ def _swap_draft_request(
             ),
             "symbol": normalized["destination_symbol"],
             "decimals": int(normalized["destination_decimals"]),
-            "address": normalized["destination_token_address"],
+            "address": normalized.get("destination_token_address"),
             **(
                 {"name": normalized["destination_name"]}
                 if normalized.get("destination_name") is not None
@@ -1172,10 +1225,32 @@ async def _resolve_swap_assets(
     asset_providers = {
         name: provider for name, provider in providers.items() if hasattr(provider, "list_assets")
     }
+    for side in ("source", "destination"):
+        chain = resolved.get(f"{side}_chain")
+        symbol = resolved.get(f"{side}_symbol")
+        if not chain or not symbol:
+            continue
+        native_asset = _native_swap_asset(str(chain), str(symbol))
+        if native_asset is None:
+            continue
+        resolved[f"{side}_chain"] = native_asset.chain
+        resolved[f"{side}_symbol"] = native_asset.symbol
+        resolved[f"{side}_decimals"] = native_asset.decimals
+        if native_asset.chain_id is not None:
+            resolved[f"{side}_chain_id"] = native_asset.chain_id
+        resolved.pop(f"{side}_token_address", None)
     resolvable_sides = [
         side
         for side in ("source", "destination")
         if resolved.get(f"{side}_chain") and resolved.get(f"{side}_symbol")
+        and _native_swap_asset(
+            str(resolved[f"{side}_chain"]), str(resolved[f"{side}_symbol"])
+        )
+        is None
+        and not (
+            resolved.get(f"{side}_token_address")
+            and resolved.get(f"{side}_decimals") is not None
+        )
     ]
     if resolvable_sides and not asset_providers:
         return (
@@ -1187,6 +1262,8 @@ async def _resolve_swap_assets(
         chain = resolved.get(f"{side}_chain")
         symbol = resolved.get(f"{side}_symbol")
         if not chain or not symbol:
+            continue
+        if _native_swap_asset(str(chain), str(symbol)) is not None:
             continue
         if resolved.get(f"{side}_token_address") and resolved.get(f"{side}_decimals") is not None:
             continue
