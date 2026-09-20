@@ -132,7 +132,21 @@ async def test_new_message_resumes_pending_graph_interrupt_with_request_context(
                 next = ()
 
             if not self.inputs:
-                Snapshot.tasks = (object(),)
+                Snapshot.tasks = (
+                    type(
+                        "Task",
+                        (),
+                        {
+                            "interrupts": (
+                                type(
+                                    "Interrupt",
+                                    (),
+                                    {"value": {"kind": "confirmation_required"}},
+                                )(),
+                            )
+                        },
+                    )(),
+                )
                 Snapshot.next = ("confirmation_wait",)
             return Snapshot()
 
@@ -151,6 +165,145 @@ async def test_new_message_resumes_pending_graph_interrupt_with_request_context(
 
     assert isinstance(graph.inputs[0], Command)
     assert graph.inputs[0].resume["request"]["message"] == "改成 1 USDC 换 USDT"
+
+
+@pytest.mark.asyncio
+async def test_new_message_does_not_resume_status_poll_task():
+    class StatusPollGraph:
+        def __init__(self):
+            self.inputs = []
+
+        async def astream(self, value, *, config, stream_mode):
+            del config, stream_mode
+            self.inputs.append(value)
+            yield {"response": {"kind": "swap_status"}}
+
+        async def aget_state(self, _config):
+            class Snapshot:
+                values = {"response": {"kind": "swap_status"}}
+                tasks = (type("Task", (), {"interrupts": ()})(),)
+                next = ("status_poll",)
+
+            return Snapshot()
+
+    graph = StatusPollGraph()
+    app, client = await client_for(graph=graph)
+    async with client:
+        turn = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "conversation_id": "status-thread",
+                "message": "怎么样了？",
+            },
+        )
+        await app.state.runs[turn.json()["run_id"]]["task"]
+
+    assert graph.inputs
+    assert not isinstance(graph.inputs[0], Command)
+
+
+@pytest.mark.asyncio
+async def test_approval_interrupt_requires_approval_tx_hash_before_resume():
+    class ApprovalGraph:
+        def __init__(self):
+            self.inputs = []
+
+        async def astream(self, value, *, config, stream_mode):
+            del config, stream_mode
+            self.inputs.append(value)
+            yield {"response": {"kind": "swap_status"}}
+
+        async def aget_state(self, _config):
+            class Snapshot:
+                values = {"response": {"kind": "approval_required"}}
+                tasks = (
+                    type(
+                        "Task",
+                        (),
+                        {
+                            "interrupts": (
+                                type(
+                                    "Interrupt",
+                                    (),
+                                    {"value": {"kind": "approval_required"}},
+                                )(),
+                            )
+                        },
+                    )(),
+                )
+                next = ("swap_allowance",)
+
+            return Snapshot()
+
+    graph = ApprovalGraph()
+    app, client = await client_for(graph=graph)
+    async with client:
+        turn = await client.post(
+            "/v1/agent/turn",
+            json={"user_id": "alice", "conversation_id": "approval-thread", "message": "继续"},
+        )
+        await app.state.runs[turn.json()["run_id"]]["task"]
+
+    assert graph.inputs == []
+    errors = [
+        event
+        for event in app.state.runs[turn.json()["run_id"]]["events"]
+        if event["event"] == "error"
+    ]
+    assert errors
+    assert errors[-1]["error"]["code"] == "GRAPH_INTERRUPT_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_unknown_interrupt_does_not_mutate_graph_checkpoint():
+    class UnknownGraph:
+        def __init__(self):
+            self.invoked = False
+
+        async def astream(self, _value, *, config, stream_mode):
+            del config, stream_mode
+            self.invoked = True
+            yield {"response": {"kind": "unexpected"}}
+
+        async def aget_state(self, _config):
+            class Snapshot:
+                values = {}
+                tasks = (
+                    type(
+                        "Task",
+                        (),
+                        {
+                            "interrupts": (
+                                type(
+                                    "Interrupt",
+                                    (),
+                                    {"value": {"kind": "new_interrupt_kind"}},
+                                )(),
+                            )
+                        },
+                    )(),
+                )
+                next = ("unknown",)
+
+            return Snapshot()
+
+    graph = UnknownGraph()
+    app, client = await client_for(graph=graph)
+    async with client:
+        turn = await client.post(
+            "/v1/agent/turn",
+            json={"user_id": "alice", "conversation_id": "unknown-thread", "message": "继续"},
+        )
+        await app.state.runs[turn.json()["run_id"]]["task"]
+
+    assert graph.invoked is False
+    errors = [
+        event
+        for event in app.state.runs[turn.json()["run_id"]]["events"]
+        if event["event"] == "error"
+    ]
+    assert errors[-1]["error"]["code"] == "GRAPH_INTERRUPT_CONFLICT"
 
 
 @pytest.mark.asyncio

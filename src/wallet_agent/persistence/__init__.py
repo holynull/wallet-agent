@@ -2,11 +2,18 @@
 
 from .checkpoints import CheckpointerHandle, create_checkpointer
 from .migrations import initialize_checkpointer
-from .store import InMemorySessionStore, SessionStore, SqliteSessionStore, SwapSessionRecord
+from .store import (
+    InMemorySessionStore,
+    SessionRevisionConflict,
+    SessionStore,
+    SqliteSessionStore,
+    SwapSessionRecord,
+)
 
 __all__ = [
     "CheckpointerHandle",
     "InMemorySessionStore",
+    "SessionRevisionConflict",
     "SessionStore",
     "SqliteSessionStore",
     "SwapSessionRecord",

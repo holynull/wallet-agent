@@ -7,6 +7,7 @@ changing API handlers.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -41,35 +42,71 @@ class SwapSessionRecord(DomainModel):
     preflight: dict | None = None
     confirmation_state: dict | None = None
     gas_estimate: dict | None = None
+    state_schema_version: int = 1
+    revision: int = 0
+    last_run_id: str | None = None
+    last_error: dict | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class SessionRevisionConflict(RuntimeError):
+    """Raised when a session update was based on a stale revision."""
+
+    def __init__(self, session_id: str, expected: int, actual: int) -> None:
+        self.session_id = session_id
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"session {session_id} revision conflict: expected {expected}, actual {actual}"
+        )
 
 
 class SessionStore(Protocol):
     async def save(self, session: SwapSessionRecord) -> SwapSessionRecord: ...
     async def get(self, session_id: str) -> SwapSessionRecord | None: ...
-    async def update(self, session_id: str, **changes: object) -> SwapSessionRecord: ...
+    async def update(
+        self,
+        session_id: str,
+        *,
+        expected_revision: int | None = None,
+        **changes: object,
+    ) -> SwapSessionRecord: ...
 
 
 class InMemorySessionStore:
     def __init__(self) -> None:
         self._sessions: dict[str, SwapSessionRecord] = {}
+        self._lock = asyncio.Lock()
 
     async def save(self, session: SwapSessionRecord) -> SwapSessionRecord:
-        self._sessions[session.session_id] = session
-        return session
+        async with self._lock:
+            self._sessions[session.session_id] = session.model_copy(deep=True)
+            return self._sessions[session.session_id].model_copy(deep=True)
 
     async def get(self, session_id: str) -> SwapSessionRecord | None:
-        return self._sessions.get(session_id)
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            return session.model_copy(deep=True) if session is not None else None
 
-    async def update(self, session_id: str, **changes: object) -> SwapSessionRecord:
-        current = self._sessions.get(session_id)
-        if current is None:
-            raise KeyError(session_id)
-        changes["updated_at"] = datetime.now(timezone.utc)
-        updated = current.model_copy(update=changes)
-        self._sessions[session_id] = updated
-        return updated
+    async def update(
+        self,
+        session_id: str,
+        *,
+        expected_revision: int | None = None,
+        **changes: object,
+    ) -> SwapSessionRecord:
+        async with self._lock:
+            current = self._sessions.get(session_id)
+            if current is None:
+                raise KeyError(session_id)
+            if expected_revision is not None and current.revision != expected_revision:
+                raise SessionRevisionConflict(session_id, expected_revision, current.revision)
+            changes["revision"] = current.revision + 1
+            changes["updated_at"] = datetime.now(timezone.utc)
+            updated = current.model_copy(update=changes, deep=True)
+            self._sessions[session_id] = updated
+            return updated.model_copy(deep=True)
 
 
 class SqliteSessionStore:
@@ -90,10 +127,20 @@ class SqliteSessionStore:
         self._initialized = False
 
     async def init(self) -> None:
+        from sqlalchemy import text
+
         from .tables import Base
 
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+            # ``create_all`` does not add columns to an existing deployment.
+            # Keep the tiny projection migration local and idempotent.
+            try:
+                await connection.execute(
+                    text("ALTER TABLE swap_sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+                )
+            except Exception:
+                pass
         self._initialized = True
 
     async def _ensure_init(self) -> None:
@@ -109,6 +156,7 @@ class SqliteSessionStore:
                 db.add(row)
             row.user_id = session.user_id
             row.thread_id = session.thread_id
+            row.revision = session.revision
             row.payload = session.model_dump_json()
             await db.commit()
         return session
@@ -119,10 +167,47 @@ class SqliteSessionStore:
             row = await db.get(self.row_model, session_id)
             return SwapSessionRecord.model_validate_json(row.payload) if row else None
 
-    async def update(self, session_id: str, **changes: object) -> SwapSessionRecord:
-        current = await self.get(session_id)
-        if current is None:
-            raise KeyError(session_id)
-        updated = current.model_copy(update={**changes, "updated_at": datetime.now(timezone.utc)})
-        await self.save(updated)
-        return updated
+    async def update(
+        self,
+        session_id: str,
+        *,
+        expected_revision: int | None = None,
+        **changes: object,
+    ) -> SwapSessionRecord:
+        from sqlalchemy import update
+
+        await self._ensure_init()
+        async with self.session_factory() as db:
+            row = await db.get(self.row_model, session_id)
+            if row is None:
+                raise KeyError(session_id)
+            current = SwapSessionRecord.model_validate_json(row.payload)
+            if expected_revision is not None and current.revision != expected_revision:
+                raise SessionRevisionConflict(session_id, expected_revision, current.revision)
+            updated = current.model_copy(
+                update={
+                    **changes,
+                    "revision": current.revision + 1,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            result = await db.execute(
+                update(self.row_model)
+                .where(
+                    self.row_model.session_id == session_id,
+                    self.row_model.revision == current.revision,
+                )
+                .values(
+                    user_id=updated.user_id,
+                    thread_id=updated.thread_id,
+                    revision=updated.revision,
+                    payload=updated.model_dump_json(),
+                )
+            )
+            if result.rowcount != 1:
+                await db.rollback()
+                latest = await self.get(session_id)
+                actual = latest.revision if latest is not None else -1
+                raise SessionRevisionConflict(session_id, current.revision, actual)
+            await db.commit()
+            return updated

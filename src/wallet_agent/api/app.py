@@ -29,7 +29,12 @@ from wallet_agent.domain.models import (
     ProviderOrder,
     UnsignedTransaction,
 )
-from wallet_agent.persistence import InMemorySessionStore, SessionStore, SwapSessionRecord
+from wallet_agent.persistence import (
+    InMemorySessionStore,
+    SessionRevisionConflict,
+    SessionStore,
+    SwapSessionRecord,
+)
 
 from .auth import TokenVerifier
 from .dependencies import authenticated_user
@@ -227,6 +232,52 @@ def _interrupt_values(snapshot: Any) -> list[Any]:
     return values
 
 
+class _GraphInterruptConflict(Exception):
+    """Raised when an API turn cannot safely resume the current checkpoint."""
+
+    code = "GRAPH_INTERRUPT_CONFLICT"
+
+    def __init__(self, *, kinds: set[str | None]) -> None:
+        self.kinds = kinds
+        rendered = ", ".join(sorted(kind or "unknown" for kind in kinds))
+        super().__init__(
+            "The graph is waiting for an action that this request cannot safely resume"
+            f" ({rendered})."
+        )
+
+
+def _interrupt_kind(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        kind = value.get("kind")
+        return str(kind) if kind is not None else None
+    return None
+
+
+def _resolve_graph_input(snapshot: Any, graph_input: dict[str, Any]) -> dict[str, Any] | Command:
+    """Choose a normal graph input or an explicit resume command.
+
+    ``snapshot.next`` only tells us that a checkpoint has work remaining; it
+    does not mean that the work is an interrupt.  Resuming based on that flag
+    can feed a status-poll or an unrelated task back into the wrong node.  We
+    therefore require a known interrupt kind before constructing ``Command``.
+    """
+
+    values = _interrupt_values(snapshot)
+    if not values:
+        return graph_input
+    kinds = {_interrupt_kind(value) for value in values}
+    if kinds == {"approval_required"}:
+        if not graph_input.get("approval_tx_hash"):
+            raise _GraphInterruptConflict(kinds=kinds)
+    elif kinds == {"confirmation_required"}:
+        # A confirmation turn may contain either a yes/no answer or a revised
+        # request.  The graph owns that interpretation, so both are resumed.
+        pass
+    else:
+        raise _GraphInterruptConflict(kinds=kinds)
+    return Command(resume=graph_input)
+
+
 def _has_approval_interrupt(snapshot: Any) -> bool:
     """Return true only for the explicit wallet-approval interrupt."""
     return any(
@@ -397,7 +448,20 @@ def create_app(
             changes["status"] = status
         if not changes:
             return current
-        return await session_store.update(session_id, **changes)
+        try:
+            return await session_store.update(
+                session_id, expected_revision=current.revision, **changes
+            )
+        except SessionRevisionConflict:
+            # A concurrent idempotent endpoint may have advanced the
+            # projection.  Re-read and apply only this projection's fields so
+            # unrelated state is never rolled back.
+            latest = await session_store.get(session_id)
+            if latest is None:
+                return None
+            return await session_store.update(
+                session_id, expected_revision=latest.revision, **changes
+            )
 
     async def run_graph(
         run_id: str,
@@ -433,11 +497,9 @@ def create_app(
                     message = request.get("message") if isinstance(request, Mapping) else None
                     if (
                         isinstance(graph_input, dict)
-                        and getattr(snapshot, "tasks", ())
-                        and getattr(snapshot, "next", ())
                         and message
                     ):
-                        graph_input = Command(resume=graph_input)
+                        graph_input = _resolve_graph_input(snapshot, graph_input)
                     async for event in app.state.graph.astream(
                         graph_input, config=config, stream_mode="updates"
                     ):
@@ -507,16 +569,48 @@ def create_app(
                     await project_session(session_id, result, status=session_status)
             if app.state.runs[run_id]["status"] == "running":
                 app.state.runs[run_id]["status"] = "complete"
-        except Exception as exc:  # errors are returned without exception internals
+        except _GraphInterruptConflict as exc:
             app.state.runs[run_id]["status"] = "failed"
+            error = AgentError(
+                code=exc.code,
+                message=str(exc),
+                details={
+                    "interrupt_kinds": sorted(kind or "unknown" for kind in exc.kinds)
+                },
+            ).model_dump(mode="json")
             app.state.runs[run_id]["events"].append(
                 {
                     "event": "error",
-                    "error": AgentError(code="AGENT_EXECUTION_ERROR", message=str(exc)).model_dump(
-                        mode="json"
-                    ),
+                    "error": error,
                 }
             )
+        except Exception as exc:  # errors are returned without exception internals
+            app.state.runs[run_id]["status"] = "failed"
+            error = AgentError(code="AGENT_EXECUTION_ERROR", message=str(exc)).model_dump(
+                mode="json"
+            )
+            app.state.runs[run_id]["events"].append(
+                {
+                    "event": "error",
+                    "error": error,
+                }
+            )
+            if session_id:
+                current = await session_store.get(session_id)
+                if current is not None:
+                    try:
+                        await session_store.update(
+                            session_id,
+                            expected_revision=current.revision,
+                            status="failed",
+                            stage="failed",
+                            last_run_id=run_id,
+                            last_error=error,
+                        )
+                    except SessionRevisionConflict:
+                        # A concurrent request may have advanced the session;
+                        # never let cleanup hide the original graph error.
+                        pass
         finally:
             lock.release()
 
@@ -758,8 +852,15 @@ def create_app(
                     updated = await project_session(session_id, result, status="cancelled")
                     if updated is not None:
                         return _jsonable(updated)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "code": "CONFIRMATION_CANCEL_FAILED",
+                            "message": "无法取消当前确认流程，请稍后重试。",
+                            "details": {"error": str(exc)},
+                        },
+                    ) from exc
             return _jsonable(await session_store.update(session_id, status="cancelled"))
         if session.pending_transaction is not None:
             return _jsonable(session)
@@ -856,19 +957,35 @@ def create_app(
                             "details": {"error": str(exc)},
                         },
                     ) from exc
-        reference = session.quote.provider_reference
-        if session.pending_transaction is not None:
-            transaction_reference = getattr(session.pending_transaction, "provider_reference", None)
-            if transaction_reference:
-                reference = str(transaction_reference)
-        order = await provider.register_broadcast(reference, payload.tx_hash)
-        updated = await session_store.update(
-            session_id,
-            status=broadcast_status,
-            stage=broadcast_status,
-            broadcast_tx_hash=payload.tx_hash,
-            provider_order=order,
-        )
+        # Re-check and register under the per-thread lock.  This closes the
+        # duplicate-provider-call window when a wallet retries the same hash.
+        async with graph_lock(session.thread_id):
+            session = await owned_session(session_id, user_id)
+            if session.broadcast_tx_hash:
+                if session.broadcast_tx_hash == payload.tx_hash:
+                    return _jsonable(session)
+                raise HTTPException(
+                    status_code=409, detail="session already has a different broadcast hash"
+                )
+            provider = app.state.providers.get(session.quote.provider if session.quote else "")
+            if provider is None or session.quote is None:
+                raise HTTPException(status_code=409, detail="swap provider or quote unavailable")
+            reference = session.quote.provider_reference
+            if session.pending_transaction is not None:
+                transaction_reference = getattr(
+                    session.pending_transaction, "provider_reference", None
+                )
+                if transaction_reference:
+                    reference = str(transaction_reference)
+            order = await provider.register_broadcast(reference, payload.tx_hash)
+            updated = await session_store.update(
+                session_id,
+                expected_revision=session.revision,
+                status=broadcast_status,
+                stage=broadcast_status,
+                broadcast_tx_hash=payload.tx_hash,
+                provider_order=order,
+            )
         return _jsonable(updated)
 
     @app.post("/v1/swap/{session_id}/select-quote")
@@ -982,17 +1099,22 @@ def create_app(
             raise HTTPException(
                 status_code=422, detail="approve_tx_hash must be a chain-qualified transaction hash"
             )
-        if session.approval_tx_hash:
-            if session.approval_tx_hash == payload.approve_tx_hash:
-                return _jsonable(session)
-            raise HTTPException(
-                status_code=409, detail="session already has a different approval hash"
+        async with graph_lock(session.thread_id):
+            session = await owned_session(session_id, user_id)
+            if session.approval_tx_hash:
+                if session.approval_tx_hash == payload.approve_tx_hash:
+                    return _jsonable(session)
+                raise HTTPException(
+                    status_code=409, detail="session already has a different approval hash"
+                )
+            return _jsonable(
+                await session_store.update(
+                    session_id,
+                    expected_revision=session.revision,
+                    approval_tx_hash=payload.approve_tx_hash,
+                    stage="approval_submitted",
+                )
             )
-        return _jsonable(
-            await session_store.update(
-                session_id, approval_tx_hash=payload.approve_tx_hash, stage="approval_submitted"
-            )
-        )
 
     @app.post("/v1/swap/{session_id}/continue")
     async def continue_swap(
