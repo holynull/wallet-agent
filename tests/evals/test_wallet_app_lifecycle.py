@@ -1085,3 +1085,86 @@ async def test_reverted_swap_is_not_registered_or_reported_successful():
         for call in report.provider_calls
         if call["operation"] == "register_broadcast"
     ] == []
+
+
+@pytest.mark.parametrize(
+    "scenario_id",
+    [
+        "duplicate_and_conflicting_swap_hash",
+        "provider_register_timeout_then_retry",
+        "omnibridge_erc20_deposit_order",
+    ],
+)
+@pytest.mark.asyncio
+async def test_retry_and_omni_scenarios_pass_all_invariants(scenario_id):
+    report = await run_scenario(scenario_id)
+
+    assert report.status == "passed"
+    assert report.failures == ()
+    assert all(result.passed for result in report.invariants)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_hash_is_idempotent_and_conflicting_hash_is_rejected():
+    report = await run_scenario("duplicate_and_conflicting_swap_hash")
+    broadcasts = [step for step in report.steps if step.operation == "broadcast"]
+    registrations = [
+        call
+        for call in report.provider_calls
+        if call["operation"] == "register_broadcast"
+    ]
+
+    assert [step.http_status for step in broadcasts] == [200, 200, 409]
+    assert broadcasts[2].error_code == "HTTP_409"
+    assert len(registrations) == 1
+    assert registrations[0]["tx_hash"] == "0x" + "d" * 64
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_retry_commits_one_order_for_same_wallet_hash():
+    report = await run_scenario("provider_register_timeout_then_retry")
+    attempts = [
+        call
+        for call in report.provider_calls
+        if call["operation"] == "register_broadcast"
+    ]
+
+    assert [call["outcome"] for call in attempts] == ["timeout", "success"]
+    assert len([call for call in attempts if call.get("provider_order_id")]) == 1
+    assert (
+        len(
+            [
+                call
+                for call in report.wallet_calls
+                if call["method"] == "eth_sendTransaction"
+            ]
+        )
+        == 1
+    )
+    timeout = next(
+        step
+        for step in report.steps
+        if step.error_code == "PROVIDER_REGISTRATION_FAILED"
+    )
+    assert timeout.http_status == 503
+    assert timeout.evidence["retryable"] is True
+
+
+@pytest.mark.asyncio
+async def test_omni_erc20_deposit_uses_order_reference_and_token_transfer():
+    report = await run_scenario("omnibridge_erc20_deposit_order")
+    wallet_send = next(
+        call
+        for call in report.wallet_calls
+        if call["method"] == "eth_sendTransaction"
+    )
+    registration = next(
+        call
+        for call in report.provider_calls
+        if call["operation"] == "register_broadcast"
+    )
+
+    assert wallet_send["params"][0]["to"] == "0x" + "3" * 40
+    assert wallet_send["params"][0]["data"]["selector"] == "0xa9059cbb"
+    assert registration["provider_reference"] == "omni-deposit-order-1"
+    assert registration["provider_reference"] != "omni-quote-1"

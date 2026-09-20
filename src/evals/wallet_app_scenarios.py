@@ -57,6 +57,20 @@ RECIPIENT_ADDRESS = "0x" + "2" * 40
 USDC_ADDRESS = "0x" + "3" * 40
 USDT_ADDRESS = "0x" + "4" * 40
 SWAP_DEPOSIT_ADDRESS = "0x" + "5" * 40
+ETH_USDC = Asset(
+    chain="ETH",
+    chain_id=1,
+    symbol="USDC",
+    decimals=6,
+    address=USDC_ADDRESS,
+)
+BSC_USDT = Asset(
+    chain="BSC",
+    chain_id=56,
+    symbol="USDT",
+    decimals=6,
+    address=USDT_ADDRESS,
+)
 
 
 @dataclass(frozen=True)
@@ -70,6 +84,7 @@ class ScenarioDefinition:
     expected_wallet_sends: int
     expected_register_attempts: int
     restart_after_approval: bool = False
+    driver_actions: tuple[str, ...] = ("broadcast", "status")
     dimensions: tuple[str, ...] = ("wallet_api_contract", "safety")
 
 
@@ -203,10 +218,75 @@ SCENARIOS = {
         expected_register_attempts=0,
         dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
     ),
+    "duplicate_and_conflicting_swap_hash": ScenarioDefinition(
+        id="duplicate_and_conflicting_swap_hash",
+        provider="bridgers",
+        allowance_required=False,
+        fault_plan=FaultPlan(
+            allowances=(FaultOutcome("sufficient", "10000000"),),
+            chain_receipts=(FaultOutcome("confirmed", {"status": "0x1"}),),
+            provider_register=(FaultOutcome("success", "order-idempotent"),),
+        ),
+        wallet_hashes=("0x" + "d" * 64,),
+        expected_final_stage="broadcasted",
+        expected_wallet_sends=1,
+        expected_register_attempts=1,
+        driver_actions=("broadcast", "broadcast_same", "broadcast_conflict"),
+        dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
+    ),
+    "provider_register_timeout_then_retry": ScenarioDefinition(
+        id="provider_register_timeout_then_retry",
+        provider="bridgers",
+        allowance_required=False,
+        fault_plan=FaultPlan(
+            allowances=(FaultOutcome("sufficient", "10000000"),),
+            chain_receipts=(FaultOutcome("confirmed", {"status": "0x1"}),),
+            provider_register=(
+                FaultOutcome("timeout", message="provider register timed out"),
+                FaultOutcome("success", "order-after-timeout"),
+            ),
+            provider_status=(FaultOutcome("completed"),),
+        ),
+        wallet_hashes=("0x" + "f" * 64,),
+        expected_final_stage="completed",
+        expected_wallet_sends=1,
+        expected_register_attempts=2,
+        driver_actions=("broadcast_timeout", "broadcast_retry", "status"),
+        dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
+    ),
+    "omnibridge_erc20_deposit_order": ScenarioDefinition(
+        id="omnibridge_erc20_deposit_order",
+        provider="omnibridge",
+        allowance_required=False,
+        fault_plan=FaultPlan(
+            allowances=(FaultOutcome("sufficient", "9500000"),),
+            chain_receipts=(FaultOutcome("confirmed", {"status": "0x1"}),),
+            provider_register=(FaultOutcome("success", "omni-deposit-order-1"),),
+            provider_status=(FaultOutcome("completed"),),
+        ),
+        wallet_hashes=("0x" + "8" * 64,),
+        expected_final_stage="completed",
+        expected_wallet_sends=1,
+        expected_register_attempts=1,
+        dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
+    ),
 }
 
 
-def literal_swap_request() -> dict[str, Any]:
+def literal_swap_request(
+    definition: ScenarioDefinition | None = None,
+) -> dict[str, Any]:
+    if definition is not None and definition.id == "omnibridge_erc20_deposit_order":
+        return {
+            "source_asset": ETH_USDC.model_dump(mode="json"),
+            "destination_asset": BSC_USDT.model_dump(mode="json"),
+            "input_amount": "9.5",
+            "input_amount_raw": "9500000",
+            "sender_address": WALLET_ADDRESS,
+            "recipient_address": WALLET_ADDRESS,
+            "refund_address": WALLET_ADDRESS,
+            "slippage_bps": 100,
+        }
     return {
         "source_asset": {
             "chain": "ETH",
@@ -443,9 +523,15 @@ class RecordingChainAdapter:
         to_address: str,
         amount_raw: str,
     ) -> UnsignedTransaction:
-        del from_address, to_address, amount_raw
+        del from_address
+        padded_to = to_address.removeprefix("0x").lower().rjust(64, "0")
+        padded_amount = hex(int(amount_raw))[2:].rjust(64, "0")
         return UnsignedTransaction(
-            chain="ETH", chain_id=1, to=str(token.address), data="0xa9059cbb", value="0"
+            chain="ETH",
+            chain_id=1,
+            to=str(token.address),
+            data=f"0xa9059cbb{padded_to}{padded_amount}",
+            value="0",
         )
 
 
@@ -513,6 +599,16 @@ class RecordingProvider:
                 required_amount_raw=request.input_amount_raw,
                 current_allowance_raw="0",
             )
+        provider_reference = (
+            "omni-quote-1"
+            if self.definition.id == "omnibridge_erc20_deposit_order"
+            and not self.alternate
+            else (
+                f"{self.provider_name}-alternate-quote"
+                if self.alternate
+                else f"{self.provider_name}-primary-quote"
+            )
+        )
         return NormalizedQuote(
             provider=self.provider_name,
             source_asset=request.source_asset,
@@ -521,11 +617,7 @@ class RecordingProvider:
             input_amount_raw=request.input_amount_raw,
             expected_output=Decimal("9.9"),
             expected_output_raw="9900000",
-            provider_reference=(
-                f"{self.provider_name}-alternate-quote"
-                if self.alternate
-                else f"{self.provider_name}-primary-quote"
-            ),
+            provider_reference=provider_reference,
             allowance_requirement=requirement,
         )
 
@@ -533,6 +625,22 @@ class RecordingProvider:
         outcome = self._prepare.next()
         self._record("prepare", outcome, provider_reference=quote.provider_reference, quote=quote)
         if outcome.kind == "success":
+            if (
+                self.definition.id == "omnibridge_erc20_deposit_order"
+                and self.provider_name == "omnibridge"
+            ):
+                return DepositOrder(
+                    provider="omnibridge",
+                    provider_order_id="omni-deposit-order-1",
+                    deposit_address="0x" + "4" * 40,
+                    source_asset=ETH_USDC,
+                    destination_asset=BSC_USDT,
+                    input_amount=Decimal("9.5"),
+                    input_amount_raw="9500000",
+                    recipient_address=WALLET_ADDRESS,
+                    refund_address=WALLET_ADDRESS,
+                    provider_reference="omni-deposit-order-1",
+                )
             return UnsignedTransaction(
                 chain="ETH",
                 chain_id=1,
@@ -550,16 +658,30 @@ class RecordingProvider:
 
     async def register_broadcast(self, provider_reference: str, tx_hash: str) -> ProviderOrder:
         outcome = self._register.next()
-        self._record(
+        provider_order_id = (
+            str(outcome.value or "order") if outcome.kind == "success" else None
+        )
+        self.ledger.record(
+            "provider",
             "register_broadcast",
-            outcome,
+            provider=self.provider_name,
             provider_reference=provider_reference,
             tx_hash=tx_hash,
+            arguments={
+                "provider_reference": provider_reference,
+                "tx_hash": tx_hash,
+            },
+            outcome=outcome.kind,
+            **(
+                {"provider_order_id": provider_order_id}
+                if provider_order_id is not None
+                else {}
+            ),
         )
         if outcome.kind == "success":
             return ProviderOrder(
                 provider=self.provider_name,
-                provider_order_id=str(outcome.value or "order"),
+                provider_order_id=provider_order_id,
                 provider_reference=provider_reference,
                 tx_hash=tx_hash,
             )
@@ -1264,6 +1386,45 @@ def _lifecycle_invariants(
         and steps[index + 1].operation in {"session", "continue"}
         for index in restart_indices
     )
+    successful_broadcasts = [
+        step
+        for step in steps
+        if step.operation == "broadcast"
+        and step.http_status is not None
+        and 200 <= step.http_status < 300
+    ]
+    successful_broadcast_hashes = [
+        step.evidence.get("broadcast_tx_hash") for step in successful_broadcasts
+    ]
+    successful_registrations = [
+        event for event in register_events if event.get("provider_order_id")
+    ]
+    duplicate_submissions = len(successful_broadcasts) > 1
+    same_hash_safe = not duplicate_submissions or (
+        len(set(successful_broadcast_hashes)) == 1
+        and None not in successful_broadcast_hashes
+        and len(successful_registrations) == 1
+    )
+    conflicting_broadcasts = [
+        step
+        for step in steps
+        if step.operation == "broadcast"
+        and step.http_status == 409
+        and step.error_code == "HTTP_409"
+    ]
+    first_successful_hash = (
+        successful_broadcast_hashes[0] if successful_broadcast_hashes else None
+    )
+    conflicting_hash_safe = not conflicting_broadcasts or (
+        isinstance(first_successful_hash, str)
+        and bool(first_successful_hash)
+        and all(step.error_code == "HTTP_409" for step in conflicting_broadcasts)
+        and session.get("broadcast_tx_hash") == first_successful_hash
+        and all(
+            event.get("tx_hash") == first_successful_hash
+            for event in successful_registrations
+        )
+    )
     sanitized_public_requests, _ = _sanitize_public_value(public_requests)
     return (
         InvariantResult(
@@ -1278,8 +1439,11 @@ def _lifecycle_invariants(
             "bounded_progress",
             len([step for step in steps if step.operation == "continue"]) <= max_attempts
             and len([step for step in steps if step.operation == "status_turn"])
-            <= max_attempts,
+            <= max_attempts
+            and len(register_events) <= max_attempts,
         ),
+        InvariantResult("same_hash_is_idempotent", same_hash_safe),
+        InvariantResult("conflicting_hash_is_rejected", conflicting_hash_safe),
         InvariantResult("rejection_stops_side_effects", rejection_safe),
         InvariantResult("reverted_is_not_success", reverted_safe),
         InvariantResult("pending_is_recoverable", pending_safe),
@@ -1333,7 +1497,7 @@ async def build_scenario_runtime(definition: ScenarioDefinition) -> ScenarioRunt
         user_id="eval-user",
         address=WALLET_ADDRESS,
         chain="ETH",
-        turn_metadata={"swap_request": literal_swap_request()},
+        turn_metadata={"swap_request": literal_swap_request(definition)},
     )
     return ScenarioRuntime(
         definition,
@@ -1502,6 +1666,17 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
             session = await client.session()
             final_stage = str(session.get("stage") or client.stage or "")
         else:
+            if definition.id == "omnibridge_erc20_deposit_order" and not all(
+                prepared.get(field)
+                for field in (
+                    "gas_limit",
+                    "max_fee_per_gas",
+                    "max_priority_fee_per_gas",
+                )
+            ):
+                raise AssertionError(
+                    "Omni ERC-20 deposit transaction did not include fixed fee fields"
+                )
             swap_tx = wallet_transaction(prepared, WALLET_ADDRESS)
             try:
                 swap_hash = await runtime.wallet.request("eth_sendTransaction", [swap_tx])
@@ -1525,24 +1700,60 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
                     "wallet_swap",
                     {"method": "eth_sendTransaction", "transaction": swap_tx},
                 )
-                try:
-                    broadcast = await client.submit_swap_hash("ETH", str(swap_hash))
-                except EvaluationHttpError as exc:
-                    if exc.code != "TRANSACTION_FAILED":
+                for action in definition.driver_actions:
+                    if action == "status":
+                        for _attempt in range(max_attempts):
+                            session = await _status_turn(client)
+                            final_stage = str(
+                                session.get("stage") or client.stage or ""
+                            )
+                            if final_stage == "completed":
+                                break
+                        continue
+
+                    submitted_hash = (
+                        "0x" + "e" * 64
+                        if action == "broadcast_conflict"
+                        else str(swap_hash)
+                    )
+                    try:
+                        broadcast = await client.submit_swap_hash(
+                            "ETH", submitted_hash
+                        )
+                    except EvaluationHttpError as exc:
+                        if action == "broadcast" and exc.code == "TRANSACTION_FAILED":
+                            final_stage = "failed"
+                            break
+                        if (
+                            action == "broadcast_timeout"
+                            and exc.code == "PROVIDER_REGISTRATION_FAILED"
+                            and exc.status_code == 503
+                            and exc.details.get("retryable") is True
+                        ):
+                            continue
+                        if (
+                            action == "broadcast_conflict"
+                            and exc.code == "HTTP_409"
+                            and exc.status_code == 409
+                        ):
+                            session = await client.session()
+                            final_stage = str(
+                                session.get("stage") or client.stage or ""
+                            )
+                            continue
                         raise
-                    final_stage = "failed"
-                else:
+                    if action == "broadcast_timeout":
+                        raise AssertionError(
+                            "provider timeout broadcast unexpectedly succeeded"
+                        )
                     if broadcast.get("status") == "broadcast_pending":
-                        submitted_hash = broadcast.get("broadcast_tx_hash")
-                        if submitted_hash != swap_hash:
+                        retained_hash = broadcast.get("broadcast_tx_hash")
+                        if retained_hash != submitted_hash:
                             raise AssertionError(
                                 "broadcast pending did not retain the submitted hash"
                             )
-                    for _attempt in range(max_attempts):
-                        session = await _status_turn(client)
-                        final_stage = str(session.get("stage") or client.stage or "")
-                        if final_stage == "completed":
-                            break
+                    session = broadcast
+                    final_stage = str(session.get("stage") or client.stage or "")
     except Exception as exc:  # reports preserve evidence while keeping test assertions simple
         failures.append(str(exc))
         final_stage = str(client.stage or "failed")
