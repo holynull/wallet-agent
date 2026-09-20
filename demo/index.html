@@ -7,8 +7,18 @@
   <style>
     :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     * { box-sizing: border-box; }
+    html, body { height: 100%; overflow: hidden; }
     body { margin: 0; background: #0d1117; color: #edf2f7; }
-    main { width: min(760px, 100%); min-height: 100vh; margin: 0 auto; display: flex; flex-direction: column; background: #111821; }
+    main {
+      width: min(760px, 100%);
+      height: 100dvh;
+      min-height: 0;
+      margin: 0 auto;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      background: #111821;
+    }
     header { position: sticky; top: 0; z-index: 2; padding: 16px; border-bottom: 1px solid #283242; background: rgba(17, 24, 33, .96); backdrop-filter: blur(10px); }
     header h1 { margin: 0; font-size: 20px; }
     header p { margin: 4px 0 12px; color: #9aa8bb; font-size: 12px; }
@@ -19,7 +29,13 @@
     button { border: 1px solid #4269c7; border-radius: 8px; padding: 9px 12px; color: white; background: #2f5fc9; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
     button.secondary { border-color: #435166; background: #263142; }
     button:disabled { opacity: .5; cursor: wait; }
-    #messages { flex: 1; padding: 18px 14px 120px; overflow-y: auto; }
+    #messages {
+      flex: 1;
+      min-height: 0;
+      padding: 18px 14px 120px;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
     .message { display: flex; margin: 10px 0; }
     .message.user { justify-content: flex-end; }
     .bubble { max-width: 88%; padding: 11px 13px; border-radius: 14px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -416,7 +432,6 @@
     if (shouldRender && current?.session_id) state.sessionId = current.session_id;
     if (shouldRender && Array.isArray(current?.quote_candidates)) { state.quotes = current.quote_candidates; renderQuotes(); }
     if (shouldRender && current?.selected_provider_reference) state.selectedProviderReference = current.selected_provider_reference;
-    if (shouldRender && current?.active_task) renderActiveTask(current.active_task);
     if (shouldRender && current?.response) renderResponse(current.response);
     if (shouldRender && (current?.preflight || current?.response?.preflight)) {
       renderPreflight(current.preflight || current.response.preflight);
@@ -436,21 +451,6 @@
     if (shouldRender && event === 'error') addTypingMessage(current?.error?.message || 'Agent 执行失败。');
     if (shouldRender) updateMeta();
     return current;
-  }
-  function renderActiveTask(task) {
-    const fingerprint = json(task);
-    if (fingerprint === state.lastActiveTask) return;
-    state.lastActiveTask = fingerprint;
-    const slots = Object.entries(task.slots || {})
-      .map(([key, value]) => `${key}: ${value}`)
-      .join(' · ');
-    const missing = (task.missing_fields || []).join('、');
-    const status = `${task.kind || 'wallet'} · ${task.stage || task.status || 'active'} · r${task.revision ?? 0}`;
-    addTypingMessage([
-      `当前任务：${status}`,
-      slots ? `已保留：${slots}` : '',
-      missing ? `还需要：${missing}` : '',
-    ].filter(Boolean).join('\n'));
   }
   function renderResponse(response) {
     const fingerprint = json(response); if (fingerprint === state.lastResponse) return; state.lastResponse = fingerprint;

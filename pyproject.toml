@@ -21,6 +21,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+  "playwright>=1.55,<2",
   "pytest>=8.3,<9",
   "pytest-asyncio>=0.24,<1",
   "ruff>=0.8,<1",
@@ -32,7 +33,10 @@ packages = ["src/wallet_agent", "src/evals"]
 [tool.pytest.ini_options]
 addopts = "-q"
 asyncio_mode = "auto"
-markers = ["integration: tests that call external provider, RPC, or model services"]
+markers = [
+  "browser: tests that require a locally installed Playwright Chromium",
+  "integration: tests that call external provider, RPC, or model services",
+]
 
 [tool.ruff]
 line-length = 100

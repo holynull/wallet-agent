@@ -50,10 +50,10 @@ async def test_mobile_demo_page_is_served_by_api_app():
     assert "recordDebug" in response.text
     assert "SSE CONNECT" in response.text
     assert "SSE ${event}" in response.text
-    assert "function renderActiveTask" in response.text
-    assert "active_task" in response.text
-    assert "task.revision" in response.text
-    assert "task.missing_fields" in response.text
+    assert "height: 100dvh" in response.text
+    assert "min-height: 0" in response.text
+    assert "overscroll-behavior: contain" in response.text
+    assert "当前任务：${status}" not in response.text
     assert "function renderSuggestions" in response.text
     assert "response.suggestions" in response.text
     assert "suggestion.message; sendMessage()" in response.text
