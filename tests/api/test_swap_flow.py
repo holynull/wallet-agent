@@ -558,3 +558,67 @@ async def test_swap_session_is_owner_scoped():
             f"/v1/swap/{body['session_id']}", params={"user_id": "mallory"}
         )
         assert denied.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_provider_registration_timeout_allows_same_hash_retry_without_duplicate_order():
+    class FlakyProvider(FakeProvider):
+        def __init__(self):
+            super().__init__()
+            self.register_attempts = 0
+            self.created_orders = 0
+
+        async def register_broadcast(self, provider_reference, tx_hash):
+            self.register_attempts += 1
+            if self.register_attempts == 1:
+                raise TimeoutError("provider timed out")
+            self.created_orders += 1
+            return ProviderOrder(
+                provider="bridgers",
+                provider_order_id="order-after-retry",
+                provider_reference=provider_reference,
+                tx_hash=tx_hash,
+            )
+
+    provider = FlakyProvider()
+    graph = build_graph(model=FakeModel(), providers=[provider])
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        store=InMemorySessionStore(),
+    )
+    tx_hash = "0x" + "f" * 64
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        turn = await client.post("/v1/agent/turn", json=request_payload())
+        await app.state.runs[turn.json()["run_id"]]["task"]
+        session_id = turn.json()["session_id"]
+        await client.post(
+            f"/v1/swap/{session_id}/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+        first = await client.post(
+            f"/v1/swap/{session_id}/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": tx_hash},
+        )
+        second = await client.post(
+            f"/v1/swap/{session_id}/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": tx_hash},
+        )
+        duplicate = await client.post(
+            f"/v1/swap/{session_id}/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": tx_hash},
+        )
+
+    assert first.status_code == 503
+    assert first.json() == {
+        "code": "PROVIDER_REGISTRATION_FAILED",
+        "message": "兑换服务暂时无法登记交易，请使用同一交易哈希重试。",
+        "details": {"provider": "bridgers", "tx_hash": tx_hash, "retryable": True},
+    }
+    assert second.status_code == 200
+    assert duplicate.status_code == 200
+    assert second.json()["broadcast_tx_hash"] == tx_hash
+    assert provider.register_attempts == 2
+    assert provider.created_orders == 1

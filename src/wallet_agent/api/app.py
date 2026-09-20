@@ -1038,7 +1038,21 @@ def create_app(
                 )
                 if transaction_reference:
                     reference = str(transaction_reference)
-            order = await provider.register_broadcast(reference, payload.tx_hash)
+            try:
+                order = await provider.register_broadcast(reference, payload.tx_hash)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "PROVIDER_REGISTRATION_FAILED",
+                        "message": "兑换服务暂时无法登记交易，请使用同一交易哈希重试。",
+                        "details": {
+                            "provider": session.quote.provider,
+                            "tx_hash": payload.tx_hash,
+                            "retryable": True,
+                        },
+                    },
+                ) from exc
             updated = await session_store.update(
                 session_id,
                 expected_revision=session.revision,
