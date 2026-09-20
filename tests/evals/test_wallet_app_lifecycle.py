@@ -216,6 +216,36 @@ def test_exit_codes_distinguish_success_failure_blocked_and_usage_error(capsys):
     assert body["code"] == "UNKNOWN_SCENARIO"
 
 
+def test_unknown_scenario_error_does_not_echo_requested_id(capsys):
+    sentinel = "private_key=LEAKED"
+
+    assert main(["--scenario", sentinel]) == 2
+
+    captured = capsys.readouterr()
+    body = json.loads(captured.out)
+    assert body == {
+        "code": "UNKNOWN_SCENARIO",
+        "message": "unknown scenario",
+    }
+    assert sentinel not in captured.out
+    assert sentinel not in captured.err
+
+
+def test_usage_errors_do_not_echo_unknown_argument_tokens(capsys):
+    sentinel = "private_key=LEAKED"
+
+    assert main(["--bogus", sentinel]) == 2
+
+    captured = capsys.readouterr()
+    body = json.loads(captured.out)
+    assert body == {
+        "code": "USAGE_ERROR",
+        "message": "invalid command-line arguments",
+    }
+    assert sentinel not in captured.out
+    assert sentinel not in captured.err
+
+
 def test_evaluator_error_does_not_leak_exception_details(monkeypatch, capsys):
     async def raise_with_secrets(_scenario_id=None):
         raise RuntimeError("private_key=LEAKED; apiKey=LEAKED2")

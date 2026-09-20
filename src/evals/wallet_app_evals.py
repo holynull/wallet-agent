@@ -31,6 +31,20 @@ class UnknownScenarioError(ValueError):
         super().__init__(f"unknown scenario: {scenario_id}")
 
 
+class _UsageError(Exception):
+    """Internal signal for a machine-readable, non-leaking CLI error."""
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    """Argument parser that never echoes untrusted command-line arguments."""
+
+    def error(self, _message: str) -> None:
+        raise _UsageError
+
+    def exit(self, _status: int = 0, _message: str | None = None) -> None:
+        raise _UsageError
+
+
 async def run_definition(
     definition: ScenarioDefinition, *, max_attempts: int = 3
 ) -> LifecycleReport:
@@ -112,16 +126,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Keep every invocation machine-readable, including ``--help``.  The
     # default argparse help action writes human-oriented text and exits before
     # this function can emit its single JSON document.
-    parser = argparse.ArgumentParser(description=__doc__, add_help=False)
+    parser = _SafeArgumentParser(description=__doc__, add_help=False)
     parser.add_argument("--help", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--scenario")
     try:
         args = parser.parse_args(argv)
-    except SystemExit as exc:
-        # argparse has already explained the usage error on stderr.  Keep the
-        # machine-facing stdout contract to one JSON document as well.
-        if int(exc.code or 0) == 0:
-            raise
+    except _UsageError:
         print(
             json.dumps(
                 {"code": "USAGE_ERROR", "message": "invalid command-line arguments"},
@@ -141,10 +151,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         report = asyncio.run(run_wallet_app_evals(args.scenario))
-    except UnknownScenarioError as exc:
+    except UnknownScenarioError:
         print(
             json.dumps(
-                {"code": "UNKNOWN_SCENARIO", "message": str(exc)},
+                {"code": "UNKNOWN_SCENARIO", "message": "unknown scenario"},
                 ensure_ascii=False,
             )
         )
