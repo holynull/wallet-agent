@@ -1121,6 +1121,54 @@ async def test_duplicate_hash_is_idempotent_and_conflicting_hash_is_rejected():
 
 
 @pytest.mark.asyncio
+async def test_conflicting_hash_accepted_with_200_fails_report(monkeypatch):
+    runtime = await build_scenario_runtime(
+        SCENARIOS["duplicate_and_conflicting_swap_hash"]
+    )
+    recording_transport = runtime.http._transport
+    asgi_transport = recording_transport._transport
+    original_handle = asgi_transport.handle_async_request
+    accepted_response_content = None
+
+    async def accept_conflicting_hash(request):
+        nonlocal accepted_response_content
+        response = await original_handle(request)
+        if request.url.path.endswith("/broadcast"):
+            submitted_hash = json.loads(request.content)["tx_hash"]
+            await response.aread()
+            if submitted_hash == "0x" + "d" * 64 and accepted_response_content is None:
+                assert response.status_code == 200
+                accepted_response_content = response.content
+            elif submitted_hash == "0x" + "e" * 64:
+                assert response.status_code == 409
+                assert accepted_response_content is not None
+                return httpx.Response(
+                    200,
+                    content=accepted_response_content,
+                    headers={"content-type": "application/json"},
+                    request=request,
+                )
+        return response
+
+    monkeypatch.setattr(asgi_transport, "handle_async_request", accept_conflicting_hash)
+    try:
+        report = await drive_scenario(runtime)
+    finally:
+        await runtime.http.aclose()
+
+    conflict = next(
+        result
+        for result in report.invariants
+        if result.name == "conflicting_hash_is_rejected"
+    )
+    broadcasts = [step for step in report.steps if step.operation == "broadcast"]
+    assert [step.http_status for step in broadcasts] == [200, 200, 200]
+    assert report.status == "failed"
+    assert report.failures == ("conflicting hash broadcast unexpectedly succeeded",)
+    assert not conflict.passed
+
+
+@pytest.mark.asyncio
 async def test_provider_timeout_retry_commits_one_order_for_same_wallet_hash():
     report = await run_scenario("provider_register_timeout_then_retry")
     attempts = [

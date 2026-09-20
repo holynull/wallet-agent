@@ -1123,7 +1123,7 @@ def _lifecycle_invariants(
         and len(public_sequences) == len(set(public_sequences))
     )
 
-    def matching_selection_result(
+    def matching_public_result(
         request: Mapping[str, Any],
     ) -> Mapping[str, Any] | None:
         matching = [
@@ -1162,7 +1162,7 @@ def _lifecycle_invariants(
     selection_pairs = [
         (request, result)
         for request in selection_requests
-        if (result := matching_selection_result(request)) is not None
+        if (result := matching_public_result(request)) is not None
     ]
     selection_pairs_valid = (
         public_correlation_valid and len(selection_pairs) == len(selection_requests)
@@ -1405,20 +1405,28 @@ def _lifecycle_invariants(
         and None not in successful_broadcast_hashes
         and len(successful_registrations) == 1
     )
-    conflicting_broadcasts = [
-        step
-        for step in steps
-        if step.operation == "broadcast"
-        and step.http_status == 409
-        and step.error_code == "HTTP_409"
-    ]
     first_successful_hash = (
         successful_broadcast_hashes[0] if successful_broadcast_hashes else None
     )
-    conflicting_hash_safe = not conflicting_broadcasts or (
+    conflicting_requests = [
+        request
+        for request in broadcast_requests
+        if isinstance(request.get("body"), Mapping)
+        and isinstance(request["body"].get("tx_hash"), str)
+        and request["body"]["tx_hash"]
+        and isinstance(first_successful_hash, str)
+        and request["body"]["tx_hash"] != first_successful_hash
+    ]
+
+    def conflicting_request_is_rejected(request: Mapping[str, Any]) -> bool:
+        result = matching_public_result(request)
+        return result is not None and result["http_status"] == 409
+
+    conflicting_hash_safe = not conflicting_requests or (
         isinstance(first_successful_hash, str)
         and bool(first_successful_hash)
-        and all(step.error_code == "HTTP_409" for step in conflicting_broadcasts)
+        and public_correlation_valid
+        and all(conflicting_request_is_rejected(request) for request in conflicting_requests)
         and session.get("broadcast_tx_hash") == first_successful_hash
         and all(
             event.get("tx_hash") == first_successful_hash
@@ -1746,6 +1754,15 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
                         raise AssertionError(
                             "provider timeout broadcast unexpectedly succeeded"
                         )
+                    if action == "broadcast_conflict":
+                        failures.append(
+                            "conflicting hash broadcast unexpectedly succeeded"
+                        )
+                        session = await client.session()
+                        final_stage = str(
+                            session.get("stage") or client.stage or ""
+                        )
+                        continue
                     if broadcast.get("status") == "broadcast_pending":
                         retained_hash = broadcast.get("broadcast_tx_hash")
                         if retained_hash != submitted_hash:
