@@ -1838,8 +1838,11 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
                             )
                     session = broadcast
                     final_stage = str(session.get("stage") or client.stage or "")
-    except Exception as exc:  # reports preserve evidence while keeping test assertions simple
-        failures.append(str(exc))
+    except Exception:
+        # Exception text may contain credentials or other sensitive request data.
+        # Keep the lifecycle report machine-readable without echoing it into the
+        # report (and therefore into aggregate JSON/CLI output).
+        failures.append("scenario execution failed")
         final_stage = str(client.stage or "failed")
 
     wallet_calls = tuple(

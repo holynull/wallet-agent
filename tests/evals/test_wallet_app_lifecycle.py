@@ -251,6 +251,25 @@ async def test_deliberate_failed_expectation_returns_nonzero_exit_code():
     assert exit_code(report) == 1
 
 
+@pytest.mark.asyncio
+async def test_scenario_exception_details_are_not_exposed_in_reports(monkeypatch):
+    async def raise_with_secrets(_self, _prompt):
+        raise RuntimeError("private_key=LEAKED; apiKey=LEAKED2")
+
+    monkeypatch.setattr(
+        "evals.wallet_app_simulator.WalletAppClient.turn", raise_with_secrets
+    )
+
+    lifecycle = await run_definition(SCENARIOS["erc20_swap_without_approval"])
+    report = aggregate_reports([lifecycle])
+    serialized = json.dumps(report)
+
+    assert lifecycle.status == "failed"
+    assert "LEAKED" not in serialized
+    assert "private_key" not in serialized
+    assert "apiKey" not in serialized
+
+
 @pytest.mark.parametrize(
     ("outbound_request", "sentinel"),
     [
