@@ -7,6 +7,8 @@ from wallet_agent.api import create_app
 from wallet_agent.chains.registry import ChainAdapterRegistry
 from wallet_agent.domain.models import (
     Asset,
+    DepositOrder,
+    FeeEstimate,
     NormalizedOrderStatus,
     NormalizedQuote,
     ProviderOrder,
@@ -14,6 +16,7 @@ from wallet_agent.domain.models import (
     UnsignedTransaction,
 )
 from wallet_agent.graph.build import build_graph
+from wallet_agent.graph.nodes import _deposit_order_to_transaction
 from wallet_agent.persistence import InMemorySessionStore
 
 
@@ -248,6 +251,179 @@ async def test_broadcast_rejects_explicitly_failed_receipt():
     assert broadcast.status_code == 409
     assert broadcast.json()["code"] == "TRANSACTION_FAILED"
     assert provider.broadcast_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_omnibridge_deposit_order_becomes_wallet_transaction_and_registers_order_id():
+    source = Asset(
+        chain="ETH", chain_id=1, symbol="USDC", decimals=6, address="0x" + "1" * 40
+    )
+    destination = Asset(
+        chain="ETH", chain_id=1, symbol="USDT", decimals=6, address="0x" + "2" * 40
+    )
+    sender = "0x" + "3" * 40
+    deposit_address = "0x" + "4" * 40
+
+    class DepositAdapter:
+        def __init__(self):
+            self.registered_receipt = {"status": "0x1"}
+
+        def build_erc20_transfer(self, *, token, from_address, to_address, amount_raw):
+            return UnsignedTransaction(
+                chain=token.chain,
+                chain_id=token.chain_id,
+                to=token.address,
+                data=f"transfer:{from_address}:{to_address}:{amount_raw}",
+                value="0",
+            )
+
+        async def estimate_fee(self, *, to=None, data=None, from_address=None, value=None):
+            return FeeEstimate(
+                chain="ETH",
+                chain_id=1,
+                asset=Asset(chain="ETH", chain_id=1, symbol="ETH", decimals=18),
+                amount=Decimal("0.000004"),
+                amount_raw="4000000000000",
+                gas_limit="50000",
+                max_fee_per_gas="100000000",
+                max_priority_fee_per_gas="2000000",
+            )
+
+        async def get_transaction_receipt(self, _tx_hash):
+            return self.registered_receipt
+
+    class DepositProvider:
+        provider_name = "omnibridge"
+
+        def __init__(self):
+            self.registered_reference = None
+
+        async def quote(self, request):
+            return NormalizedQuote(
+                provider="omnibridge",
+                source_asset=request.source_asset,
+                destination_asset=request.destination_asset,
+                input_amount=request.input_amount,
+                input_amount_raw=request.input_amount_raw,
+                expected_output=Decimal("9"),
+                expected_output_raw="9000000",
+                provider_reference="quote-hash",
+            )
+
+        async def prepare(self, quote):
+            return DepositOrder(
+                provider="omnibridge",
+                provider_order_id="order-omni",
+                deposit_address=deposit_address,
+                source_asset=quote.source_asset,
+                destination_asset=quote.destination_asset,
+                input_amount=quote.input_amount,
+                input_amount_raw=quote.input_amount_raw,
+                recipient_address=sender,
+                provider_reference="order-omni",
+            )
+
+        async def register_broadcast(self, provider_reference, tx_hash):
+            self.registered_reference = provider_reference
+            return ProviderOrder(
+                provider="omnibridge",
+                provider_order_id=provider_reference,
+                provider_reference=provider_reference,
+                tx_hash=tx_hash,
+            )
+
+    adapter = DepositAdapter()
+    provider = DepositProvider()
+    store = InMemorySessionStore()
+    graph = build_graph(model=FakeModel(), providers=[provider], chains={"ETH": adapter})
+    app = create_app(
+        graph=graph,
+        providers={"omnibridge": provider},
+        chain_registry=ChainAdapterRegistry({"ETH": adapter}),
+        store=store,
+    )
+    request = SwapQuoteRequest(
+        source_asset=source,
+        destination_asset=destination,
+        input_amount=Decimal("9.5"),
+        input_amount_raw="9500000",
+        sender_address=sender,
+        recipient_address=sender,
+    )
+    payload = {
+        "conversation_id": "omni-conversation",
+        "user_id": "alice",
+        "message": "swap",
+        "metadata": {"swap_request": request.model_dump(mode="json")},
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/v1/agent/turn", json=payload)
+        body = response.json()
+        await app.state.runs[body["run_id"]]["task"]
+        session_id = body["session_id"]
+        prepared = await client.post(
+            f"/v1/swap/{session_id}/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+        transaction = prepared.json()["pending_transaction"]
+        broadcast = await client.post(
+            f"/v1/swap/{session_id}/broadcast",
+            json={"user_id": "alice", "chain": "ETH", "tx_hash": "0x" + "e" * 64},
+        )
+
+    assert transaction["to"] == source.address
+    assert transaction["data"] == f"transfer:{sender}:{deposit_address}:9500000"
+    assert transaction["value"] == "0"
+    assert transaction["gas_limit"] == "50000"
+    assert transaction["max_fee_per_gas"] == "100000000"
+    assert transaction["max_priority_fee_per_gas"] == "2000000"
+    assert transaction["provider_reference"] == "order-omni"
+    assert broadcast.status_code == 200
+    assert provider.registered_reference == "order-omni"
+
+
+def test_omnibridge_native_deposit_order_becomes_native_wallet_transaction():
+    source = Asset(chain="ETH", chain_id=1, symbol="ETH", decimals=18)
+    destination = Asset(
+        chain="ETH", chain_id=1, symbol="USDT", decimals=6, address="0x" + "2" * 40
+    )
+    sender = "0x" + "3" * 40
+    deposit_address = "0x" + "4" * 40
+
+    class NativeDepositAdapter:
+        def build_native_transfer(self, *, from_address, to_address, amount_raw):
+            return UnsignedTransaction(
+                chain="ETH",
+                chain_id=1,
+                to=to_address,
+                data="0x",
+                value=amount_raw,
+                display={"from": from_address},
+            )
+
+    transaction = _deposit_order_to_transaction(
+        DepositOrder(
+            provider="omnibridge",
+            provider_order_id="order-native",
+            deposit_address=deposit_address,
+            source_asset=source,
+            destination_asset=destination,
+            input_amount=Decimal("0.01"),
+            input_amount_raw="10000000000000000",
+            recipient_address=sender,
+            provider_reference="order-native",
+        ),
+        adapter=NativeDepositAdapter(),
+        sender=sender,
+    )
+
+    assert transaction.to == deposit_address
+    assert transaction.data == "0x"
+    assert transaction.value == "10000000000000000"
+    assert transaction.provider_reference == "order-native"
+    assert transaction.display["provider_order_id"] == "order-native"
 
 
 @pytest.mark.asyncio

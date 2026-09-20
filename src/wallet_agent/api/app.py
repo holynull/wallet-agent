@@ -767,6 +767,10 @@ def create_app(
                         },
                     ) from exc
         reference = session.quote.provider_reference
+        if session.pending_transaction is not None:
+            transaction_reference = getattr(session.pending_transaction, "provider_reference", None)
+            if transaction_reference:
+                reference = str(transaction_reference)
         order = await provider.register_broadcast(reference, payload.tx_hash)
         updated = await session_store.update(
             session_id,

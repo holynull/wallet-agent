@@ -22,6 +22,7 @@ from wallet_agent.domain.models import (
     ApprovalTransaction,
     Asset,
     AssetQuery,
+    DepositOrder,
     NormalizedQuote,
     ProviderOrder,
     SwapQuoteRequest,
@@ -188,6 +189,57 @@ def _apply_fee_estimate(transaction: Any, fee: Mapping[str, Any] | None) -> Any:
         if fee.get(key) is not None
     }
     return transaction.model_copy(update=updates) if updates else transaction
+
+
+def _deposit_order_to_transaction(
+    order: Any,
+    *,
+    adapter: Any,
+    sender: str,
+) -> UnsignedTransaction | Any:
+    """Turn a provider deposit order into the source-chain wallet transaction."""
+    if not isinstance(order, DepositOrder):
+        return order
+    if not sender:
+        raise ValueError("provider deposit transaction requires the connected wallet address")
+    if order.source_asset.address:
+        builder = getattr(adapter, "build_erc20_transfer", None)
+        if builder is None:
+            raise ValueError(
+                f"{order.source_asset.chain} adapter cannot build an ERC-20 deposit transaction"
+            )
+        transaction = builder(
+            token=order.source_asset,
+            from_address=sender,
+            to_address=order.deposit_address,
+            amount_raw=order.input_amount_raw,
+        )
+    else:
+        builder = getattr(adapter, "build_native_transfer", None)
+        if builder is None:
+            raise ValueError(
+                f"{order.source_asset.chain} adapter cannot build a native deposit transaction"
+            )
+        transaction = builder(
+            from_address=sender,
+            to_address=order.deposit_address,
+            amount_raw=order.input_amount_raw,
+        )
+    return transaction.model_copy(
+        update={
+            "provider": order.provider,
+            "provider_reference": order.provider_reference,
+            "expires_at": order.expires_at,
+            "display": {
+                "action": "provider_deposit",
+                "provider": order.provider,
+                "deposit_address": order.deposit_address,
+                "input_amount": str(order.input_amount),
+                "input_amount_raw": order.input_amount_raw,
+                "provider_order_id": order.provider_order_id,
+            },
+        }
+    )
 
 
 def _quote(value: Any) -> NormalizedQuote:
@@ -2745,43 +2797,49 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     }
                 }
             prepared = await provider.prepare(quote)
-            dumped = _dump(prepared)
             preflight = None
-            if isinstance(prepared, UnsignedTransaction):
-                request = state.get("swap_request") or {}
-                source_asset = request.get("source_asset") or selected.get("source_asset") or {}
-                source_chain = str(source_asset.get("chain") or prepared.chain)
-                adapter = runtime.chains.get(source_chain.upper())
-                if adapter is not None:
-                    preflight = await _transaction_preflight(
-                        adapter=adapter,
-                        chain=source_chain,
-                        sender=str(request.get("sender_address") or ""),
-                        recipient=str(request.get("recipient_address") or ""),
-                        amount_raw=str(request.get("input_amount_raw") or "0"),
-                        token=(
-                            Asset.model_validate(source_asset)
-                            if source_asset.get("address")
-                            else None
-                        ),
-                        transaction=prepared,
-                        wallet_context=state.get("wallet_context"),
-                    )
-                    if not preflight["ok"]:
-                        return {
-                            "preflight": preflight,
-                            "response": {
-                                "kind": "error",
-                                "errors": [
-                                    _error(
-                                        "TRANSACTION_PREFLIGHT_FAILED",
-                                        "交易预检查未通过。",
-                                        details={"preflight": preflight},
-                                    )
-                                ],
-                                "preflight": preflight,
-                            },
-                        }
+            request = state.get("swap_request") or {}
+            source_asset = request.get("source_asset") or selected.get("source_asset") or {}
+            source_chain = str(source_asset.get("chain") or getattr(prepared, "chain", ""))
+            adapter = runtime.chains.get(source_chain.upper())
+            if isinstance(prepared, DepositOrder):
+                if adapter is None:
+                    raise ValueError(f"Chain adapter unavailable for {source_chain} deposit")
+                prepared = _deposit_order_to_transaction(
+                    prepared,
+                    adapter=adapter,
+                    sender=str(request.get("sender_address") or ""),
+                )
+            if isinstance(prepared, UnsignedTransaction) and adapter is not None:
+                preflight = await _transaction_preflight(
+                    adapter=adapter,
+                    chain=source_chain,
+                    sender=str(request.get("sender_address") or ""),
+                    recipient=(
+                        prepared.display.get("deposit_address")
+                        or str(request.get("recipient_address") or "")
+                    ),
+                    amount_raw=str(request.get("input_amount_raw") or "0"),
+                    token=(
+                        Asset.model_validate(source_asset) if source_asset.get("address") else None
+                    ),
+                    transaction=prepared,
+                    wallet_context=state.get("wallet_context"),
+                )
+                if not preflight["ok"]:
+                    return {
+                        "preflight": preflight,
+                        "response": {
+                            "kind": "error",
+                            "errors": [
+                                _error(
+                                    "TRANSACTION_PREFLIGHT_FAILED",
+                                    "交易预检查未通过。",
+                                    details={"preflight": preflight},
+                                )
+                            ],
+                        },
+                    }
             prepared = _apply_fee_estimate(
                 prepared, preflight.get("fee_estimate") if preflight else None
             )
@@ -2888,41 +2946,47 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             }
         prepared = await provider.prepare(quote)
-        dumped = _dump(prepared)
         preflight = None
-        if isinstance(prepared, UnsignedTransaction):
-            request = state.get("swap_request") or {}
-            source_asset = request.get("source_asset") or selected.get("source_asset") or {}
-            source_chain = str(source_asset.get("chain") or prepared.chain)
-            adapter = runtime.chains.get(source_chain.upper())
-            if adapter is not None:
-                preflight = await _transaction_preflight(
-                    adapter=adapter,
-                    chain=source_chain,
-                    sender=str(request.get("sender_address") or requirement.owner),
-                    recipient=str(request.get("recipient_address") or requirement.owner),
-                    amount_raw=str(request.get("input_amount_raw") or "0"),
-                    token=(
-                        Asset.model_validate(source_asset) if source_asset.get("address") else None
-                    ),
-                    transaction=prepared,
-                    wallet_context=state.get("wallet_context"),
-                )
-                if not preflight["ok"]:
-                    return {
-                        "preflight": preflight,
-                        "response": {
-                            "kind": "error",
-                            "errors": [
-                                _error(
-                                    "TRANSACTION_PREFLIGHT_FAILED",
-                                    "交易预检查未通过。",
-                                    details={"preflight": preflight},
-                                )
-                            ],
-                            "preflight": preflight,
-                        },
-                    }
+        request = state.get("swap_request") or {}
+        source_asset = request.get("source_asset") or selected.get("source_asset") or {}
+        source_chain = str(source_asset.get("chain") or getattr(prepared, "chain", ""))
+        adapter = runtime.chains.get(source_chain.upper())
+        if isinstance(prepared, DepositOrder):
+            if adapter is None:
+                raise ValueError(f"Chain adapter unavailable for {source_chain} deposit")
+            prepared = _deposit_order_to_transaction(
+                prepared,
+                adapter=adapter,
+                sender=str(request.get("sender_address") or requirement.owner),
+            )
+        if isinstance(prepared, UnsignedTransaction) and adapter is not None:
+            preflight = await _transaction_preflight(
+                adapter=adapter,
+                chain=source_chain,
+                sender=str(request.get("sender_address") or requirement.owner),
+                recipient=(
+                    prepared.display.get("deposit_address")
+                    or str(request.get("recipient_address") or requirement.owner)
+                ),
+                amount_raw=str(request.get("input_amount_raw") or "0"),
+                token=(Asset.model_validate(source_asset) if source_asset.get("address") else None),
+                transaction=prepared,
+                wallet_context=state.get("wallet_context"),
+            )
+            if not preflight["ok"]:
+                return {
+                    "preflight": preflight,
+                    "response": {
+                        "kind": "error",
+                        "errors": [
+                            _error(
+                                "TRANSACTION_PREFLIGHT_FAILED",
+                                "交易预检查未通过。",
+                                details={"preflight": preflight},
+                            )
+                        ],
+                    },
+                }
             prepared = _apply_fee_estimate(
                 prepared, preflight.get("fee_estimate") if preflight else None
             )
@@ -3359,22 +3423,33 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         try:
             prepared = await provider.prepare(_quote(selected))
             preflight = None
+            request = state.get("swap_request") or {}
+            source_asset = request.get("source_asset") or selected.get("source_asset") or {}
+            source_chain = str(source_asset.get("chain") or selected.get("chain") or "")
+            adapter = runtime.chains.get(source_chain.upper())
+            if isinstance(prepared, DepositOrder):
+                if adapter is None:
+                    raise ValueError(f"Chain adapter unavailable for {source_chain} deposit")
+                prepared = _deposit_order_to_transaction(
+                    prepared,
+                    adapter=adapter,
+                    sender=str(request.get("sender_address") or ""),
+                )
             if isinstance(prepared, dict) and {"to", "data"}.issubset(prepared):
                 prepared_transaction = UnsignedTransaction.model_validate(prepared)
             elif hasattr(prepared, "to") and hasattr(prepared, "data"):
                 prepared_transaction = prepared
             else:
                 prepared_transaction = None
-            request = state.get("swap_request") or {}
-            source_asset = request.get("source_asset") or selected.get("source_asset") or {}
-            source_chain = str(source_asset.get("chain") or selected.get("chain") or "")
-            adapter = runtime.chains.get(source_chain.upper())
             if prepared_transaction is not None and adapter is not None:
                 preflight = await _transaction_preflight(
                     adapter=adapter,
                     chain=source_chain,
                     sender=str(request.get("sender_address") or ""),
-                    recipient=str(request.get("recipient_address") or ""),
+                    recipient=(
+                        prepared_transaction.display.get("deposit_address")
+                        or str(request.get("recipient_address") or "")
+                    ),
                     amount_raw=str(request.get("input_amount_raw") or "0"),
                     token=(
                         Asset.model_validate(source_asset) if source_asset.get("address") else None
@@ -3398,6 +3473,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             "preflight": preflight,
                         },
                     }
+            prepared = _apply_fee_estimate(
+                prepared, preflight.get("fee_estimate") if preflight else None
+            )
             return {
                 "user_confirmation": confirmation,
                 "preflight": preflight,
@@ -3440,8 +3518,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 ]
             }
         try:
+            pending = state.get("pending_transaction")
+            provider_reference = (
+                pending.get("provider_reference")
+                if isinstance(pending, Mapping)
+                else getattr(pending, "provider_reference", None)
+            ) or selected.get("provider_reference", "")
             order = await provider.register_broadcast(
-                selected.get("provider_reference", ""), tx_hash
+                str(provider_reference), tx_hash
             )
             value = _dump(order)
             return {
