@@ -166,6 +166,140 @@ async def test_select_quote_requires_confirmation_before_allowance_and_prepare()
     assert provider.prepare_calls == 0
 
 
+@pytest.mark.asyncio
+async def test_reselecting_quote_requires_fresh_confirmation_without_allowance_side_effects():
+    quote = authorization_quote("ref-reselect")
+
+    class CountingAdapter(Adapter):
+        def __init__(self):
+            super().__init__()
+            self.allowance_calls = 0
+
+        async def get_allowance(self, *args):
+            self.allowance_calls += 1
+            return await super().get_allowance(*args)
+
+    adapter = CountingAdapter()
+    provider = Provider()
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-reselect",
+            user_id="alice",
+            thread_id="t-reselect",
+            quote_candidates=[quote],
+        )
+    )
+    graph = build_graph(model=Model(), providers=[provider], chains={"BASE": adapter})
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        chain_registry=ChainAdapterRegistry({"BASE": adapter}),
+        store=store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = await select_and_confirm(client, "s-reselect", quote.provider_reference)
+        assert first.status_code == 200
+        assert first.json()["status"] == "approval_required"
+        assert adapter.allowance_calls == 1
+
+        selected_again = await client.post(
+            "/v1/swap/s-reselect/select-quote",
+            json={"user_id": "alice", "provider_reference": quote.provider_reference},
+        )
+        assert selected_again.status_code == 200
+        assert selected_again.json()["status"] == "awaiting_confirmation"
+        assert adapter.allowance_calls == 1
+        assert provider.prepare_calls == 0
+
+        confirmed_again = await client.post(
+            "/v1/swap/s-reselect/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+
+    assert confirmed_again.status_code == 200
+    assert confirmed_again.json()["status"] == "approval_required"
+    assert adapter.allowance_calls == 2
+    assert provider.prepare_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_selecting_different_quote_invalidates_stale_confirmation():
+    first_quote = authorization_quote("ref-first")
+    second_quote = authorization_quote("ref-second")
+    second_quote = second_quote.model_copy(
+        update={
+            "allowance_requirement": second_quote.allowance_requirement.model_copy(
+                update={"required_amount_raw": "200"}
+            )
+        }
+    )
+
+    class CountingAdapter(Adapter):
+        def __init__(self):
+            super().__init__()
+            self.allowance_calls = 0
+
+        async def get_allowance(self, *args):
+            self.allowance_calls += 1
+            return await super().get_allowance(*args)
+
+    adapter = CountingAdapter()
+    provider = Provider()
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-switch-quote",
+            user_id="alice",
+            thread_id="t-switch-quote",
+            quote_candidates=[first_quote, second_quote],
+        )
+    )
+    graph = build_graph(model=Model(), providers=[provider], chains={"BASE": adapter})
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        chain_registry=ChainAdapterRegistry({"BASE": adapter}),
+        store=store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        selected_first = await client.post(
+            "/v1/swap/s-switch-quote/select-quote",
+            json={"user_id": "alice", "provider_reference": first_quote.provider_reference},
+        )
+        assert selected_first.status_code == 200
+        assert selected_first.json()["status"] == "awaiting_confirmation"
+
+        selected_second = await client.post(
+            "/v1/swap/s-switch-quote/select-quote",
+            json={"user_id": "alice", "provider_reference": second_quote.provider_reference},
+        )
+        assert selected_second.status_code == 200
+        assert selected_second.json()["status"] == "awaiting_confirmation"
+        assert (
+            selected_second.json()["selected_provider_reference"]
+            == second_quote.provider_reference
+        )
+        assert adapter.allowance_calls == 0
+
+        confirmed_second = await client.post(
+            "/v1/swap/s-switch-quote/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+
+    assert confirmed_second.status_code == 200
+    assert confirmed_second.json()["status"] == "approval_required"
+    assert confirmed_second.json()["allowance_requirement"]["required_amount_raw"] == "200"
+    assert adapter.allowance_calls == 1
+    assert provider.prepare_calls == 0
+
+
 async def select_and_confirm(client, session_id: str, provider_reference: str):
     selected = await client.post(
         f"/v1/swap/{session_id}/select-quote",

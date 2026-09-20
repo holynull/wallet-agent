@@ -1095,6 +1095,11 @@ def create_app(
                     "intent": "swap_select",
                     "forced_intent": "swap_select",
                     "selected_quote": selected_quote.model_dump(mode="json"),
+                    # Every explicit selection starts a fresh confirmation
+                    # cycle, even when this thread has an interrupted or
+                    # previously approved confirmation checkpoint.
+                    "confirmation_state": None,
+                    "user_confirmation": None,
                 },
                 config={"configurable": {"thread_id": session.thread_id}},
             )
