@@ -466,6 +466,41 @@ def create_app(
                 session_id, expected_revision=latest.revision, **changes
             )
 
+    async def persist_approval_projection(
+        session_id: str,
+        session: SwapSessionRecord,
+        quote: NormalizedQuote,
+    ) -> SwapSessionRecord:
+        requirement = quote.allowance_requirement
+        if requirement is None or app.state.chain_registry is None:
+            return session
+        adapter = app.state.chain_registry.get_adapter(requirement.token.chain)
+        tx = adapter.build_erc20_approve(
+            token=requirement.token,
+            owner=requirement.owner,
+            spender=requirement.spender,
+            amount_raw=requirement.required_amount_raw,
+        )
+        approval = {
+            "chain": requirement.token.chain,
+            "chain_id": requirement.token.chain_id,
+            "to": tx.to,
+            "data": tx.data,
+            "value": tx.value,
+            "token": requirement.token.model_dump(mode="json"),
+            "owner": requirement.owner,
+            "spender": requirement.spender,
+            "amount_raw": requirement.required_amount_raw,
+            "expires_at": None,
+        }
+        return await session_store.update(
+            session_id,
+            status="approval_required",
+            stage="approval_required",
+            approval_transaction=approval,
+            allowance_requirement=requirement.model_dump(mode="json"),
+        )
+
     async def run_graph(
         run_id: str,
         input_state: dict[str, Any],
@@ -883,17 +918,33 @@ def create_app(
                 Command(resume={"approved": True}),
                 config=config,
             )
+            if hasattr(graph, "aget_state"):
+                snapshot = await graph.aget_state(config)
+            else:
+                snapshot = graph.get_state(config)
+            if _has_approval_interrupt(snapshot):
+                updated = await project_session(
+                    session_id, result, status="approval_required"
+                )
+                if updated is not None and session.quote is not None:
+                    updated = await persist_approval_projection(
+                        session_id, updated, session.quote
+                    )
+                return _jsonable(updated or result)
         response = result.get("response") or {}
         errors = response.get("errors") or []
         expired = any(item.get("code") == "CONFIRMATION_EXPIRED" for item in errors)
-        status = (
-            "prepared"
-            if result.get("pending_transaction")
-            else "confirmation_expired"
-            if expired
-            else "confirmed"
+        authorization_stage = result.get("authorization_stage")
+        status = authorization_stage or (
+            "confirmation_expired" if expired else "confirmed"
         )
         updated = await project_session(session_id, result, status=status)
+        if updated is not None and authorization_stage:
+            updated = await session_store.update(
+                session_id,
+                status=authorization_stage,
+                stage=authorization_stage,
+            )
         return _jsonable(updated or result)
 
     @app.post("/v1/swap/{session_id}/cancel")
@@ -1041,57 +1092,20 @@ def create_app(
         async with graph_lock(session.thread_id):
             result = await app.state.graph.ainvoke(
                 {
-                    "intent": "swap_allowance",
-                    "forced_intent": "swap_allowance",
+                    "intent": "swap_select",
+                    "forced_intent": "swap_select",
                     "selected_quote": selected_quote.model_dump(mode="json"),
                 },
                 config={"configurable": {"thread_id": session.thread_id}},
             )
-        updated = await project_session(
-            session_id, result, status=result.get("authorization_stage", "approval_required")
-        )
+        updated = await project_session(session_id, result, status="awaiting_confirmation")
         if updated is not None:
             updated = await session_store.update(
                 session_id,
+                status="awaiting_confirmation",
+                stage="confirmation_required",
                 selected_provider_reference=payload.provider_reference,
             )
-        # An interrupt aborts the node before its return value is committed.
-        # Persist the deterministic approval payload so the app can sign it.
-        if (
-            updated is not None
-            and updated.approval_transaction is None
-            and selected_quote.allowance_requirement is not None
-            and app.state.chain_registry is not None
-        ):
-            requirement = selected_quote.allowance_requirement
-            try:
-                adapter = app.state.chain_registry.get_adapter(requirement.token.chain)
-                tx = adapter.build_erc20_approve(
-                    token=requirement.token,
-                    owner=requirement.owner,
-                    spender=requirement.spender,
-                    amount_raw=requirement.required_amount_raw,
-                )
-                approval = {
-                    "chain": requirement.token.chain,
-                    "chain_id": requirement.token.chain_id,
-                    "to": tx.to,
-                    "data": tx.data,
-                    "value": tx.value,
-                    "token": requirement.token.model_dump(mode="json"),
-                    "owner": requirement.owner,
-                    "spender": requirement.spender,
-                    "amount_raw": requirement.required_amount_raw,
-                    "expires_at": None,
-                }
-                updated = await session_store.update(
-                    session_id,
-                    stage="approval_required",
-                    approval_transaction=approval,
-                    allowance_requirement=requirement.model_dump(mode="json"),
-                )
-            except Exception:
-                pass
         return _jsonable(updated or result)
 
     @app.post("/v1/swap/{session_id}/approve-broadcast")

@@ -93,6 +93,7 @@ def build_graph(
         {
             "wallet_query": "wallet_tool_call",
             "transfer": "transfer",
+            "confirmation_request": "confirmation_request",
             "swap_allowance": "swap_allowance",
             "price_query": "price_query",
             "transaction_status": "transaction_tool_call",
@@ -115,7 +116,11 @@ def build_graph(
     builder.add_conditional_edges(
         "confirmation_wait",
         route_after_confirmation,
-        {"prepare": "prepare", "response": "response", "supervisor": "supervisor"},
+        {
+            "swap_allowance": "swap_allowance",
+            "response": "response",
+            "supervisor": "supervisor",
+        },
     )
     builder.add_edge("quote_provider", "quote_response")
     builder.add_edge("quote_response", END)

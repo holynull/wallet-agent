@@ -33,7 +33,9 @@ def route_after_intent(state: dict[str, Any]) -> str:
         return "wallet_query"
     if intent == "transfer":
         return "transfer"
-    if intent in {"swap_select", "swap_allowance"}:
+    if intent == "swap_select":
+        return "confirmation_request"
+    if intent == "swap_allowance":
         return "swap_allowance"
     if intent == "price_query":
         return "price_query"
@@ -89,7 +91,7 @@ def route_after_confirmation(state: dict[str, Any]) -> str:
         return "supervisor"
     confirmation = state.get("confirmation_state") or {}
     if confirmation.get("status") == "approved":
-        return "prepare"
+        return "swap_allowance"
     return "response"
 
 
