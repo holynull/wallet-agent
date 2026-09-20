@@ -6,6 +6,8 @@ from collections.abc import AsyncIterable, AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
+
 
 @dataclass(frozen=True)
 class SseEvent:
@@ -149,6 +151,52 @@ def sanitize_evidence(value: Any) -> Any:
     return value
 
 
+class EvaluationHttpError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        operation: str,
+        status_code: int,
+        code: str,
+        message: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.operation = operation
+        self.status_code = status_code
+        self.code = code
+        self.details = sanitize_evidence(dict(details or {}))
+        super().__init__(message)
+
+
+async def _response_json(
+    response: httpx.Response, operation: str
+) -> dict[str, Any]:
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise EvaluationHttpError(
+            operation=operation,
+            status_code=response.status_code,
+            code="INVALID_JSON_RESPONSE",
+            message="endpoint returned non-JSON content",
+            details={},
+        ) from exc
+    if not response.is_success:
+        error_body = body if isinstance(body, Mapping) else {}
+        raise EvaluationHttpError(
+            operation=operation,
+            status_code=response.status_code,
+            code=str(error_body.get("code", f"HTTP_{response.status_code}")),
+            message=str(error_body.get("message", "request failed")),
+            details=(
+                error_body.get("details")
+                if isinstance(error_body.get("details"), Mapping)
+                else {}
+            ),
+        )
+    return dict(body)
+
+
 async def parse_sse(chunks: AsyncIterable[bytes]) -> AsyncIterator[SseEvent]:
     buffer = ""
     decoder = codecs.getincrementaldecoder("utf-8")()
@@ -187,6 +235,261 @@ async def parse_sse(chunks: AsyncIterable[bytes]) -> AsyncIterator[SseEvent]:
         event = await decode(buffer)
         if event is not None:
             yield event
+
+
+def _public_stage(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        stage = value.get("stage")
+        if isinstance(stage, str):
+            return stage
+        for nested in value.values():
+            found = _public_stage(nested)
+            if found is not None:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            found = _public_stage(nested)
+            if found is not None:
+                return found
+    return None
+
+
+class WalletAppClient:
+    def __init__(
+        self,
+        http: httpx.AsyncClient,
+        *,
+        user_id: str,
+        address: str,
+        chain: str,
+        conversation_id: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        turn_metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.http = http
+        self.user_id = user_id
+        self.address = address
+        self.chain = chain
+        self.conversation_id = conversation_id
+        self.session_id = session_id
+        self.run_id = run_id
+        self.turn_metadata = dict(turn_metadata or {})
+        self.stage: str | None = None
+        self.steps: list[LifecycleStep] = []
+        self.events: list[SseEvent] = []
+
+    @classmethod
+    def restore(
+        cls,
+        http: httpx.AsyncClient,
+        *,
+        user_id: str,
+        address: str,
+        chain: str,
+        conversation_id: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+    ) -> WalletAppClient:
+        return cls(
+            http,
+            user_id=user_id,
+            address=address,
+            chain=chain,
+            conversation_id=conversation_id,
+            session_id=session_id,
+            run_id=run_id,
+        )
+
+    def _record(
+        self,
+        operation: str,
+        *,
+        stage_before: str | None,
+        status_code: int,
+        evidence: Any,
+        error_code: str | None = None,
+    ) -> None:
+        stage_after = _public_stage(evidence) or stage_before
+        self.stage = stage_after
+        self.steps.append(
+            LifecycleStep(
+                operation=operation,
+                stage_before=stage_before,
+                stage_after=stage_after,
+                http_status=status_code,
+                error_code=error_code,
+                evidence=sanitize_evidence(evidence),
+            )
+        )
+
+    def _record_error(
+        self,
+        error: EvaluationHttpError,
+        *,
+        stage_before: str | None,
+    ) -> None:
+        self._record(
+            error.operation,
+            stage_before=stage_before,
+            status_code=error.status_code,
+            evidence=error.details,
+            error_code=error.code,
+        )
+
+    async def _json(
+        self,
+        operation: str,
+        method: str,
+        path: str,
+        **request_kwargs: Any,
+    ) -> dict[str, Any]:
+        stage_before = self.stage
+        response = await self.http.request(method, path, **request_kwargs)
+        try:
+            body = await _response_json(response, operation)
+        except EvaluationHttpError as exc:
+            self._record_error(exc, stage_before=stage_before)
+            raise
+        self._record(
+            operation,
+            stage_before=stage_before,
+            status_code=response.status_code,
+            evidence=body,
+        )
+        return body
+
+    def _require_session(self) -> str:
+        if self.session_id is None:
+            raise RuntimeError("session_id is required for this operation")
+        return self.session_id
+
+    async def turn(self, message: str) -> list[SseEvent]:
+        metadata = dict(self.turn_metadata)
+        turn_stage_before = self.stage
+        response = await self.http.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": self.user_id,
+                "conversation_id": self.conversation_id,
+                "session_id": self.session_id,
+                "message": message,
+                "address": self.address,
+                "chain": self.chain,
+                "metadata": metadata,
+            },
+        )
+        try:
+            body = await _response_json(response, "turn")
+        except EvaluationHttpError as exc:
+            self._record_error(exc, stage_before=turn_stage_before)
+            raise
+        self.turn_metadata.clear()
+        self.run_id = str(body["run_id"])
+        self.conversation_id = str(body["conversation_id"])
+        if body.get("session_id"):
+            self.session_id = str(body["session_id"])
+        self._record(
+            "turn",
+            stage_before=turn_stage_before,
+            status_code=response.status_code,
+            evidence=body,
+        )
+
+        stream_stage_before = self.stage
+        async with self.http.stream(
+            "GET", f"/v1/agent/stream/{self.run_id}"
+        ) as stream:
+            if not stream.is_success:
+                await stream.aread()
+                try:
+                    await _response_json(stream, "stream")
+                except EvaluationHttpError as exc:
+                    self._record_error(exc, stage_before=stream_stage_before)
+                    raise
+            events = [event async for event in parse_sse(stream.aiter_bytes())]
+            stream_status = stream.status_code
+        self.events.extend(events)
+        self._record(
+            "stream",
+            stage_before=stream_stage_before,
+            status_code=stream_status,
+            evidence={
+                "events": [
+                    {"name": event.name, "data": event.data} for event in events
+                ]
+            },
+        )
+        return events
+
+    async def session(self) -> dict[str, Any]:
+        return await self._json(
+            "session",
+            "GET",
+            f"/v1/swap/{self._require_session()}",
+            params={"user_id": self.user_id},
+        )
+
+    async def select_quote(self, provider_reference: str) -> dict[str, Any]:
+        return await self._json(
+            "select_quote",
+            "POST",
+            f"/v1/swap/{self._require_session()}/select-quote",
+            json={
+                "user_id": self.user_id,
+                "provider_reference": provider_reference,
+            },
+        )
+
+    async def confirm(self, approved: bool) -> dict[str, Any]:
+        return await self._json(
+            "confirm",
+            "POST",
+            f"/v1/swap/{self._require_session()}/confirm",
+            json={"user_id": self.user_id, "approved": approved},
+        )
+
+    async def submit_approval_hash(
+        self, chain: str, tx_hash: str
+    ) -> dict[str, Any]:
+        return await self._json(
+            "approve_broadcast",
+            "POST",
+            f"/v1/swap/{self._require_session()}/approve-broadcast",
+            json={
+                "user_id": self.user_id,
+                "chain": chain,
+                "approve_tx_hash": tx_hash,
+            },
+        )
+
+    async def continue_swap(self) -> dict[str, Any]:
+        return await self._json(
+            "continue",
+            "POST",
+            f"/v1/swap/{self._require_session()}/continue",
+            json={"user_id": self.user_id},
+        )
+
+    async def submit_swap_hash(
+        self, chain: str, tx_hash: str
+    ) -> dict[str, Any]:
+        return await self._json(
+            "broadcast",
+            "POST",
+            f"/v1/swap/{self._require_session()}/broadcast",
+            json={"user_id": self.user_id, "chain": chain, "tx_hash": tx_hash},
+        )
+
+    async def transaction_status(
+        self, chain: str, tx_hash: str
+    ) -> dict[str, Any]:
+        return await self._json(
+            "transaction_status",
+            "GET",
+            f"/v1/transactions/{chain}/{tx_hash}",
+            params={"user_id": self.user_id},
+        )
 
 
 class Eip1193Error(RuntimeError):
