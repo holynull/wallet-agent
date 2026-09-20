@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 
@@ -31,6 +33,36 @@ def _invariant(name, *, events=(), steps=(), manifest=None, session=None):
         max_attempts=3,
     )
     return next(result for result in results if result.name == name)
+
+
+def _selection_request(sequence, request_id, reference):
+    return {
+        "sequence": sequence,
+        "actor": "public_http",
+        "operation": "request",
+        "request_id": request_id,
+        "path": "/v1/swap/s/select-quote",
+        "body": {"provider_reference": reference},
+    }
+
+
+def _request_result(sequence, request_id, status):
+    return {
+        "sequence": sequence,
+        "actor": "public_http",
+        "operation": "request_result",
+        "request_id": request_id,
+        "http_status": status,
+    }
+
+
+def _prepare(sequence, reference):
+    return {
+        "sequence": sequence,
+        "actor": "provider",
+        "operation": "prepare",
+        "provider_reference": reference,
+    }
 
 
 @pytest.mark.parametrize("scenario_id", ["erc20_swap_without_approval", "erc20_swap_with_approval"])
@@ -106,24 +138,130 @@ def test_safe_evidence_accepts_only_redacted_forbidden_fields():
     assert not _safe_evidence({"outer": [{"label": "signed_raw_transaction"}]})
 
 
+@pytest.mark.parametrize(
+    ("outbound_request", "sentinel"),
+    [
+        (
+            httpx.Request(
+                "POST",
+                "http://wallet.test/v1/agent/turn",
+                headers={"content-type": "application/x-www-form-urlencoded"},
+                content="private_key=FORM_PRIVATE_KEY_SENTINEL",
+            ),
+            "FORM_PRIVATE_KEY_SENTINEL",
+        ),
+        (
+            httpx.Request(
+                "POST",
+                "http://wallet.test/v1/agent/turn",
+                json={
+                    "metadata": json.dumps(
+                        {"private_key": "JSON_STRING_PRIVATE_KEY_SENTINEL"}
+                    )
+                },
+            ),
+            "JSON_STRING_PRIVATE_KEY_SENTINEL",
+        ),
+        (
+            httpx.Request(
+                "POST",
+                "http://wallet.test/v1/agent/turn",
+                headers={"X-API-Key": "HEADER_API_KEY_SENTINEL"},
+            ),
+            "HEADER_API_KEY_SENTINEL",
+        ),
+        (
+            httpx.Request(
+                "POST",
+                "http://wallet.test/v1/agent/turn",
+                headers={"content-type": "application/octet-stream"},
+                content=b"OPAQUE_BODY_SENTINEL",
+            ),
+            "OPAQUE_BODY_SENTINEL",
+        ),
+        (
+            httpx.Request(
+                "POST",
+                "http://wallet.test/v1/agent/turn",
+                headers={"content-type": "application/json"},
+                content=json.dumps("OPAQUE_JSON_STRING_SENTINEL"),
+            ),
+            "OPAQUE_JSON_STRING_SENTINEL",
+        ),
+        (
+            httpx.Request(
+                "POST",
+                "http://wallet.test/v1/agent/turn",
+                json={
+                    "metadata": (
+                        '{"private_key":"MALFORMED_JSON_PRIVATE_KEY_SENTINEL"'
+                    )
+                },
+            ),
+            "MALFORMED_JSON_PRIVATE_KEY_SENTINEL",
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_public_request_capture_marks_and_redacts_private_material():
+async def test_public_request_capture_never_reports_private_or_opaque_material(
+    outbound_request, sentinel
+):
+    ledger = EvidenceLedger()
+
+    await _public_request_recorder(ledger)(outbound_request)
+
+    event = ledger.events[0]
+    assert event["private_material_detected"] is True
+    result = _invariant("no_signing_material_to_server", events=ledger.events)
+    recorded_report = json.dumps(result.evidence)
+    assert sentinel not in json.dumps(event)
+    assert sentinel not in recorded_report
+    assert not result.passed
+
+
+@pytest.mark.asyncio
+async def test_public_request_capture_accepts_ordinary_erc20_token_metadata():
     ledger = EvidenceLedger()
     request = httpx.Request(
         "POST",
         "http://wallet.test/v1/agent/turn",
-        json={"metadata": {"private_key": "do-not-report"}},
+        json={
+            "metadata": {
+                "token_metadata": {
+                    "address": "0x" + "3" * 40,
+                    "symbol": "USDC",
+                    "decimals": 6,
+                }
+            }
+        },
     )
 
     await _public_request_recorder(ledger)(request)
 
-    event = ledger.events[0]
-    assert event["private_material_detected"] is True
-    assert event["body"] == {"metadata": {"private_key": "[REDACTED]"}}
-    assert "do-not-report" not in str(event)
+    assert ledger.events[0]["private_material_detected"] is False
+    assert _invariant(
+        "no_signing_material_to_server", events=ledger.events
+    ).passed
 
 
-@pytest.mark.parametrize("method", ["personal_sign", "wallet_switchEthereumChain"])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "eth_chainId",
+        "eth_accounts",
+        "wallet_switchEthereumChain",
+        "wallet_addEthereumChain",
+        "eth_sendTransaction",
+        "eth_sendRawTransaction",
+        "personal_sign",
+        "eth_sign",
+        "eth_signTransaction",
+        "eth_signTypedData",
+        "eth_signTypedData_v1",
+        "eth_signTypedData_v3",
+        "eth_signTypedData_v4",
+    ],
+)
 def test_server_wallet_action_invariant_recognizes_non_eth_wallet_methods(method):
     result = _invariant(
         "no_server_wallet_actions",
@@ -288,32 +426,15 @@ def test_register_invariant_matches_each_registration_to_result_and_public_submi
 
 
 def test_quote_selection_invariant_requires_selected_reference_before_prepare():
-    steps = (
-        _step(
-            "select_quote",
-            {"selected_quote": {"provider_reference": "quote-selected"}},
-        ),
-    )
     events = (
-        {
-            "sequence": 1,
-            "actor": "public_http",
-            "operation": "request",
-            "path": "/v1/swap/s/select-quote",
-            "body": {"provider_reference": "quote-selected"},
-        },
-        {
-            "sequence": 2,
-            "actor": "provider",
-            "operation": "prepare",
-            "provider_reference": "quote-other",
-        },
+        _selection_request(1, "selection-1", "quote-selected"),
+        _request_result(2, "selection-1", 200),
+        _prepare(3, "quote-other"),
     )
 
     result = _invariant(
         "explicit_quote_selection",
         events=events,
-        steps=steps,
         session={"quote_candidates": [{}, {}]},
     )
 
@@ -321,37 +442,89 @@ def test_quote_selection_invariant_requires_selected_reference_before_prepare():
 
 
 def test_quote_selection_invariant_uses_latest_successful_selection():
-    steps = (
-        _step("select_quote", {"selected_quote": {"provider_reference": "quote-a"}}),
-        _step("select_quote", {"selected_quote": {"provider_reference": "quote-b"}}),
-    )
     events = (
-        {
-            "sequence": 1,
-            "actor": "public_http",
-            "operation": "select_quote_result",
-            "provider_reference": "quote-a",
-            "success": True,
-        },
-        {
-            "sequence": 2,
-            "actor": "public_http",
-            "operation": "select_quote_result",
-            "provider_reference": "quote-b",
-            "success": True,
-        },
-        {
-            "sequence": 3,
-            "actor": "provider",
-            "operation": "prepare",
-            "provider_reference": "quote-a",
-        },
+        _selection_request(1, "selection-a", "quote-a"),
+        _request_result(2, "selection-a", 200),
+        _selection_request(3, "selection-b", "quote-b"),
+        _request_result(4, "selection-b", 200),
+        _prepare(5, "quote-a"),
     )
 
     result = _invariant(
         "explicit_quote_selection",
         events=events,
-        steps=steps,
+        session={"quote_candidates": [{}, {}]},
+    )
+
+    assert not result.passed
+
+
+def test_quote_selection_invariant_accepts_latest_mixed_successful_selection():
+    events = (
+        _selection_request(3, "selection-b", "quote-b"),
+        _request_result(4, "selection-b", 204),
+        _selection_request(1, "selection-a", "quote-a"),
+        _request_result(2, "selection-a", 200),
+        _prepare(5, "quote-b"),
+    )
+
+    assert _invariant(
+        "explicit_quote_selection",
+        events=events,
+        session={"quote_candidates": [{}, {}]},
+    ).passed
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        (
+            _selection_request(1, "selection-failed", "quote-a"),
+            _request_result(2, "selection-failed", 409),
+            _prepare(3, "quote-a"),
+            _selection_request(4, "selection-later", "quote-a"),
+            _request_result(5, "selection-later", 200),
+        ),
+        (
+            _selection_request(1, "selection-unpaired", "quote-a"),
+            _prepare(2, "quote-a"),
+        ),
+        (
+            _selection_request(1, "selection-duplicate", "quote-a"),
+            _selection_request(2, "selection-duplicate", "quote-a"),
+            _request_result(3, "selection-duplicate", 200),
+            _prepare(4, "quote-a"),
+        ),
+        (
+            _selection_request(1, "selection-two-results", "quote-a"),
+            _request_result(2, "selection-two-results", 200),
+            _request_result(3, "selection-two-results", None),
+            _prepare(4, "quote-a"),
+        ),
+        (
+            _selection_request(1, "selection-sequence-a", "quote-a"),
+            _request_result(2, "selection-sequence-a", 200),
+            _selection_request(1, "selection-sequence-b", "quote-b"),
+            _request_result(3, "selection-sequence-b", 200),
+            _prepare(4, "quote-b"),
+        ),
+        (
+            _selection_request(1, "selection-late-result", "quote-a"),
+            _prepare(2, "quote-a"),
+            _request_result(3, "selection-late-result", 200),
+        ),
+    ],
+)
+def test_quote_selection_invariant_rejects_failed_unpaired_or_duplicate_requests(events):
+    result = _invariant(
+        "explicit_quote_selection",
+        events=events,
+        steps=(
+            _step(
+                "select_quote",
+                {"selected_quote": {"provider_reference": "quote-a"}},
+            ),
+        ),
         session={"quote_candidates": [{}, {}]},
     )
 

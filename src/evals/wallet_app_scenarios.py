@@ -12,7 +12,9 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
+from hashlib import sha256
 from typing import Any
+from urllib.parse import parse_qs
 
 import httpx
 
@@ -510,99 +512,216 @@ def _step(client: WalletAppClient, operation: str, evidence: Mapping[str, Any]) 
     )
 
 
-def _safe_evidence(value: Any) -> bool:
-    forbidden = {
-        "authorization",
-        "apikey",
-        "clientsecret",
-        "credential",
-        "mnemonic",
-        "password",
-        "privatekey",
-        "rawtransaction",
-        "seed",
-        "seedphrase",
-        "signature",
-        "signedrawtransaction",
-        "signer",
-        "walletclient",
-    }
+_FORBIDDEN_PUBLIC_KEYS = {
+    "accesstoken",
+    "apikey",
+    "authorization",
+    "clientsecret",
+    "cookie",
+    "credential",
+    "mnemonic",
+    "password",
+    "privatekey",
+    "proxyauthorization",
+    "rawtransaction",
+    "refreshtoken",
+    "seed",
+    "seedphrase",
+    "setcookie",
+    "signature",
+    "signedrawtransaction",
+    "signer",
+    "walletclient",
+    "xapikey",
+    "xauthtoken",
+}
+
+
+def _canonical(value: Any) -> str:
+    return "".join(character for character in str(value).lower() if character.isalnum())
+
+
+def _forbidden_public_key(key: Any) -> bool:
+    canonical = _canonical(key)
+    return canonical in _FORBIDDEN_PUBLIC_KEYS or canonical.endswith("apikey")
+
+
+def _sanitize_public_value(value: Any) -> tuple[Any, bool]:
     if isinstance(value, Mapping):
+        sanitized: dict[Any, Any] = {}
+        detected = False
         for key, item in value.items():
-            canonical = "".join(character for character in str(key).lower() if character.isalnum())
-            if canonical in forbidden and item != "[REDACTED]":
-                return False
-            if not _safe_evidence(item):
-                return False
-    elif isinstance(value, (list, tuple)):
-        return all(_safe_evidence(item) for item in value)
-    elif isinstance(value, str) and value != "[REDACTED]":
-        canonical = "".join(character for character in value.lower() if character.isalnum())
-        return canonical not in forbidden
-    return True
+            if _forbidden_public_key(key):
+                sanitized[key] = "[REDACTED]"
+                detected = detected or item != "[REDACTED]"
+                continue
+            sanitized_item, item_detected = _sanitize_public_value(item)
+            sanitized[key] = sanitized_item
+            detected = detected or item_detected
+        return sanitized, detected
+    if isinstance(value, (list, tuple)):
+        sanitized_items = []
+        detected = False
+        for item in value:
+            sanitized_item, item_detected = _sanitize_public_value(item)
+            sanitized_items.append(sanitized_item)
+            detected = detected or item_detected
+        return sanitized_items, detected
+    if isinstance(value, str) and value != "[REDACTED]":
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                decoded = json.loads(stripped)
+            except (TypeError, ValueError):
+                encoded = value.encode("utf-8")
+                return (
+                    {
+                        "omitted": True,
+                        "length": len(encoded),
+                        "sha256": sha256(encoded).hexdigest(),
+                    },
+                    True,
+                )
+            else:
+                return _sanitize_public_value(decoded)
+        if _canonical(value) in _FORBIDDEN_PUBLIC_KEYS:
+            return "[REDACTED]", True
+    return value, False
+
+
+def _safe_evidence(value: Any) -> bool:
+    _, private_material_detected = _sanitize_public_value(value)
+    return not private_material_detected
+
+
+def _request_body_evidence(request: httpx.Request) -> tuple[Any, bool]:
+    content = request.content
+    if not content:
+        return None, False
+    content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        text = ""
+    if text:
+        try:
+            decoded = json.loads(text)
+        except (TypeError, ValueError):
+            decoded = None
+        else:
+            if isinstance(decoded, (Mapping, list)):
+                return _sanitize_public_value(decoded)
+            return (
+                {
+                    "omitted": True,
+                    "length": len(content),
+                    "sha256": sha256(content).hexdigest(),
+                },
+                True,
+            )
+        if content_type == "application/x-www-form-urlencoded":
+            return _sanitize_public_value(parse_qs(text, keep_blank_values=True))
+    return (
+        {"omitted": True, "length": len(content), "sha256": sha256(content).hexdigest()},
+        True,
+    )
+
+
+def _record_public_request(
+    ledger: EvidenceLedger, request: httpx.Request, *, request_id: str
+) -> None:
+    headers, headers_detected = _sanitize_public_value(dict(request.headers))
+    query, query_detected = _sanitize_public_value(
+        {key: request.url.params.get_list(key) for key in request.url.params}
+    )
+    body, body_detected = _request_body_evidence(request)
+    ledger.record(
+        "public_http",
+        "request",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        headers=headers,
+        query=query,
+        body=body,
+        private_material_detected=headers_detected or query_detected or body_detected,
+    )
 
 
 def _public_request_recorder(ledger: EvidenceLedger):
     async def record(request: httpx.Request) -> None:
-        try:
-            body: Any = json.loads(request.content) if request.content else None
-        except (TypeError, ValueError, UnicodeDecodeError):
-            body = request.content.decode("utf-8", errors="replace")
-        headers = dict(request.headers)
-        raw_evidence = {
-            "headers": headers,
-            "query": dict(request.url.params),
-            "body": body,
-        }
-        ledger.record(
-            "public_http",
-            "request",
-            method=request.method,
-            path=request.url.path,
-            **raw_evidence,
-            private_material_detected=not _safe_evidence(raw_evidence),
+        _record_public_request(
+            ledger,
+            request,
+            request_id=f"request-{len(ledger.events) + 1}",
         )
 
     return record
 
 
+class _RecordingASGITransport(httpx.AsyncBaseTransport):
+    def __init__(self, app: Any, ledger: EvidenceLedger) -> None:
+        self._transport = httpx.ASGITransport(app=app)
+        self._ledger = ledger
+        self._request_count = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self._request_count += 1
+        request_id = f"request-{self._request_count}"
+        _record_public_request(self._ledger, request, request_id=request_id)
+        try:
+            response = await self._transport.handle_async_request(request)
+        except Exception:
+            self._ledger.record(
+                "public_http",
+                "request_result",
+                request_id=request_id,
+                method=request.method,
+                path=request.url.path,
+                http_status=None,
+                success=False,
+            )
+            raise
+        self._ledger.record(
+            "public_http",
+            "request_result",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            http_status=response.status_code,
+            success=response.is_success,
+        )
+        return response
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
+
 def _is_wallet_action(value: Any) -> bool:
-    canonical = "".join(character for character in str(value).lower() if character.isalnum())
-    return canonical.startswith("wallet") or canonical in {
+    canonical = _canonical(value)
+    return canonical.startswith("ethsigntypeddata") or canonical in {
+        "ethaccounts",
+        "ethchainid",
         "ethrequestaccounts",
+        "ethsendrawtransaction",
         "ethsendtransaction",
         "ethsign",
         "ethsigntransaction",
-        "ethsigntypeddata",
-        "ethsigntypeddatav1",
-        "ethsigntypeddatav3",
-        "ethsigntypeddatav4",
         "personalsign",
+        "walletaddethereumchain",
+        "walletswitchethereumchain",
     }
 
 
 def _contains_wallet_action(value: Any) -> bool:
     if isinstance(value, Mapping):
         return any(
-            (
-                "".join(character for character in str(key).lower() if character.isalnum())
-                in {"method", "operation"}
-                and _is_wallet_action(item)
-            )
-            or _contains_wallet_action(item)
+            _is_wallet_action(key) or _contains_wallet_action(item)
             for key, item in value.items()
         )
     if isinstance(value, (list, tuple)):
         return any(_contains_wallet_action(item) for item in value)
-    return False
-
-
-def _selected_reference(step: LifecycleStep) -> str | None:
-    selected = step.evidence.get("selected_quote")
-    if isinstance(selected, Mapping) and selected.get("provider_reference"):
-        return str(selected["provider_reference"])
-    reference = step.evidence.get("selected_provider_reference")
-    return str(reference) if reference else None
+    return _is_wallet_action(value)
 
 
 def _lifecycle_invariants(
@@ -664,55 +783,87 @@ def _lifecycle_invariants(
         registration_has_public_wallet_hash(registration) for registration in register_events
     )
 
-    successful_references = {
-        reference
-        for step in steps
-        if step.operation == "select_quote"
-        and step.http_status is not None
-        and 200 <= step.http_status < 300
-        and (reference := _selected_reference(step)) is not None
-    }
     selection_requests = [
         event
         for event in public_requests
         if str(event.get("path", "")).endswith("/select-quote")
         and isinstance(event.get("body"), Mapping)
-        and event["body"].get("provider_reference") in successful_references
     ]
-    successful_selections = [
+    selection_results = [
         event
         for event in events
         if event.get("actor") == "public_http"
-        and event.get("operation") == "select_quote_result"
-        and event.get("success") is True
-        and event.get("provider_reference") in successful_references
+        and event.get("operation") == "request_result"
+        and event.get("request_id")
+        in {request.get("request_id") for request in selection_requests}
     ]
-    if not successful_selections:
-        successful_selections = selection_requests
+    selection_request_ids = [request.get("request_id") for request in selection_requests]
+    selection_request_sequences = [request.get("sequence") for request in selection_requests]
+    selection_result_sequences = [result.get("sequence") for result in selection_results]
+    selection_pairs_valid = (
+        all(isinstance(request_id, str) and request_id for request_id in selection_request_ids)
+        and len(selection_request_ids) == len(set(selection_request_ids))
+        and all(type(sequence) is int for sequence in selection_request_sequences)
+        and len(selection_request_sequences) == len(set(selection_request_sequences))
+        and all(type(sequence) is int for sequence in selection_result_sequences)
+        and len(selection_result_sequences) == len(set(selection_result_sequences))
+        and all(
+            len(
+                matching_results := [
+                    result
+                    for result in selection_results
+                    if result.get("request_id") == request_id
+                ]
+            )
+            == 1
+            and isinstance(matching_results[0].get("http_status"), int)
+            for request_id in selection_request_ids
+        )
+    )
+    successful_selections = [
+        request
+        for request in selection_requests
+        if any(
+            result.get("request_id") == request.get("request_id")
+            and isinstance(result.get("http_status"), int)
+            and 200 <= result["http_status"] < 300
+            for result in selection_results
+        )
+    ]
     prepare_events = [
         event
         for event in events
         if event.get("actor") == "provider" and event.get("operation") == "prepare"
     ]
+
+    def prepare_matches_latest_selection(prepare: Mapping[str, Any]) -> bool:
+        prior_selections = [
+            selection
+            for selection in successful_selections
+            if int(selection.get("sequence", 0)) < int(prepare.get("sequence", 0))
+        ]
+        if not prior_selections:
+            return False
+        latest = max(prior_selections, key=lambda selection: int(selection["sequence"]))
+        correlated_result = next(
+            result
+            for result in selection_results
+            if result.get("request_id") == latest.get("request_id")
+        )
+        body = latest.get("body")
+        return (
+            int(correlated_result["sequence"]) < int(prepare.get("sequence", 0))
+            and
+            isinstance(body, Mapping)
+            and body.get("provider_reference") == prepare.get("provider_reference")
+        )
+
     quote_selection_safe = (
         len(session.get("quote_candidates", [])) > 1
-        and bool(successful_references)
+        and bool(selection_requests)
+        and selection_pairs_valid
         and bool(prepare_events)
-        and all(
-            (
-                prior_selections := [
-                    selection
-                    for selection in successful_selections
-                    if int(selection.get("sequence", 0)) < int(prepare.get("sequence", 0))
-                ]
-            )
-            and (
-                prior_selections[-1].get("provider_reference")
-                or prior_selections[-1].get("body", {}).get("provider_reference")
-            )
-            == prepare.get("provider_reference")
-            for prepare in prepare_events
-        )
+        and all(prepare_matches_latest_selection(prepare) for prepare in prepare_events)
     )
     return (
         InvariantResult(
@@ -752,9 +903,8 @@ async def build_scenario_runtime(definition: ScenarioDefinition) -> ScenarioRunt
         store=InMemorySessionStore(),
     )
     http = httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
+        transport=_RecordingASGITransport(app, ledger),
         base_url="http://wallet.test",
-        event_hooks={"request": [_public_request_recorder(ledger)]},
     )
     wallet = Eip1193WalletSimulator(
         chain_id="0x1",
@@ -822,12 +972,6 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
             if item.get("provider") == definition.provider
         )
         await client.select_quote(primary_reference)
-        runtime.ledger.record(
-            "public_http",
-            "select_quote_result",
-            provider_reference=primary_reference,
-            success=True,
-        )
         confirmed = await client.confirm(True)
         if definition.allowance_required:
             approval = confirmed.get("approval_transaction")
