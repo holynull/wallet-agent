@@ -20,7 +20,11 @@ from evals.wallet_app_scenarios import (
     drive_scenario,
     run_scenario,
 )
-from evals.wallet_app_simulator import EvidenceLedger, LifecycleStep
+from evals.wallet_app_simulator import (
+    EvidenceLedger,
+    FaultOutcome,
+    LifecycleStep,
+)
 
 
 def _step(operation, evidence=None, *, status=200):
@@ -298,6 +302,145 @@ async def test_scenario_exception_details_are_not_exposed_in_reports(monkeypatch
     assert "LEAKED" not in serialized
     assert "private_key" not in serialized
     assert "apiKey" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "blocked_operation"),
+    [
+        ("erc20_swap_without_approval", "prepare"),
+        ("erc20_swap_with_approval", "get_allowance"),
+    ],
+)
+@pytest.mark.parametrize("recovery_action", ["continue", "status_turn"])
+@pytest.mark.asyncio
+async def test_rejected_confirmation_is_terminal_across_continue_and_status_turn(
+    scenario_id, blocked_operation, recovery_action
+):
+    runtime = await build_scenario_runtime(SCENARIOS[scenario_id])
+    client = runtime.client
+    try:
+        await client.turn("Swap 10 USDC to USDT on Ethereum")
+        session = await client.session()
+        reference = next(
+            candidate["provider_reference"]
+            for candidate in session["quote_candidates"]
+            if candidate["provider"] == runtime.definition.provider
+        )
+        await client.select_quote(reference)
+
+        rejected = await client.confirm(False)
+        if recovery_action == "continue":
+            await client.continue_swap()
+        else:
+            await client.turn("Check the swap status")
+        recovered = await client.session()
+    finally:
+        await runtime.http.aclose()
+
+    assert rejected["status"] == "cancelled"
+    assert rejected["stage"] == "cancelled"
+    assert recovered["status"] == "cancelled"
+    assert recovered["stage"] == "cancelled"
+    assert rejected["pending_transaction"] is None
+    assert recovered["pending_transaction"] is None
+    assert not any(
+        event.get("operation") == blocked_operation
+        for event in runtime.ledger.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_reselect_after_rejection_starts_a_fresh_authorization_cycle():
+    runtime = await build_scenario_runtime(SCENARIOS["erc20_swap_without_approval"])
+    client = runtime.client
+    try:
+        await client.turn("Swap 10 USDC to USDT on Ethereum")
+        session = await client.session()
+        reference = next(
+            candidate["provider_reference"]
+            for candidate in session["quote_candidates"]
+            if candidate["provider"] == runtime.definition.provider
+        )
+        await client.select_quote(reference)
+        await client.confirm(False)
+
+        selected_again = await client.select_quote(reference)
+        confirmed = await client.confirm(True)
+    finally:
+        await runtime.http.aclose()
+
+    assert selected_again["status"] == "awaiting_confirmation"
+    assert selected_again["stage"] == "confirmation_required"
+    assert confirmed["status"] == "swap_ready"
+    assert confirmed["pending_transaction"] is not None
+
+
+@pytest.mark.parametrize("fault_boundary", ["wallet", "provider"])
+@pytest.mark.asyncio
+async def test_fault_messages_are_sanitized_across_the_entire_report(fault_boundary):
+    wallet_sentinel = "REVIEW_SYNTHETIC_SENTINEL"
+    provider_sentinel = "REVIEW_API_SENTINEL"
+    base = (
+        SCENARIOS["wallet_rejects_swap"]
+        if fault_boundary == "wallet"
+        else SCENARIOS["erc20_swap_without_approval"]
+    )
+    fault_plan = replace(
+        base.fault_plan,
+        **(
+            {
+                "wallet_send": (
+                    FaultOutcome(
+                        "reject",
+                        code=4001,
+                        message=f"private_key={wallet_sentinel}; apiKey={provider_sentinel}",
+                    ),
+                )
+            }
+            if fault_boundary == "wallet"
+            else {
+                "provider_prepare": (
+                    FaultOutcome(
+                        "error",
+                        message=f"private_key={wallet_sentinel}; apiKey={provider_sentinel}",
+                    ),
+                )
+            }
+        ),
+    )
+    lifecycle = await run_definition(replace(base, fault_plan=fault_plan))
+    report = aggregate_reports([lifecycle])
+    serialized = json.dumps(report)
+    invariant = next(
+        item
+        for item in lifecycle.invariants
+        if item.name == "no_signing_material_to_server"
+    )
+
+    assert wallet_sentinel not in serialized
+    assert provider_sentinel not in serialized
+    assert "private_key" not in serialized.lower()
+    assert "apikey" not in serialized.lower()
+    assert invariant.passed
+
+
+def test_signing_material_invariant_checks_session_and_non_evidence_step_fields():
+    result = _invariant(
+        "no_signing_material_to_server",
+        steps=(
+            LifecycleStep(
+                "wallet_swap",
+                "private_key=STEP_SENTINEL",
+                "swap_ready",
+                None,
+                None,
+                {},
+            ),
+        ),
+        session={"status": "apiKey=SESSION_SENTINEL"},
+    )
+
+    assert not result.passed
 
 
 @pytest.mark.parametrize(

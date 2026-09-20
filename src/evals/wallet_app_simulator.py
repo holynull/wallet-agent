@@ -124,6 +124,27 @@ def _canonical_key(key: Any) -> str:
     return "".join(character for character in str(key).lower() if character.isalnum())
 
 
+def contains_sensitive_evidence(value: Any) -> bool:
+    """Detect credential/signing material in keys or untrusted free-form text."""
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if (
+                _canonical_key(key) in _FORBIDDEN_EVIDENCE_KEYS
+                and item != "[REDACTED]"
+            ):
+                return True
+            if contains_sensitive_evidence(item):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(contains_sensitive_evidence(item) for item in value)
+    if isinstance(value, str) and value != "[REDACTED]":
+        canonical = _canonical_key(value)
+        return any(marker in canonical for marker in _FORBIDDEN_EVIDENCE_KEYS)
+    return False
+
+
 def _normalize_chain_id(chain_id: str) -> str:
     return hex(int(chain_id, 0))
 
@@ -148,6 +169,11 @@ def sanitize_evidence(value: Any) -> Any:
         return [sanitize_evidence(item) for item in value]
     if isinstance(value, tuple):
         return tuple(sanitize_evidence(item) for item in value)
+    if isinstance(value, str) and contains_sensitive_evidence(value):
+        # Wallet/provider/RPC exception text is untrusted and can embed a key
+        # name and value inside an otherwise ordinary message. Preserve the
+        # stable error code/category elsewhere and never echo the raw text.
+        return "[REDACTED]"
     return value
 
 

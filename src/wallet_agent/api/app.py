@@ -1189,6 +1189,8 @@ def create_app(
             fallback_user_id=(payload or {}).get("user_id"),
         )
         session = await owned_session(session_id, user_id)
+        if session.status == "cancelled" or session.stage == "cancelled":
+            return _jsonable(session)
         if app.state.graph is None:
             return _jsonable(session)
         graph = app.state.graph

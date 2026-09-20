@@ -49,6 +49,7 @@ from .wallet_app_simulator import (
     LifecycleReport,
     LifecycleStep,
     WalletAppClient,
+    contains_sensitive_evidence,
     sanitize_evidence,
 )
 
@@ -923,7 +924,7 @@ def _request_header_evidence(headers: httpx.Headers) -> tuple[dict[str, Any], bo
 
 def _safe_evidence(value: Any) -> bool:
     _, private_material_detected = _sanitize_public_value(value)
-    return not private_material_detected
+    return not private_material_detected and not contains_sensitive_evidence(value)
 
 
 def _request_body_evidence(request: httpx.Request) -> tuple[Any, bool]:
@@ -1071,9 +1072,26 @@ def _lifecycle_invariants(
         if event.get("actor") == "public_http"
         and event.get("operation") == "request_result"
     ]
+    complete_report_evidence = {
+        "events": list(events),
+        "steps": [
+            {
+                "operation": step.operation,
+                "stage_before": step.stage_before,
+                "stage_after": step.stage_after,
+                "http_status": step.http_status,
+                "error_code": step.error_code,
+                "evidence": step.evidence,
+            }
+            for step in steps
+        ],
+        "session": dict(session),
+        "final_stage": final_stage,
+        "expected_swap_transaction": dict(expected_swap_transaction or {}),
+        "actual_swap_transaction": dict(actual_swap_transaction or {}),
+    }
     signing_material_safe = (
-        all(_safe_evidence(event) for event in events)
-        and all(_safe_evidence(step.evidence) for step in steps)
+        _safe_evidence(complete_report_evidence)
         and not any(event.get("private_material_detected") is True for event in public_requests)
     )
     server_wallet_actions_safe = (

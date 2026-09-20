@@ -2018,9 +2018,29 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "reason": None if approved else "user_rejected",
         }
         if not approved:
+            active_task = hydrate_active_task(state)
+            if active_task:
+                active_task = {
+                    **active_task,
+                    "status": "cancelled",
+                    "stage": "cancelled",
+                    "missing_fields": [],
+                    "updated_by": "user",
+                }
+            cancelled = _task_state(
+                state.get("conversation_state"),
+                goal=str((active_task or {}).get("kind") or "swap"),
+                stage="cancelled",
+                slots=(active_task or {}).get("slots") or {},
+                missing_fields=[],
+                status="cancelled",
+                updated_by="user",
+            )
             return {
                 "confirmation_state": updated,
                 "user_confirmation": {"approved": False},
+                "active_task": active_task,
+                "conversation_state": cancelled,
                 "task_stage": "cancelled",
                 "response": {
                     "kind": "cancelled",
