@@ -217,6 +217,24 @@ def _looks_like_swap(message: str) -> bool:
     )
 
 
+def _interrupt_values(snapshot: Any) -> list[Any]:
+    if not getattr(snapshot, "next", ()):
+        return []
+    values: list[Any] = []
+    for task in getattr(snapshot, "tasks", ()):
+        for interruption in getattr(task, "interrupts", ()):
+            values.append(getattr(interruption, "value", interruption))
+    return values
+
+
+def _has_approval_interrupt(snapshot: Any) -> bool:
+    """Return true only for the explicit wallet-approval interrupt."""
+    return any(
+        isinstance(value, Mapping) and value.get("kind") == "approval_required"
+        for value in _interrupt_values(snapshot)
+    )
+
+
 def create_app(
     *,
     graph: Any = None,
@@ -237,9 +255,17 @@ def create_app(
     app.state.price_provider = price_provider
     app.state.session_store = session_store
     app.state.runs: dict[str, dict[str, Any]] = {}
+    app.state.graph_locks: dict[str, asyncio.Lock] = {}
     app.state.token_verifier = token_verifier
     app.state.require_auth = require_auth
     app.state.model_registry = model_registry
+
+    def graph_lock(thread_id: str) -> asyncio.Lock:
+        lock = app.state.graph_locks.get(thread_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            app.state.graph_locks[thread_id] = lock
+        return lock
 
     demo_dir = Path(__file__).resolve().parents[3] / "demo"
     if demo_dir.is_dir():
@@ -353,10 +379,11 @@ def create_app(
             )
             if order_state:
                 changes["stage"] = str(order_state)
-            # Once a swap has been broadcast, old checkpoint values are no
-            # longer actionable and must not make clients render signing cards.
-            changes["approval_transaction"] = None
-            changes["pending_transaction"] = None
+            if state.get("provider_orders") or state.get("broadcast_tx_hash"):
+                # Once a swap has been broadcast, old checkpoint values are no
+                # longer actionable and must not make clients render signing cards.
+                changes["approval_transaction"] = None
+                changes["pending_transaction"] = None
         for field in ("approval_transaction", "approval_tx_hash", "allowance_requirement"):
             if state.get(field) is not None:
                 changes[field] = state[field]
@@ -379,7 +406,12 @@ def create_app(
         *,
         session_id: str | None = None,
     ) -> None:
-        app.state.runs[run_id] = {"status": "running", "events": []}
+        run = app.state.runs.setdefault(run_id, {"events": []})
+        run["status"] = "running"
+        run.setdefault("events", [])
+        thread_id = str(config.get("configurable", {}).get("thread_id", ""))
+        lock = graph_lock(thread_id)
+        await lock.acquire()
         try:
             if app.state.graph is None:
                 result = input_state
@@ -485,6 +517,8 @@ def create_app(
                     ),
                 }
             )
+        finally:
+            lock.release()
 
     @app.post("/v1/agent/turn")
     async def turn(request: Request, payload: TurnRequest) -> dict[str, Any]:
@@ -592,6 +626,18 @@ def create_app(
             # value left in the LangGraph checkpoint by select/continue APIs.
             "forced_intent": None,
         }
+        if existing_session is not None:
+            if existing_session.quote is not None:
+                input_state["selected_quote"] = existing_session.quote.model_dump(mode="json")
+            if existing_session.approval_tx_hash is not None:
+                input_state["approval_tx_hash"] = existing_session.approval_tx_hash
+            if existing_session.approval_transaction is not None:
+                input_state["approval_transaction"] = existing_session.approval_transaction
+            if existing_session.allowance_requirement is not None:
+                input_state["allowance_requirement"] = existing_session.allowance_requirement
+            if existing_session.pending_transaction is not None:
+                pending_transaction = existing_session.pending_transaction
+                input_state["pending_transaction"] = pending_transaction.model_dump(mode="json")
         if existing_session is not None and existing_session.provider_order is not None:
             order = existing_session.provider_order
             input_state.update(
@@ -704,10 +750,11 @@ def create_app(
             graph = app.state.graph
             if graph is not None:
                 try:
-                    result = await graph.ainvoke(
-                        Command(resume={"approved": False}),
-                        config={"configurable": {"thread_id": session.thread_id}},
-                    )
+                    async with graph_lock(session.thread_id):
+                        result = await graph.ainvoke(
+                            Command(resume={"approved": False}),
+                            config={"configurable": {"thread_id": session.thread_id}},
+                        )
                     updated = await project_session(session_id, result, status="cancelled")
                     if updated is not None:
                         return _jsonable(updated)
@@ -720,10 +767,11 @@ def create_app(
         if graph is None:
             return _jsonable(await session_store.update(session_id, status="confirmed"))
         config = {"configurable": {"thread_id": session.thread_id}}
-        result = await graph.ainvoke(
-            Command(resume={"approved": True}),
-            config=config,
-        )
+        async with graph_lock(session.thread_id):
+            result = await graph.ainvoke(
+                Command(resume={"approved": True}),
+                config=config,
+            )
         response = result.get("response") or {}
         errors = response.get("errors") or []
         expired = any(item.get("code") == "CONFIRMATION_EXPIRED" for item in errors)
@@ -863,14 +911,15 @@ def create_app(
                     selected_provider_reference=payload.provider_reference,
                 )
             )
-        result = await app.state.graph.ainvoke(
-            {
-                "intent": "swap_allowance",
-                "forced_intent": "swap_allowance",
-                "selected_quote": selected_quote.model_dump(mode="json"),
-            },
-            config={"configurable": {"thread_id": session.thread_id}},
-        )
+        async with graph_lock(session.thread_id):
+            result = await app.state.graph.ainvoke(
+                {
+                    "intent": "swap_allowance",
+                    "forced_intent": "swap_allowance",
+                    "selected_quote": selected_quote.model_dump(mode="json"),
+                },
+                config={"configurable": {"thread_id": session.thread_id}},
+            )
         updated = await project_session(
             session_id, result, status=result.get("authorization_stage", "approval_required")
         )
@@ -960,30 +1009,30 @@ def create_app(
             return _jsonable(session)
         graph = app.state.graph
         config = {"configurable": {"thread_id": session.thread_id}}
-        snapshot = None
-        if hasattr(graph, "aget_state"):
-            snapshot = await graph.aget_state(config)
-        elif hasattr(graph, "get_state"):
-            snapshot = graph.get_state(config)
-        has_pending_interrupt = bool(getattr(snapshot, "tasks", ())) and bool(
-            getattr(snapshot, "next", ())
-        )
-        if has_pending_interrupt:
-            result = await graph.ainvoke(
-                Command(resume={"approve_tx_hash": session.approval_tx_hash}),
-                config=config,
-            )
-        else:
-            selected_quote = session.quote.model_dump(mode="json") if session.quote else None
-            result = await graph.ainvoke(
-                {
-                    "intent": "swap_allowance",
-                    "forced_intent": "swap_allowance",
-                    "selected_quote": selected_quote,
-                    "approval_tx_hash": session.approval_tx_hash,
-                },
-                config=config,
-            )
+        async with graph_lock(session.thread_id):
+            snapshot = None
+            if hasattr(graph, "aget_state"):
+                snapshot = await graph.aget_state(config)
+            elif hasattr(graph, "get_state"):
+                snapshot = graph.get_state(config)
+            if _has_approval_interrupt(snapshot):
+                result = await graph.ainvoke(
+                    Command(resume={"approve_tx_hash": session.approval_tx_hash}),
+                    config=config,
+                )
+            elif _interrupt_values(snapshot):
+                return _jsonable(session)
+            else:
+                selected_quote = session.quote.model_dump(mode="json") if session.quote else None
+                result = await graph.ainvoke(
+                    {
+                        "intent": "swap_allowance",
+                        "forced_intent": "swap_allowance",
+                        "selected_quote": selected_quote,
+                        "approval_tx_hash": session.approval_tx_hash,
+                    },
+                    config=config,
+                )
         response = result.get("response") or {}
         stage = result.get("authorization_stage") or response.get("stage") or "swap_ready"
         return _jsonable(
@@ -1008,14 +1057,15 @@ def create_app(
             return _jsonable(session)
         if app.state.graph is None:
             raise HTTPException(status_code=503, detail="agent graph is not configured")
-        result = await app.state.graph.ainvoke(
-            {
-                "intent": "transfer",
-                "forced_intent": "transfer",
-                "transfer_request": payload.model_dump(mode="json", exclude={"user_id"}),
-            },
-            config={"configurable": {"thread_id": session.thread_id}},
-        )
+        async with graph_lock(session.thread_id):
+            result = await app.state.graph.ainvoke(
+                {
+                    "intent": "transfer",
+                    "forced_intent": "transfer",
+                    "transfer_request": payload.model_dump(mode="json", exclude={"user_id"}),
+                },
+                config={"configurable": {"thread_id": session.thread_id}},
+            )
         response = result.get("response") or {}
         status = "transfer_ready" if response.get("kind") == "transfer_prepare" else "failed"
         return _jsonable(await project_session(session_id, result, status=status) or result)

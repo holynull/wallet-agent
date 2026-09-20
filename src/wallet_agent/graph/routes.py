@@ -22,6 +22,13 @@ def route_after_intent(state: dict[str, Any]) -> str:
     intent = state.get("intent", "clarification")
     if state.get("broadcast_tx_hash") and intent in {"swap_status", "swap_prepare"}:
         return "register_broadcast"
+    if (
+        intent == "swap_status"
+        and state.get("selected_quote")
+        and not state.get("provider_orders")
+        and not state.get("pending_transaction")
+    ):
+        return "swap_allowance"
     if intent == "wallet_query":
         return "wallet_query"
     if intent == "transfer":

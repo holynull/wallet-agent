@@ -2776,6 +2776,22 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             }
 
     async def swap_allowance(state: dict[str, Any]) -> dict[str, Any]:
+        def authorization_response(stage: str, **payload: Any) -> dict[str, Any]:
+            response = {"stage": stage, **payload}
+            if state.get("intent") == "swap_status":
+                messages = {
+                    "approval_pending": "Approve 交易已提交，正在等待链上确认。",
+                    "approval_failed": "Approve 交易链上执行失败，请重新发起授权。",
+                    "approval_required": "Approve 已确认，但授权额度仍不足，请重新授权。",
+                    "swap_ready": "Approve 已确认，兑换交易已准备好，请在钱包中签名并广播。",
+                }
+                response.update(
+                    kind="swap_status",
+                    status=stage,
+                    message=messages.get(stage, "兑换授权状态已更新。"),
+                )
+            return response
+
         selected = state.get("selected_quote")
         if not selected:
             return {
@@ -2848,11 +2864,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "pending_transaction": dumped,
                 "preflight": preflight,
                 "authorization_stage": "swap_ready",
-                "response": {
-                    "stage": "swap_ready",
-                    "pending_transaction": dumped,
+                "response": authorization_response(
+                    "swap_ready",
+                    pending_transaction=dumped,
                     **({"preflight": preflight} if preflight is not None else {}),
-                },
+                ),
             }
         adapter = runtime.chains.get(requirement.token.chain.upper())
         if adapter is None:
@@ -2902,10 +2918,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "approval_transaction": approval_model.model_dump(mode="json"),
                     "allowance_requirement": requirement.model_dump(mode="json"),
                     "authorization_stage": "approval_required",
-                    "response": {
-                        "stage": "approval_required",
-                        "approval_transaction": approval_model.model_dump(mode="json"),
-                    },
+                    "response": authorization_response(
+                        "approval_required",
+                        approval_transaction=approval_model.model_dump(mode="json"),
+                    ),
                 }
         if approval_tx_hash:
             receipt = await adapter.get_transaction_receipt(str(approval_tx_hash))
@@ -2918,10 +2934,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "authorization_stage": "approval_pending"
                     if receipt is None
                     else "approval_failed",
-                    "response": {
-                        "stage": "approval_pending" if receipt is None else "approval_failed",
-                        "approval_transaction": approval_transaction,
-                    },
+                    "response": authorization_response(
+                        "approval_pending" if receipt is None else "approval_failed",
+                        approval_transaction=approval_transaction,
+                    ),
                 }
             allowance_raw = await adapter.get_allowance(
                 requirement.token, requirement.owner, requirement.spender
@@ -2932,10 +2948,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "approval_tx_hash": approval_tx_hash,
                     "allowance_requirement": requirement.model_dump(mode="json"),
                     "authorization_stage": "approval_required",
-                    "response": {
-                        "stage": "approval_required",
-                        "approval_transaction": approval_transaction,
-                    },
+                    "response": authorization_response(
+                        "approval_required",
+                        approval_transaction=approval_transaction,
+                    ),
                 }
         provider = runtime.providers.get(str(selected.get("provider")))
         if provider is None:
@@ -2998,11 +3014,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "pending_transaction": dumped,
                 "preflight": preflight,
                 "authorization_stage": "swap_ready",
-                "response": {
-                    "stage": "swap_ready",
-                    "pending_transaction": dumped,
+                "response": authorization_response(
+                    "swap_ready",
+                    pending_transaction=dumped,
                     **({"preflight": preflight} if preflight is not None else {}),
-                },
+                ),
             }
 
     async def wallet_query(state: dict[str, Any]) -> dict[str, Any]:
@@ -3552,6 +3568,15 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         }
         orders = state.get("provider_orders", {})
         if not orders:
+            if state.get("pending_transaction"):
+                return {
+                    "response": {
+                        "kind": "swap_status",
+                        "status": "swap_ready",
+                        "message": "兑换交易已准备好，正在等待钱包签名并广播。",
+                        "pending_transaction": state["pending_transaction"],
+                    }
+                }
             return {
                 "response": {
                     "kind": "swap_status",
