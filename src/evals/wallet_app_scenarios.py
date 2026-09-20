@@ -871,10 +871,18 @@ def _lifecycle_invariants(
         registration_has_public_wallet_hash(registration) for registration in register_events
     )
 
+    session_id = session.get("session_id")
+    selection_path = (
+        f"/v1/swap/{session_id}/select-quote"
+        if isinstance(session_id, str) and session_id
+        else None
+    )
     selection_requests = [
         event
         for event in public_requests
-        if str(event.get("path", "")).endswith("/select-quote")
+        if event.get("method") == "POST"
+        and selection_path is not None
+        and event.get("path") == selection_path
         and isinstance(event.get("body"), Mapping)
     ]
     public_request_ids = [request.get("request_id") for request in public_requests]
@@ -901,19 +909,26 @@ def _lifecycle_invariants(
         result = matching[0]
         request_sequence = request.get("sequence")
         result_sequence = result.get("sequence")
+        request_method = request.get("method")
+        request_path = request.get("path")
+        result_method = result.get("method")
+        result_path = result.get("path")
         if (
             type(request_sequence) is not int
             or type(result_sequence) is not int
             or request_sequence >= result_sequence
             or type(result.get("http_status")) is not int
+            or not isinstance(request_method, str)
+            or not request_method
+            or not isinstance(request_path, str)
+            or not request_path
+            or not isinstance(result_method, str)
+            or not result_method
+            or not isinstance(result_path, str)
+            or not result_path
+            or result_method != request_method
+            or result_path != request_path
         ):
-            return None
-        if result.get("method") is not None and (
-            request.get("method") is None
-            or str(result["method"]).upper() != str(request["method"]).upper()
-        ):
-            return None
-        if result.get("path") is not None and result.get("path") != request.get("path"):
             return None
         return result
 

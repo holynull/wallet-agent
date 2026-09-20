@@ -20,6 +20,9 @@ def _step(operation, evidence=None, *, status=200):
 
 
 def _invariant(name, *, events=(), steps=(), manifest=None, session=None):
+    session_evidence = dict(session or {})
+    if session is not None:
+        session_evidence.setdefault("session_id", "s")
     results = _lifecycle_invariants(
         events=events,
         steps=steps,
@@ -29,7 +32,7 @@ def _invariant(name, *, events=(), steps=(), manifest=None, session=None):
             "wallet_injected_into_graph": False,
             "wallet_injected_into_app": False,
         },
-        session=session or {},
+        session=session_evidence,
         max_attempts=3,
     )
     return next(result for result in results if result.name == name)
@@ -595,6 +598,85 @@ def test_quote_selection_invariant_accepts_latest_mixed_successful_selection():
         events=events,
         session={"quote_candidates": [{}, {}]},
     ).passed
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("post", "/v1/swap/s/select-quote"),
+        ("POST", "/unexpected/v1/swap/s/select-quote"),
+    ],
+)
+def test_quote_selection_invariant_requires_post_to_exact_session_endpoint(method, path):
+    events = (
+        {
+            **_selection_request(1, "selection-endpoint", "quote-a"),
+            "method": method,
+            "path": path,
+        },
+        {
+            **_request_result(2, "selection-endpoint", 200),
+            "method": method,
+            "path": path,
+        },
+        _prepare(3, "quote-a"),
+    )
+
+    assert not _invariant(
+        "explicit_quote_selection",
+        events=events,
+        session={"quote_candidates": [{}, {}]},
+    ).passed
+
+
+@pytest.mark.parametrize(
+    ("field", "action", "value"),
+    [
+        ("method", "omit", None),
+        ("path", "omit", None),
+        ("method", "replace", None),
+        ("path", "replace", None),
+        ("method", "replace", ""),
+        ("path", "replace", ""),
+    ],
+    ids=[
+        "method-omitted",
+        "path-omitted",
+        "method-null",
+        "path-null",
+        "method-empty",
+        "path-empty",
+    ],
+)
+@pytest.mark.asyncio
+async def test_incomplete_selection_response_evidence_fails_invariant_and_report(
+    field, action, value
+):
+    runtime = await build_scenario_runtime(SCENARIOS["erc20_swap_without_approval"])
+    original_record = runtime.ledger.record
+
+    def record_with_incomplete_selection_result(actor, operation, **evidence):
+        if operation == "request_result" and str(evidence.get("path", "")).endswith(
+            "/select-quote"
+        ):
+            if action == "omit":
+                evidence.pop(field)
+            else:
+                evidence[field] = value
+        return original_record(actor, operation, **evidence)
+
+    runtime.ledger.record = record_with_incomplete_selection_result
+    try:
+        report = await drive_scenario(runtime)
+    finally:
+        await runtime.http.aclose()
+
+    selection_invariant = next(
+        result for result in report.invariants if result.name == "explicit_quote_selection"
+    )
+    assert report.failures == ()
+    assert not selection_invariant.passed
+    assert report.status == "failed"
 
 
 @pytest.mark.parametrize(
