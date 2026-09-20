@@ -243,7 +243,7 @@ POST /v1/swap/{session_id}/broadcast
 ### 自动化 Wallet App 评测
 
 本地一键评测使用 fake chain/provider 后端覆盖钱包能力链路，不读取私钥、
-助记词、signer 或生产 secret，不签名，也不广播任何主网交易。默认命令
+助记词、signer 或生产 secret，不签名，也不广播任何交易。默认命令
 适合作为 Phase 1 的确定性回归检查：
 
 ```bash

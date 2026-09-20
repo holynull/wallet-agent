@@ -266,11 +266,17 @@ def _same_swap_asset(request: SwapQuoteRequest) -> bool:
     destination = request.destination_asset
     source_address = str(source.address or "").strip().lower()
     destination_address = str(destination.address or "").strip().lower()
+    same_chain = canonical_chain(source.chain) == canonical_chain(destination.chain)
+    if not same_chain:
+        return False
+    if source_address or destination_address:
+        return bool(
+            source_address and destination_address and source_address == destination_address
+        )
     return bool(
-        source_address
-        and destination_address
-        and canonical_chain(source.chain) == canonical_chain(destination.chain)
-        and source_address == destination_address
+        _native_swap_asset(source.chain, source.symbol)
+        and _native_swap_asset(destination.chain, destination.symbol)
+        and canonical_symbol(source.symbol) == canonical_symbol(destination.symbol)
     )
 
 
@@ -504,6 +510,21 @@ def _merge_swap_slots(existing: dict[str, Any], incoming: dict[str, Any]) -> dic
                 merged.pop(field, None)
     if "input_amount" in changed and "input_amount_raw" not in changed:
         merged.pop("input_amount_raw", None)
+    for side in ("source", "destination"):
+        chain_key = f"{side}_chain"
+        symbol_key = f"{side}_symbol"
+        token_key = f"{side}_token_address"
+        if (
+            chain_key in incoming
+            and symbol_key in incoming
+            and token_key not in incoming
+            and _native_swap_asset(str(merged.get(chain_key)), str(merged.get(symbol_key)))
+            is not None
+        ):
+            merged.pop(token_key, None)
+            merged.pop(f"{side}_decimals", None)
+            for field in (f"{side}_chain_id", f"{side}_name", f"{side}_logo_url"):
+                merged.pop(field, None)
     return merged
 
 
@@ -725,6 +746,11 @@ def _native_swap_asset(chain: str, symbol: str) -> Asset | None:
         decimals=decimals,
         address=None,
     )
+
+
+def _explicit_token_address(value: Any) -> str | None:
+    address = str(value).strip() if value is not None else ""
+    return address or None
 
 
 _COMMON_TRANSFER_ASSETS: dict[tuple[str, str], Asset] = {
@@ -1099,7 +1125,14 @@ def _swap_draft_request(
     for side in ("source", "destination"):
         chain = normalized.get(f"{side}_chain")
         symbol = normalized.get(f"{side}_symbol")
-        if chain and symbol and _native_swap_asset(str(chain), str(symbol)) is None:
+        token_address = _explicit_token_address(normalized.get(f"{side}_token_address"))
+        is_native = (
+            chain
+            and symbol
+            and not token_address
+            and _native_swap_asset(str(chain), str(symbol)) is not None
+        )
+        if chain and symbol and not is_native:
             required.append(f"{side}_token_address")
     exact_out = normalized.get("output_amount") not in (None, "") and not normalized.get(
         "input_amount"
@@ -1130,12 +1163,18 @@ def _swap_draft_request(
             normalized["input_amount_raw"] = str(int(raw))
         except Exception:
             return None, ["input_amount_raw"]
-    source_native = _native_swap_asset(
-        str(normalized["source_chain"]), str(normalized["source_symbol"])
-    )
-    destination_native = _native_swap_asset(
-        str(normalized["destination_chain"]), str(normalized["destination_symbol"])
-    )
+    source_address = _explicit_token_address(normalized.get("source_token_address"))
+    destination_address = _explicit_token_address(normalized.get("destination_token_address"))
+    source_native = None
+    if not source_address:
+        source_native = _native_swap_asset(
+            str(normalized["source_chain"]), str(normalized["source_symbol"])
+        )
+    destination_native = None
+    if not destination_address:
+        destination_native = _native_swap_asset(
+            str(normalized["destination_chain"]), str(normalized["destination_symbol"])
+        )
     same_chain = canonical_chain(str(normalized["source_chain"])) == canonical_chain(
         str(normalized["destination_chain"])
     )
@@ -1146,14 +1185,10 @@ def _swap_draft_request(
         and canonical_symbol(str(normalized["source_symbol"]))
         == canonical_symbol(str(normalized["destination_symbol"]))
     )
-    source_address = normalized.get("source_token_address")
-    destination_address = normalized.get("destination_token_address")
     same_contract_asset = (
         same_chain
-        and source_native is None
-        and destination_native is None
-        and source_address not in (None, "")
-        and destination_address not in (None, "")
+        and source_address is not None
+        and destination_address is not None
         and str(source_address).strip().lower() == str(destination_address).strip().lower()
     )
     if same_native_asset or same_contract_asset:
@@ -1168,7 +1203,7 @@ def _swap_draft_request(
             ),
             "symbol": normalized["source_symbol"],
             "decimals": int(normalized["source_decimals"]),
-            "address": normalized.get("source_token_address"),
+            "address": source_address,
             **(
                 {"name": normalized["source_name"]}
                 if normalized.get("source_name") is not None
@@ -1189,7 +1224,7 @@ def _swap_draft_request(
             ),
             "symbol": normalized["destination_symbol"],
             "decimals": int(normalized["destination_decimals"]),
-            "address": normalized.get("destination_token_address"),
+            "address": destination_address,
             **(
                 {"name": normalized["destination_name"]}
                 if normalized.get("destination_name") is not None
@@ -1230,6 +1265,8 @@ async def _resolve_swap_assets(
         symbol = resolved.get(f"{side}_symbol")
         if not chain or not symbol:
             continue
+        if _explicit_token_address(resolved.get(f"{side}_token_address")):
+            continue
         native_asset = _native_swap_asset(str(chain), str(symbol))
         if native_asset is None:
             continue
@@ -1243,10 +1280,13 @@ async def _resolve_swap_assets(
         side
         for side in ("source", "destination")
         if resolved.get(f"{side}_chain") and resolved.get(f"{side}_symbol")
-        and _native_swap_asset(
-            str(resolved[f"{side}_chain"]), str(resolved[f"{side}_symbol"])
+        and (
+            _explicit_token_address(resolved.get(f"{side}_token_address"))
+            or _native_swap_asset(
+                str(resolved[f"{side}_chain"]), str(resolved[f"{side}_symbol"])
+            )
+            is None
         )
-        is None
         and not (
             resolved.get(f"{side}_token_address")
             and resolved.get(f"{side}_decimals") is not None
@@ -1263,9 +1303,10 @@ async def _resolve_swap_assets(
         symbol = resolved.get(f"{side}_symbol")
         if not chain or not symbol:
             continue
-        if _native_swap_asset(str(chain), str(symbol)) is not None:
+        explicit_address = _explicit_token_address(resolved.get(f"{side}_token_address"))
+        if not explicit_address and _native_swap_asset(str(chain), str(symbol)) is not None:
             continue
-        if resolved.get(f"{side}_token_address") and resolved.get(f"{side}_decimals") is not None:
+        if explicit_address and resolved.get(f"{side}_decimals") is not None:
             continue
         matches: list[Asset] = []
         query = AssetQuery(chain=canonical_chain(str(chain)), search=canonical_symbol(str(symbol)))
@@ -1287,6 +1328,10 @@ async def _resolve_swap_assets(
             if asset.address
             and canonical_chain(str(asset.chain)) == canonical_chain(str(chain))
             and canonical_symbol(str(asset.symbol)) == canonical_symbol(str(symbol))
+            and (
+                explicit_address is None
+                or str(asset.address).strip().lower() == explicit_address.lower()
+            )
         }
         if len(unique) == 1:
             asset = next(iter(unique.values()))

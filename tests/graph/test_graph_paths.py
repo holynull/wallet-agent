@@ -14,6 +14,7 @@ from wallet_agent.domain.models import (
 from wallet_agent.graph.build import build_graph
 from wallet_agent.graph.nodes import (
     GraphRuntime,
+    _merge_swap_slots,
     _resolve_swap_assets,
     _swap_draft_request,
     make_nodes,
@@ -71,6 +72,16 @@ class FakeProvider:
             provider=self.provider_name,
             provider_reference=quote.provider_reference,
         )
+
+
+class AssetDiscoveryProvider(FakeProvider):
+    def __init__(self, name: str, assets: list[Asset]):
+        super().__init__(name)
+        self.assets = assets
+
+    async def list_assets(self, query):
+        self.calls.append(("list_assets", query))
+        return self.assets
 
 
 class ZeroOutputProvider(FakeProvider):
@@ -304,6 +315,123 @@ async def test_swap_asset_resolution_accepts_native_source_without_contract_addr
     assert request is not None
     assert request.input_amount_raw == "100000000000000000"
     assert request.source_asset.address is None
+
+
+@pytest.mark.asyncio
+async def test_swap_asset_resolution_preserves_explicit_source_contract_named_like_native():
+    bnb_contract_address = "0x" + "b" * 40
+    provider = AssetDiscoveryProvider(
+        "catalog",
+        [
+            Asset(
+                chain="BSC",
+                chain_id=56,
+                symbol="BNB",
+                decimals=9,
+                address=bnb_contract_address,
+                name="BNB Token",
+            )
+        ],
+    )
+
+    resolved, candidates, errors = await _resolve_swap_assets(
+        {
+            "source_chain": "BSC",
+            "source_symbol": "BNB",
+            "source_token_address": bnb_contract_address,
+            "destination_chain": "BSC",
+            "destination_symbol": "BNB",
+            "input_amount": "1",
+        },
+        {"catalog": provider},
+    )
+
+    assert candidates == []
+    assert errors == []
+    assert resolved["source_token_address"] == bnb_contract_address
+    assert resolved["source_decimals"] == 9
+    assert resolved["destination_decimals"] == 18
+    assert resolved.get("destination_token_address") is None
+
+    request, missing = _swap_draft_request(
+        resolved,
+        {"address": "0x" + "1" * 40, "chain": "BSC", "chain_id": 56},
+    )
+    assert missing == []
+    assert request is not None
+    assert request.source_asset.address == bnb_contract_address
+    assert request.source_asset.decimals == 9
+    assert request.destination_asset.address is None
+    assert request.input_amount_raw == "1000000000"
+
+
+@pytest.mark.asyncio
+async def test_swap_asset_resolution_preserves_explicit_destination_contract_named_like_native():
+    bnb_contract_address = "0x" + "c" * 40
+    provider = AssetDiscoveryProvider(
+        "catalog",
+        [
+            Asset(
+                chain="BSC",
+                chain_id=56,
+                symbol="BNB",
+                decimals=9,
+                address=bnb_contract_address,
+                name="BNB Token",
+            )
+        ],
+    )
+
+    resolved, candidates, errors = await _resolve_swap_assets(
+        {
+            "source_chain": "BSC",
+            "source_symbol": "BNB",
+            "destination_chain": "BSC",
+            "destination_symbol": "BNB",
+            "destination_token_address": bnb_contract_address,
+            "input_amount": "1",
+        },
+        {"catalog": provider},
+    )
+
+    assert candidates == []
+    assert errors == []
+    assert resolved["source_decimals"] == 18
+    assert resolved.get("source_token_address") is None
+    assert resolved["destination_token_address"] == bnb_contract_address
+    assert resolved["destination_decimals"] == 9
+
+    request, missing = _swap_draft_request(
+        resolved,
+        {"address": "0x" + "1" * 40, "chain": "BSC", "chain_id": 56},
+    )
+    assert missing == []
+    assert request is not None
+    assert request.source_asset.address is None
+    assert request.destination_asset.address == bnb_contract_address
+    assert request.destination_asset.decimals == 9
+
+
+def test_swap_native_correction_clears_stale_same_symbol_token_metadata():
+    existing = {
+        "source_chain": "ETH",
+        "source_symbol": "USDT",
+        "source_token_address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+        "source_decimals": 6,
+        "destination_chain": "BSC",
+        "destination_symbol": "BNB",
+        "destination_token_address": "0x" + "d" * 40,
+        "destination_decimals": 9,
+        "input_amount": "1",
+    }
+
+    merged = _merge_swap_slots(
+        existing,
+        {"destination_chain": "BSC", "destination_symbol": "BNB"},
+    )
+
+    assert "destination_token_address" not in merged
+    assert "destination_decimals" not in merged
 
 
 @pytest.mark.asyncio
