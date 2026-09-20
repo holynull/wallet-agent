@@ -72,6 +72,27 @@ def _prepare(sequence, reference):
     }
 
 
+@pytest.mark.parametrize("scenario_id", SCENARIOS)
+@pytest.mark.parametrize("max_attempts", [0, -1])
+@pytest.mark.asyncio
+async def test_run_scenario_rejects_non_positive_max_attempts(
+    scenario_id, max_attempts
+):
+    with pytest.raises(ValueError, match=r"^max_attempts must be >= 1$"):
+        await run_scenario(scenario_id, max_attempts=max_attempts)
+
+
+@pytest.mark.parametrize("max_attempts", [0, -1])
+@pytest.mark.asyncio
+async def test_drive_scenario_rejects_non_positive_max_attempts(max_attempts):
+    runtime = await build_scenario_runtime(SCENARIOS["erc20_swap_without_approval"])
+    try:
+        with pytest.raises(ValueError, match=r"^max_attempts must be >= 1$"):
+            await drive_scenario(runtime, max_attempts=max_attempts)
+    finally:
+        await runtime.http.aclose()
+
+
 @pytest.mark.parametrize("scenario_id", ["erc20_swap_without_approval", "erc20_swap_with_approval"])
 @pytest.mark.asyncio
 async def test_happy_paths_complete_through_public_wallet_app_contract(scenario_id):

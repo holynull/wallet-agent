@@ -1413,6 +1413,8 @@ async def _status_turn(client: WalletAppClient) -> dict[str, Any]:
 
 
 async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> LifecycleReport:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
     definition = runtime.definition
     client = runtime.client
     failures: list[str] = []
