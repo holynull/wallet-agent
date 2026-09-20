@@ -36,6 +36,7 @@ class EvalCase:
     turns: tuple[str, ...]
     offline_outputs: tuple[dict[str, Any], ...]
     expected: dict[str, Any]
+    dimensions: tuple[str, ...] = ()
 
 
 class FixedOutputModel:
@@ -140,26 +141,34 @@ class FakeSwapProvider:
         self.prepare_calls = 0
         self.broadcast_calls = 0
         self.assets = {
-            "USDC": Asset(
+            ("BASE", "USDC"): Asset(
                 chain="BASE",
                 chain_id=8453,
                 symbol="USDC",
                 decimals=6,
                 address=USDC_ADDRESS,
             ),
-            "USDT": Asset(
+            ("BASE", "USDT"): Asset(
                 chain="BASE",
                 chain_id=8453,
                 symbol="USDT",
                 decimals=6,
                 address=USDT_ADDRESS,
             ),
+            ("ETH", "USDT"): Asset(
+                chain="ETH",
+                chain_id=1,
+                symbol="USDT",
+                decimals=6,
+                address="0xdac17f958d2ee523a2206206994597c13d831ec7",
+            ),
         }
 
     async def list_assets(self, query: AssetQuery) -> list[Asset]:
         symbol = str(query.search or "").upper()
-        asset = self.assets.get(symbol)
-        if asset is None or (query.chain and query.chain.upper() != asset.chain.upper()):
+        chain = str(query.chain or "BASE").upper()
+        asset = self.assets.get((chain, symbol))
+        if asset is None:
             return []
         return [asset]
 
@@ -529,6 +538,39 @@ CASES = (
             "forbid_broadcast": True,
         },
     ),
+    EvalCase(
+        id="swap_eth_usdt_to_bsc_bnb_multiturn",
+        capability="swap",
+        turns=("把 10usdt 换成bnb", "用以太链上的usdt 换bnb", "目标链在bsc"),
+        offline_outputs=(
+            {
+                "intent": "swap_quote",
+                "source_symbol": "USDT",
+                "destination_symbol": "BNB",
+                "input_amount": "10",
+            },
+            {"intent": "swap_quote", "source_chain": "ETH"},
+            {"intent": "swap_quote", "destination_chain": "BSC"},
+        ),
+        expected={
+            "response_kind": "swap_quote",
+            "equals": {
+                "swap_request.source_asset.chain": "ETH",
+                "swap_request.destination_asset.chain": "BSC",
+                "swap_request.destination_asset.symbol": "BNB",
+                "swap_request.destination_asset.address": None,
+                "active_task.slots.input_amount": "10",
+            },
+            "side_effects": {"quote_calls": 1},
+            "forbid_prepare": True,
+            "forbid_broadcast": True,
+        },
+        dimensions=(
+            "conversation_understanding",
+            "state_and_resume",
+            "asset_and_chain_resolution",
+        ),
+    ),
 )
 
 
@@ -636,6 +678,7 @@ async def _run_case(case: EvalCase, model: Any) -> dict[str, Any]:
         "capability": case.capability,
         "passed": not failures,
         "failures": failures,
+        "dimensions": list(case.dimensions),
         "response_kind": _path_value(state, "response.kind"),
         "intent": state.get("intent"),
         "missing_fields": state.get("missing_fields", []),
@@ -657,6 +700,19 @@ async def _run_suite(
             "passed": passed,
             "pass_rate": passed / len(selected),
         }
+    dimension_names = sorted(
+        {dimension for item in results for dimension in item.get("dimensions", [])}
+    )
+    dimensions = {}
+    for dimension in dimension_names:
+        selected = [item for item in results if dimension in item.get("dimensions", [])]
+        passed = sum(bool(item["passed"]) for item in selected)
+        dimensions[dimension] = {
+            "total": len(selected),
+            "passed": passed,
+            "failed": len(selected) - passed,
+            "pass_rate": passed / len(selected),
+        }
     passed = sum(bool(item["passed"]) for item in results)
     return {
         "mode": mode,
@@ -667,6 +723,7 @@ async def _run_suite(
             "pass_rate": passed / len(results),
         },
         "capabilities": capabilities,
+        "dimensions": dimensions,
         "cases": results,
         "safety": {"signing": False, "broadcasting": False, "real_providers": False},
     }

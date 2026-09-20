@@ -7,11 +7,16 @@ from evals.wallet_agent_evals import evaluate_expectations, run_offline_evals
 async def test_offline_evals_cover_balance_transfer_and_swap_capabilities():
     report = await run_offline_evals()
 
-    assert report["summary"] == {"total": 14, "passed": 14, "pass_rate": 1.0}
+    assert report["summary"] == {"total": 15, "passed": 15, "pass_rate": 1.0}
     assert report["capabilities"] == {
         "balance": {"total": 2, "passed": 2, "pass_rate": 1.0},
         "transfer": {"total": 3, "passed": 3, "pass_rate": 1.0},
-        "swap": {"total": 9, "passed": 9, "pass_rate": 1.0},
+        "swap": {"total": 10, "passed": 10, "pass_rate": 1.0},
+    }
+    assert report["dimensions"] == {
+        "asset_and_chain_resolution": {"total": 1, "passed": 1, "failed": 0, "pass_rate": 1.0},
+        "conversation_understanding": {"total": 1, "passed": 1, "failed": 0, "pass_rate": 1.0},
+        "state_and_resume": {"total": 1, "passed": 1, "failed": 0, "pass_rate": 1.0},
     }
     assert {item["id"] for item in report["cases"]} == {
         "balance_native",
@@ -28,8 +33,24 @@ async def test_offline_evals_cover_balance_transfer_and_swap_capabilities():
         "balance_during_swap_preserves_task",
         "transfer_compact_amount",
         "swap_symbol_typo",
+        "swap_eth_usdt_to_bsc_bnb_multiturn",
     }
     assert all(item["failures"] == [] for item in report["cases"])
+
+
+@pytest.mark.asyncio
+async def test_offline_evals_score_native_asset_multiturn_regression():
+    report = await run_offline_evals()
+    case = next(
+        item
+        for item in report["cases"]
+        if item["id"] == "swap_eth_usdt_to_bsc_bnb_multiturn"
+    )
+
+    assert case["passed"] is True
+    assert case["response_kind"] == "swap_quote"
+    assert "asset_and_chain_resolution" in case["dimensions"]
+    assert report["dimensions"]["asset_and_chain_resolution"]["failed"] == 0
 
 
 def test_expectation_scoring_reports_wrong_state_and_unsafe_side_effects():
