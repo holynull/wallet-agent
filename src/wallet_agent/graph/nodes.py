@@ -698,6 +698,79 @@ def _native_symbol(chain: str, wallet_context: dict[str, Any] | None) -> str | N
     }.get(chain.upper())
 
 
+_COMMON_TRANSFER_ASSETS: dict[tuple[str, str], Asset] = {
+    ("ETH", "USDC"): Asset(
+        chain="ETH",
+        chain_id=1,
+        symbol="USDC",
+        decimals=6,
+        address="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        name="USD Coin",
+    ),
+    ("ETH", "USDT"): Asset(
+        chain="ETH",
+        chain_id=1,
+        symbol="USDT",
+        decimals=6,
+        address="0xdAC17F958D2ee523a2206206994597C13D831ec7",
+        name="Tether USD",
+    ),
+}
+
+
+async def _resolve_transfer_asset(
+    draft: dict[str, Any], providers: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Fill transfer token metadata from trusted common assets or providers."""
+    resolved = dict(draft)
+    chain = resolved.get("transfer_chain") or resolved.get("chain")
+    symbol = resolved.get("transfer_symbol") or resolved.get("symbol")
+    if not chain or not symbol:
+        return resolved
+    canonical_chain_name = canonical_chain(str(chain))
+    canonical_symbol_name = canonical_symbol(str(symbol))
+    if _native_symbol(canonical_chain_name, None) == canonical_symbol_name:
+        return resolved
+    if resolved.get("transfer_token_address") and resolved.get("transfer_decimals") is not None:
+        return resolved
+
+    asset = _COMMON_TRANSFER_ASSETS.get((canonical_chain_name, canonical_symbol_name))
+    if asset is None:
+        matches: list[Asset] = []
+        for provider in providers.values():
+            if not hasattr(provider, "list_assets"):
+                continue
+            try:
+                matches.extend(
+                    await provider.list_assets(
+                        AssetQuery(
+                            chain=canonical_chain_name,
+                            search=canonical_symbol_name,
+                        )
+                    )
+                )
+            except Exception:
+                continue
+        unique = {
+            (str(item.address).lower(), int(item.decimals)): item
+            for item in matches
+            if item.address
+            and canonical_chain(str(item.chain)) == canonical_chain_name
+            and canonical_symbol(str(item.symbol)) == canonical_symbol_name
+        }
+        if len(unique) == 1:
+            asset = next(iter(unique.values()))
+    if asset is None:
+        return resolved
+    resolved["transfer_chain"] = canonical_chain_name
+    resolved["transfer_symbol"] = asset.symbol
+    resolved["transfer_token_address"] = asset.address
+    resolved["transfer_decimals"] = asset.decimals
+    if asset.chain_id is not None:
+        resolved["transfer_chain_id"] = asset.chain_id
+    return resolved
+
+
 def _transfer_draft_request(
     draft: dict[str, Any], wallet_context: dict[str, Any] | None
 ) -> tuple[TransferRequest | None, list[str]]:
@@ -2324,6 +2397,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 if active_task and active_task.get("kind") == "transfer"
                 else dict(state.get("transfer_draft") or {})
             )
+            draft = await _resolve_transfer_asset(draft, runtime.providers)
             request_model, missing = _transfer_draft_request(draft, state.get("wallet_context"))
             if request_model is None:
                 labels = ", ".join(missing)

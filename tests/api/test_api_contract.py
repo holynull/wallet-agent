@@ -483,6 +483,44 @@ async def test_failed_swap_quote_session_is_not_marked_completed():
 
 
 @pytest.mark.asyncio
+async def test_parameter_clarification_projects_collecting_session_status():
+    class ClarificationGraph:
+        async def astream(self, _value, *, config, stream_mode):
+            del config, stream_mode
+            yield {"response": {"kind": "clarification"}}
+
+        def get_state(self, _config):
+            class Snapshot:
+                values = {
+                    "active_task": {
+                        "kind": "transfer",
+                        "stage": "collecting_parameters",
+                    },
+                    "task_stage": "collecting_parameters",
+                    "response": {"kind": "clarification"},
+                }
+                tasks = ()
+                next = ()
+
+            return Snapshot()
+
+    app, client = await client_for(graph=ClarificationGraph())
+    async with client:
+        response = await client.post(
+            "/v1/agent/turn",
+            json={"user_id": "alice", "message": "给地址转 1 USDC"},
+        )
+        await app.state.runs[response.json()["run_id"]]["task"]
+        session = await client.get(
+            f"/v1/swap/{response.json()['session_id']}", params={"user_id": "alice"}
+        )
+
+    assert session.status_code == 200
+    assert session.json()["status"] == "collecting_parameters"
+    assert session.json()["stage"] == "collecting_parameters"
+
+
+@pytest.mark.asyncio
 async def test_unsupported_chain_error_is_stable():
     class Registry:
         def get_adapter(self, chain):

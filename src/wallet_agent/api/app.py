@@ -369,6 +369,7 @@ def create_app(
         state: Mapping[str, Any],
         *,
         status: str | None = None,
+        run_id: str | None = None,
     ) -> SwapSessionRecord | None:
         """Project only normalized graph values into the app-facing session index."""
         if not session_id:
@@ -446,6 +447,8 @@ def create_app(
             changes["gas_estimate"] = _jsonable(state["swap_gas_estimate"])
         if status:
             changes["status"] = status
+        if run_id:
+            changes["last_run_id"] = run_id
         if not changes:
             return current
         try:
@@ -519,7 +522,7 @@ def create_app(
                     and result.get("selected_quote")
                     and not result.get("pending_transaction")
                 ):
-                    await project_session(session_id, result, status="quoted")
+                    await project_session(session_id, result, status="quoted", run_id=run_id)
                     result = await execute(
                         {
                             "request": result.get("request"),
@@ -544,7 +547,9 @@ def create_app(
                     app.state.runs[run_id]["events"].append(
                         {"event": "action_required", "state": result}
                     )
-                    await project_session(session_id, result, status="awaiting_confirmation")
+                    await project_session(
+                        session_id, result, status="awaiting_confirmation", run_id=run_id
+                    )
                 else:
                     app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
                     app.state.runs[run_id]["status"] = "complete"
@@ -566,7 +571,12 @@ def create_app(
                         session_status = "quote_failed"
                     elif response_kind == "swap_quote" and not result.get("selected_quote"):
                         session_status = "quoted"
-                    await project_session(session_id, result, status=session_status)
+                    elif response_kind == "clarification":
+                        active_task = result.get("active_task") or {}
+                        task_stage = result.get("task_stage") or active_task.get("stage")
+                        if task_stage == "collecting_parameters":
+                            session_status = "collecting_parameters"
+                    await project_session(session_id, result, status=session_status, run_id=run_id)
             if app.state.runs[run_id]["status"] == "running":
                 app.state.runs[run_id]["status"] = "complete"
         except _GraphInterruptConflict as exc:

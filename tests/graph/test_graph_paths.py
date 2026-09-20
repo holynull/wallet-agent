@@ -540,6 +540,42 @@ async def test_conversational_transfer_extracts_fields_and_returns_preflight():
 
 
 @pytest.mark.asyncio
+async def test_conversational_eth_usdc_transfer_resolves_common_token_metadata():
+    graph = build_graph(
+        model=SwapExtractionModel(
+            {
+                "intent": "transfer",
+                "transfer_chain": "ETH",
+                "transfer_symbol": "USDC",
+                "transfer_amount": "1",
+                "transfer_recipient": "0x" + "2" * 40,
+            }
+        ),
+        chains={"ETH": TransferAdapter()},
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "transfer-eth-usdc",
+            "user_id": "u1",
+            "message": "给地址转 1 USDC",
+            "wallet_context": {
+                "address": "0x" + "1" * 40,
+                "chain": "ETH",
+                "chain_id": 1,
+            },
+        },
+        config={"configurable": {"thread_id": "transfer-eth-usdc"}},
+    )
+
+    assert result["response"]["kind"] == "transfer_prepare"
+    assert result["transfer_request"]["token"]["address"] == (
+        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+    )
+    assert result["transfer_request"]["token"]["decimals"] == 6
+    assert result["transfer_request"]["amount_raw"] == "1000000"
+
+
+@pytest.mark.asyncio
 async def test_conversational_transfer_asks_for_missing_recipient():
     graph = build_graph(
         model=SwapExtractionModel(
