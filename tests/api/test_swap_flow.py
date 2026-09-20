@@ -152,7 +152,7 @@ async def test_broadcast_is_idempotent_and_conflicting_hash_is_rejected():
 
 
 @pytest.mark.asyncio
-async def test_broadcast_rejects_hash_missing_from_chain_before_provider_registration():
+async def test_broadcast_accepts_hash_temporarily_missing_from_chain():
     class BroadcastAdapter:
         async def get_transaction_receipt(self, _tx_hash):
             return None
@@ -176,8 +176,77 @@ async def test_broadcast_rejects_hash_missing_from_chain_before_provider_registr
             json={"user_id": "alice", "chain": "BASE", "tx_hash": tx_hash},
         )
 
+    assert broadcast.status_code == 200
+    assert broadcast.json()["status"] == "broadcast_pending"
+    assert broadcast.json()["broadcast_tx_hash"] == tx_hash
+    assert provider.broadcast_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_broadcast_retries_rpc_visibility_before_marking_pending():
+    class EventuallyVisibleAdapter:
+        def __init__(self):
+            self.receipt_calls = 0
+            self.transaction_calls = 0
+
+        async def get_transaction_receipt(self, _tx_hash):
+            self.receipt_calls += 1
+            return None
+
+        async def get_transaction(self, _tx_hash):
+            self.transaction_calls += 1
+            if self.transaction_calls < 2:
+                return None
+            return {"hash": _tx_hash}
+
+    app, _client, provider = await make_client()
+    adapter = EventuallyVisibleAdapter()
+    app.state.chain_registry = ChainAdapterRegistry({"BASE": adapter})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/v1/agent/turn", json=request_payload())
+        body = response.json()
+        await app.state.runs[body["run_id"]]["task"]
+        session_id = body["session_id"]
+        await client.post(
+            f"/v1/swap/{session_id}/confirm", json={"user_id": "alice", "approved": True}
+        )
+        tx_hash = "0x" + "c" * 64
+        broadcast = await client.post(
+            f"/v1/swap/{session_id}/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": tx_hash},
+        )
+
+    assert broadcast.status_code == 200
+    assert broadcast.json()["status"] == "broadcast_pending"
+    assert adapter.receipt_calls == 2
+    assert adapter.transaction_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_broadcast_rejects_explicitly_failed_receipt():
+    class FailedReceiptAdapter:
+        async def get_transaction_receipt(self, _tx_hash):
+            return {"status": "0x0"}
+
+    app, client, provider = await make_client()
+    app.state.chain_registry = ChainAdapterRegistry({"BASE": FailedReceiptAdapter()})
+    async with client:
+        response = await client.post("/v1/agent/turn", json=request_payload())
+        body = response.json()
+        await app.state.runs[body["run_id"]]["task"]
+        session_id = body["session_id"]
+        await client.post(
+            f"/v1/swap/{session_id}/confirm", json={"user_id": "alice", "approved": True}
+        )
+        broadcast = await client.post(
+            f"/v1/swap/{session_id}/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": "0x" + "d" * 64},
+        )
+
     assert broadcast.status_code == 409
-    assert broadcast.json()["code"] == "TRANSACTION_NOT_FOUND"
+    assert broadcast.json()["code"] == "TRANSACTION_FAILED"
     assert provider.broadcast_calls == 0
 
 

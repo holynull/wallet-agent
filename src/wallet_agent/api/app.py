@@ -51,6 +51,9 @@ _AGENT_TEST_INTENTS = {
     "asset_discovery",
 }
 
+_BROADCAST_RPC_ATTEMPTS = 3
+_BROADCAST_RPC_DELAY_SECONDS = 0.2
+
 
 class TurnRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -149,6 +152,32 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     return value
+
+
+async def _chain_broadcast_status(adapter: Any, tx_hash: str) -> str:
+    """Classify a wallet-returned hash without treating RPC propagation as failure."""
+    last_error: Exception | None = None
+    receipt_lookup_succeeded = False
+    for attempt in range(_BROADCAST_RPC_ATTEMPTS):
+        try:
+            receipt = await adapter.get_transaction_receipt(tx_hash)
+            receipt_lookup_succeeded = True
+            if receipt is not None:
+                success = receipt_success(receipt)
+                if success is False:
+                    return "failed"
+                return "broadcasted" if success is True else "broadcast_pending"
+            if hasattr(adapter, "get_transaction"):
+                transaction = await adapter.get_transaction(tx_hash)
+                if transaction is not None:
+                    return "broadcast_pending"
+        except Exception as exc:
+            last_error = exc
+        if attempt + 1 < _BROADCAST_RPC_ATTEMPTS:
+            await asyncio.sleep(_BROADCAST_RPC_DELAY_SECONDS)
+    if last_error is not None and not receipt_lookup_succeeded:
+        raise last_error
+    return "broadcast_pending"
 
 
 def _qualified_hash(chain: str, tx_hash: str) -> bool:
@@ -715,29 +744,17 @@ def create_app(
                 adapter = None
             if adapter is not None and hasattr(adapter, "get_transaction_receipt"):
                 try:
-                    receipt = await adapter.get_transaction_receipt(payload.tx_hash)
-                    if receipt is not None:
-                        if receipt_success(receipt) is False:
-                            raise HTTPException(
-                                status_code=409,
-                                detail={
-                                    "code": "TRANSACTION_FAILED",
-                                    "message": "链上交易已确认失败，请检查钱包和交易参数。",
-                                    "details": {"tx_hash": payload.tx_hash},
-                                },
-                            )
-                    elif hasattr(adapter, "get_transaction"):
-                        transaction = await adapter.get_transaction(payload.tx_hash)
-                        if transaction is None:
-                            raise HTTPException(
-                                status_code=409,
-                                detail={
-                                    "code": "TRANSACTION_NOT_FOUND",
-                                    "message": "链上节点尚未看到这笔交易，请确认钱包广播是否成功。",
-                                    "details": {"tx_hash": payload.tx_hash},
-                                },
-                            )
-                        broadcast_status = "broadcast_pending"
+                    chain_status = await _chain_broadcast_status(adapter, payload.tx_hash)
+                    if chain_status == "failed":
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "TRANSACTION_FAILED",
+                                "message": "链上交易已确认失败，请检查钱包和交易参数。",
+                                "details": {"tx_hash": payload.tx_hash},
+                            },
+                        )
+                    broadcast_status = chain_status
                 except HTTPException:
                     raise
                 except Exception as exc:

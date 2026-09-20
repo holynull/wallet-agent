@@ -63,6 +63,7 @@ async def test_mobile_demo_page_is_served_by_api_app():
         "request.maxPriorityFeePerGas = transactionValue(transaction.max_priority_fee_per_gas)"
         in response.text
     )
+    assert "Swap 已提交，正在等待节点确认" in response.text
 
 
 @pytest.mark.asyncio

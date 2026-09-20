@@ -718,7 +718,7 @@
   }
   function renderSwap(transaction) {
     const card = document.createElement('div'); card.className = 'card'; const title = document.createElement('h3'); title.textContent = '兑换交易已准备好'; const pre = document.createElement('pre'); pre.textContent = json(transaction); const actions = document.createElement('div'); actions.className = 'card-actions';
-    const sign = document.createElement('button'); sign.dataset.walletAction = 'true'; sign.textContent = '钱包签名并广播 Swap'; sign.onclick = async () => { sign.disabled = true; try { const hash = await sendUnsignedTransaction(transaction); await api(`/v1/swap/${state.sessionId}/broadcast`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo', chain: transaction.chain, tx_hash: hash }) }); addMessage('assistant', `Swap 已广播：${hash}`); } catch (error) { sign.disabled = false; addMessage('assistant', `Swap 失败：${error.message}`); } };
+    const sign = document.createElement('button'); sign.dataset.walletAction = 'true'; sign.textContent = '钱包签名并广播 Swap'; sign.onclick = async () => { sign.disabled = true; try { const hash = await sendUnsignedTransaction(transaction); const result = await api(`/v1/swap/${state.sessionId}/broadcast`, { method: 'POST', headers: jsonHeaders(), body: JSON.stringify({ user_id: 'browser-demo', chain: transaction.chain, tx_hash: hash }) }); addMessage('assistant', result?.status === 'broadcast_pending' ? `Swap 已提交，正在等待节点确认：${hash}` : `Swap 已广播：${hash}`); } catch (error) { sign.disabled = false; addMessage('assistant', `Swap 失败：${error.message}`); } };
     actions.append(sign); card.append(title, pre, actions); addCard('swap', card);
   }
   function renderTransfer(transaction) {
