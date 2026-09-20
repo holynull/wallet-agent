@@ -541,7 +541,7 @@ CASES = (
     EvalCase(
         id="swap_eth_usdt_to_bsc_bnb_multiturn",
         capability="swap",
-        turns=("把 10usdt 换成bnb", "用以太链上的usdt 换bnb", "目标链在bsc"),
+        turns=("把 10usdt 换成bnb", "从以太换上换"),
         offline_outputs=(
             {
                 "intent": "swap_quote",
@@ -550,7 +550,6 @@ CASES = (
                 "input_amount": "10",
             },
             {"intent": "swap_quote", "source_chain": "ETH"},
-            {"intent": "swap_quote", "destination_chain": "BSC"},
         ),
         expected={
             "response_kind": "swap_quote",

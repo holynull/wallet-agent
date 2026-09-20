@@ -329,6 +329,100 @@ async def test_swap_suggests_known_source_chain_instead_of_different_wallet_chai
 
 
 @pytest.mark.asyncio
+async def test_swap_infers_unique_native_destination_chain_after_source_chain_follow_up():
+    model = UnderstandingModel(
+        ["swap_quote", "clarification"],
+        swap=[
+            SwapSlotPatch(
+                source_symbol="USDT",
+                destination_symbol="BNB",
+                input_amount="10",
+            ),
+            SwapSlotPatch(source_chain="ETH"),
+        ],
+    )
+    provider = EthereumCatalogProvider()
+    graph = build_graph(model=model, providers=[provider])
+    config = {"configurable": {"thread_id": "unique-native-destination-chain"}}
+
+    first = await graph.ainvoke(turn("把 10usdt 换成bnb"), config=config)
+    second = await graph.ainvoke(turn("从以太换上换"), config=config)
+
+    assert first["response"]["kind"] == "clarification"
+    assert first["active_task"]["slots"]["destination_chain"] == "BSC"
+    assert second["response"]["kind"] == "swap_quote"
+    assert second["active_task"]["revision"] == 2
+    assert second["active_task"]["slots"]["destination_chain"] == "BSC"
+    assert second["swap_request"]["destination_asset"] == {
+        "chain": "BSC",
+        "chain_id": 56,
+        "symbol": "BNB",
+        "address": None,
+        "decimals": 18,
+        "name": None,
+        "logo_url": None,
+    }
+    assert provider.quote_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_swap_does_not_infer_ambiguous_eth_destination_chain():
+    model = UnderstandingModel(
+        ["swap_quote"],
+        swap=[
+            SwapSlotPatch(
+                source_chain="BASE",
+                source_symbol="USDC",
+                destination_symbol="ETH",
+                input_amount="1",
+            )
+        ],
+    )
+    provider = Provider()
+    graph = build_graph(model=model, providers=[provider])
+
+    result = await graph.ainvoke(
+        turn("在 Base 用 1 USDC 换 ETH"),
+        config={"configurable": {"thread_id": "ambiguous-native-destination-chain"}},
+    )
+
+    assert result["response"]["kind"] == "clarification"
+    assert "destination_chain" in result["response"]["missing_fields"]
+    assert "destination_chain" not in result["active_task"]["slots"]
+    assert provider.quote_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_swap_explicit_token_address_prevents_native_chain_inference():
+    explicit_bnb_token = "0x" + "b" * 40
+    model = UnderstandingModel(
+        ["swap_quote"],
+        swap=[
+            SwapSlotPatch(
+                source_chain="ETH",
+                source_symbol="USDT",
+                destination_symbol="BNB",
+                destination_token_address=explicit_bnb_token,
+                input_amount="10",
+            )
+        ],
+    )
+    provider = EthereumCatalogProvider()
+    graph = build_graph(model=model, providers=[provider])
+
+    result = await graph.ainvoke(
+        turn("用 ETH 上的 10 USDT 换合约 BNB"),
+        config={"configurable": {"thread_id": "explicit-token-is-not-native"}},
+    )
+
+    assert result["response"]["kind"] == "clarification"
+    assert "destination_chain" in result["response"]["missing_fields"]
+    assert result["active_task"]["slots"]["destination_token_address"] == explicit_bnb_token
+    assert "destination_chain" not in result["active_task"]["slots"]
+    assert provider.quote_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_transient_balance_query_preserves_active_swap_task():
     model = UnderstandingModel(
         ["swap_quote", "wallet_query"],

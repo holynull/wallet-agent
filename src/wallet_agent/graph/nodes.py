@@ -731,6 +731,19 @@ _NATIVE_ASSET_DECIMALS = {
 }
 
 
+def _unique_native_chain(symbol: str, explicit_address: Any = None) -> str | None:
+    """Return a chain only when a symbol identifies one supported native asset."""
+    if _explicit_token_address(explicit_address):
+        return None
+    canonical_symbol_name = canonical_symbol(symbol)
+    matches = [
+        chain
+        for chain in _NATIVE_ASSET_DECIMALS
+        if _native_symbol(chain, None) == canonical_symbol_name
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _native_swap_asset(chain: str, symbol: str) -> Asset | None:
     canonical_chain_name = canonical_chain(chain)
     canonical_symbol_name = canonical_symbol(symbol)
@@ -1260,6 +1273,16 @@ async def _resolve_swap_assets(
     asset_providers = {
         name: provider for name, provider in providers.items() if hasattr(provider, "list_assets")
     }
+    for side in ("source", "destination"):
+        chain_key = f"{side}_chain"
+        symbol = resolved.get(f"{side}_symbol")
+        if resolved.get(chain_key) or not symbol:
+            continue
+        inferred_chain = _unique_native_chain(
+            str(symbol), resolved.get(f"{side}_token_address")
+        )
+        if inferred_chain is not None:
+            resolved[chain_key] = inferred_chain
     for side in ("source", "destination"):
         chain = resolved.get(f"{side}_chain")
         symbol = resolved.get(f"{side}_symbol")
