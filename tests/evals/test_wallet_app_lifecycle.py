@@ -4,6 +4,13 @@ from dataclasses import replace
 import httpx
 import pytest
 
+from evals.wallet_app_evals import (
+    aggregate_reports,
+    exit_code,
+    main,
+    run_definition,
+    run_wallet_app_evals,
+)
 from evals.wallet_app_scenarios import (
     SCENARIOS,
     _lifecycle_invariants,
@@ -164,6 +171,62 @@ def test_signing_material_invariant_recurses_through_public_evidence(evidence):
 def test_safe_evidence_accepts_only_redacted_forbidden_fields():
     assert _safe_evidence({"outer": [{"signature": "[REDACTED]"}]})
     assert not _safe_evidence({"outer": [{"label": "signed_raw_transaction"}]})
+
+
+@pytest.mark.asyncio
+async def test_wallet_app_report_has_stable_schema_dimensions_and_ten_scenarios():
+    report = await run_wallet_app_evals()
+
+    assert report["schema_version"] == 1
+    assert report["mode"] == "offline-wallet-app"
+    assert report["summary"] == {"total": 10, "passed": 10, "failed": 0, "blocked": 0}
+    assert report["dimensions"]["wallet_api_contract"] == {"total": 10, "passed": 10}
+    assert report["dimensions"]["broadcast_and_confirmation"] == {"total": 8, "passed": 8}
+    assert report["dimensions"]["safety"] == {"total": 10, "passed": 10}
+    assert {item["id"] for item in report["scenarios"]} == {
+        "erc20_swap_without_approval",
+        "erc20_swap_with_approval",
+        "approval_pending_restart_resume",
+        "wallet_rejects_approval",
+        "wallet_rejects_swap",
+        "swap_temporarily_not_visible",
+        "swap_reverted",
+        "duplicate_and_conflicting_swap_hash",
+        "provider_register_timeout_then_retry",
+        "omnibridge_erc20_deposit_order",
+    }
+    assert all(item["invariants"] for item in report["scenarios"])
+    assert "private_key" not in json.dumps(report).lower()
+    assert "signedrawtransaction" not in json.dumps(report).lower()
+
+
+@pytest.mark.asyncio
+async def test_single_scenario_report_is_exactly_reproducible():
+    report = await run_wallet_app_evals("swap_reverted")
+    assert report["summary"]["total"] == 1
+    assert [item["id"] for item in report["scenarios"]] == ["swap_reverted"]
+
+
+def test_exit_codes_distinguish_success_failure_blocked_and_usage_error(capsys):
+    assert exit_code({"summary": {"failed": 0, "blocked": 0}}) == 0
+    assert exit_code({"summary": {"failed": 1, "blocked": 0}}) == 1
+    assert exit_code({"summary": {"failed": 0, "blocked": 1}}) == 1
+    assert main(["--scenario", "does-not-exist"]) == 2
+    body = json.loads(capsys.readouterr().out)
+    assert body["code"] == "UNKNOWN_SCENARIO"
+
+
+@pytest.mark.asyncio
+async def test_deliberate_failed_expectation_returns_nonzero_exit_code():
+    definition = replace(
+        SCENARIOS["erc20_swap_without_approval"], expected_wallet_sends=2
+    )
+    lifecycle = await run_definition(definition)
+    report = aggregate_reports([lifecycle])
+
+    assert lifecycle.status == "failed"
+    assert any("wallet sends" in failure for failure in lifecycle.failures)
+    assert exit_code(report) == 1
 
 
 @pytest.mark.parametrize(
