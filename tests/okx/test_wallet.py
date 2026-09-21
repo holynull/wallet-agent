@@ -40,9 +40,9 @@ async def test_total_value_maps_chain_names_and_normalizes_decimal():
     assert result.total_value == Decimal("123.45")
     assert client.calls[0][2] == {
         "address": ADDRESS,
-        "chainIndex": "1,56",
+        "chains": "1,56",
         "assetType": "0",
-        "excludeRiskToken": "true",
+        "excludeRiskToken": True,
     }
 
 
@@ -54,18 +54,18 @@ async def test_token_balances_construct_native_and_token_assets_with_risk_flags(
                 "code": "0",
                 "data": [
                     {
-                        "chainIndex": "1",
                         "tokenAssets": [
                             {
+                                "chainIndex": "1",
                                 "symbol": "ETH",
                                 "tokenContractAddress": "",
-                                "decimals": "18",
                                 "balance": "1.25",
                                 "rawBalance": "1250000000000000000",
                                 "tokenPrice": "2500.5",
                                 "isRiskToken": False,
                             },
                             {
+                                "chainIndex": "1",
                                 "symbol": "USDC",
                                 "tokenContractAddress": "0x" + "a" * 40,
                                 "decimals": "6",
@@ -90,6 +90,8 @@ async def test_token_balances_construct_native_and_token_assets_with_risk_flags(
     assert balances[0].usd_value == Decimal("3125.625")
     assert balances[1].asset.address == "0x" + "a" * 40
     assert balances[1].is_risk_token is True
+    assert client.calls[0][2]["chains"] == "1"
+    assert client.calls[0][2]["excludeRiskToken"] == "0"
 
 
 @pytest.mark.asyncio
@@ -102,7 +104,7 @@ async def test_pretransaction_calls_use_exact_documented_body_fields():
             },
             "/api/v6/dex/pre-transaction/simulate": {
                 "code": "0",
-                "data": [{"success": True, "gasUsed": "20500"}],
+                "data": [{"gasUsed": "20500", "failReason": ""}],
             },
         }
     )
@@ -123,13 +125,69 @@ async def test_pretransaction_calls_use_exact_documented_body_fields():
         "fromAddress": ADDRESS,
         "toAddress": TO,
         "txAmount": "100",
-        "inputData": "0xabcdef",
+        "extJson": {"inputData": "0xabcdef"},
     }
     assert client.calls[0][3] == expected
     assert client.calls[1][3] == expected
     assert estimate.gas_limit == "21000"
     assert simulation.success is True
     assert simulation.gas_used == "20500"
+
+
+@pytest.mark.asyncio
+async def test_simulation_fail_reason_becomes_unsuccessful_normalized_evidence():
+    client = FakeClient(
+        {
+            "/api/v6/dex/pre-transaction/simulate": {
+                "code": "0",
+                "data": [{"gasUsed": "21000", "failReason": "insufficient funds"}],
+            }
+        }
+    )
+    adapter = OkxWalletAdapter(client, {"ETH": "1"})
+    transaction = TransactionContext(
+        chain="ETH",
+        from_address=ADDRESS,
+        to_address=TO,
+        native_amount="0",
+        calldata="0x",
+    )
+
+    result = await adapter.simulate_transaction(transaction)
+
+    assert result.success is False
+    assert result.failure_reason == "insufficient funds"
+
+
+@pytest.mark.asyncio
+async def test_erc20_balance_requires_documented_decimals_and_raw_balance():
+    client = FakeClient(
+        {
+            "/api/v6/dex/balance/all-token-balances-by-address": {
+                "code": "0",
+                "data": [
+                    {
+                        "tokenAssets": [
+                            {
+                                "chainIndex": "1",
+                                "symbol": "USDC",
+                                "tokenContractAddress": "0x" + "a" * 40,
+                                "balance": "12.5",
+                                "tokenPrice": "1",
+                                "isRiskToken": False,
+                            }
+                        ]
+                    }
+                ],
+            }
+        }
+    )
+    adapter = OkxWalletAdapter(client, {"ETH": "1"})
+
+    with pytest.raises(OkxWalletError) as raised:
+        await adapter.get_token_balances(ADDRESS, ["ETH"])
+
+    assert raised.value.code == "OKX_MALFORMED_RESPONSE"
 
 
 @pytest.mark.asyncio

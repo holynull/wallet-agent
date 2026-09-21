@@ -20,13 +20,27 @@ normalization layer.
 - Kept raw OKX response fields inside the adapter; callers receive only domain
   models.
 
+## Review Follow-Up
+
+- Balance requests now use the documented `chains` query parameter. The total
+  value endpoint sends its boolean `excludeRiskToken` value, while the token
+  balance endpoint uses its documented `0`/`1` encoding.
+- Token rows resolve `chainIndex` from each token entry rather than assuming an
+  outer chain group.
+- Pre-transaction calldata is sent under `extJson.inputData`.
+- Simulation success is derived from the documented `failReason`; non-empty
+  reasons become sanitized failure evidence.
+- ERC-20 rows must provide explicit decimals and raw balance data. Symbol-based
+  defaults are not used; only native assets may use configured native decimals
+  to derive a missing raw amount.
+
 ## Verification
 
 ```text
 UV_CACHE_DIR=/private/tmp/wallet-agent-uv-cache uv run pytest \
   tests/okx/test_models.py tests/okx/test_wallet.py \
   tests/domain/test_models.py tests/domain/test_contracts.py -q
-25 passed
+27 passed
 
 UV_CACHE_DIR=/private/tmp/wallet-agent-uv-cache uv run ruff check \
   src/wallet_agent/okx src/wallet_agent/domain/models.py \

@@ -85,9 +85,9 @@ class OkxWalletAdapter:
             "/api/v6/dex/balance/total-value-by-address",
             query={
                 "address": address,
-                "chainIndex": ",".join(indexes),
+                "chains": ",".join(indexes),
                 "assetType": asset_type,
-                "excludeRiskToken": str(exclude_risk_tokens).lower(),
+                "excludeRiskToken": exclude_risk_tokens,
             },
         )
         item = self._first_data(payload, "total value")
@@ -114,8 +114,8 @@ class OkxWalletAdapter:
             "/api/v6/dex/balance/all-token-balances-by-address",
             query={
                 "address": address,
-                "chainIndex": ",".join(indexes),
-                "excludeRiskToken": str(exclude_risk_tokens).lower(),
+                "chains": ",".join(indexes),
+                "excludeRiskToken": "0" if exclude_risk_tokens else "1",
             },
         )
         data = payload.get("data")
@@ -125,14 +125,6 @@ class OkxWalletAdapter:
         for group in data:
             if not isinstance(group, dict):
                 raise self._malformed("token balances")
-            chain_index = str(group.get("chainIndex") or group.get("chainIndexId") or "")
-            chain = self.chain_name_by_index.get(chain_index)
-            if chain is None:
-                raise OkxWalletError(
-                    "OKX_CHAIN_UNSUPPORTED",
-                    "OKX returned an unsupported chain.",
-                    details={"chain_index": chain_index},
-                )
             if any(key in group for key in ("symbol", "tokenSymbol")):
                 entries = [group]
             else:
@@ -140,6 +132,16 @@ class OkxWalletAdapter:
             if not isinstance(entries, list):
                 raise self._malformed("token balances")
             for entry in entries:
+                if not isinstance(entry, dict):
+                    raise self._malformed("token balance")
+                chain_index = str(entry.get("chainIndex") or entry.get("chainIndexId") or "")
+                chain = self.chain_name_by_index.get(chain_index)
+                if chain is None:
+                    raise OkxWalletError(
+                        "OKX_CHAIN_UNSUPPORTED",
+                        "OKX returned an unsupported chain.",
+                        details={"chain_index": chain_index},
+                    )
                 balances.append(self._token_balance(entry, chain))
         return balances
 
@@ -164,16 +166,11 @@ class OkxWalletAdapter:
             "/api/v6/dex/pre-transaction/simulate", transaction
         )
         item = self._first_data(payload, "simulation")
-        raw_success = item.get("success", item.get("isSuccess"))
-        if isinstance(raw_success, str):
-            success = raw_success.lower() in {"true", "1", "success", "succeeded"}
-        elif isinstance(raw_success, (bool, int)):
-            success = bool(raw_success)
-        else:
+        reason = item.get("failReason")
+        if reason is None:
             raise self._malformed("simulation")
-        reason = item.get("failureReason", item.get("errorMsg", item.get("errorMessage")))
         return SimulationResult(
-            success=success,
+            success=not bool(str(reason)),
             gas_used=self._raw_optional(item.get("gasUsed", item.get("gas_used"))),
             failure_reason=str(reason) if reason not in (None, "") else None,
             chain=transaction.chain,
@@ -192,7 +189,7 @@ class OkxWalletAdapter:
                 "fromAddress": transaction.from_address,
                 "toAddress": transaction.to_address,
                 "txAmount": transaction.native_amount,
-                "inputData": transaction.calldata,
+                "extJson": {"inputData": transaction.calldata},
             },
         )
 
@@ -239,10 +236,12 @@ class OkxWalletAdapter:
         if not symbol:
             raise self._malformed("token balance")
         address = entry.get("tokenContractAddress") or entry.get("contractAddress") or None
-        decimals_value = entry.get(
-            "decimals",
-            entry.get("tokenDecimal", self._native_decimals.get(str(symbol).upper(), 18)),
-        )
+        is_native = not address
+        decimals_value = entry.get("decimals", entry.get("tokenDecimal"))
+        if decimals_value is None and not is_native:
+            raise self._malformed("token balance")
+        if decimals_value is None:
+            decimals_value = self._native_decimals.get(str(symbol).upper(), 0) if is_native else 0
         try:
             decimals = int(decimals_value)
         except (TypeError, ValueError) as exc:
@@ -258,7 +257,7 @@ class OkxWalletAdapter:
             "rawBalance",
             entry.get("balanceRaw", entry.get("tokenAmountRaw")),
         )
-        if raw_value in (None, ""):
+        if raw_value in (None, "") and is_native and decimals:
             raw_value = self._derived_raw(amount, decimals)
         raw = self._raw_optional(raw_value)
         if raw is None:
