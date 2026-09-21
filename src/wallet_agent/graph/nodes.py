@@ -52,6 +52,7 @@ class GraphRuntime:
     model: Any
     providers: dict[str, Any]
     chains: dict[str, Any]
+    wallet_provider: Any | None = None
     price_provider: Any | None = None
     max_poll_attempts: int = 3
     confirmation_ttl_seconds: int = 900

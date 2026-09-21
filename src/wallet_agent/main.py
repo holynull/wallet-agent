@@ -20,9 +20,9 @@ from wallet_agent.models import (
     SwapSlotPatch,
     TransferSlotPatch,
 )
-from wallet_agent.okx import OkxSignedClient
+from wallet_agent.okx import OKX_CHAIN_INDEX_BY_NAME, OkxSignedClient, OkxWalletAdapter
 from wallet_agent.persistence import SqliteSessionStore, initialize_checkpointer
-from wallet_agent.prices import CoinGeckoPriceProvider
+from wallet_agent.prices import CoinGeckoPriceProvider, CompositePriceProvider, OkxPriceProvider
 from wallet_agent.providers import BridgersProvider, HttpJsonTransport, OmniBridgeProvider
 
 IntentOutput = RouteDecision
@@ -69,6 +69,8 @@ def build_application(settings: Settings | None = None) -> Any:
     providers: dict[str, Any] = {}
     transports: list[Any] = []
     okx_client = None
+    wallet_provider = None
+    okx_price_provider = None
     if settings.okx_enabled:
         okx_client = OkxSignedClient(
             settings.okx_base_url,
@@ -80,6 +82,12 @@ def build_application(settings: Settings | None = None) -> Any:
             max_attempts=settings.okx_max_attempts,
         )
         transports.append(okx_client)
+        wallet_provider = OkxWalletAdapter(okx_client, OKX_CHAIN_INDEX_BY_NAME)
+        okx_price_provider = OkxPriceProvider(
+            okx_client,
+            OKX_CHAIN_INDEX_BY_NAME,
+            ttl_seconds=settings.okx_cache_ttl_seconds,
+        )
     price_provider = None
     default_coingecko_base_url = "https://pro-api.coingecko.com/api/v3"
     if settings.bridgers_enabled:
@@ -126,6 +134,11 @@ def build_application(settings: Settings | None = None) -> Any:
             api_key=settings.coingecko_api_key,
             base_url=settings.coingecko_base_url,
         )
+    if okx_price_provider is not None:
+        price_provider = CompositePriceProvider(
+            primary=okx_price_provider,
+            fallback=price_provider,
+        )
     chain_registry = build_default_registry(
         rpc_urls=settings.rpc_urls,
         rpc_timeout_seconds=settings.rpc_timeout_seconds,
@@ -136,6 +149,7 @@ def build_application(settings: Settings | None = None) -> Any:
         model=model,
         providers=providers,
         chains=dict(chain_registry.items()),
+        wallet_provider=wallet_provider,
         price_provider=price_provider,
         checkpointer=checkpoint_handle.checkpointer,
         max_poll_attempts=settings.poll_max_attempts,
@@ -145,6 +159,7 @@ def build_application(settings: Settings | None = None) -> Any:
     application = create_app(
         graph=graph,
         providers=providers,
+        wallet_provider=wallet_provider,
         price_provider=price_provider,
         store=session_store,
         model_registry=model_registry,
