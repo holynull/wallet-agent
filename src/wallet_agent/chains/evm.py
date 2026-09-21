@@ -172,7 +172,26 @@ class EVMChainAdapter:
             )
         except Exception:
             priority_fee = gas_price
+        if priority_fee <= 0:
+            try:
+                history = await rpc_call(
+                    self.transport, "eth_feeHistory", ["0x4", "latest", [25]]
+                )
+                rewards = history.get("reward") if isinstance(history, dict) else None
+                values = [
+                    quantity(item)
+                    for row in (rewards or [])
+                    if isinstance(row, (list, tuple))
+                    for item in row
+                ]
+                priority_fee = max(values, default=0)
+            except Exception:
+                priority_fee = 0
+        if priority_fee <= 0:
+            priority_fee = max(1, gas_price // 10)
         priority_fee = min(priority_fee, gas_price)
+        if priority_fee <= 0:
+            priority_fee = 1
         # ``eth_gasPrice`` is not guaranteed to be an EIP-1559 max fee.  Some
         # RPCs return a cached value which can already be below the latest
         # block's base fee; passing that value to eth_sendTransaction makes
@@ -187,7 +206,7 @@ class EVMChainAdapter:
             )
             if isinstance(latest_block, dict) and latest_block.get("baseFeePerGas") is not None:
                 base_fee = quantity(latest_block["baseFeePerGas"])
-                max_fee = max(gas_price, base_fee * 2 + priority_fee)
+                max_fee = max(gas_price, base_fee * 2, base_fee + priority_fee)
         except Exception:
             pass
         total = gas * max_fee

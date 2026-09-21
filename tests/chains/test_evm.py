@@ -243,3 +243,27 @@ async def test_evm_fee_estimate_keeps_max_fee_above_latest_base_fee():
     assert fee.max_fee_per_gas == str(2 * int("0x7497670", 16))
     assert int(fee.max_fee_per_gas) > int("0x7497670", 16)
     assert fee.amount_raw == str(21000 * int(fee.max_fee_per_gas))
+
+
+@pytest.mark.asyncio
+async def test_evm_fee_estimate_replaces_zero_priority_fee_with_positive_bounded_value():
+    rpc = RecordingRpc(
+        {
+            "eth_estimateGas": "0x5208",
+            "eth_gasPrice": "0x3b9aca00",
+            "eth_maxPriorityFeePerGas": "0x0",
+            "eth_feeHistory": {
+                "baseFeePerGas": ["0x3b9aca00", "0x3b9aca00"],
+                "reward": [["0x1dcd6500"]],
+            },
+            "eth_getBlockByNumber": {"baseFeePerGas": "0x3b9aca00"},
+        }
+    )
+    adapter = EVMChainAdapter(rpc, chain="ETH", chain_id=1)
+
+    fee = await adapter.estimate_fee(to=RECIPIENT, data="0xabc", from_address=OWNER)
+
+    assert int(fee.max_priority_fee_per_gas) > 0
+    assert int(fee.max_fee_per_gas) >= int("0x3b9aca00", 16) + int(
+        fee.max_priority_fee_per_gas
+    )

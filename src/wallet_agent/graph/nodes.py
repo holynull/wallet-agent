@@ -27,6 +27,7 @@ from wallet_agent.domain.models import (
     ProviderOrder,
     SwapQuoteRequest,
     TransferRequest,
+    TransactionContext,
     UnsignedTransaction,
 )
 from wallet_agent.domain.normalization import (
@@ -929,6 +930,7 @@ async def _transaction_preflight(
     token: Any,
     transaction: Any,
     wallet_context: dict[str, Any] | None,
+    wallet_provider: Any | None = None,
 ) -> dict[str, Any]:
     """Run read-only checks and keep unavailable optional checks non-blocking."""
     checks: list[dict[str, Any]] = []
@@ -1033,6 +1035,68 @@ async def _transaction_preflight(
     else:
         add("network_fee", "warning", "当前链适配器不支持手续费估算。", code="CHECK_UNAVAILABLE")
 
+    gas_sources: dict[str, Any] = {
+        "rpc": _fee_dump(fee).get("gas_limit") if fee is not None else None,
+        "okx": None,
+        "simulation": None,
+    }
+    simulation = None
+    if wallet_provider is not None:
+        tx_context = TransactionContext(
+            chain=chain,
+            from_address=sender,
+            to_address=recipient,
+            native_amount=str(getattr(transaction, "value", "0")).removeprefix("0x") or "0",
+            calldata=str(getattr(transaction, "data", "0x")),
+        )
+        if hasattr(wallet_provider, "estimate_gas_limit"):
+            try:
+                estimate = await wallet_provider.estimate_gas_limit(tx_context)
+                gas_sources["okx"] = str(estimate.gas_limit)
+            except Exception:
+                add(
+                    "okx_gas",
+                    "warning",
+                    "OKX gas-limit 预检查暂时不可用。",
+                    code="OKX_GAS_UNAVAILABLE",
+                )
+        if hasattr(wallet_provider, "simulate_transaction"):
+            try:
+                simulation = await wallet_provider.simulate_transaction(tx_context)
+                if simulation.gas_used is not None:
+                    gas_sources["simulation"] = str(simulation.gas_used)
+                if simulation.success:
+                    add("simulation", "passed", "OKX 交易模拟通过。")
+                else:
+                    add(
+                        "simulation",
+                        "failed",
+                        "交易模拟失败，签名前请检查交易参数。",
+                        code="SIMULATION_FAILED",
+                        details={"failure_reason": simulation.failure_reason},
+                    )
+            except Exception:
+                add(
+                    "simulation",
+                    "warning",
+                    "OKX 交易模拟暂时不可用，签名前请在钱包中确认。",
+                    code="SIMULATION_UNAVAILABLE",
+                )
+    if fee is not None and any(gas_sources.get(key) for key in ("okx", "simulation")):
+        values = [
+            int(value)
+            for value in (
+                gas_sources.get("rpc"),
+                gas_sources.get("okx"),
+                gas_sources.get("simulation"),
+            )
+            if value is not None
+        ]
+        fee = _fee_dump(fee)
+        fee["gas_limit"] = str(max(values))
+        if fee.get("max_fee_per_gas"):
+            fee["amount_raw"] = str(int(fee["gas_limit"]) * int(fee["max_fee_per_gas"]))
+
     native_balance = None
     if hasattr(adapter, "get_native_balance"):
         try:
@@ -1048,7 +1112,7 @@ async def _transaction_preflight(
 
     if token is None:
         if native_balance is not None:
-            fee_raw = int(fee.amount_raw) if fee is not None else 0
+            fee_raw = int(fee["amount_raw"] if isinstance(fee, dict) else fee.amount_raw) if fee is not None else 0
             required = int(amount_raw) + fee_raw
             if int(native_balance.amount_raw) < required:
                 add(
@@ -1094,13 +1158,14 @@ async def _transaction_preflight(
                     details={"error": str(exc)},
                 )
         if native_balance is not None and fee is not None:
-            if int(native_balance.amount_raw) < int(fee.amount_raw):
+            fee_raw = int(fee["amount_raw"] if isinstance(fee, dict) else fee.amount_raw)
+            if int(native_balance.amount_raw) < fee_raw:
                 add(
                     "gas_balance",
                     "failed",
                     "原生币余额不足以支付网络手续费。",
                     code="INSUFFICIENT_GAS",
-                    details={"balance_raw": native_balance.amount_raw, "fee_raw": fee.amount_raw},
+                    details={"balance_raw": native_balance.amount_raw, "fee_raw": str(fee_raw)},
                 )
             else:
                 add("gas_balance", "passed", "原生币余额足够支付网络手续费。")
@@ -1112,7 +1177,9 @@ async def _transaction_preflight(
         "chain": chain,
         "sender": sender,
         "recipient": recipient,
-        "fee_estimate": _fee_dump(fee) if fee is not None else None,
+        "fee_estimate": fee if isinstance(fee, dict) else (_fee_dump(fee) if fee is not None else None),
+        "gas_sources": gas_sources,
+        **({"simulation": _dump(simulation)} if simulation is not None else {}),
         "checks": checks,
         "warnings": [item for item in checks if item["status"] == "warning"],
     }
