@@ -4,11 +4,18 @@ import httpx
 import pytest
 
 from wallet_agent.api import StaticTokenVerifier, create_app
-from wallet_agent.domain.models import TokenBalance, WalletTotalValue
+from wallet_agent.domain.models import WalletTotalValue
 
 
 class WalletProvider:
-    async def get_total_value(self, address, chain_indexes, *, asset_type="0", exclude_risk_tokens=True):
+    async def get_total_value(
+        self,
+        address,
+        chain_indexes,
+        *,
+        asset_type="0",
+        exclude_risk_tokens=True,
+    ):
         return WalletTotalValue(
             address=address,
             chain_indexes=chain_indexes,

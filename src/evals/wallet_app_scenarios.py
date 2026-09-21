@@ -204,6 +204,7 @@ SCENARIOS = {
         expected_final_stage="completed",
         expected_wallet_sends=1,
         expected_register_attempts=1,
+        driver_actions=("broadcast", "broadcast_retry", "status"),
         dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
     ),
     "swap_reverted": ScenarioDefinition(
@@ -230,7 +231,7 @@ SCENARIOS = {
             provider_register=(FaultOutcome("success", "order-idempotent"),),
         ),
         wallet_hashes=("0x" + "d" * 64,),
-        expected_final_stage="broadcasted",
+        expected_final_stage="confirmed",
         expected_wallet_sends=1,
         expected_register_attempts=1,
         driver_actions=("broadcast", "broadcast_same", "broadcast_conflict"),
@@ -373,7 +374,7 @@ class RecordingChainAdapter:
         )
         self._receipts = _sequence(
             plan.chain_receipts,
-            fallback=FaultOutcome("not_found"),
+            fallback=FaultOutcome("confirmed", {"status": "0x1"}),
         )
         self._transactions = _sequence(
             plan.chain_transactions,
@@ -1346,7 +1347,8 @@ def _lifecycle_invariants(
     pending_broadcasts = [
         (index, step)
         for index, step in enumerate(steps)
-        if step.operation == "broadcast" and step.stage_after == "broadcast_pending"
+        if step.operation == "broadcast"
+        and step.stage_after in {"broadcast_pending", "not_propagated"}
     ]
 
     def pending_broadcast_recovers(index: int, step: LifecycleStep) -> bool:
@@ -1381,7 +1383,7 @@ def _lifecycle_invariants(
         advanced_sessions = [
             later
             for _, later in later_sessions
-            if later.stage_after not in {None, "broadcast_pending"}
+            if later.stage_after not in {None, "broadcast_pending", "not_propagated"}
         ]
         return (
             isinstance(tx_hash, str)
@@ -1400,7 +1402,7 @@ def _lifecycle_invariants(
             and all(status_has_matching_session(item) for item in status_indices)
             and all(event.get("tx_hash") == tx_hash for event in register_events)
             and (
-                session.get("stage") in {None, "broadcast_pending"}
+                session.get("stage") in {None, "broadcast_pending", "not_propagated"}
                 or session.get("broadcast_tx_hash") == tx_hash
             )
             and len([item for item in steps if item.operation == "wallet_swap"]) == 1

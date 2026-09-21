@@ -66,6 +66,37 @@ Use a stable `conversation_id` as the LangGraph `thread_id` when reconnecting.
 intent `portfolio_query`、`gas_check` 调用。Token 资产发现提供
 `GET /assets?chain=BASE&search=USDC` 和对话 intent `asset_discovery`。
 
+## Optional OKX Wallet and Market enhancement
+
+Set `OKX_ENABLED=true` plus `OKX_API_KEY`, `OKX_SECRET_KEY`,
+`OKX_PASSPHRASE`, and `OKX_PROJECT_ID` to enable the signed OKX Onchain OS
+read-only enhancement. When disabled, the existing RPC/CoinGecko behavior is
+unchanged. OKX supplies portfolio totals/token balances, current and detailed
+prices, history/candles, gas-limit estimates, and transaction simulation.
+CoinGecko fills only assets for which OKX did not return a price; providers are
+never averaged. Direct chain RPC remains the source of truth for spendable
+balance, allowance, receipt, nonce, and transaction visibility.
+
+The integration uses only these documented `/api/v6` endpoints:
+
+- `/api/v6/dex/balance/total-value-by-address`
+- `/api/v6/dex/balance/all-token-balances-by-address`
+- `/api/v6/dex/market/price`
+- `/api/v6/dex/market/price-info`
+- `/api/v6/dex/index/historical-price`
+- `/api/v6/dex/market/candles`
+- `/api/v6/dex/pre-transaction/gas-limit`
+- `/api/v6/dex/pre-transaction/simulate`
+
+OKX DEX aggregation and cross-chain swap APIs are intentionally not connected;
+Bridgers and OmniBridge remain the swap providers. The browser/mobile wallet is
+still the only signer and broadcaster. No private key, seed phrase, signer,
+signed transaction, OKX credential, or signed header enters REST/SSE, graph
+state, logs, or Demo debug output.
+
+Additional normalized routes include `/v1/wallet/{address}/total-value`,
+`/v1/prices/market`, `/v1/prices/history`, and `/v1/prices/candles`.
+
 For swap authorization, the service returns an ERC-20 `approval_transaction`
 when allowance is insufficient. Sign and broadcast that transaction in the app,
 submit only its hash, then call `/continue`. The service verifies the receipt
@@ -82,6 +113,9 @@ they are not presented as partially implemented capabilities.
 Do not put private keys, seed phrases, signer objects, wallet clients, or
 provider credentials in requests, prompts, checkpoints, logs, or issue
 reports. `/v1/swap/{session_id}/broadcast` accepts only a hash and chain.
+The backend distinguishes `not_propagated` from `broadcast_pending`: a hash
+that is still absent from source-chain RPC is saved for retry, but Provider
+registration/polling does not start until the transaction is visible.
 
 ## Verification
 

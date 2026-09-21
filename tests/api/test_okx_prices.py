@@ -5,7 +5,6 @@ import pytest
 
 from wallet_agent.api import create_app
 from wallet_agent.domain.models import (
-    Asset,
     HistoricalPricePage,
     HistoricalPricePoint,
     PriceCandle,

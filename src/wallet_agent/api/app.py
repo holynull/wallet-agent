@@ -31,13 +31,13 @@ from wallet_agent.domain.models import (
     UnsignedTransaction,
 )
 from wallet_agent.okx import OKX_CHAIN_INDEX_BY_NAME, OkxWalletError
-from wallet_agent.prices.okx import PriceProviderError
 from wallet_agent.persistence import (
     InMemorySessionStore,
     SessionRevisionConflict,
     SessionStore,
     SwapSessionRecord,
 )
+from wallet_agent.prices.okx import PriceProviderError
 
 from .auth import TokenVerifier
 from .dependencies import authenticated_user
@@ -1522,7 +1522,10 @@ def create_app(
         if provider is None:
             raise HTTPException(
                 status_code=503,
-                detail={"code": "PRICE_PROVIDER_UNAVAILABLE", "message": "Price provider unavailable."},
+                detail={
+                    "code": "PRICE_PROVIDER_UNAVAILABLE",
+                    "message": "Price provider unavailable.",
+                },
             )
         try:
             asset = Asset(chain=chain.upper(), symbol=symbol, decimals=decimals, address=address)
@@ -1566,13 +1569,19 @@ def create_app(
         if extras or period not in {"1m", "5m", "30m", "1h", "1d"} or not 1 <= limit <= 200:
             raise HTTPException(
                 status_code=422,
-                detail={"code": "INVALID_PRICE_QUERY", "message": "Invalid historical price parameters."},
+                detail={
+                    "code": "INVALID_PRICE_QUERY",
+                    "message": "Invalid historical price parameters.",
+                },
             )
         provider = app.state.price_provider
         if provider is None:
             raise HTTPException(
                 status_code=503,
-                detail={"code": "PRICE_PROVIDER_UNAVAILABLE", "message": "Price provider unavailable."},
+                detail={
+                    "code": "PRICE_PROVIDER_UNAVAILABLE",
+                    "message": "Price provider unavailable.",
+                },
             )
         try:
             asset = Asset(chain=chain.upper(), symbol=symbol, decimals=decimals, address=address)
@@ -1619,7 +1628,10 @@ def create_app(
         if provider is None:
             raise HTTPException(
                 status_code=503,
-                detail={"code": "PRICE_PROVIDER_UNAVAILABLE", "message": "Price provider unavailable."},
+                detail={
+                    "code": "PRICE_PROVIDER_UNAVAILABLE",
+                    "message": "Price provider unavailable.",
+                },
             )
         try:
             asset = Asset(chain=chain.upper(), symbol=symbol, decimals=decimals, address=address)
@@ -1772,14 +1784,19 @@ def create_app(
         if provider is None:
             raise HTTPException(
                 status_code=503,
-                detail={"code": "WALLET_PROVIDER_UNAVAILABLE", "message": "Wallet provider unavailable."},
+                detail={
+                    "code": "WALLET_PROVIDER_UNAVAILABLE",
+                    "message": "Wallet provider unavailable.",
+                },
             )
         try:
             indexes = _okx_chain_indexes(chains)
             type_value = {"all": "0", "token": "1", "defi": "2"}.get(asset_type.lower())
             if type_value is None:
                 raise OkxWalletError(
-                    "OKX_INVALID_ARGUMENT", "Unsupported asset_type.", details={"asset_type": asset_type}
+                    "OKX_INVALID_ARGUMENT",
+                    "Unsupported asset_type.",
+                    details={"asset_type": asset_type},
                 )
             value = await provider.get_total_value(
                 address,
@@ -1794,13 +1811,20 @@ def create_app(
             }
         except OkxWalletError as exc:
             raise HTTPException(
-                status_code=422 if exc.code in {"OKX_CHAIN_UNSUPPORTED", "OKX_INVALID_ARGUMENT"} else 502,
+                status_code=(
+                    422
+                    if exc.code in {"OKX_CHAIN_UNSUPPORTED", "OKX_INVALID_ARGUMENT"}
+                    else 502
+                ),
                 detail={"code": exc.code, "message": exc.message, "details": exc.details},
             ) from exc
         except Exception as exc:
             raise HTTPException(
                 status_code=502,
-                detail={"code": "OKX_WALLET_UNAVAILABLE", "message": "OKX wallet provider unavailable."},
+                detail={
+                    "code": "OKX_WALLET_UNAVAILABLE",
+                    "message": "OKX wallet provider unavailable.",
+                },
             ) from exc
 
     @app.get("/v1/wallet/{address}/gas")

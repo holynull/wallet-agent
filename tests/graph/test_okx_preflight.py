@@ -8,11 +8,9 @@ from wallet_agent.domain.models import (
     GasLimitEstimate,
     SimulationResult,
     TokenBalance,
-    TransactionContext,
     UnsignedTransaction,
 )
 from wallet_agent.graph.nodes import _transaction_preflight
-
 
 OWNER = "0x" + "1" * 40
 RECIPIENT = "0x" + "2" * 40
@@ -75,7 +73,11 @@ async def test_preflight_uses_maximum_rpc_okx_and_simulation_gas_with_sources():
 async def test_preflight_blocks_explicit_simulation_failure_but_warns_when_unavailable():
     class FailedOkx(Okx):
         async def simulate_transaction(self, transaction):
-            return SimulationResult(success=False, failure_reason="reverted", chain=transaction.chain)
+            return SimulationResult(
+                success=False,
+                failure_reason="reverted",
+                chain=transaction.chain,
+            )
 
     tx = UnsignedTransaction(chain="BASE", to=RECIPIENT, data="0x", value="0")
     failed = await _transaction_preflight(

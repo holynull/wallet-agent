@@ -26,8 +26,8 @@ from wallet_agent.domain.models import (
     NormalizedQuote,
     ProviderOrder,
     SwapQuoteRequest,
-    TransferRequest,
     TransactionContext,
+    TransferRequest,
     UnsignedTransaction,
 )
 from wallet_agent.domain.normalization import (
@@ -1112,7 +1112,11 @@ async def _transaction_preflight(
 
     if token is None:
         if native_balance is not None:
-            fee_raw = int(fee["amount_raw"] if isinstance(fee, dict) else fee.amount_raw) if fee is not None else 0
+            fee_raw = (
+                int(fee["amount_raw"] if isinstance(fee, dict) else fee.amount_raw)
+                if fee is not None
+                else 0
+            )
             required = int(amount_raw) + fee_raw
             if int(native_balance.amount_raw) < required:
                 add(
@@ -1177,7 +1181,11 @@ async def _transaction_preflight(
         "chain": chain,
         "sender": sender,
         "recipient": recipient,
-        "fee_estimate": fee if isinstance(fee, dict) else (_fee_dump(fee) if fee is not None else None),
+        "fee_estimate": (
+            fee
+            if isinstance(fee, dict)
+            else (_fee_dump(fee) if fee is not None else None)
+        ),
         "gas_sources": gas_sources,
         **({"simulation": _dump(simulation)} if simulation is not None else {}),
         "checks": checks,

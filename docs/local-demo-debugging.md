@@ -60,6 +60,25 @@ OMNIBRIDGE_SPENDER_BY_CHAIN='{"BASE":"0x..."}'
 
 不要把私钥、助记词、signer、wallet client 或其他签名材料放入请求、Prompt、日志或页面字段中。
 
+### 可选：配置 OKX 钱包和价格增强
+
+OKX 默认关闭；关闭时 RPC、CoinGecko 和现有兑换流程保持不变。启用时填写：
+
+```dotenv
+OKX_ENABLED=true
+OKX_BASE_URL=https://web3.okx.com
+OKX_API_KEY=...
+OKX_SECRET_KEY=...
+OKX_PASSPHRASE=...
+OKX_PROJECT_ID=...
+```
+
+OKX 只用于余额/总价值、价格/市场历史、gas-limit 和 simulation 增强。
+浏览器钱包仍是唯一签名和广播方；OmniBridge/Bridgers 仍是兑换 Provider。
+随时可设置 `OKX_ENABLED=false` 安全回退。若要运行只读真实契约测试，还需
+设置 `OKX_INTEGRATION=1`、`OKX_INTEGRATION_ADDRESS` 和
+`OKX_INTEGRATION_TOKEN_ADDRESS`；测试不会签名、提交或广播交易。
+
 ## 2. 使用 Python 启动服务
 
 安装项目依赖：
