@@ -1,0 +1,1 @@
+"""OKX adapter tests."""

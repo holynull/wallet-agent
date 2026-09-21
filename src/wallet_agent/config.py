@@ -1,6 +1,6 @@
 """Application configuration loaded from environment variables and dotenv files."""
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     coingecko_native_ids: dict[str, str] = Field(default_factory=dict)
     price_cache_ttl_seconds: int = Field(default=60, ge=0)
 
+    okx_enabled: bool = False
+    okx_base_url: str = "https://web3.okx.com"
+    okx_api_key: SecretStr | None = None
+    okx_secret_key: SecretStr | None = None
+    okx_passphrase: SecretStr | None = None
+    okx_project_id: SecretStr | None = None
+    okx_max_attempts: int = Field(default=3, ge=1, le=5)
+    okx_cache_ttl_seconds: int = Field(default=60, ge=0)
+    okx_exclude_risk_tokens: bool = True
+
     persistence_url: str = "sqlite+aiosqlite:///./wallet_agent.db"
     auth_required: bool = False
     auth_tokens: dict[str, str] = Field(default_factory=dict)
@@ -58,4 +68,17 @@ class Settings(BaseSettings):
     def require_model_key(self) -> "Settings":
         if not (self.deepseek_api_key or self.openai_api_key):
             raise ValueError("DEEPSEEK_API_KEY or OPENAI_API_KEY is required")
+        if self.okx_enabled:
+            missing = [
+                name
+                for name, value in (
+                    ("OKX_API_KEY", self.okx_api_key),
+                    ("OKX_SECRET_KEY", self.okx_secret_key),
+                    ("OKX_PASSPHRASE", self.okx_passphrase),
+                    ("OKX_PROJECT_ID", self.okx_project_id),
+                )
+                if value is None or not value.get_secret_value()
+            ]
+            if missing:
+                raise ValueError(f"{', '.join(missing)} required when OKX_ENABLED=true")
         return self

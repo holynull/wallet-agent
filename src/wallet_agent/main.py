@@ -20,6 +20,7 @@ from wallet_agent.models import (
     SwapSlotPatch,
     TransferSlotPatch,
 )
+from wallet_agent.okx import OkxSignedClient
 from wallet_agent.persistence import SqliteSessionStore, initialize_checkpointer
 from wallet_agent.prices import CoinGeckoPriceProvider
 from wallet_agent.providers import BridgersProvider, HttpJsonTransport, OmniBridgeProvider
@@ -66,7 +67,19 @@ def build_application(settings: Settings | None = None) -> Any:
     )
     model = ModelRouter(model_registry)
     providers: dict[str, Any] = {}
-    transports: list[HttpJsonTransport] = []
+    transports: list[Any] = []
+    okx_client = None
+    if settings.okx_enabled:
+        okx_client = OkxSignedClient(
+            settings.okx_base_url,
+            api_key=settings.okx_api_key.get_secret_value(),
+            secret_key=settings.okx_secret_key.get_secret_value(),
+            passphrase=settings.okx_passphrase.get_secret_value(),
+            project_id=settings.okx_project_id.get_secret_value(),
+            timeout_seconds=settings.http_timeout_seconds,
+            max_attempts=settings.okx_max_attempts,
+        )
+        transports.append(okx_client)
     price_provider = None
     default_coingecko_base_url = "https://pro-api.coingecko.com/api/v3"
     if settings.bridgers_enabled:
@@ -141,6 +154,7 @@ def build_application(settings: Settings | None = None) -> Any:
     )
     application.state.checkpointer_handle = checkpoint_handle
     application.state.transports = transports
+    application.state.okx_client = okx_client
     return application
 
 
