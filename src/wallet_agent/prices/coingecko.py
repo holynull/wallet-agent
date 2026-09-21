@@ -123,6 +123,7 @@ class CoinGeckoPriceProvider:
                 TokenPrice(
                     asset=asset,
                     usd_price=Decimal(str(entry["usd"])),
+                    provider=self.provider_name,
                     observed_at=(
                         datetime.fromtimestamp(int(observed_at), tz=timezone.utc)
                         if observed_at is not None

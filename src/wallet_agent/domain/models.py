@@ -338,6 +338,9 @@ class TokenMarketDetails(DomainModel):
     usd_price: Decimal | None = Field(default=None, ge=0)
     market_cap: Decimal | None = Field(default=None, ge=0)
     volume_24h: Decimal | None = Field(default=None, ge=0)
+    price_change_24h: Decimal | None = None
+    liquidity: Decimal | None = Field(default=None, ge=0)
+    holder_count: int | None = Field(default=None, ge=0)
 
 
 class WalletTotalValue(DomainModel):
@@ -389,6 +392,28 @@ class TokenPrice(DomainModel):
     asset: Asset
     usd_price: Decimal = Field(ge=0)
     observed_at: datetime | None = None
+    provider: ProviderName | None = None
+
+
+class HistoricalPricePoint(DomainModel):
+    observed_at: datetime
+    price: Decimal = Field(ge=0)
+
+
+class HistoricalPricePage(DomainModel):
+    points: list[HistoricalPricePoint] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class PriceCandle(DomainModel):
+    observed_at: datetime
+    open: Decimal = Field(ge=0)
+    high: Decimal = Field(ge=0)
+    low: Decimal = Field(ge=0)
+    close: Decimal = Field(ge=0)
+    volume: Decimal = Field(ge=0)
+    volume_usd: Decimal = Field(ge=0)
+    confirmed: bool
 
 
 class WalletSnapshot(DomainModel):
