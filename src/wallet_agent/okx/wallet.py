@@ -298,7 +298,10 @@ class OkxWalletAdapter:
     @staticmethod
     def _decimal(value: Any, field: str) -> Decimal:
         try:
-            return Decimal(str(value))
+            parsed = Decimal(str(value))
+            if not parsed.is_finite():
+                raise InvalidOperation
+            return parsed
         except (InvalidOperation, TypeError, ValueError) as exc:
             raise OkxWalletError(
                 "OKX_MALFORMED_RESPONSE", f"OKX returned malformed {field} data."

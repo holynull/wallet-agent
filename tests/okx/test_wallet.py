@@ -191,6 +191,24 @@ async def test_erc20_balance_requires_documented_decimals_and_raw_balance():
 
 
 @pytest.mark.asyncio
+async def test_non_finite_provider_numbers_are_stable_malformed_errors():
+    client = FakeClient(
+        {
+            "/api/v6/dex/balance/total-value-by-address": {
+                "code": "0",
+                "data": [{"totalValue": "NaN"}],
+            }
+        }
+    )
+    adapter = OkxWalletAdapter(client, {"ETH": "1"})
+
+    with pytest.raises(OkxWalletError) as raised:
+        await adapter.get_total_value(ADDRESS, ["ETH"])
+
+    assert raised.value.code == "OKX_MALFORMED_RESPONSE"
+
+
+@pytest.mark.asyncio
 async def test_unknown_chain_and_malformed_response_are_stable_agent_errors():
     adapter = OkxWalletAdapter(FakeClient(), {"ETH": "1"})
     with pytest.raises(OkxWalletError) as unknown:
