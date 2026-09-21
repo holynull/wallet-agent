@@ -8,15 +8,19 @@ from .models import (
     AssetQuery,
     DepositOrder,
     FeeEstimate,
+    GasLimitEstimate,
     NormalizedOrderStatus,
     NormalizedQuote,
     ProviderOrder,
+    SimulationResult,
     SwapQuoteRequest,
     TokenBalance,
     TokenPrice,
+    TransactionContext,
     TransactionRecord,
     TransactionStatus,
     UnsignedTransaction,
+    WalletTotalValue,
 )
 
 
@@ -81,3 +85,28 @@ class TokenPriceProvider(Protocol):
     """Normalized interface for batch asset price lookup."""
 
     async def get_prices(self, assets: list[Asset]) -> list[TokenPrice]: ...
+
+
+class WalletProvider(Protocol):
+    """Normalized optional wallet valuation and pre-transaction access."""
+
+    async def get_total_value(
+        self,
+        address: str,
+        chain_indexes: list[str],
+        *,
+        asset_type: str = "0",
+        exclude_risk_tokens: bool = True,
+    ) -> WalletTotalValue: ...
+
+    async def get_token_balances(
+        self,
+        address: str,
+        chain_indexes: list[str],
+        *,
+        exclude_risk_tokens: bool = True,
+    ) -> list[TokenBalance]: ...
+
+    async def estimate_gas_limit(self, transaction: TransactionContext) -> GasLimitEstimate: ...
+
+    async def simulate_transaction(self, transaction: TransactionContext) -> SimulationResult: ...

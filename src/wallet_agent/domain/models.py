@@ -8,7 +8,7 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
-ProviderName = Literal["bridgers", "omnibridge"]
+ProviderName = Literal["bridgers", "omnibridge", "okx", "coingecko"]
 OrderState = Literal[
     "pending",
     "processing",
@@ -325,6 +325,64 @@ class TokenBalance(DomainModel):
     amount: Decimal = Field(ge=0)
     amount_raw: RawInteger
     usd_value: Decimal | None = Field(default=None, ge=0)
+    is_risk_token: bool = False
+    provider: ProviderName | None = None
+    observed_at: datetime | None = None
+    market_details: "TokenMarketDetails | None" = None
+
+
+class TokenMarketDetails(DomainModel):
+    """Normalized optional market metadata associated with a token balance."""
+
+    asset: Asset | None = None
+    usd_price: Decimal | None = Field(default=None, ge=0)
+    market_cap: Decimal | None = Field(default=None, ge=0)
+    volume_24h: Decimal | None = Field(default=None, ge=0)
+
+
+class WalletTotalValue(DomainModel):
+    """A normalized multi-chain wallet valuation returned by a wallet provider."""
+
+    address: str
+    chain_indexes: list[str] = Field(default_factory=list)
+    asset_type: str = "0"
+    exclude_risk_tokens: bool = True
+    total_value: Decimal = Field(ge=0)
+    provider: Literal["okx"] = "okx"
+    observed_at: datetime | None = None
+
+
+class TransactionContext(DomainModel):
+    """Unsigned transaction context accepted by OKX pre-transaction endpoints."""
+
+    chain: str
+    from_address: str
+    to_address: str
+    native_amount: RawInteger = "0"
+    calldata: str = "0x"
+
+
+_PositiveRawInteger = Annotated[str, Field(pattern=r"^[1-9][0-9]*$")]
+
+
+class GasLimitEstimate(DomainModel):
+    """A validated gas-limit observation from OKX."""
+
+    gas_limit: _PositiveRawInteger
+    chain: str | None = None
+    provider: Literal["okx"] = "okx"
+    observed_at: datetime | None = None
+
+
+class SimulationResult(DomainModel):
+    """Sanitized transaction simulation evidence from OKX."""
+
+    success: bool
+    gas_used: RawInteger | None = None
+    failure_reason: str | None = None
+    chain: str | None = None
+    provider: Literal["okx"] = "okx"
+    observed_at: datetime | None = None
 
 
 class TokenPrice(DomainModel):
