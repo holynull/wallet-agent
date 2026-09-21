@@ -3057,6 +3057,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 token=req.token,
                 transaction=tx,
                 wallet_context=state.get("wallet_context"),
+                wallet_provider=runtime.wallet_provider,
             )
             if not preflight["ok"]:
                 return {
@@ -3157,6 +3158,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     ),
                     transaction=prepared,
                     wallet_context=state.get("wallet_context"),
+                    wallet_provider=runtime.wallet_provider,
                 )
                 if not preflight["ok"]:
                     return {
@@ -3304,6 +3306,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 token=(Asset.model_validate(source_asset) if source_asset.get("address") else None),
                 transaction=prepared,
                 wallet_context=state.get("wallet_context"),
+                wallet_provider=runtime.wallet_provider,
             )
             if not preflight["ok"]:
                 return {
@@ -3788,6 +3791,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     ),
                     transaction=prepared_transaction,
                     wallet_context=state.get("wallet_context"),
+                    wallet_provider=runtime.wallet_provider,
                 )
                 if not preflight["ok"]:
                     return {
