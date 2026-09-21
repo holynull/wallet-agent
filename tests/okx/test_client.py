@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import logging
 
 import httpx
 import pytest
@@ -175,3 +176,52 @@ async def test_http_auth_failure_is_not_retried():
         await client.aclose()
     assert attempts == 1
     assert raised.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_has_bounded_jitter_and_safe_diagnostics(caplog):
+    attempts = 0
+    delays = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503, json={"secret": "body-secret"})
+        return httpx.Response(200, json={"code": "0", "msg": "", "data": []})
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    client = OkxSignedClient(
+        "https://web3.okx.com",
+        api_key="api-key",
+        secret_key="secret-value",
+        passphrase="passphrase-value",
+        retry_delay_seconds=0.1,
+        transport=httpx.MockTransport(handler),
+        sleep=sleep,
+        jitter_fn=lambda base: base * 0.1,
+    )
+    try:
+        with caplog.at_level(logging.DEBUG, logger="wallet_agent.okx.client"):
+            await client.request(
+                "GET",
+                "/api/v6/dex/market/price",
+                query={"address": "0xprivate", "tokenContractAddress": "body-secret"},
+                body={"signed": "body-secret"},
+            )
+    finally:
+        await client.aclose()
+
+    assert attempts == 2
+    assert delays == [pytest.approx(0.11)]
+    assert "body-secret" not in caplog.text
+    assert "0xprivate" not in caplog.text
+    assert "secret-value" not in caplog.text
+    assert "passphrase-value" not in caplog.text
+    assert "method=GET" in caplog.text
+    assert "path=/api/v6/dex/market/price" in caplog.text
+    assert "status=503" in caplog.text
+    assert "attempt=1" in caplog.text
+    assert "elapsed_ms=" in caplog.text

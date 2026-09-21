@@ -6,6 +6,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -297,7 +298,19 @@ def create_app(
     require_auth: bool = False,
     model_registry: Any = None,
 ) -> FastAPI:
-    app = FastAPI(title="Wallet Agent", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            transports = list(application.state.transports)
+            application.state.transports.clear()
+            for transport in transports:
+                close = getattr(transport, "aclose", None)
+                if close is not None:
+                    await close()
+
+    app = FastAPI(title="Wallet Agent", version="0.1.0", lifespan=lifespan)
     session_store = store or InMemorySessionStore()
     provider_map = dict(providers or {})
     app.state.graph = graph
@@ -310,6 +323,7 @@ def create_app(
     app.state.token_verifier = token_verifier
     app.state.require_auth = require_auth
     app.state.model_registry = model_registry
+    app.state.transports: list[Any] = []
 
     def graph_lock(thread_id: str) -> asyncio.Lock:
         lock = app.state.graph_locks.get(thread_id)

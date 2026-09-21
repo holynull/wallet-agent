@@ -7,6 +7,8 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
+import random
 import time
 from collections.abc import Callable, Mapping
 from email.utils import parsedate_to_datetime
@@ -15,6 +17,8 @@ from typing import Any
 import httpx
 
 from .errors import OkxClientError
+
+logger = logging.getLogger(__name__)
 
 
 class OkxSignedClient:
@@ -34,6 +38,7 @@ class OkxSignedClient:
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], str] | None = None,
         sleep: Callable[[float], Any] | None = None,
+        jitter_fn: Callable[[float], float] | None = None,
     ) -> None:
         self.max_attempts = max(1, max_attempts)
         self.retry_delay_seconds = max(0, retry_delay_seconds)
@@ -43,6 +48,7 @@ class OkxSignedClient:
         self._project_id = project_id
         self._clock = clock or self._utc_timestamp
         self._sleep = sleep or asyncio.sleep
+        self._jitter_fn = jitter_fn or (lambda base: random.uniform(0, base * 0.1))
         self.client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=timeout_seconds,
@@ -109,6 +115,7 @@ class OkxSignedClient:
         request_path = f"{path}?{query_string}" if query_string else path
         body_bytes = self._body_bytes(body)
         for attempt in range(self.max_attempts):
+            started = time.monotonic()
             timestamp = self._clock()
             prehash = f"{timestamp}{method}{request_path}{body_bytes.decode('utf-8')}"
             signature = base64.b64encode(
@@ -136,11 +143,38 @@ class OkxSignedClient:
                     headers=headers,
                 )
             except httpx.TransportError as exc:
+                logger.debug(
+                    "okx request method=%s path=%s status=%s code=%s attempt=%s "
+                    "elapsed_ms=%.1f error=%s",
+                    method,
+                    path,
+                    None,
+                    None,
+                    attempt + 1,
+                    (time.monotonic() - started) * 1000,
+                    type(exc).__name__,
+                )
                 if attempt + 1 >= self.max_attempts:
                     raise OkxClientError("transport_error", "OKX transport unavailable") from exc
                 await self._wait(None, attempt)
                 continue
 
+            response_code = None
+            try:
+                response_json = response.json()
+                if isinstance(response_json, dict):
+                    response_code = response_json.get("code")
+            except ValueError:
+                pass
+            logger.debug(
+                "okx request method=%s path=%s status=%s code=%s attempt=%s elapsed_ms=%.1f",
+                method,
+                path,
+                response.status_code,
+                response_code,
+                attempt + 1,
+                (time.monotonic() - started) * 1000,
+            )
             if self._retryable_status(response.status_code):
                 if attempt + 1 >= self.max_attempts:
                     raise OkxClientError(
@@ -175,7 +209,11 @@ class OkxSignedClient:
         raise OkxClientError("retry_exhausted", "OKX request failed after retries", retryable=True)
 
     async def _wait(self, retry_after: float | None, attempt: int) -> None:
-        delay = retry_after if retry_after is not None else self.retry_delay_seconds * (2**attempt)
+        if retry_after is not None:
+            delay = retry_after
+        else:
+            base = min(self.retry_delay_seconds * (2**attempt), 30.0)
+            delay = min(30.0, base + (self._jitter_fn(base) if base else 0))
         if delay:
             await self._sleep(delay)
 
