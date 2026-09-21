@@ -41,6 +41,8 @@ async def test_mobile_demo_page_is_served_by_api_app():
     assert "资产组合" in response.text
     assert "Token 资产发现" in response.text
     assert "后端调试数据" in response.text
+    assert "debugCopyButton" in response.text
+    assert "copyDebugData" in response.text
     assert "联调检查" in response.text
     assert "debugSmokeButton" in response.text
     assert "测试全部 Agent 功能" in response.text
@@ -64,6 +66,11 @@ async def test_mobile_demo_page_is_served_by_api_app():
         in response.text
     )
     assert "Swap 已提交，正在等待节点确认" in response.text
+    assert "gas_sources" in response.text
+    assert "not_propagated" in response.text
+    assert "observed_at" in response.text
+    assert "history" in response.text
+    assert "candles" in response.text
 
 
 @pytest.mark.asyncio

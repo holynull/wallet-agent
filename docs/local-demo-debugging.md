@@ -216,6 +216,17 @@ POST /v1/swap/{session_id}/broadcast
 - 每条 `SSE update`、`SSE complete`、`SSE error` 事件；
 - 非 JSON 错误响应的原始文本。
 
+点击“复制调试数据”可把当前面板内容复制到剪贴板，方便提交问题。复制内容
+与页面显示使用同一份安全归一化结果：`OK-ACCESS-*`、API key、secret、
+passphrase、Authorization、签名/私钥/助记词及签名请求体等字段会先被移除
+或遮蔽。不要把浏览器 Network 面板中未经检查的认证请求头直接粘贴到工单。
+
+启用 OKX 增强后，Demo 还会展示价格 `provider`、`observed_at`、市场指标、
+历史价格/K 线、预检查的 `gas_sources` 和 simulation 警告。广播状态为
+`not_propagated` 时表示钱包返回了交易哈希，但 RPC 在有限重试后仍未看到
+源链交易；此时后端会保存哈希，但不会登记或轮询兑换 Provider，页面也不会
+误报“Provider 处理中”。
+
 点击面板里的“联调检查”，Demo 会按顺序执行 health、ready、一次
 `你好，联调检查` Agent turn 和对应 SSE 读取。这个入口不需要连接钱包，
 适合先确认浏览器页面、HTTP API、Agent 图和 SSE 是否打通。若页面上出现

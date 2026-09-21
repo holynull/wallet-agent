@@ -104,6 +104,7 @@
     <summary>后端调试数据（0 条）</summary>
     <div class="debug-actions">
       <button id="debugSmokeButton" class="secondary" type="button">联调检查</button>
+      <button id="debugCopyButton" class="secondary" type="button">复制调试数据</button>
       <button id="debugClearButton" class="secondary" type="button">清空</button>
     </div>
     <pre id="debugOutput">等待后端响应…</pre>
@@ -153,6 +154,25 @@
   const MESSAGE_BOTTOM_THRESHOLD = 48;
 
   function json(value) { return JSON.stringify(value, null, 2); }
+  function isSensitiveDebugKey(key) {
+    const canonical = String(key).toLowerCase().replace(/[^a-z0-9]/g, '');
+    return canonical.includes('okaccess') || canonical.includes('authorization')
+      || canonical.includes('apikey') || canonical.includes('secret')
+      || canonical.includes('passphrase') || canonical.includes('privatekey')
+      || canonical.includes('seedphrase') || canonical.includes('mnemonic')
+      || canonical.includes('signedbody') || canonical.includes('signature')
+      || canonical.includes('credential');
+  }
+  function sanitizeDebug(value, key = '') {
+    if (isSensitiveDebugKey(key)) return '[redacted]';
+    if (Array.isArray(value)) return value.map((item) => sanitizeDebug(item));
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([name, item]) => (
+        isSensitiveDebugKey(name) ? ['[redacted-key]', '[redacted]'] : [name, sanitizeDebug(item, name)]
+      )));
+    }
+    return value;
+  }
   function isMessagesNearBottom() {
     return messages.scrollHeight - messages.scrollTop - messages.clientHeight <= MESSAGE_BOTTOM_THRESHOLD;
   }
@@ -170,12 +190,31 @@
     state.debugLog.push({
       time: new Date().toISOString(),
       type,
-      data
+      data: sanitizeDebug(data)
     });
     if (state.debugLog.length > 100) state.debugLog.shift();
     const panel = $('debugPanel');
     $('debugOutput').textContent = state.debugLog.map((item) => `[${item.time}] ${item.type}\n${json(item.data)}`).join('\n\n');
     panel.querySelector('summary').textContent = `后端调试数据（${state.debugLog.length} 条）`;
+  }
+  async function copyDebugData() {
+    const button = $('debugCopyButton');
+    const value = $('debugOutput').textContent || '';
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        const area = document.createElement('textarea');
+        area.value = value; area.style.position = 'fixed'; area.style.opacity = '0';
+        document.body.append(area); area.select(); document.execCommand('copy'); area.remove();
+      }
+      const original = button.textContent;
+      button.textContent = '已复制';
+      window.setTimeout(() => { button.textContent = original; }, 1200);
+    } catch (error) {
+      button.textContent = '复制失败';
+      recordDebug('DEBUG COPY ERROR', { message: error?.message || String(error) });
+    }
   }
   function clearDebug() {
     state.debugLog = [];
@@ -453,7 +492,7 @@
     return current;
   }
   function renderResponse(response) {
-    const fingerprint = json(response); if (fingerprint === state.lastResponse) return; state.lastResponse = fingerprint;
+    const fingerprint = `${state.runId || 'direct'}:${json(response)}`; if (fingerprint === state.lastResponse) return; state.lastResponse = fingerprint;
     if (response.kind === 'clarification') {
       const missing = (response.missing_fields || []).join('、');
       addTypingMessage(response.message || (
@@ -495,14 +534,20 @@
       const status = typeof response.status === 'object'
         ? (response.status.status || response.status.state || 'unknown')
         : (response.status || 'unknown');
+      const broadcastStatus = response.broadcast_status || (typeof response.status === 'object' ? response.status.broadcast_status : null);
       const messages = {
         pending: '兑换订单已提交，Provider 仍在处理中。',
+        broadcast_pending: '交易已被节点看到，正在等待链上确认。',
+        confirmed: '交易已确认，Provider 可以继续处理兑换订单。',
+        not_propagated: '交易哈希暂时还没有在源链上出现，Provider 轮询尚未开始。',
+        dropped_or_replaced: '交易可能已被丢弃或被同 nonce 的新交易替换。',
         completed: '兑换已完成，可以到目标链查看到账资产。',
         failed: '兑换没有成功完成，请检查订单详情或稍后重试。',
         timed_out: 'Provider 暂时没有返回最终结果，订单可能仍在处理中，建议稍后查询。',
         unknown: '暂时拿不到兑换订单的最新状态，建议稍后重新查询。'
       };
       addTypingMessage(response.message || messages[status] || `兑换订单状态：${status}`);
+      if (broadcastStatus || response.tx_hash) renderBroadcastStatus({ ...response, broadcast_status: broadcastStatus || status });
     }
     else if (response.kind === 'wallet_query') {
       const wallet = response.wallet || {};
@@ -516,6 +561,12 @@
       const portfolio = response.portfolio || {};
       addTypingMessage(`你在 ${portfolio.chain || '当前网络'} 上共有 ${portfolio.assets?.length || 0} 项资产，USD 估值为 ${portfolio.total_usd_value ?? '暂不可用'}。`);
       renderPortfolio(portfolio);
+    }
+    else if (response.kind === 'price_query') {
+      const prices = response.prices || [];
+      const sourceSummary = prices.map((item) => `${String(item.provider || '未知来源').toUpperCase()} ${item.asset?.symbol || ''} ${item.usd_price || '-'}`).join('；');
+      addTypingMessage(sourceSummary ? `价格来源：${sourceSummary}` : '暂时没有可用的价格数据。');
+      renderPriceData(response);
     }
     else if (response.kind === 'gas_check') {
       addTypingMessage(response.sufficient
@@ -561,10 +612,38 @@
     if (!preflight) return;
     const card = document.createElement('div'); card.className = 'card';
     const title = document.createElement('h3'); title.textContent = preflight.ok ? '交易预检查通过' : '交易预检查未通过';
-    const summary = document.createElement('p'); summary.textContent = (preflight.checks || []).map((item) => `${item.status === 'passed' ? '✓' : item.status === 'warning' ? '!' : '×'} ${item.message}`).join('\n');
+    const sourceText = preflight.gas_sources ? `Gas 来源：${Object.entries(preflight.gas_sources).map(([name, used]) => `${name}=${used ? '已用' : '未用'}`).join('、')}` : '';
+    const simulation = preflight.simulation;
+    const simulationText = simulation && simulation.success === false ? `模拟警告：${simulation.error || simulation.fail_reason || 'simulation failed'}` : '';
+    const summary = document.createElement('p'); summary.textContent = [sourceText, simulationText, ...(preflight.checks || []).map((item) => `${item.status === 'passed' ? '✓' : item.status === 'warning' ? '!' : '×'} ${item.message}`)].filter(Boolean).join('\n');
     summary.style.whiteSpace = 'pre-line';
     card.append(title, summary);
     addCard('preflight', card);
+  }
+  function renderBroadcastStatus(result) {
+    const card = document.createElement('div'); card.className = 'card';
+    const title = document.createElement('h3'); title.textContent = '源链广播状态';
+    const summary = document.createElement('p');
+    summary.textContent = `${result.broadcast_status || result.status || 'unknown'}${result.tx_hash ? `\n交易哈希：${result.tx_hash}` : ''}\n${result.message || ''}`;
+    summary.style.whiteSpace = 'pre-line';
+    card.append(title, summary); addCard('broadcast-status', card);
+  }
+  function renderPriceData(response) {
+    const card = document.createElement('div'); card.className = 'card';
+    const title = document.createElement('h3'); title.textContent = '价格与市场数据'; card.append(title);
+    const prices = response.prices || [];
+    const details = response.details || response.market_details || [];
+    const history = response.history || response.historical || {};
+    const candles = response.candles || [];
+    const lines = [];
+    prices.forEach((item) => lines.push(`当前：${String(item.provider || '未知').toUpperCase()} · ${item.asset?.symbol || '-'} · $${item.usd_price || '-'} · ${item.observed_at || '-'}`));
+    details.forEach((item) => lines.push(`市场：${String(item.provider || '未知').toUpperCase()} · ${item.asset?.symbol || '-'} · 持有人 ${item.holder_count ?? '-'} · 市值 ${item.market_cap ?? '-'}`));
+    if (history.points?.length) lines.push(`历史价格：${history.points.length} 条${history.next_cursor ? `，cursor ${history.next_cursor}` : ''}`);
+    if (candles.length) lines.push(`K 线：${candles.length} 条 · 最新收盘 ${candles[candles.length - 1].close ?? '-'}`);
+    const summary = document.createElement('p'); summary.textContent = lines.length ? lines.join('\n') : '暂无价格、历史或市场数据。'; summary.style.whiteSpace = 'pre-line'; card.append(summary);
+    if (history.points?.length) { const pre = document.createElement('pre'); pre.textContent = `历史价格\n${json(history.points)}`; card.append(pre); }
+    if (candles.length) { const pre = document.createElement('pre'); pre.textContent = `K 线\n${json(candles)}`; card.append(pre); }
+    addCard('prices', card);
   }
   function renderPortfolio(portfolio) {
     if (!portfolio) return;
@@ -1112,7 +1191,7 @@
   renderAgentTestList(); updateAgentTestSummary();
   $('connectButton').onclick = connectWallet; $('refreshButton').onclick = refreshSession; $('sendButton').onclick = sendMessage;
   $('cancelRequestButton').onclick = cancelActiveRequest; $('retryButton').onclick = retryLastMessage;
-  $('debugSmokeButton').onclick = runDebugSmoke; $('debugClearButton').onclick = clearDebug;
+  $('debugSmokeButton').onclick = runDebugSmoke; $('debugCopyButton').onclick = copyDebugData; $('debugClearButton').onclick = clearDebug;
   $('runAgentTestsButton').onclick = runAgentTests;
   $('composer').addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); } });
   discoverWalletProviders(); updateMeta(); addMessage('assistant', '你好，我可以帮你查询余额、比较兑换报价，并准备未签名交易。先连接浏览器钱包，然后告诉我你想兑换什么。');
