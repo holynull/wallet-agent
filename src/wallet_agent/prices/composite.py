@@ -35,6 +35,27 @@ class CompositePriceProvider:
         self.last_error = self._provider_error()
         return [by_key[self._key(asset)] for asset in assets if self._key(asset) in by_key]
 
+    async def get_market_details(self, assets):
+        provider = self.primary or self.fallback
+        method = getattr(provider, "get_market_details", None)
+        if method is None:
+            raise RuntimeError("detailed market prices are unavailable")
+        return await method(assets)
+
+    async def get_historical_prices(self, asset, **kwargs):
+        provider = self.primary or self.fallback
+        method = getattr(provider, "get_historical_prices", None)
+        if method is None:
+            raise RuntimeError("historical prices are unavailable")
+        return await method(asset, **kwargs)
+
+    async def get_candles(self, asset, **kwargs):
+        provider = self.primary or self.fallback
+        method = getattr(provider, "get_candles", None)
+        if method is None:
+            raise RuntimeError("price candles are unavailable")
+        return await method(asset, **kwargs)
+
     def _provider_error(self):
         for provider in (self.primary, self.fallback):
             error = getattr(provider, "last_error", None)

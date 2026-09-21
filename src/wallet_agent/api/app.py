@@ -30,6 +30,8 @@ from wallet_agent.domain.models import (
     ProviderOrder,
     UnsignedTransaction,
 )
+from wallet_agent.okx import OKX_CHAIN_INDEX_BY_NAME, OkxWalletError
+from wallet_agent.prices.okx import PriceProviderError
 from wallet_agent.persistence import (
     InMemorySessionStore,
     SessionRevisionConflict,
@@ -215,6 +217,24 @@ def _qualified_hash(chain: str, tx_hash: str) -> bool:
     return False
 
 
+def _okx_chain_indexes(chains: str) -> list[str]:
+    values = [item.strip() for item in str(chains).split(",") if item.strip()]
+    if not values:
+        raise ValueError("at least one chain is required")
+    indexes: list[str] = []
+    for value in values:
+        index = OKX_CHAIN_INDEX_BY_NAME.get(value.upper())
+        if index is None:
+            raise OkxWalletError(
+                "OKX_CHAIN_UNSUPPORTED",
+                "The requested chain is not supported by OKX.",
+                details={"chain": value},
+            )
+        if index not in indexes:
+            indexes.append(index)
+    return indexes
+
+
 def _looks_like_swap(message: str) -> bool:
     text = message.lower()
     return any(
@@ -292,6 +312,7 @@ def create_app(
     graph: Any = None,
     chain_registry: Any = None,
     providers: Mapping[str, Any] | None = None,
+    wallet_provider: Any | None = None,
     price_provider: Any | None = None,
     store: SessionStore | None = None,
     token_verifier: TokenVerifier | None = None,
@@ -316,6 +337,7 @@ def create_app(
     app.state.graph = graph
     app.state.chain_registry = chain_registry
     app.state.providers = provider_map
+    app.state.wallet_provider = wallet_provider
     app.state.price_provider = price_provider
     app.state.session_store = session_store
     app.state.runs: dict[str, dict[str, Any]] = {}
@@ -1357,6 +1379,144 @@ def create_app(
                 status_code=502, detail={"code": "PRICE_QUERY_FAILED", "message": str(exc)}
             ) from exc
 
+    @app.get("/v1/prices/market")
+    async def market_prices(
+        request: Request,
+        chain: str,
+        address: str | None = None,
+        symbol: str = "TOKEN",
+        decimals: int = 18,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        await authenticated_user(
+            request, verifier=token_verifier, required=require_auth, fallback_user_id=user_id
+        )
+        extras = set(request.query_params) - {"chain", "address", "symbol", "decimals", "user_id"}
+        if extras:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "VALIDATION_ERROR", "message": "Unsupported price parameters."},
+            )
+        provider = app.state.price_provider
+        if provider is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "PRICE_PROVIDER_UNAVAILABLE", "message": "Price provider unavailable."},
+            )
+        try:
+            asset = Asset(chain=chain.upper(), symbol=symbol, decimals=decimals, address=address)
+            method = getattr(provider, "get_market_details", None)
+            if method is None:
+                raise PriceProviderError("Detailed market prices are unavailable.")
+            details = await method([asset])
+            return {"asset": _jsonable(asset), "details": [_jsonable(item) for item in details]}
+        except PriceProviderError as exc:
+            raise HTTPException(
+                status_code=422 if exc.code == "OKX_INVALID_ARGUMENT" else 502,
+                detail={"code": exc.code, "message": str(exc), "details": {"provider": "okx"}},
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "PRICE_QUERY_FAILED", "message": "Price provider unavailable."},
+            ) from exc
+
+    @app.get("/v1/prices/history")
+    async def historical_prices(
+        request: Request,
+        chain: str,
+        address: str | None = None,
+        symbol: str = "TOKEN",
+        decimals: int = 18,
+        period: str = "1h",
+        begin: int | None = None,
+        end: int | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        await authenticated_user(
+            request, verifier=token_verifier, required=require_auth, fallback_user_id=user_id
+        )
+        extras = set(request.query_params) - {
+            "chain", "address", "symbol", "decimals", "period", "begin", "end",
+            "cursor", "limit", "user_id",
+        }
+        if extras or period not in {"1m", "5m", "30m", "1h", "1d"} or not 1 <= limit <= 200:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "INVALID_PRICE_QUERY", "message": "Invalid historical price parameters."},
+            )
+        provider = app.state.price_provider
+        if provider is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "PRICE_PROVIDER_UNAVAILABLE", "message": "Price provider unavailable."},
+            )
+        try:
+            asset = Asset(chain=chain.upper(), symbol=symbol, decimals=decimals, address=address)
+            page = await provider.get_historical_prices(
+                asset, period=period, begin_ms=begin, end_ms=end, cursor=cursor, limit=limit
+            )
+            return _jsonable(page)
+        except PriceProviderError as exc:
+            raise HTTPException(
+                status_code=422 if exc.code == "OKX_INVALID_ARGUMENT" else 502,
+                detail={"code": exc.code, "message": str(exc), "details": {"provider": "okx"}},
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "PRICE_QUERY_FAILED", "message": "Price provider unavailable."},
+            ) from exc
+
+    @app.get("/v1/prices/candles")
+    async def price_candles(
+        request: Request,
+        chain: str,
+        address: str | None = None,
+        symbol: str = "TOKEN",
+        decimals: int = 18,
+        bar: str = "1H",
+        before: int | None = None,
+        after: int | None = None,
+        limit: int = 100,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        await authenticated_user(
+            request, verifier=token_verifier, required=require_auth, fallback_user_id=user_id
+        )
+        extras = set(request.query_params) - {
+            "chain", "address", "symbol", "decimals", "bar", "before", "after", "limit", "user_id",
+        }
+        if extras or not 1 <= limit <= 299 or not bar.strip():
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "INVALID_PRICE_QUERY", "message": "Invalid candle parameters."},
+            )
+        provider = app.state.price_provider
+        if provider is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "PRICE_PROVIDER_UNAVAILABLE", "message": "Price provider unavailable."},
+            )
+        try:
+            asset = Asset(chain=chain.upper(), symbol=symbol, decimals=decimals, address=address)
+            candles = await provider.get_candles(
+                asset, bar=bar, before_ms=before, after_ms=after, limit=limit
+            )
+            return {"candles": [_jsonable(item) for item in candles]}
+        except PriceProviderError as exc:
+            raise HTTPException(
+                status_code=422 if exc.code == "OKX_INVALID_ARGUMENT" else 502,
+                detail={"code": exc.code, "message": str(exc), "details": {"provider": "okx"}},
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "PRICE_QUERY_FAILED", "message": "Price provider unavailable."},
+            ) from exc
+
     @app.get("/v1/swap/{session_id}")
     async def get_swap(
         request: Request, session_id: str, user_id: str | None = None
@@ -1473,6 +1633,53 @@ def create_app(
             raise HTTPException(
                 status_code=502,
                 detail={"code": "PORTFOLIO_QUERY_FAILED", "message": str(exc)},
+            ) from exc
+
+    @app.get("/v1/wallet/{address}/total-value")
+    async def total_value(
+        request: Request,
+        address: str,
+        chains: str,
+        asset_type: str = "all",
+        exclude_risk_tokens: bool = True,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        await authenticated_user(
+            request, verifier=token_verifier, required=require_auth, fallback_user_id=user_id
+        )
+        provider = app.state.wallet_provider
+        if provider is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "WALLET_PROVIDER_UNAVAILABLE", "message": "Wallet provider unavailable."},
+            )
+        try:
+            indexes = _okx_chain_indexes(chains)
+            type_value = {"all": "0", "token": "1", "defi": "2"}.get(asset_type.lower())
+            if type_value is None:
+                raise OkxWalletError(
+                    "OKX_INVALID_ARGUMENT", "Unsupported asset_type.", details={"asset_type": asset_type}
+                )
+            value = await provider.get_total_value(
+                address,
+                indexes,
+                asset_type=type_value,
+                exclude_risk_tokens=exclude_risk_tokens,
+            )
+            return {
+                **_jsonable(value),
+                "source": "okx",
+                "observed_at": _jsonable(value.observed_at),
+            }
+        except OkxWalletError as exc:
+            raise HTTPException(
+                status_code=422 if exc.code in {"OKX_CHAIN_UNSUPPORTED", "OKX_INVALID_ARGUMENT"} else 502,
+                detail={"code": exc.code, "message": exc.message, "details": exc.details},
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "OKX_WALLET_UNAVAILABLE", "message": "OKX wallet provider unavailable."},
             ) from exc
 
     @app.get("/v1/wallet/{address}/gas")
