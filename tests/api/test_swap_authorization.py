@@ -600,7 +600,8 @@ async def test_status_turn_after_broadcast_polls_order_without_reopening_approva
     session = await store.get("s-status")
 
     assert broadcast.status_code == 200
-    assert broadcast.json()["stage"] == "broadcasted"
+    assert broadcast.json()["stage"] == "confirmed"
+    assert broadcast.json()["broadcast_status"] == "confirmed"
     assert provider.status_calls == 1
     assert final_state["response"]["kind"] == "swap_status"
     assert final_state["response"]["status"]["status"] == "processing"

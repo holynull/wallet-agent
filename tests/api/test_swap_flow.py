@@ -276,7 +276,7 @@ async def test_broadcast_is_idempotent_and_conflicting_hash_is_rejected():
 
 
 @pytest.mark.asyncio
-async def test_broadcast_accepts_hash_temporarily_missing_from_chain():
+async def test_broadcast_records_hash_missing_from_chain_without_provider_polling():
     class BroadcastAdapter:
         async def get_transaction_receipt(self, _tx_hash):
             return None
@@ -301,9 +301,11 @@ async def test_broadcast_accepts_hash_temporarily_missing_from_chain():
         )
 
     assert broadcast.status_code == 200
-    assert broadcast.json()["status"] == "broadcast_pending"
+    assert broadcast.json()["status"] == "not_propagated"
+    assert broadcast.json()["broadcast_status"] == "not_propagated"
     assert broadcast.json()["broadcast_tx_hash"] == tx_hash
-    assert provider.broadcast_calls == 1
+    assert "not yet visible" in broadcast.json()["message"]
+    assert provider.broadcast_calls == 0
 
 
 @pytest.mark.asyncio
@@ -344,8 +346,65 @@ async def test_broadcast_retries_rpc_visibility_before_marking_pending():
 
     assert broadcast.status_code == 200
     assert broadcast.json()["status"] == "broadcast_pending"
+    assert broadcast.json()["broadcast_status"] == "broadcast_pending"
     assert adapter.receipt_calls == 2
     assert adapter.transaction_calls == 2
+    assert provider.broadcast_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_status_turn_preserves_not_propagated_broadcast_state_without_provider_polling():
+    provider = FakeProvider()
+    quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=Asset(
+            chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x" + "1" * 40
+        ),
+        destination_asset=Asset(
+            chain="BSC", chain_id=56, symbol="USDT", decimals=6, address="0x" + "2" * 40
+        ),
+        input_amount=Decimal("10"),
+        input_amount_raw="10000000",
+        expected_output=Decimal("9"),
+        expected_output_raw="9000000",
+        provider_reference="quote-not-propagated",
+    )
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-not-propagated-turn",
+            user_id="alice",
+            thread_id="t-not-propagated-turn",
+            quote=quote,
+            broadcast_tx_hash="0x" + "f" * 64,
+            status="not_propagated",
+            stage="not_propagated",
+        )
+    )
+    graph = build_graph(model=FakeModel(), providers=[provider])
+    app = create_app(graph=graph, providers={"bridgers": provider}, store=store)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/agent/turn",
+            json={
+                "conversation_id": "t-not-propagated-turn",
+                "session_id": "s-not-propagated-turn",
+                "user_id": "alice",
+                "message": "怎么样了",
+                "metadata": {"agent_test_intent": "swap_status"},
+            },
+        )
+        await app.state.runs[response.json()["run_id"]]["task"]
+        events = app.state.runs[response.json()["run_id"]]["events"]
+
+    complete = next(event["state"] for event in reversed(events) if event["event"] == "complete")
+    assert response.status_code == 200
+    assert complete["response"]["status"] == "not_propagated"
+    assert complete["response"]["broadcast_status"] == "not_propagated"
+    assert provider.broadcast_calls == 0
 
 
 @pytest.mark.asyncio

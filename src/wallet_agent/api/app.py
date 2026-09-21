@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import fields, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -61,6 +61,18 @@ _AGENT_TEST_INTENTS = {
 
 _BROADCAST_RPC_ATTEMPTS = 3
 _BROADCAST_RPC_DELAY_SECONDS = 0.2
+BroadcastStatus = Literal[
+    "broadcast_seen",
+    "broadcast_pending",
+    "not_propagated",
+    "confirmed",
+    "failed",
+    "dropped_or_replaced",
+    "unknown",
+]
+_BROADCAST_PROVIDER_VISIBLE: frozenset[BroadcastStatus] = frozenset(
+    {"broadcast_seen", "broadcast_pending", "confirmed"}
+)
 
 
 class TurnRequest(BaseModel):
@@ -162,30 +174,89 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-async def _chain_broadcast_status(adapter: Any, tx_hash: str) -> str:
+def _broadcast_response(
+    record: SwapSessionRecord,
+    broadcast_status: BroadcastStatus | str | None = None,
+    *,
+    message: str | None = None,
+) -> dict[str, Any]:
+    payload = _jsonable(record)
+    payload["broadcast_status"] = broadcast_status or record.stage or record.status
+    if message is not None:
+        payload["message"] = message
+    return payload
+
+
+def _display_text(record: SwapSessionRecord, *keys: str) -> str | None:
+    pending = record.pending_transaction
+    display = getattr(pending, "display", None)
+    if not isinstance(display, Mapping):
+        return None
+    for key in keys:
+        value = display.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _display_int(record: SwapSessionRecord, *keys: str) -> int | None:
+    value = _display_text(record, *keys)
+    if value is None:
+        return None
+    try:
+        return int(value, 0)
+    except ValueError:
+        return None
+
+
+async def _chain_broadcast_status(
+    adapter: Any,
+    tx_hash: str,
+    *,
+    sender: str | None = None,
+    nonce: int | None = None,
+) -> BroadcastStatus:
     """Classify a wallet-returned hash without treating RPC propagation as failure."""
     last_error: Exception | None = None
-    receipt_lookup_succeeded = False
+    observer_succeeded = False
+    observer_error = False
     for attempt in range(_BROADCAST_RPC_ATTEMPTS):
         try:
             receipt = await adapter.get_transaction_receipt(tx_hash)
-            receipt_lookup_succeeded = True
+            observer_succeeded = True
             if receipt is not None:
                 success = receipt_success(receipt)
                 if success is False:
                     return "failed"
-                return "broadcasted" if success is True else "broadcast_pending"
+                return "confirmed" if success is True else "broadcast_pending"
             if hasattr(adapter, "get_transaction"):
                 transaction = await adapter.get_transaction(tx_hash)
+                observer_succeeded = True
                 if transaction is not None:
                     return "broadcast_pending"
         except Exception as exc:
             last_error = exc
+            observer_error = True
         if attempt + 1 < _BROADCAST_RPC_ATTEMPTS:
             await asyncio.sleep(_BROADCAST_RPC_DELAY_SECONDS)
-    if last_error is not None and not receipt_lookup_succeeded:
-        raise last_error
-    return "broadcast_pending"
+    if (
+        sender
+        and nonce is not None
+        and hasattr(adapter, "get_transaction_count")
+    ):
+        try:
+            current_nonce = await adapter.get_transaction_count(sender)
+            observer_succeeded = True
+            if current_nonce > nonce:
+                return "dropped_or_replaced"
+        except Exception as exc:
+            last_error = exc
+            observer_error = True
+    if observer_error:
+        return "unknown"
+    if last_error is not None and not observer_succeeded:
+        return "unknown"
+    return "not_propagated"
 
 
 def _qualified_hash(chain: str, tx_hash: str) -> bool:
@@ -813,6 +884,19 @@ def create_app(
             if existing_session.pending_transaction is not None:
                 pending_transaction = existing_session.pending_transaction
                 input_state["pending_transaction"] = pending_transaction.model_dump(mode="json")
+            if existing_session.broadcast_tx_hash:
+                input_state["broadcast_tx_hash"] = existing_session.broadcast_tx_hash
+                broadcast_status = existing_session.stage or existing_session.status
+                if broadcast_status in {
+                    "broadcast_seen",
+                    "broadcast_pending",
+                    "not_propagated",
+                    "confirmed",
+                    "failed",
+                    "dropped_or_replaced",
+                    "unknown",
+                }:
+                    input_state["broadcast_status"] = broadcast_status
         if existing_session is not None and existing_session.provider_order is not None:
             order = existing_session.provider_order
             input_state.update(
@@ -1011,15 +1095,21 @@ def create_app(
             )
         if session.broadcast_tx_hash:
             if session.broadcast_tx_hash == payload.tx_hash:
-                return _jsonable(session)
-            raise HTTPException(
-                status_code=409, detail="session already has a different broadcast hash"
-            )
+                if session.status not in {
+                    "not_propagated",
+                    "unknown",
+                    "dropped_or_replaced",
+                }:
+                    return _broadcast_response(session)
+            else:
+                raise HTTPException(
+                    status_code=409, detail="session already has a different broadcast hash"
+                )
         provider = app.state.providers.get(session.quote.provider if session.quote else "")
         if provider is None or session.quote is None:
             raise HTTPException(status_code=409, detail="swap provider or quote unavailable")
 
-        broadcast_status = "broadcasted"
+        broadcast_status: BroadcastStatus = "broadcast_seen"
         registry = app.state.chain_registry
         if registry is not None:
             try:
@@ -1031,42 +1121,73 @@ def create_app(
             except Exception:
                 adapter = None
             if adapter is not None and hasattr(adapter, "get_transaction_receipt"):
-                try:
-                    chain_status = await _chain_broadcast_status(adapter, payload.tx_hash)
-                    if chain_status == "failed":
-                        raise HTTPException(
-                            status_code=409,
-                            detail={
-                                "code": "TRANSACTION_FAILED",
-                                "message": "链上交易已确认失败，请检查钱包和交易参数。",
-                                "details": {"tx_hash": payload.tx_hash},
-                            },
-                        )
-                    broadcast_status = chain_status
-                except HTTPException:
-                    raise
-                except Exception as exc:
+                sender = _display_text(
+                    session,
+                    "from",
+                    "sender",
+                    "sender_address",
+                    "owner",
+                )
+                nonce = _display_int(session, "nonce", "transaction_nonce", "source_nonce")
+                chain_status = await _chain_broadcast_status(
+                    adapter,
+                    payload.tx_hash,
+                    sender=sender,
+                    nonce=nonce,
+                )
+                if chain_status == "failed":
                     raise HTTPException(
-                        status_code=503,
+                        status_code=409,
                         detail={
-                            "code": "TRANSACTION_STATUS_UNAVAILABLE",
-                            "message": "暂时无法验证交易是否已广播，请稍后重试。",
-                            "details": {"error": str(exc)},
+                            "code": "TRANSACTION_FAILED",
+                            "message": "链上交易已确认失败，请检查钱包和交易参数。",
+                            "details": {"tx_hash": payload.tx_hash},
                         },
-                    ) from exc
+                    )
+                broadcast_status = chain_status
         # Re-check and register under the per-thread lock.  This closes the
         # duplicate-provider-call window when a wallet retries the same hash.
         async with graph_lock(session.thread_id):
             session = await owned_session(session_id, user_id)
             if session.broadcast_tx_hash:
                 if session.broadcast_tx_hash == payload.tx_hash:
-                    return _jsonable(session)
-                raise HTTPException(
-                    status_code=409, detail="session already has a different broadcast hash"
-                )
+                    if session.status not in {
+                        "not_propagated",
+                        "unknown",
+                        "dropped_or_replaced",
+                    }:
+                        return _broadcast_response(session)
+                else:
+                    raise HTTPException(
+                        status_code=409, detail="session already has a different broadcast hash"
+                    )
             provider = app.state.providers.get(session.quote.provider if session.quote else "")
             if provider is None or session.quote is None:
                 raise HTTPException(status_code=409, detail="swap provider or quote unavailable")
+            if broadcast_status not in _BROADCAST_PROVIDER_VISIBLE:
+                message = {
+                    "not_propagated": (
+                        "The transaction hash is not yet visible on the source chain. "
+                        "The hash was saved; retry broadcast status after RPC propagation."
+                    ),
+                    "unknown": (
+                        "The transaction observer could not verify source-chain propagation. "
+                        "The hash was saved; retry status later."
+                    ),
+                    "dropped_or_replaced": (
+                        "The source account nonce has advanced while this hash is not visible; "
+                        "the transaction may have been dropped or replaced."
+                    ),
+                }.get(broadcast_status, "The transaction is not ready for provider polling.")
+                updated = await session_store.update(
+                    session_id,
+                    expected_revision=session.revision,
+                    status=broadcast_status,
+                    stage=broadcast_status,
+                    broadcast_tx_hash=payload.tx_hash,
+                    provider_order=None,
+                )
+                return _broadcast_response(updated, broadcast_status, message=message)
             reference = session.quote.provider_reference
             if session.pending_transaction is not None:
                 transaction_reference = getattr(
@@ -1097,7 +1218,7 @@ def create_app(
                 broadcast_tx_hash=payload.tx_hash,
                 provider_order=order,
             )
-        return _jsonable(updated)
+        return _broadcast_response(updated, broadcast_status)
 
     @app.post("/v1/swap/{session_id}/select-quote")
     async def select_quote(

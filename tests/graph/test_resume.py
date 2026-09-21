@@ -6,7 +6,9 @@ from langgraph.types import Command
 
 from wallet_agent.domain.models import (
     Asset,
+    NormalizedOrderStatus,
     NormalizedQuote,
+    ProviderOrder,
     UnsignedTransaction,
 )
 from wallet_agent.graph.build import build_graph
@@ -28,6 +30,33 @@ class PrepareProvider:
             value="0x0",
             provider="bridgers",
             provider_reference=quote.provider_reference,
+        )
+
+
+class BroadcastProvider:
+    provider_name = "bridgers"
+
+    def __init__(self):
+        self.broadcast_calls = 0
+        self.status_calls = 0
+
+    async def register_broadcast(self, provider_reference, tx_hash):
+        self.broadcast_calls += 1
+        return ProviderOrder(
+            provider="bridgers",
+            provider_order_id="order-1",
+            provider_reference=provider_reference,
+            tx_hash=tx_hash,
+        )
+
+    async def get_status(self, order):
+        self.status_calls += 1
+        return NormalizedOrderStatus(
+            provider="bridgers",
+            provider_order_id=order.provider_order_id,
+            provider_reference=order.provider_reference,
+            status="processing",
+            tx_hash=order.tx_hash,
         )
 
 
@@ -223,3 +252,26 @@ async def test_new_message_during_confirmation_reparses_and_invalidates_old_conf
     assert result["response"]["kind"] == "swap_quote"
     assert result["swap_request"]["source_asset"]["symbol"] == "USDC"
     assert result["confirmation_state"] is None
+
+
+@pytest.mark.asyncio
+async def test_broadcast_status_not_propagated_skips_provider_registration_and_polling():
+    provider = BroadcastProvider()
+    graph = build_graph(model=object(), providers=[provider])
+    quote = selected_quote()
+
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "not-propagated-status",
+            "forced_intent": "swap_status",
+            "broadcast_tx_hash": "0x" + "6" * 64,
+            "broadcast_status": "not_propagated",
+            "selected_quote": quote,
+        },
+        config={"configurable": {"thread_id": "not-propagated-status"}},
+    )
+
+    assert result["response"]["kind"] == "swap_status"
+    assert result["response"]["status"] == "not_propagated"
+    assert provider.broadcast_calls == 0
+    assert provider.status_calls == 0

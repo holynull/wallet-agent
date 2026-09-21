@@ -3841,6 +3841,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     )
                 ]
             }
+        broadcast_status = state.get("broadcast_status")
+        provider_visible = {"broadcast_seen", "broadcast_pending", "confirmed"}
+        if broadcast_status and broadcast_status not in provider_visible:
+            return {
+                "response": {
+                    "kind": "swap_status",
+                    "status": broadcast_status,
+                    "broadcast_status": broadcast_status,
+                    "tx_hash": tx_hash,
+                    "message": (
+                        "Source-chain transaction propagation is not confirmed yet; "
+                        "provider order polling has not started."
+                    ),
+                }
+            }
         orders = state.get("provider_orders", {})
         if provider_name in orders:
             return {
@@ -3886,6 +3901,22 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "timed_out": "Provider 暂时没有返回最终结果，建议稍后重新查询订单状态。",
             "unknown": "暂时拿不到兑换订单的最新状态，建议稍后重新查询。",
         }
+        broadcast_status = state.get("broadcast_status")
+        provider_visible = {"broadcast_seen", "broadcast_pending", "confirmed", None}
+        if state.get("broadcast_tx_hash") and broadcast_status not in provider_visible:
+            return {
+                "response": {
+                    "kind": "swap_status",
+                    "status": broadcast_status,
+                    "broadcast_status": broadcast_status,
+                    "tx_hash": state.get("broadcast_tx_hash"),
+                    "message": (
+                        "Source-chain transaction propagation is not confirmed yet; "
+                        "provider order polling has not started."
+                    ),
+                },
+                "poll_attempts": state.get("poll_attempts", 0),
+            }
         orders = state.get("provider_orders", {})
         if not orders:
             if state.get("pending_transaction"):

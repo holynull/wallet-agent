@@ -134,6 +134,14 @@ class EVMChainAdapter:
         transaction = await rpc_call(self.transport, "eth_getTransactionByHash", [tx_hash])
         return transaction if isinstance(transaction, dict) else None
 
+    async def get_transaction_count(self, address: str, block: str = "pending") -> int:
+        raw = await rpc_call(
+            self.transport,
+            "eth_getTransactionCount",
+            [validate_evm_address(address), block],
+        )
+        return quantity(raw)
+
     async def get_transaction_history(
         self, address: str, *, limit: int = 20
     ) -> list[TransactionRecord]:

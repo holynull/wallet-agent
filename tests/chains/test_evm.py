@@ -182,6 +182,16 @@ async def test_get_transaction_receipt_returns_none_for_missing_receipt():
 
     assert await adapter.get_transaction_receipt("0xabc") is None
 
+
+@pytest.mark.asyncio
+async def test_get_transaction_count_reads_pending_nonce_as_integer():
+    rpc = RecordingRpc({"eth_getTransactionCount": "0x8"})
+    adapter = EVMChainAdapter(rpc)
+
+    assert await adapter.get_transaction_count(OWNER) == 8
+    assert rpc.calls == [("eth_getTransactionCount", [OWNER, "pending"])]
+
+
 async def test_evm_read_only_methods_and_units():
     rpc = RpcFake()
     token = Asset(chain="EVM", symbol="USDC", decimals=6, address="0x" + "2" * 40)
