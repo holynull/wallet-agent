@@ -15,7 +15,7 @@
 
 ## Commit
 
-Not committed yet.
+`906e777` (`test: add response and amount contract helpers`)
 
 ## Concerns
 
