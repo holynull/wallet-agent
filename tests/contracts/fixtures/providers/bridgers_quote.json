@@ -1,0 +1,16 @@
+{
+  "resCode": 100,
+  "resMsg": "success",
+  "data": {
+    "txData": {
+      "toTokenAmount": "9.8",
+      "amountOutMin": "9700000",
+      "toTokenDecimal": 6,
+      "depositMin": "0.1",
+      "depositMax": "1000",
+      "fee": "0.002",
+      "chainFee": "0.01",
+      "contractAddress": "0x0000000000000000000000000000000000000033"
+    }
+  }
+}

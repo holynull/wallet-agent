@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any
 
 from wallet_agent.domain.models import (
@@ -20,6 +20,7 @@ from wallet_agent.domain.models import (
 )
 from wallet_agent.domain.normalization import canonical_chain, canonical_symbol
 
+from .cache import AsyncTTLCache
 from .http import ProviderResponseError
 
 
@@ -48,11 +49,7 @@ def _coin_code(asset: Asset) -> str:
     """Return Omni's catalog coin code, not our normalized chain label."""
     symbol = str(asset.symbol)
     if not asset.address:
-        return (
-            symbol.split("(", 1)[0]
-            if asset.chain == "ETH"
-            else f"{symbol}({asset.chain})"
-        )
+        return symbol.split("(", 1)[0] if asset.chain == "ETH" else f"{symbol}({asset.chain})"
     if symbol.endswith("(ERC20)"):
         return symbol
     # Omni's Ethereum catalog uses a bare USDC code but explicitly marks
@@ -75,6 +72,7 @@ class OmniBridgeProvider:
         source_type: str = "H5",
         spender_by_chain: dict[str, str] | None = None,
         swap_spender: str | None = None,
+        asset_cache_ttl_seconds: float = 600,
     ) -> None:
         self.transport = transport
         self.source_flag = source_flag
@@ -85,6 +83,7 @@ class OmniBridgeProvider:
         self.swap_spender = swap_spender
         self._quotes: dict[str, dict[str, Any]] = {}
         self._orders: dict[str, dict[str, Any]] = {}
+        self._asset_cache: AsyncTTLCache[list[Asset]] = AsyncTTLCache(asset_cache_ttl_seconds)
 
     @classmethod
     def from_transport(cls, transport: Any, **kwargs: Any) -> "OmniBridgeProvider":
@@ -96,36 +95,45 @@ class OmniBridgeProvider:
         search_filter = canonical_symbol(query.search) if query.search else None
         if chain_filter:
             payload["mainNetwork"] = chain_filter
-        data = _success(await self.transport.post("/api/v1/queryCoinList", payload))
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            items = data.get("list", data.get("coins", []))
-        else:
-            items = []
-        return [
-            Asset(
-                chain=str(x.get("mainNetwork", x.get("chain", ""))),
-                symbol=str(x.get("coinCode", x.get("symbol", ""))),
-                decimals=int(x.get("coinDecimal", x.get("decimals", 0))),
-                address=x.get("contact", x.get("address")),
-                name=x.get("coinName", x.get("name")),
-                logo_url=x.get("coinImageUrl", x.get("logoUrl")),
-            )
-            for x in items
-            if isinstance(x, dict)
-            and (
-                chain_filter is None
-                or canonical_chain(str(x.get("mainNetwork", x.get("chain", ""))))
-                == chain_filter
-            )
-            and (
-                search_filter is None
-                or search_filter
-                in canonical_symbol(str(x.get("coinCode", x.get("symbol", ""))))
-                or search_filter in canonical_symbol(str(x.get("coinName", x.get("name", ""))))
-            )
-        ]
+
+        async def load() -> list[Asset]:
+            data = _success(await self.transport.post("/api/v1/queryCoinList", payload))
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("list", data.get("coins", []))
+            else:
+                items = []
+            items = items or []
+            if not isinstance(items, list):
+                raise ProviderResponseError("800", "Malformed coin catalog", category="client")
+            return [
+                Asset(
+                    chain=str(x.get("mainNetwork", x.get("chain", ""))),
+                    symbol=str(x.get("coinCode", x.get("symbol", ""))),
+                    decimals=int(x.get("coinDecimal", x.get("decimals", 0))),
+                    address=x.get("contact", x.get("address")),
+                    name=x.get("coinName", x.get("name")),
+                    logo_url=x.get("coinImageUrl", x.get("logoUrl")),
+                )
+                for x in items
+                if isinstance(x, dict)
+                and (
+                    chain_filter is None
+                    or canonical_chain(str(x.get("mainNetwork", x.get("chain", ""))))
+                    == chain_filter
+                )
+            ]
+
+        assets = await self._asset_cache.get_or_set(chain_filter or "*", load)
+        if search_filter:
+            return [
+                asset
+                for asset in assets
+                if search_filter in canonical_symbol(asset.symbol)
+                or search_filter in canonical_symbol(asset.name or "")
+            ]
+        return list(assets)
 
     async def quote(self, request: SwapQuoteRequest) -> NormalizedQuote:
         deposit_code = _coin_code(request.source_asset)
@@ -137,10 +145,27 @@ class OmniBridgeProvider:
             "sourceFlag": self.source_flag,
         }
         data = _success(await self.transport.post("/api/v1/getBaseInfo", payload))
+        if not isinstance(data, dict):
+            raise ProviderResponseError("800", "Malformed quote data", category="client")
         self.minimum_source_amount = str(data.get("depositMin", "0"))
-        rate = Decimal(str(data.get("instantRate", "0")))
-        fee_rate = Decimal(str(data.get("depositCoinFeeRate", "0")))
-        network_fee = Decimal(str(data.get("chainFee", "0")))
+        try:
+            rate = Decimal(str(data.get("instantRate", "0")))
+            fee_rate = Decimal(str(data.get("depositCoinFeeRate", "0")))
+            network_fee = Decimal(str(data.get("chainFee", "0")))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ProviderResponseError(
+                "800", "Malformed quote numeric data", category="client"
+            ) from exc
+        if (
+            not rate.is_finite()
+            or rate < 0
+            or not fee_rate.is_finite()
+            or fee_rate < 0
+            or fee_rate > 1
+            or not network_fee.is_finite()
+            or network_fee < 0
+        ):
+            raise ProviderResponseError("800", "Invalid quote rate or fee", category="client")
         expected = request.input_amount * (Decimal(1) - fee_rate) * rate - network_fee
         if expected < 0:
             expected = Decimal(0)
@@ -173,10 +198,7 @@ class OmniBridgeProvider:
             )
             spender = str(candidate) if candidate else None
         allowance = None
-        if (
-            spender
-            and request.source_asset.address
-        ):
+        if spender and request.source_asset.address:
             try:
                 allowance = AllowanceRequirement(
                     token=request.source_asset,
@@ -265,9 +287,7 @@ class OmniBridgeProvider:
             deposit_code = _coin_code(quote.source_asset)
             request = {
                 "depositCoinCode": deposit_code,
-                "receiveCoinCode": (
-                    _coin_code(quote.destination_asset)
-                ),
+                "receiveCoinCode": (_coin_code(quote.destination_asset)),
                 "depositCoinAmt": str(quote.input_amount),
                 "sourceFlag": meta.get("source_flag", self.source_flag),
             }

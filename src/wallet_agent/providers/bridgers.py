@@ -20,6 +20,7 @@ from wallet_agent.domain.models import (
 )
 from wallet_agent.domain.normalization import canonical_chain, canonical_symbol
 
+from .cache import AsyncTTLCache
 from .http import ProviderResponseError
 
 _RETRYABLE = {"412", "413", "415", "777"}
@@ -56,6 +57,15 @@ def _raw_decimal(value: Decimal, decimals: int) -> str:
     return str(int(value * (Decimal(10) ** decimals)))
 
 
+def _catalog_symbol_matches(asset: Asset, candidate: Asset) -> bool:
+    target = canonical_symbol(asset.symbol)
+    symbol = canonical_symbol(candidate.symbol)
+    if symbol == target:
+        return True
+    chain_suffix = f"({canonical_chain(asset.chain)})"
+    return symbol.removesuffix(chain_suffix) == target
+
+
 class BridgersProvider:
     provider_name = "bridgers"
 
@@ -67,6 +77,7 @@ class BridgersProvider:
         source_type: str | None = None,
         spender_by_chain: dict[str, str] | None = None,
         swap_spender: str | None = None,
+        asset_cache_ttl_seconds: float = 600,
     ) -> None:
         self.transport = transport
         self.source_flag = source_flag
@@ -76,6 +87,7 @@ class BridgersProvider:
         }
         self.swap_spender = swap_spender
         self._quotes: dict[str, dict[str, Any]] = {}
+        self._asset_cache: AsyncTTLCache[list[Asset]] = AsyncTTLCache(asset_cache_ttl_seconds)
 
     @classmethod
     def from_transport(cls, transport: Any, **kwargs: Any) -> "BridgersProvider":
@@ -85,32 +97,82 @@ class BridgersProvider:
         chain_filter = canonical_chain(query.chain) if query.chain else None
         search_filter = canonical_symbol(query.search) if query.search else None
         payload = {"chain": chain_filter} if chain_filter else {}
-        data = _ensure_success(await self.transport.post("/api/exchangeRecord/getToken", payload))
-        assets: list[Asset] = []
-        for item in data.get("tokens", []):
-            if isinstance(item, dict):
-                asset = Asset(
-                    chain=str(item.get("chain", "")),
-                    symbol=str(item.get("symbol", "")),
-                    name=item.get("name"),
-                    address=item.get("address"),
-                    decimals=int(item.get("decimals", 0)),
-                    logo_url=item.get("logoURI"),
+
+        async def load() -> list[Asset]:
+            data = _ensure_success(
+                await self.transport.post("/api/exchangeRecord/getToken", payload)
+            )
+            assets: list[Asset] = []
+            tokens = data.get("tokens") or []
+            if not isinstance(tokens, list):
+                raise ProviderResponseError("100", "Malformed token catalog", category="client")
+            for item in tokens:
+                if isinstance(item, dict):
+                    asset = Asset(
+                        chain=str(item.get("chain", "")),
+                        symbol=str(item.get("symbol", "")),
+                        name=item.get("name"),
+                        address=item.get("address"),
+                        decimals=int(item.get("decimals", 0)),
+                        logo_url=item.get("logoURI"),
+                    )
+                    if chain_filter and canonical_chain(asset.chain) != chain_filter:
+                        continue
+                    assets.append(asset)
+            return assets
+
+        assets = await self._asset_cache.get_or_set(chain_filter or "*", load)
+        if search_filter:
+            return [
+                asset
+                for asset in assets
+                if any(
+                    search_filter in value
+                    for value in (
+                        canonical_symbol(asset.symbol),
+                        canonical_symbol(asset.name or ""),
+                    )
                 )
-                if chain_filter and canonical_chain(asset.chain) != chain_filter:
-                    continue
-                searchable = (canonical_symbol(asset.symbol), canonical_symbol(asset.name or ""))
-                if search_filter and not any(search_filter in value for value in searchable):
-                    continue
-                assets.append(asset)
-        return assets
+            ]
+        return list(assets)
+
+    async def _resolve_token_address(self, asset: Asset) -> str:
+        """Resolve an address required by Bridgers for a native asset.
+
+        The graph intentionally models native assets without a contract address.
+        Bridgers' quote API, however, requires the provider catalog address for
+        both sides of a quote.  Resolve only missing addresses here so explicit
+        token addresses remain untouched.
+        """
+        if asset.address:
+            return asset.address
+        matches = await self.list_assets(
+            AssetQuery(chain=asset.chain, search=asset.symbol)
+        )
+        addresses = {
+            str(candidate.address)
+            for candidate in matches
+            if candidate.address
+            and canonical_chain(candidate.chain) == canonical_chain(asset.chain)
+            and _catalog_symbol_matches(asset, candidate)
+        }
+        if len(addresses) != 1:
+            raise ProviderResponseError(
+                "100",
+                f"Bridgers token catalog has no unique address for "
+                f"{asset.symbol} on {asset.chain}",
+                category="client",
+            )
+        return next(iter(addresses))
 
     async def quote(self, request: SwapQuoteRequest) -> NormalizedQuote:
+        source_address = await self._resolve_token_address(request.source_asset)
+        destination_address = await self._resolve_token_address(request.destination_asset)
         payload = {
             "equipmentNo": _equipment(request.sender_address),
             "sourceFlag": self.source_flag,
-            "fromTokenAddress": request.source_asset.address or "",
-            "toTokenAddress": request.destination_asset.address or "",
+            "fromTokenAddress": source_address,
+            "toTokenAddress": destination_address,
             "fromTokenAmount": request.input_amount_raw,
             "fromTokenChain": request.source_asset.chain,
             "toTokenChain": request.destination_asset.chain,
@@ -119,8 +181,8 @@ class BridgersProvider:
             "toCoinCode": f"{request.destination_asset.symbol}({request.destination_asset.chain})",
         }
         data = _ensure_success(await self.transport.post("/api/sswap/quote", payload))
-        tx = data.get("txData", {})
-        if not isinstance(tx, dict):
+        tx = data.get("txData")
+        if not isinstance(tx, dict) or not tx:
             raise ProviderResponseError("100", "Missing txData", category="client")
         self.minimum_source_amount = str(tx.get("depositMin", "0"))
         reference = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -144,6 +206,8 @@ class BridgersProvider:
             "source_flag": self.source_flag,
             "sender_address": request.sender_address,
             "recipient_address": request.recipient_address,
+            "from_token_address": source_address,
+            "to_token_address": destination_address,
             "slippage_bps": request.slippage_bps,
             "amount_out_min_raw": minimum_raw,
         }
@@ -258,8 +322,12 @@ class BridgersProvider:
             request = {
                 "equipmentNo": meta.get("equipment_no", _equipment(meta.get("sender_address", ""))),
                 "sourceFlag": meta.get("source_flag", self.source_flag),
-                "fromTokenAddress": quote.source_asset.address or "",
-                "toTokenAddress": quote.destination_asset.address or "",
+                "fromTokenAddress": meta.get(
+                    "from_token_address", quote.source_asset.address or ""
+                ),
+                "toTokenAddress": meta.get(
+                    "to_token_address", quote.destination_asset.address or ""
+                ),
                 "fromTokenAmount": quote.input_amount_raw,
                 "fromTokenChain": quote.source_asset.chain,
                 "toTokenChain": quote.destination_asset.chain,

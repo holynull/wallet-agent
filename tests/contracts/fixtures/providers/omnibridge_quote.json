@@ -1,0 +1,11 @@
+{
+  "resCode": 800,
+  "resMsg": "Success",
+  "data": {
+    "chainFee": "0.001",
+    "depositCoinFeeRate": "0.002",
+    "depositMax": "14",
+    "depositMin": "0.038603",
+    "instantRate": "6.875775974236"
+  }
+}
