@@ -8,10 +8,10 @@ from decimal import Decimal, InvalidOperation
 
 from wallet_agent.domain.normalization import canonical_chain, canonical_symbol
 
-_ADDRESS = re.compile(r"^(?:0x[0-9a-fA-F]{32,}|[1-9A-HJ-NP-Za-km-z]{32,})$")
+_ADDRESS = re.compile(r"^(?:0[xX][0-9a-fA-F]{32,}|[1-9A-HJ-NP-Za-km-z]{32,})$")
 _SENSITIVE = re.compile(
     r"(?:api[_-]?key|access[_-]?token|auth(?:orization)?|password|secret|"
-    r"private[_-]?key|seed|mnemonic)",
+    r"private[_-]?key|seed|mnemonic|token|signature)",
     re.IGNORECASE,
 )
 
@@ -36,9 +36,6 @@ def assert_response_shape(
             _fail(key, "missing")
         if not isinstance(payload[key], list):
             _fail(key, f"type={type(payload[key]).__name__}")
-        # Length is intentionally the only list detail exposed by this helper.
-        if len(payload[key]) < 0:  # pragma: no cover - documents the invariant
-            _fail(key, "list_length=invalid")
 
 
 def assert_decimal_in_range(value: object, *, field: str) -> int:

@@ -20,3 +20,10 @@
 ## Concerns
 
 The repository environment contains a site-packages package named `tests`; the local `tests/__init__.py` marker is required for the requested `tests.helpers.contracts` import to resolve reliably.
+
+## Review fix
+
+- Expanded fixture redaction to cover bare `token` and `signature` keys and uppercase `0X` hexadecimal addresses.
+- Removed the dead negative-list-length branch from response shape validation.
+- `PYTHONPATH=.:src .venv/bin/pytest tests/contracts/test_helpers.py -q` — 9 passed.
+- `.venv/bin/ruff check tests/helpers tests/contracts/test_helpers.py` — all checks passed.

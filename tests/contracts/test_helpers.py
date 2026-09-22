@@ -88,6 +88,17 @@ def test_redact_fixture_replaces_sensitive_and_address_like_values():
     assert redacted["nested"] == ["token"]
 
 
+def test_redact_fixture_redacts_bare_token_signature_and_uppercase_addresses():
+    redacted = redact_fixture(
+        {"token": "bearer", "signature": "signed", "address": "0X" + "A" * 40}
+    )
+    assert redacted == {
+        "token": "<redacted>",
+        "signature": "<redacted>",
+        "address": "<redacted-address>",
+    }
+
+
 def test_raw_amount_rejects_non_finite_values():
     with pytest.raises(AssertionError, match="amount"):
         assert_raw_matches_human(Decimal("NaN"), "1", 0)
