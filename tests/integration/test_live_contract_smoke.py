@@ -47,7 +47,7 @@ def _live_config(prefix: str, required: tuple[str, ...]) -> dict[str, str] | Non
     for suffix in required:
         key = str(suffix).strip().upper()
         env_name = key if key.startswith(f"{normalized_prefix}_") else f"{normalized_prefix}_{key}"
-        values[key.removeprefix(f"{normalized_prefix}_")] = os.getenv(env_name, "").strip()
+        values[key] = os.getenv(env_name, "").strip()
     return values if all(values.values()) else None
 
 
