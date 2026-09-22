@@ -116,6 +116,68 @@ async def test_happy_paths_complete_through_public_wallet_app_contract(scenario_
 
 
 @pytest.mark.asyncio
+async def test_approved_swap_status_never_regresses_to_unconfirmed():
+    report = await run_scenario("approved_swap_then_status")
+
+    assert report.status == "passed"
+    status_messages = [
+        step.evidence.get("assistant_message", "")
+        for step in report.steps
+        if step.operation == "status_turn"
+    ]
+    assert status_messages and all("未确认" not in message for message in status_messages)
+    assert all(
+        step.evidence.get("response_kind") == "swap_status"
+        for step in report.steps
+        if step.operation == "status_turn"
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_provider_quote_failure_preserves_successful_candidate():
+    report = await run_scenario("provider_partial_failure_preserves_success")
+
+    assert report.status == "passed"
+    quote_step = next(step for step in report.steps if step.operation == "turn")
+    assert quote_step.evidence["provider_candidates"] == ["omnibridge"]
+    assert quote_step.evidence["route"] == "swap_prepare"
+    assert quote_step.evidence["intent"] == "swap_prepare"
+    assert quote_step.evidence["task_stage"] == "awaiting_confirmation"
+    assert any(
+        call["provider"] == "bridgers" and call["operation"] == "quote"
+        and call["outcome"]["kind"] == "error"
+        for call in report.provider_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_status_does_not_duplicate_assistant_history():
+    report = await run_scenario("repeated_status_response")
+
+    assert report.status == "passed"
+    status_steps = [step for step in report.steps if step.operation == "status_turn"]
+    assert len(status_steps) == 2
+    assert status_steps[0].evidence["assistant_message"] == status_steps[1].evidence[
+        "assistant_message"
+    ]
+    assert status_steps[1].evidence["assistant_history_count"] == status_steps[0].evidence[
+        "assistant_history_count"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sse_final_response_is_retained_in_history():
+    report = await run_scenario("sse_final_response_history")
+
+    assert report.status == "passed"
+    turn = next(step for step in report.steps if step.operation == "turn")
+    assert turn.evidence["stream_event_count"] > 1
+    assert turn.evidence["response_kind"] == "swap_quote"
+    assert turn.evidence["assistant_message"] == "swap_quote"
+    assert turn.evidence["assistant_history_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_approval_happy_path_orders_wallet_and_provider_side_effects():
     report = await run_scenario("erc20_swap_with_approval")
 
@@ -178,15 +240,15 @@ def test_safe_evidence_accepts_only_redacted_forbidden_fields():
 
 
 @pytest.mark.asyncio
-async def test_wallet_app_report_has_stable_schema_dimensions_and_ten_scenarios():
+async def test_wallet_app_report_has_stable_schema_dimensions_and_fourteen_scenarios():
     report = await run_wallet_app_evals()
 
     assert report["schema_version"] == 1
     assert report["mode"] == "offline-wallet-app"
-    assert report["summary"] == {"total": 10, "passed": 10, "failed": 0, "blocked": 0}
-    assert report["dimensions"]["wallet_api_contract"] == {"total": 10, "passed": 10}
-    assert report["dimensions"]["broadcast_and_confirmation"] == {"total": 8, "passed": 8}
-    assert report["dimensions"]["safety"] == {"total": 10, "passed": 10}
+    assert report["summary"] == {"total": 14, "passed": 14, "failed": 0, "blocked": 0}
+    assert report["dimensions"]["wallet_api_contract"] == {"total": 14, "passed": 14}
+    assert report["dimensions"]["broadcast_and_confirmation"] == {"total": 12, "passed": 12}
+    assert report["dimensions"]["safety"] == {"total": 14, "passed": 14}
     assert {item["id"] for item in report["scenarios"]} == {
         "erc20_swap_without_approval",
         "erc20_swap_with_approval",
@@ -198,6 +260,10 @@ async def test_wallet_app_report_has_stable_schema_dimensions_and_ten_scenarios(
         "duplicate_and_conflicting_swap_hash",
         "provider_register_timeout_then_retry",
         "omnibridge_erc20_deposit_order",
+        "approved_swap_then_status",
+        "provider_partial_failure_preserves_success",
+        "repeated_status_response",
+        "sse_final_response_history",
     }
     assert all(item["invariants"] for item in report["scenarios"])
     assert "private_key" not in json.dumps(report).lower()

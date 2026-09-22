@@ -88,6 +88,15 @@ class ScenarioDefinition:
     driver_actions: tuple[str, ...] = ("broadcast", "status")
     expected_swap_transaction: tuple[tuple[str, str], ...] = ()
     dimensions: tuple[str, ...] = ("wallet_api_contract", "safety")
+    expected_route: str | None = None
+    expected_intent: str | None = None
+    expected_task_stage: str | None = None
+    expected_response_kind: str | None = None
+    expected_response_message: str | None = None
+    expected_assistant_history_count: int | None = None
+    expected_candidate_providers: tuple[str, ...] = ()
+    excluded_response_messages: tuple[str, ...] = ()
+    quote_faults: tuple[FaultOutcome, ...] = ()
 
 
 SCENARIOS = {
@@ -286,6 +295,94 @@ SCENARIOS = {
             ("maxFeePerGas", "0x4a817c800"),
             ("maxPriorityFeePerGas", "0x3b9aca00"),
         ),
+        dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
+    ),
+    "approved_swap_then_status": ScenarioDefinition(
+        id="approved_swap_then_status",
+        provider="bridgers",
+        allowance_required=True,
+        fault_plan=FaultPlan(
+            allowances=(FaultOutcome("insufficient", "0"), FaultOutcome("sufficient", "10000000")),
+            chain_receipts=(FaultOutcome("confirmed", {"status": "0x1"}),),
+            provider_register=(FaultOutcome("success", "order-approved-status"),),
+            provider_status=(FaultOutcome("processing"), FaultOutcome("completed")),
+        ),
+        wallet_hashes=("0x" + "1" * 64, "0x" + "2" * 64),
+        expected_final_stage="completed",
+        expected_wallet_sends=2,
+        expected_register_attempts=1,
+        driver_actions=("broadcast", "status"),
+        expected_route="swap_status",
+        expected_intent="swap_status",
+        expected_task_stage="confirmed",
+        expected_response_kind="swap_status",
+        excluded_response_messages=("未确认",),
+        dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
+    ),
+    "provider_partial_failure_preserves_success": ScenarioDefinition(
+        id="provider_partial_failure_preserves_success",
+        provider="bridgers",
+        allowance_required=False,
+        fault_plan=FaultPlan(
+            allowances=(FaultOutcome("sufficient", "10000000"),),
+            chain_receipts=(FaultOutcome("confirmed", {"status": "0x1"}),),
+            provider_register=(FaultOutcome("success", "order-partial-quote"),),
+            provider_status=(FaultOutcome("completed"),),
+        ),
+        wallet_hashes=("0x" + "3" * 64,),
+        expected_final_stage="completed",
+        expected_wallet_sends=1,
+        expected_register_attempts=1,
+        expected_route="swap_status",
+        expected_intent="swap_status",
+        expected_task_stage="confirmed",
+        expected_response_kind="swap_status",
+        expected_candidate_providers=("omnibridge",),
+        quote_faults=(FaultOutcome("error", message="quote unavailable"),),
+        dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
+    ),
+    "repeated_status_response": ScenarioDefinition(
+        id="repeated_status_response",
+        provider="bridgers",
+        allowance_required=False,
+        fault_plan=FaultPlan(
+            allowances=(FaultOutcome("sufficient", "10000000"),),
+            chain_receipts=(FaultOutcome("confirmed", {"status": "0x1"}),),
+            provider_register=(FaultOutcome("success", "order-repeat-status"),),
+            provider_status=(FaultOutcome("completed"),),
+        ),
+        wallet_hashes=("0x" + "4" * 64,),
+        expected_final_stage="completed",
+        expected_wallet_sends=1,
+        expected_register_attempts=1,
+        driver_actions=("broadcast", "status", "status"),
+        expected_route="swap_status",
+        expected_intent="swap_status",
+        expected_task_stage="confirmed",
+        expected_response_kind="swap_status",
+        dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
+    ),
+    "sse_final_response_history": ScenarioDefinition(
+        id="sse_final_response_history",
+        provider="bridgers",
+        allowance_required=False,
+        fault_plan=FaultPlan(
+            allowances=(FaultOutcome("sufficient", "10000000"),),
+            chain_receipts=(FaultOutcome("confirmed", {"status": "0x1"}),),
+            provider_register=(FaultOutcome("success", "order-sse-final"),),
+            provider_status=(FaultOutcome("completed"),),
+        ),
+        wallet_hashes=("0x" + "5" * 64,),
+        expected_final_stage="confirmed",
+        expected_wallet_sends=1,
+        expected_register_attempts=1,
+        driver_actions=("broadcast",),
+        expected_route="swap_quote",
+        expected_intent="swap_quote",
+        expected_task_stage="selecting_quote",
+        expected_response_kind="swap_quote",
+        expected_assistant_history_count=1,
+        expected_candidate_providers=("bridgers", "omnibridge"),
         dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
     ),
 }
@@ -570,6 +667,10 @@ class RecordingProvider:
         self.ledger = ledger or EvidenceLedger()
         plan = definition.fault_plan
         self._prepare = _sequence(plan.provider_prepare, fallback=FaultOutcome("success"))
+        self._quote = _sequence(
+            definition.quote_faults if not alternate else (),
+            fallback=FaultOutcome("success", f"quote-{provider_name}"),
+        )
         self._register = _sequence(
             plan.provider_register, fallback=FaultOutcome("success", "order-fallback")
         )
@@ -604,8 +705,10 @@ class RecordingProvider:
 
     async def quote(self, request: SwapQuoteRequest) -> NormalizedQuote:
         self._quote_count += 1
-        outcome = FaultOutcome("success", f"quote-{self.provider_name}")
+        outcome = self._quote.next()
         self._record("quote", outcome, request=request)
+        if outcome.kind != "success":
+            raise RuntimeError(outcome.message or outcome.kind)
         requirement = None
         if self.definition.allowance_required:
             from wallet_agent.domain.models import AllowanceRequirement
@@ -1313,8 +1416,15 @@ def _lifecycle_invariants(
         )
 
     valid_rejection_without_prepare = valid_approval_rejection_without_prepare()
+    partial_quote_failure = any(
+        event.get("actor") == "provider"
+        and event.get("operation") == "quote"
+        and isinstance(event.get("outcome"), Mapping)
+        and event["outcome"].get("kind") == "error"
+        for event in events
+    )
     quote_selection_safe = (
-        len(session.get("quote_candidates", [])) > 1
+        (len(session.get("quote_candidates", [])) > 1 or partial_quote_failure)
         and bool(selection_requests)
         and selection_pairs_valid
         and (
@@ -1638,9 +1748,75 @@ def _record_wallet_rejection(
     )
 
 
+def _stream_summary(events: Sequence[Any]) -> dict[str, Any]:
+    """Extract only the final public response/state from a streamed turn."""
+
+    response: Mapping[str, Any] | None = None
+    state: Mapping[str, Any] | None = None
+
+    def visit(value: Any) -> None:
+        nonlocal response, state
+        if isinstance(value, Mapping):
+            candidate = value.get("response")
+            if isinstance(candidate, Mapping) and candidate:
+                response = candidate
+            candidate_state = value.get("state")
+            if isinstance(candidate_state, Mapping):
+                state = candidate_state
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    for event in events:
+        visit(getattr(event, "data", event))
+    response = response or {}
+    state = state or {}
+    history = state.get("conversation_history")
+    assistant_history_count = (
+        sum(item.get("role") == "assistant" for item in history if isinstance(item, Mapping))
+        if isinstance(history, list)
+        else None
+    )
+    return {
+        "route": state.get("route"),
+        "intent": state.get("intent"),
+        "task_stage": state.get("task_stage")
+        or (state.get("active_task") or {}).get("stage"),
+        "response_kind": response.get("kind"),
+        "assistant_message": response.get("message") or response.get("kind") or "",
+        "assistant_history_count": assistant_history_count,
+        "provider_candidates": [
+            item.get("provider")
+            for item in state.get("quote_candidates", [])
+            if isinstance(item, Mapping) and item.get("provider")
+        ],
+        "stream_event_count": len(events),
+    }
+
+
+def _annotate_last_turn(client: WalletAppClient, events: Sequence[Any]) -> dict[str, Any]:
+    summary = _stream_summary(events)
+    for index in range(len(client.steps) - 1, -1, -1):
+        if client.steps[index].operation == "turn":
+            step = client.steps[index]
+            client.steps[index] = LifecycleStep(
+                operation=step.operation,
+                stage_before=step.stage_before,
+                stage_after=step.stage_after,
+                http_status=step.http_status,
+                error_code=step.error_code,
+                evidence={**step.evidence, **summary},
+            )
+            break
+    return summary
+
+
 async def _status_turn(client: WalletAppClient) -> dict[str, Any]:
     status_turn_index = len(client.steps)
-    await client.turn("Check the swap status")
+    events = await client.turn("Check the swap status")
+    summary = _annotate_last_turn(client, events)
     if client.steps[status_turn_index].operation == "turn":
         status_turn = client.steps[status_turn_index]
         client.steps[status_turn_index] = LifecycleStep(
@@ -1649,7 +1825,7 @@ async def _status_turn(client: WalletAppClient) -> dict[str, Any]:
             stage_after=status_turn.stage_after,
             http_status=status_turn.http_status,
             error_code=status_turn.error_code,
-            evidence=status_turn.evidence,
+            evidence={**status_turn.evidence, **summary},
         )
     return await client.session()
 
@@ -1661,16 +1837,35 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
     client = runtime.client
     failures: list[str] = []
     actual_swap_transaction: dict[str, str] | None = None
+    initial_summary: dict[str, Any] = {}
     attempt_limit_exhausted = False
     try:
-        await client.turn("Swap 10 USDC to USDT on Ethereum")
+        initial_events = await client.turn("Swap 10 USDC to USDT on Ethereum")
+        initial_summary = _annotate_last_turn(client, initial_events)
         session = await client.session()
+        for index in range(len(client.steps) - 1, -1, -1):
+            if client.steps[index].operation == "session":
+                step = client.steps[index]
+                client.steps[index] = LifecycleStep(
+                    operation=step.operation,
+                    stage_before=step.stage_before,
+                    stage_after=step.stage_after,
+                    http_status=step.http_status,
+                    error_code=step.error_code,
+                    evidence={**step.evidence, **initial_summary},
+                )
+                break
         candidates = session.get("quote_candidates") or []
         primary_reference = next(
-            item["provider_reference"]
-            for item in candidates
-            if item.get("provider") == definition.provider
+            (
+                item["provider_reference"]
+                for item in candidates
+                if item.get("provider") == definition.provider
+            ),
+            candidates[0]["provider_reference"] if candidates else None,
         )
+        if not primary_reference:
+            raise AssertionError("quote candidates did not contain a selectable provider")
         await client.select_quote(primary_reference)
         confirmed = await client.confirm(True)
         wallet_rejected = False
@@ -1904,6 +2099,41 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
             f"expected {definition.expected_register_attempts} provider registrations, "
             f"got {len(register_events)}"
         )
+    status_steps = [step for step in client.steps if step.operation == "status_turn"]
+    final_summary = status_steps[-1].evidence if status_steps else initial_summary
+    expected_checks = {
+        "route": definition.expected_route,
+        "intent": definition.expected_intent,
+        "task_stage": definition.expected_task_stage,
+        "response_kind": definition.expected_response_kind,
+    }
+    for field, expected in expected_checks.items():
+        if expected is not None and final_summary.get(field) != expected:
+            failures.append(f"expected {field} {expected}, got {final_summary.get(field)}")
+    if definition.expected_response_message is not None and final_summary.get(
+        "assistant_message"
+    ) != definition.expected_response_message:
+        failures.append("unexpected assistant response message")
+    if definition.expected_candidate_providers and initial_summary.get(
+        "provider_candidates"
+    ) != list(definition.expected_candidate_providers):
+        failures.append("unexpected provider candidate list")
+    if definition.expected_assistant_history_count is not None and final_summary.get(
+        "assistant_history_count"
+    ) != definition.expected_assistant_history_count:
+        failures.append("unexpected assistant history count")
+    for step in status_steps:
+        message = str(step.evidence.get("assistant_message", ""))
+        if any(excluded in message for excluded in definition.excluded_response_messages):
+            failures.append("status response regressed to an excluded message")
+    for previous, current in zip(status_steps, status_steps[1:]):
+        if (
+            previous.evidence.get("assistant_message")
+            == current.evidence.get("assistant_message")
+            and previous.evidence.get("assistant_history_count")
+            != current.evidence.get("assistant_history_count")
+        ):
+            failures.append("duplicate assistant status message appended to history")
     status = "passed" if not failures and all(item.passed for item in invariants) else "failed"
     return LifecycleReport(
         id=definition.id,
