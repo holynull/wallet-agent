@@ -460,7 +460,60 @@ docker compose down
 | SSE 断开 | 查看浏览器 Network 和服务端日志，并复用原来的 `conversation_id` |
 | Docker 启动失败 | 确认项目根目录存在 `.env`，Compose 会强制加载它 |
 
-## 9. 相关文档
+## 9. 契约回放与回归排查
+
+契约测试默认离线运行，使用脱敏 fixture 重放外部响应，不需要 API key、钱包地址或外部网络。Fixture 按适配器分目录：
+
+```text
+tests/contracts/fixtures/okx/
+tests/contracts/fixtures/providers/
+```
+
+先运行与失败最接近的测试，再运行完整离线矩阵：
+
+```bash
+pytest tests/contracts/test_okx_contracts.py -q
+pytest tests/contracts/test_provider_contracts.py -q
+pytest tests/evals/test_wallet_app_lifecycle.py -q
+pytest tests/contracts tests/evals -q
+python -m evals.wallet_app_evals
+```
+
+### 从稳定错误码定位层级
+
+- `OKX_MALFORMED_RESPONSE`：OKX 响应为空、字段类型错误、数值非有限，或 human/raw 金额与 decimals 不一致。先查看 `tests/contracts/fixtures/okx/` 对应 fixture，再检查 `src/wallet_agent/okx/` 的响应归一化；不要把缺失 decimals 默认成零。
+- `ASSET_NOT_FOUND`：Agent 已解析出链和 Token，但资产解析器找不到受支持资产。对照 SSE `intent` 更新中的 `swap_draft`、`source_chain`、`source_symbol` 和 `destination_*` 字段，确认用户输入没有拼写错误或不受支持的网络。
+- `PROVIDER_QUOTE_FAILED`：某个 Bridgers 或 OmniBridge 请求返回应用错误、空结果或 malformed quote。检查 `tests/contracts/fixtures/providers/` 中的回放案例和该 Provider 的请求/响应 shape；一个 Provider 失败时，仍应保留其他 Provider 的成功 `quote_candidates`。
+
+失败报告只允许包含安全诊断：endpoint、顶层 `keys`、字段 `types`、`list_lengths`、稳定错误码和耗时（毫秒）。测试 helper 的 `safe_shape` 会生成这类信息；不要把原始地址、签名、认证头、API key、完整交易 data 或响应 body 写入 fixture、日志或工单。真实响应加入测试前必须先脱敏，只保留验证契约所需的非敏感数值和占位字段。
+
+### 从 Demo 调试面板回到 Graph/SSE
+
+1. 用 `run_id` 把一次 `API POST /v1/agent/turn` 与对应的 `SSE CONNECT`、`SSE update`、`SSE complete` 串起来；不要只根据 HTTP 200 判断成功。
+2. 在第一条 `SSE update` 查看 supervisor 的 `intent` 和 request，在后续 update 查看 `route`、`task_stage`、`response.kind`、`quote_candidates`、`selected_quote` 及错误码。
+3. 用 `conversation_id` 对照 Graph 的多轮状态；如果最终消息缺失，检查最后一个非空 response 是否进入 `SSE complete` 和 `conversation_history`，并确认重复状态没有重复追加 assistant 消息。
+4. 将面板中的事件字段与服务端 adapter 日志按时间戳对齐。OKX 问题回到 OKX adapter，报价问题回到 Bridgers/OmniBridge adapter，路由或历史问题回到 Graph/API 层。
+
+### 集成巡检与最终验证
+
+真实接口测试必须显式 opt-in，并在缺少完整配置时跳过：
+
+```bash
+pytest -m integration -q
+```
+
+提交前运行完整验证矩阵（浏览器测试按本机环境单独执行）：
+
+```bash
+pytest tests/contracts tests/okx tests/providers tests/evals tests/graph tests/api -q
+pytest -m "not browser" -q
+ruff check .
+git diff --check
+```
+
+`pytest -m integration -q` 不应出现在默认离线 CI 命令中；需要真实凭据时，仅通过环境变量注入，并确认测试输出仍只包含上述安全诊断字段。
+
+## 10. 相关文档
 
 - [EVM 钱包动作接口](evm-wallet-actions.md)
 - [移动端集成说明](mobile-integration.md)

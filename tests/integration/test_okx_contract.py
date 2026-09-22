@@ -4,18 +4,24 @@ import pytest
 
 from wallet_agent.okx import OkxSignedClient
 
+from .test_live_contract_smoke import _live_config
+
 
 def _live_okx_configuration() -> dict[str, str] | None:
-    names = (
-        "OKX_API_KEY",
-        "OKX_SECRET_KEY",
-        "OKX_PASSPHRASE",
-        "OKX_PROJECT_ID",
-        "OKX_INTEGRATION_ADDRESS",
-        "OKX_INTEGRATION_TOKEN_ADDRESS",
+    config = _live_config(
+        "OKX",
+        (
+            "API_KEY",
+            "SECRET_KEY",
+            "PASSPHRASE",
+            "PROJECT_ID",
+            "INTEGRATION_ADDRESS",
+            "INTEGRATION_TOKEN_ADDRESS",
+        ),
     )
-    values = {name: os.getenv(name, "").strip() for name in names}
-    return values if os.getenv("OKX_INTEGRATION") == "1" and all(values.values()) else None
+    if config is None:
+        return None
+    return {f"OKX_{key}": value for key, value in config.items()}
 
 
 @pytest.mark.integration
