@@ -2107,9 +2107,11 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
         "task_stage": definition.expected_task_stage,
         "response_kind": definition.expected_response_kind,
     }
-    for field, expected in expected_checks.items():
-        if expected is not None and final_summary.get(field) != expected:
-            failures.append(f"expected {field} {expected}, got {final_summary.get(field)}")
+    for check_field, expected in expected_checks.items():
+        if expected is not None and final_summary.get(check_field) != expected:
+            failures.append(
+                f"expected {check_field} {expected}, got {final_summary.get(check_field)}"
+            )
     if definition.expected_response_message is not None and final_summary.get(
         "assistant_message"
     ) != definition.expected_response_message:
