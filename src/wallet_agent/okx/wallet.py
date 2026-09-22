@@ -15,6 +15,7 @@ from wallet_agent.domain.models import (
     TransactionContext,
     WalletTotalValue,
 )
+from wallet_agent.providers.cache import AsyncTTLCache
 
 from .errors import OkxClientError
 from .models import TokenMarketDetails
@@ -60,8 +61,15 @@ class OkxWalletAdapter:
         "TRX": 6,
         "SOL": 9,
     }
+    _token_metadata_path = "/api/v6/dex/aggregator/all-tokens"
 
-    def __init__(self, client: Any, chain_index_by_name: dict[str, str]) -> None:
+    def __init__(
+        self,
+        client: Any,
+        chain_index_by_name: dict[str, str],
+        *,
+        metadata_ttl_seconds: float = 600,
+    ) -> None:
         self.client = client
         self.chain_index_by_name = {
             str(name).upper(): str(index) for name, index in chain_index_by_name.items()
@@ -69,6 +77,9 @@ class OkxWalletAdapter:
         self.chain_name_by_index = {
             index: name for name, index in self.chain_index_by_name.items()
         }
+        self._token_metadata_cache: AsyncTTLCache[dict[str, int]] = AsyncTTLCache(
+            metadata_ttl_seconds
+        )
 
     async def get_total_value(
         self,
@@ -121,7 +132,7 @@ class OkxWalletAdapter:
         data = payload.get("data")
         if not isinstance(data, list):
             raise self._malformed("token balances")
-        balances: list[TokenBalance] = []
+        entries_by_chain: list[tuple[str, str, dict[str, Any]]] = []
         for group in data:
             if not isinstance(group, dict):
                 raise self._malformed("token balances")
@@ -142,8 +153,134 @@ class OkxWalletAdapter:
                         "OKX returned an unsupported chain.",
                         details={"chain_index": chain_index},
                     )
-                balances.append(self._token_balance(entry, chain))
+                entries_by_chain.append((chain_index, chain, entry))
+
+        missing_metadata_chains = {
+            chain_index
+            for chain_index, _, entry in entries_by_chain
+            if (entry.get("tokenContractAddress") or entry.get("contractAddress"))
+            and entry.get("decimals", entry.get("tokenDecimal")) is None
+        }
+        metadata_by_chain = {
+            chain_index: await self._token_metadata(chain_index)
+            for chain_index in missing_metadata_chains
+        }
+        balances: list[TokenBalance] = []
+        for chain_index, chain, entry in entries_by_chain:
+            if entry.get("decimals", entry.get("tokenDecimal")) is None and (
+                entry.get("tokenContractAddress") or entry.get("contractAddress")
+            ):
+                address = str(
+                    entry.get("tokenContractAddress") or entry.get("contractAddress")
+                ).lower()
+                decimals = metadata_by_chain.get(chain_index, {}).get(address)
+                if decimals is None:
+                    decimals = self._infer_decimals(entry)
+                if decimals is None:
+                    raise self._malformed("token balance decimals")
+                entry = {**entry, "decimals": decimals}
+            balances.append(self._token_balance(entry, chain))
         return balances
+
+    async def _token_metadata(self, chain_index: str) -> dict[str, int]:
+        async def load() -> dict[str, int]:
+            payload = await self._request(
+                "GET", self._token_metadata_path, query={"chainIndex": chain_index}
+            )
+            data = payload.get("data")
+            if not isinstance(data, list):
+                raise self._malformed("token metadata")
+            result: dict[str, int] = {}
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                address = item.get("tokenContractAddress") or item.get("address")
+                decimals_value = item.get("decimals", item.get("tokenDecimal"))
+                if not address or decimals_value in (None, ""):
+                    continue
+                try:
+                    decimals = int(decimals_value)
+                except (TypeError, ValueError) as exc:
+                    raise self._malformed("token metadata") from exc
+                if not 0 <= decimals <= 255:
+                    raise self._malformed("token metadata")
+                result[str(address).lower()] = decimals
+            return result
+
+        return await self._token_metadata_cache.get_or_set(chain_index, load)
+
+    @classmethod
+    def _infer_decimals(cls, entry: dict[str, Any]) -> int | None:
+        """Infer precision only when OKX human/raw balances agree exactly."""
+        try:
+            amount = cls._decimal(entry.get("balance", entry.get("tokenAmount")), "balance")
+            raw = cls._raw_optional(
+                entry.get("rawBalance", entry.get("balanceRaw", entry.get("tokenAmountRaw")))
+            )
+        except OkxWalletError:
+            return None
+        if raw is None or amount <= 0:
+            return None
+        raw_decimal = Decimal(raw)
+        for decimals in range(256):
+            if amount * (Decimal(10) ** decimals) == raw_decimal:
+                return decimals
+        return None
+
+    async def get_specific_balances(
+        self, address: str, assets: list[Asset], *, exclude_risk_tokens: bool = True
+    ) -> list[TokenBalance]:
+        """Fetch selected token/native balances in OKX's maximum batch size."""
+        if not assets:
+            return []
+        result: list[TokenBalance] = []
+        for start in range(0, len(assets), 20):
+            batch = assets[start : start + 20]
+            requests: list[dict[str, str]] = []
+            by_key: dict[tuple[str, str], Asset] = {}
+            for asset in batch:
+                chain_index = self._resolve_chain_indexes([asset.chain])[0]
+                contract = str(asset.address or "")
+                requests.append(
+                    {"chainIndex": chain_index, "tokenContractAddress": contract}
+                )
+                by_key[(chain_index, contract.lower())] = asset
+            payload = await self._request(
+                "POST",
+                "/api/v6/dex/balance/token-balances-by-address",
+                body={
+                    "address": address,
+                    "tokenContractAddresses": requests,
+                    "excludeRiskToken": "0" if exclude_risk_tokens else "1",
+                },
+            )
+            data = payload.get("data")
+            if not isinstance(data, list):
+                raise self._malformed("token balances")
+            for entry in data:
+                if not isinstance(entry, dict):
+                    raise self._malformed("token balance")
+                chain_index = str(entry.get("chainIndex") or entry.get("chainIndexId") or "")
+                contract = str(
+                    entry.get("tokenContractAddress") or entry.get("contractAddress") or ""
+                )
+                asset = by_key.get((chain_index, contract.lower()))
+                if asset is not None:
+                    entry = {
+                        "symbol": asset.symbol,
+                        "decimals": asset.decimals,
+                        "tokenContractAddress": asset.address or "",
+                        **entry,
+                    }
+                chain = self.chain_name_by_index.get(chain_index)
+                if chain is None:
+                    raise OkxWalletError(
+                        "OKX_CHAIN_UNSUPPORTED",
+                        "OKX returned an unsupported chain.",
+                        details={"chain_index": chain_index},
+                    )
+                result.append(self._token_balance(entry, chain))
+        return result
 
     async def estimate_gas_limit(self, transaction: TransactionContext) -> GasLimitEstimate:
         payload = await self._pretransaction_request(
@@ -246,6 +383,8 @@ class OkxWalletAdapter:
             decimals = int(decimals_value)
         except (TypeError, ValueError) as exc:
             raise self._malformed("token balance") from exc
+        if not 0 <= decimals <= 255:
+            raise self._malformed("token balance")
         asset = Asset(
             chain=chain,
             symbol=str(symbol),
@@ -262,6 +401,11 @@ class OkxWalletAdapter:
         raw = self._raw_optional(raw_value)
         if raw is None:
             raise self._malformed("token balance")
+        try:
+            if amount * (Decimal(10) ** decimals) != Decimal(raw):
+                raise self._malformed("token balance amount")
+        except (InvalidOperation, ValueError) as exc:
+            raise self._malformed("token balance amount") from exc
         risk = entry.get("isRiskToken", entry.get("riskToken", False))
         if isinstance(risk, str):
             risk = risk.lower() in {"true", "1", "yes"}

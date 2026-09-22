@@ -1,0 +1,11 @@
+{
+  "response": {
+    "code": "0",
+    "data": [{
+      "chainIndex": "1",
+      "tokenContractAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tokenSymbol": "USDC",
+      "decimals": "6"
+    }]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "response": {
+    "code": "0",
+    "data": [{
+      "tokenAssets": [{
+        "chainIndex": "1",
+        "symbol": "USDC",
+        "tokenContractAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "balance": "12.5",
+        "rawBalance": "12500000",
+        "tokenPrice": "1"
+      }, {
+        "chainIndex": "1",
+        "symbol": "ETH",
+        "tokenContractAddress": "",
+        "balance": "1.25",
+        "rawBalance": "1250000000000000000"
+      }]
+    }, {
+      "tokens": [{
+        "chainIndex": "1",
+        "tokenSymbol": "USDT",
+        "contractAddress": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "tokenDecimal": "6",
+        "tokenAmount": "2.5",
+        "tokenAmountRaw": "2500000"
+      }]
+    }]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "scenarios": {
+    "empty": {"code": "0", "data": []},
+    "null": {"code": "0", "data": null},
+    "application_error": {"code": "51000", "data": []},
+    "inconsistent": {"code": "0", "data": [{"tokenAssets": [{"chainIndex": "1", "symbol": "USDC", "tokenContractAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "decimals": "6", "balance": "12.5", "rawBalance": "12500001"}]}]},
+    "metadata_out_of_range": {"code": "0", "data": [{"tokenContractAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "decimals": "256"}]}
+  }
+}
