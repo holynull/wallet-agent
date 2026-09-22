@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 DOC_PATH = Path(__file__).parents[2] / "docs" / "local-demo-debugging.md"
 
 
