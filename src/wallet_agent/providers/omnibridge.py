@@ -107,23 +107,37 @@ class OmniBridgeProvider:
             items = items or []
             if not isinstance(items, list):
                 raise ProviderResponseError("800", "Malformed coin catalog", category="client")
-            return [
-                Asset(
-                    chain=str(x.get("mainNetwork", x.get("chain", ""))),
-                    symbol=str(x.get("coinCode", x.get("symbol", ""))),
-                    decimals=int(x.get("coinDecimal", x.get("decimals", 0))),
-                    address=x.get("contact", x.get("address")),
-                    name=x.get("coinName", x.get("name")),
-                    logo_url=x.get("coinImageUrl", x.get("logoUrl")),
+            assets: list[Asset] = []
+            for x in items:
+                if not isinstance(x, dict):
+                    continue
+                try:
+                    decimals = int(x.get("coinDecimal", x.get("decimals", 0)))
+                except (TypeError, ValueError) as exc:
+                    raise ProviderResponseError(
+                        "800", "Invalid catalog decimals", category="client"
+                    ) from exc
+                if not 0 <= decimals <= 255:
+                    raise ProviderResponseError(
+                        "800", "Invalid catalog decimals", category="client"
+                    )
+                if (
+                    chain_filter
+                    and canonical_chain(str(x.get("mainNetwork", x.get("chain", ""))))
+                    != chain_filter
+                ):
+                    continue
+                assets.append(
+                    Asset(
+                        chain=str(x.get("mainNetwork", x.get("chain", ""))),
+                        symbol=str(x.get("coinCode", x.get("symbol", ""))),
+                        decimals=decimals,
+                        address=x.get("contact", x.get("address")),
+                        name=x.get("coinName", x.get("name")),
+                        logo_url=x.get("coinImageUrl", x.get("logoUrl")),
+                    )
                 )
-                for x in items
-                if isinstance(x, dict)
-                and (
-                    chain_filter is None
-                    or canonical_chain(str(x.get("mainNetwork", x.get("chain", ""))))
-                    == chain_filter
-                )
-            ]
+            return assets
 
         assets = await self._asset_cache.get_or_set(chain_filter or "*", load)
         if search_filter:

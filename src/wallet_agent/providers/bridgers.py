@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from wallet_agent.domain.models import (
@@ -55,6 +55,16 @@ def _equipment(address: str) -> str:
 
 def _raw_decimal(value: Decimal, decimals: int) -> str:
     return str(int(value * (Decimal(10) ** decimals)))
+
+
+def _quote_decimal(value: Any, field: str, *, nonnegative: bool = True) -> Decimal:
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ProviderResponseError("100", f"Invalid {field}", category="client") from exc
+    if not result.is_finite() or (nonnegative and result < 0):
+        raise ProviderResponseError("100", f"Invalid {field}", category="client")
+    return result
 
 
 def _catalog_symbol_matches(asset: Asset, candidate: Asset) -> bool:
@@ -107,18 +117,29 @@ class BridgersProvider:
             if not isinstance(tokens, list):
                 raise ProviderResponseError("100", "Malformed token catalog", category="client")
             for item in tokens:
-                if isinstance(item, dict):
-                    asset = Asset(
-                        chain=str(item.get("chain", "")),
-                        symbol=str(item.get("symbol", "")),
-                        name=item.get("name"),
-                        address=item.get("address"),
-                        decimals=int(item.get("decimals", 0)),
-                        logo_url=item.get("logoURI"),
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    decimals = int(item.get("decimals", 0))
+                except (TypeError, ValueError) as exc:
+                    raise ProviderResponseError(
+                        "100", "Invalid catalog decimals", category="client"
+                    ) from exc
+                if not 0 <= decimals <= 255:
+                    raise ProviderResponseError(
+                        "100", "Invalid catalog decimals", category="client"
                     )
-                    if chain_filter and canonical_chain(asset.chain) != chain_filter:
-                        continue
-                    assets.append(asset)
+                asset = Asset(
+                    chain=str(item.get("chain", "")),
+                    symbol=str(item.get("symbol", "")),
+                    name=item.get("name"),
+                    address=item.get("address"),
+                    decimals=decimals,
+                    logo_url=item.get("logoURI"),
+                )
+                if chain_filter and canonical_chain(asset.chain) != chain_filter:
+                    continue
+                assets.append(asset)
             return assets
 
         assets = await self._asset_cache.get_or_set(chain_filter or "*", load)
@@ -146,9 +167,7 @@ class BridgersProvider:
         """
         if asset.address:
             return asset.address
-        matches = await self.list_assets(
-            AssetQuery(chain=asset.chain, search=asset.symbol)
-        )
+        matches = await self.list_assets(AssetQuery(chain=asset.chain, search=asset.symbol))
         addresses = {
             str(candidate.address)
             for candidate in matches
@@ -159,8 +178,7 @@ class BridgersProvider:
         if len(addresses) != 1:
             raise ProviderResponseError(
                 "100",
-                f"Bridgers token catalog has no unique address for "
-                f"{asset.symbol} on {asset.chain}",
+                f"Bridgers token catalog has no unique address for {asset.symbol} on {asset.chain}",
                 category="client",
             )
         return next(iter(addresses))
@@ -186,11 +204,16 @@ class BridgersProvider:
             raise ProviderResponseError("100", "Missing txData", category="client")
         self.minimum_source_amount = str(tx.get("depositMin", "0"))
         reference = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-        to_decimals = int(tx.get("toTokenDecimal", request.destination_asset.decimals))
-        expected = Decimal(str(tx.get("toTokenAmount", "0")))
+        try:
+            to_decimals = int(tx.get("toTokenDecimal", request.destination_asset.decimals))
+        except (TypeError, ValueError) as exc:
+            raise ProviderResponseError("100", "Invalid toTokenDecimal", category="client") from exc
+        if not 0 <= to_decimals <= 255:
+            raise ProviderResponseError("100", "Invalid toTokenDecimal", category="client")
+        expected = _quote_decimal(tx.get("toTokenAmount", "0"), "toTokenAmount")
         expected_raw = _raw_decimal(expected, to_decimals)
         minimum_raw = str(tx.get("amountOutMin", "0"))
-        minimum = Decimal(minimum_raw) / (Decimal(10) ** to_decimals)
+        minimum = _quote_decimal(minimum_raw, "amountOutMin") / (Decimal(10) ** to_decimals)
         metadata = {
             "request": payload,
             "tx_data": tx,
@@ -216,10 +239,7 @@ class BridgersProvider:
             candidate = tx.get("contractAddress") or tx.get("spender") or tx.get("swapContract")
             spender = str(candidate) if candidate else None
         allowance = None
-        if (
-            spender
-            and request.source_asset.address
-        ):
+        if spender and request.source_asset.address:
             try:
                 allowance = AllowanceRequirement(
                     token=request.source_asset,
@@ -240,8 +260,10 @@ class BridgersProvider:
             expected_output_raw=expected_raw,
             minimum_output=minimum,
             minimum_output_raw=minimum_raw,
-            provider_fee=Decimal(str(tx["fee"])) if tx.get("fee") is not None else None,
-            network_fee=Decimal(str(tx["chainFee"])) if tx.get("chainFee") is not None else None,
+            provider_fee=_quote_decimal(tx["fee"], "fee") if tx.get("fee") is not None else None,
+            network_fee=_quote_decimal(tx["chainFee"], "chainFee")
+            if tx.get("chainFee") is not None
+            else None,
             expires_at=None,
             provider_reference=reference,
             provider_payload=provider_payload,

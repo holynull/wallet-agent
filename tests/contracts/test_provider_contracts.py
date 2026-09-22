@@ -74,6 +74,7 @@ async def test_bridgers_fixture_quote_preserves_human_and_raw_amounts():
     ).quote(bridgers_request())
     assert isinstance(quote, NormalizedQuote)
     assert quote.provider == "bridgers"
+    assert quote.model_dump()["provider"] == "bridgers"
     assert quote.input_amount_raw == "10000000"
     assert quote.expected_output == Decimal("9.8")
     assert quote.expected_output_raw == "9800000"
@@ -108,6 +109,33 @@ async def test_bridgers_empty_or_null_catalog_is_empty(data: Any):
         await BridgersProvider.from_transport(FakeTransport(response)).list_assets(AssetQuery())
         == []
     )
+
+
+@pytest.mark.asyncio
+async def test_bridgers_malformed_catalog_decimals_are_provider_errors():
+    response = fixture("bridgers_empty.json")
+    response["data"]["tokens"] = [{"chain": "BASE", "symbol": "USDC", "decimals": "bad"}]
+    with pytest.raises(ProviderResponseError, match="catalog decimals"):
+        await BridgersProvider.from_transport(FakeTransport(response)).list_assets(AssetQuery())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("toTokenAmount", "NaN"),
+        ("toTokenAmount", "-1"),
+        ("amountOutMin", "bad"),
+        ("toTokenDecimal", "NaN"),
+        ("fee", "Infinity"),
+        ("chainFee", "-1"),
+    ],
+)
+async def test_bridgers_invalid_quote_numbers_are_provider_errors(field: str, value: str):
+    response = fixture("bridgers_quote.json")
+    response["data"]["txData"][field] = value
+    with pytest.raises(ProviderResponseError):
+        await BridgersProvider.from_transport(FakeTransport(response)).quote(bridgers_request())
 
 
 @pytest.mark.asyncio
@@ -153,6 +181,14 @@ async def test_omnibridge_empty_or_null_catalog_is_empty(data: Any):
         await OmniBridgeProvider.from_transport(FakeTransport(response)).list_assets(AssetQuery())
         == []
     )
+
+
+@pytest.mark.asyncio
+async def test_omnibridge_malformed_catalog_decimals_are_provider_errors():
+    response = fixture("omnibridge_empty.json")
+    response["data"] = [{"mainNetwork": "ETH", "coinCode": "USDC", "coinDecimal": "bad"}]
+    with pytest.raises(ProviderResponseError, match="catalog decimals"):
+        await OmniBridgeProvider.from_transport(FakeTransport(response)).list_assets(AssetQuery())
 
 
 @pytest.mark.asyncio
