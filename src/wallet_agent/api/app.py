@@ -681,6 +681,32 @@ def create_app(
                     )
                 snapshot = await get_snapshot()
                 result = snapshot.values
+                response_for_history = result.get("response") or {}
+                if response_for_history and hasattr(app.state.graph, "aupdate_state"):
+                    assistant_content = response_for_history.get("message") or (
+                        response_for_history.get("kind")
+                    )
+                    history = result.get("conversation_history") or []
+                    duplicate_assistant = any(
+                        isinstance(item, Mapping)
+                        and item.get("role") == "assistant"
+                        and item.get("content") == str(assistant_content)
+                        for item in history
+                    )
+                    if assistant_content and not duplicate_assistant:
+                        await app.state.graph.aupdate_state(
+                            config,
+                            {
+                                "conversation_history": [
+                                    {
+                                        "role": "assistant",
+                                        "content": str(assistant_content),
+                                    }
+                                ]
+                            },
+                        )
+                        snapshot = await get_snapshot()
+                        result = snapshot.values
                 interrupted = bool(getattr(snapshot, "tasks", ())) and bool(
                     getattr(snapshot, "next", ())
                 )
