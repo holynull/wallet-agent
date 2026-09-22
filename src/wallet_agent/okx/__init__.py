@@ -2,6 +2,7 @@
 
 from .client import OkxSignedClient
 from .errors import OkxClientError
+from .explorer import OkxExplorerAdapter, OkxExplorerError
 from .wallet import OkxWalletAdapter, OkxWalletError
 
 OKX_CHAIN_INDEX_BY_NAME = {
@@ -21,6 +22,8 @@ OKX_CHAIN_INDEX_BY_NAME = {
 __all__ = [
     "OKX_CHAIN_INDEX_BY_NAME",
     "OkxClientError",
+    "OkxExplorerAdapter",
+    "OkxExplorerError",
     "OkxSignedClient",
     "OkxWalletAdapter",
     "OkxWalletError",

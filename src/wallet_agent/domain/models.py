@@ -8,7 +8,7 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
-ProviderName = Literal["bridgers", "omnibridge", "okx", "coingecko"]
+ProviderName = Literal["bridgers", "omnibridge", "okx"]
 OrderState = Literal[
     "pending",
     "processing",
@@ -226,6 +226,7 @@ class TokenPrice(DomainModel):
     asset: Asset
     usd_price: Decimal = Field(ge=0)
     observed_at: datetime | None = None
+    provider: ProviderName | None = None
 
 
 AuthorizationStage = Literal[
@@ -394,13 +395,6 @@ class SimulationResult(DomainModel):
     observed_at: datetime | None = None
 
 
-class TokenPrice(DomainModel):
-    asset: Asset
-    usd_price: Decimal = Field(ge=0)
-    observed_at: datetime | None = None
-    provider: ProviderName | None = None
-
-
 class HistoricalPricePoint(DomainModel):
     observed_at: datetime
     price: Decimal = Field(ge=0)
@@ -449,6 +443,41 @@ class TransactionRecord(DomainModel):
     value: str | None = None
     block_number: int | None = Field(default=None, ge=0)
     confirmed_at: datetime | None = None
+    source: Literal["okx"] | None = None
+    history_kind: Literal["full", "dex"] | None = None
+    method_id: str | None = None
+
+
+class TransactionHistoryPage(DomainModel):
+    """A cursor page returned by a transaction explorer."""
+
+    transactions: list[TransactionRecord] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class TokenTransfer(DomainModel):
+    """A token movement embedded in an explorer transaction detail."""
+
+    model_config = ConfigDict(extra="allow")
+
+    token: str | None = None
+    symbol: str | None = None
+    amount: str | None = None
+    from_address: str | None = None
+    to_address: str | None = None
+
+
+class TransactionDetail(DomainModel):
+    """Normalized transaction detail and the explorer record it extends."""
+
+    record: TransactionRecord
+    gas_limit: str | None = None
+    gas_used: str | None = None
+    nonce: str | None = None
+    transaction_index: str | None = None
+    block_hash: str | None = None
+    fee: str | None = None
+    token_transfers: list[TokenTransfer] = Field(default_factory=list)
 
 
 class FeeEstimate(DomainModel):
