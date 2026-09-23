@@ -59,6 +59,21 @@ def test_identical_patch_does_not_increment_revision():
     assert result.invalidation == {}
 
 
+def test_explicit_none_patch_clears_stale_transfer_amount():
+    task = merge_task_patch(
+        new_active_task("transfer", task_id="transfer-1"),
+        {"chain": "BASE", "symbol": "USDC", "amount": "1", "amount_raw": "1000000"},
+    ).task
+
+    result = merge_task_patch(task, {"symbol": "ETH", "amount": None, "amount_raw": None})
+
+    assert result.changed_slots == frozenset({"symbol", "amount", "amount_raw"})
+    assert result.task["slots"] == {"chain": "BASE", "symbol": "ETH"}
+    assert result.task["slot_sources"] == {"chain": "user", "symbol": "user"}
+    assert result.invalidation["pending_transaction"] is None
+    assert result.invalidation["transfer_request"] is None
+
+
 def test_task_patch_normalizes_chain_and_symbol_noise():
     task = new_active_task("swap", task_id="swap-1")
 

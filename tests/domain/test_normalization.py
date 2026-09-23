@@ -70,3 +70,8 @@ def test_swap_direction_hints_understand_explicit_chinese_swap_grammar():
     }
     assert swap_direction_hints("来源也在 BSC 链") == {"source_chain": "BSC"}
     assert swap_direction_hints("目标也在 ETH 网络") == {"destination_chain": "ETH"}
+    assert swap_direction_hints("以太上 10 USDC 换 BNB") == {
+        "source_chain": "ETH",
+        "source_symbol": "USDC",
+        "destination_symbol": "BNB",
+    }

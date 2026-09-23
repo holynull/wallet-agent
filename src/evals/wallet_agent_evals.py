@@ -131,6 +131,25 @@ class FakeChainAdapter:
         return TransactionStatus.CONFIRMED
 
 
+class FakeOkxWalletProvider:
+    """Deterministic OKX wallet-data boundary for offline evaluations."""
+
+    chain_index_by_name = {"BASE": "8453"}
+
+    def __init__(self, chain: FakeChainAdapter) -> None:
+        self.chain = chain
+
+    async def get_token_balances(
+        self, address: str, chain_indexes: list[str]
+    ) -> list[TokenBalance]:
+        if chain_indexes != ["8453"]:
+            return []
+        return [
+            await self.chain.get_native_balance(address),
+            *await self.chain.get_token_balances(address),
+        ]
+
+
 class FakeSwapProvider:
     """Quote simulator that records every action capable of advancing a swap."""
 
@@ -626,6 +645,7 @@ async def _run_case(case: EvalCase, model: Any) -> dict[str, Any]:
         model=model,
         chains={"BASE": chain},
         providers=[provider],
+        wallet_provider=FakeOkxWalletProvider(chain),
         price_provider=FakePriceProvider(),
     )
     config = {"configurable": {"thread_id": f"eval-{case.id}"}}

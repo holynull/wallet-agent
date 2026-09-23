@@ -30,7 +30,11 @@ from wallet_agent.domain.models import (
     ProviderOrder,
     UnsignedTransaction,
 )
-from wallet_agent.okx import OKX_CHAIN_INDEX_BY_NAME, OkxWalletError
+from wallet_agent.okx import (
+    OKX_CHAIN_INDEX_BY_NAME,
+    OkxExplorerError,
+    OkxWalletError,
+)
 from wallet_agent.persistence import (
     InMemorySessionStore,
     SessionRevisionConflict,
@@ -384,6 +388,8 @@ def create_app(
     chain_registry: Any = None,
     providers: Mapping[str, Any] | None = None,
     wallet_provider: Any | None = None,
+    explorer_provider: Any | None = None,
+    execution_observer: Any | None = None,
     price_provider: Any | None = None,
     store: SessionStore | None = None,
     token_verifier: TokenVerifier | None = None,
@@ -409,6 +415,8 @@ def create_app(
     app.state.chain_registry = chain_registry
     app.state.providers = provider_map
     app.state.wallet_provider = wallet_provider
+    app.state.explorer_provider = explorer_provider
+    app.state.execution_observer = execution_observer
     app.state.price_provider = price_provider
     app.state.session_store = session_store
     app.state.runs: dict[str, dict[str, Any]] = {}
@@ -424,6 +432,19 @@ def create_app(
             lock = asyncio.Lock()
             app.state.graph_locks[thread_id] = lock
         return lock
+
+    def execution_adapter(chain: str) -> Any:
+        observer = app.state.execution_observer
+        if observer is not None and hasattr(observer, "adapter"):
+            return observer.adapter(chain)
+        registry = app.state.chain_registry
+        if registry is None:
+            raise RuntimeError("execution observer unavailable")
+        return (
+            registry.get_adapter(chain)
+            if hasattr(registry, "get_adapter")
+            else registry.get(chain)
+        )
 
     demo_dir = Path(__file__).resolve().parents[3] / "demo"
     if demo_dir.is_dir():
@@ -486,6 +507,14 @@ def create_app(
             return None
         state = {str(key): _jsonable(value) for key, value in state.items()}
         changes: dict[str, Any] = {}
+        broadcast_lifecycle_active = bool(
+            current.broadcast_tx_hash
+            or current.provider_order
+            or current.order_status
+            or state.get("broadcast_tx_hash")
+            or state.get("provider_orders")
+            or state.get("status_snapshot")
+        )
         selected = state.get("selected_quote")
         if selected:
             changes["quote"] = (
@@ -526,10 +555,13 @@ def create_app(
         tx_hash = state.get("broadcast_tx_hash")
         if tx_hash:
             changes["broadcast_tx_hash"] = str(tx_hash)
-        if state.get("authorization_stage") is not None:
-            changes["stage"] = state["authorization_stage"]
-        elif state.get("task_stage") is not None:
-            changes["stage"] = state["task_stage"]
+        if state.get("broadcast_status") is not None:
+            changes["broadcast_status"] = str(state["broadcast_status"])
+        if not broadcast_lifecycle_active:
+            if state.get("authorization_stage") is not None:
+                changes["stage"] = state["authorization_stage"]
+            elif state.get("task_stage") is not None:
+                changes["stage"] = state["task_stage"]
         response = state.get("response") or {}
         if response.get("kind") == "swap_status":
             raw_status = response.get("status")
@@ -552,6 +584,20 @@ def create_app(
             changes["confirmation_state"] = _jsonable(state["confirmation_state"])
         if state.get("swap_gas_estimate") is not None:
             changes["gas_estimate"] = _jsonable(state["swap_gas_estimate"])
+        if response.get("kind") == "error" and not broadcast_lifecycle_active:
+            # An unsuccessful prepare/preflight must revoke every unsigned
+            # action projected by an older turn.  Otherwise clients can still
+            # render and submit a transaction that no longer matches the
+            # current request.
+            changes.update(
+                pending_transaction=None,
+                approval_transaction=None,
+                approval_tx_hash=None,
+                allowance_requirement=None,
+                confirmation_state=None,
+                gas_estimate=None,
+                stage="failed",
+            )
         if status:
             changes["status"] = status
         if run_id:
@@ -579,9 +625,12 @@ def create_app(
         quote: NormalizedQuote,
     ) -> SwapSessionRecord:
         requirement = quote.allowance_requirement
-        if requirement is None or app.state.chain_registry is None:
+        if requirement is None:
             return session
-        adapter = app.state.chain_registry.get_adapter(requirement.token.chain)
+        try:
+            adapter = execution_adapter(requirement.token.chain)
+        except Exception:
+            return session
         tx = adapter.build_erc20_approve(
             token=requirement.token,
             owner=requirement.owner,
@@ -644,12 +693,60 @@ def create_app(
                         isinstance(graph_input, dict)
                         and message
                     ):
-                        graph_input = _resolve_graph_input(snapshot, graph_input)
-                    async for event in app.state.graph.astream(
-                        graph_input, config=config, stream_mode="updates"
+                        # A broadcasted swap may leave the old confirmation
+                        # interrupt in the checkpoint until the next graph
+                        # execution.  Once the wallet has registered a tx,
+                        # an ordinary conversational turn must not resume that
+                        # stale interrupt and replay quote/prepare nodes.  A
+                        # subsequent explicit swap_status turn still routes
+                        # through the normal provider status path.
+                        broadcast_lifecycle_active = bool(
+                            graph_input.get("broadcast_tx_hash")
+                            or graph_input.get("provider_orders")
+                        )
+                        if broadcast_lifecycle_active:
+                            # Explicitly clear turn-scoped routing values from
+                            # the checkpoint.  A previous confirmation/prepare
+                            # run can otherwise leave ``forced_intent`` or
+                            # ``intent`` behind even when this request carries
+                            # a fresh message, causing the old swap path to be
+                            # replayed before the model sees the new turn.
+                            if hasattr(app.state.graph, "aupdate_state"):
+                                await app.state.graph.aupdate_state(
+                                    config,
+                                    {
+                                        "forced_intent": None,
+                                        "intent": None,
+                                        "supervisor_output": None,
+                                        "supervisor_decision": None,
+                                        "response_action": None,
+                                        "response": None,
+                                        "status_snapshot": None,
+                                    },
+                                )
+                                snapshot = await get_snapshot()
+                        else:
+                            graph_input = _resolve_graph_input(snapshot, graph_input)
+                    async for streamed in app.state.graph.astream(
+                        graph_input,
+                        config=config,
+                        stream_mode=["updates", "custom"],
                     ):
+                        if (
+                            isinstance(streamed, tuple)
+                            and len(streamed) == 2
+                            and streamed[0] in {"updates", "custom"}
+                        ):
+                            mode, event = streamed
+                        else:
+                            # Compatibility with graph doubles and older graph
+                            # implementations that return update chunks directly.
+                            mode, event = "updates", streamed
                         app.state.runs[run_id]["events"].append(
-                            {"event": "update", "data": event}
+                            {
+                                "event": "progress" if mode == "custom" else "update",
+                                "data": event,
+                            }
                         )
                     snapshot = await get_snapshot()
                     return dict(snapshot.values)
@@ -732,11 +829,12 @@ def create_app(
                             if isinstance(raw_status, Mapping)
                             else raw_status
                         )
-                    if response_kind == "error" and (
-                        result.get("intent") == "swap_quote"
-                        or (result.get("active_task") or {}).get("kind") == "swap"
-                    ):
-                        session_status = "quote_failed"
+                    if response_kind == "error":
+                        active_kind = (result.get("active_task") or {}).get("kind")
+                        if result.get("intent") == "swap_quote" or active_kind == "swap":
+                            session_status = "quote_failed"
+                        elif result.get("intent") == "transfer" or active_kind == "transfer":
+                            session_status = "failed"
                     elif response_kind == "swap_quote" and not result.get("selected_quote"):
                         session_status = "quoted"
                     elif response_kind == "clarification":
@@ -894,6 +992,10 @@ def create_app(
             "model_id": selected_model_id,
             "request": payload.model_dump(mode="json"),
             "messages": [{"role": "user", "content": payload.message}],
+            "conversation_history": [{"role": "user", "content": payload.message}],
+            # Do not let a previous checkpoint response be projected as this
+            # turn's response or lifecycle stage.
+            "response": None,
             # API-forced intents are turn-scoped. Explicitly overwrite any
             # value left in the LangGraph checkpoint by select/continue APIs.
             "forced_intent": None,
@@ -912,7 +1014,11 @@ def create_app(
                 input_state["pending_transaction"] = pending_transaction.model_dump(mode="json")
             if existing_session.broadcast_tx_hash:
                 input_state["broadcast_tx_hash"] = existing_session.broadcast_tx_hash
-                broadcast_status = existing_session.stage or existing_session.status
+                broadcast_status = (
+                    existing_session.broadcast_status
+                    or existing_session.stage
+                    or existing_session.status
+                )
                 if broadcast_status in {
                     "broadcast_seen",
                     "broadcast_pending",
@@ -941,6 +1047,13 @@ def create_app(
                     "approval_transaction": None,
                     "pending_transaction": None,
                     "authorization_stage": None,
+                    # The old task may still be marked as an active swap in
+                    # the checkpoint.  Keep the quote/order for explicit
+                    # status queries, but do not let an unrelated new message
+                    # inherit that task and get coerced into swap_quote.
+                    "active_task": None,
+                    "conversation_state": None,
+                    "swap_draft": None,
                 }
             )
         if wallet_context:
@@ -1136,41 +1249,35 @@ def create_app(
             raise HTTPException(status_code=409, detail="swap provider or quote unavailable")
 
         broadcast_status: BroadcastStatus = "broadcast_seen"
-        registry = app.state.chain_registry
-        if registry is not None:
-            try:
-                adapter = (
-                    registry.get_adapter(payload.chain)
-                    if hasattr(registry, "get_adapter")
-                    else registry.get(payload.chain)
+        try:
+            adapter = execution_adapter(payload.chain)
+        except Exception:
+            adapter = None
+        if adapter is not None and hasattr(adapter, "get_transaction_receipt"):
+            sender = _display_text(
+                session,
+                "from",
+                "sender",
+                "sender_address",
+                "owner",
+            )
+            nonce = _display_int(session, "nonce", "transaction_nonce", "source_nonce")
+            chain_status = await _chain_broadcast_status(
+                adapter,
+                payload.tx_hash,
+                sender=sender,
+                nonce=nonce,
+            )
+            if chain_status == "failed":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "TRANSACTION_FAILED",
+                        "message": "链上交易已确认失败，请检查钱包和交易参数。",
+                        "details": {"tx_hash": payload.tx_hash},
+                    },
                 )
-            except Exception:
-                adapter = None
-            if adapter is not None and hasattr(adapter, "get_transaction_receipt"):
-                sender = _display_text(
-                    session,
-                    "from",
-                    "sender",
-                    "sender_address",
-                    "owner",
-                )
-                nonce = _display_int(session, "nonce", "transaction_nonce", "source_nonce")
-                chain_status = await _chain_broadcast_status(
-                    adapter,
-                    payload.tx_hash,
-                    sender=sender,
-                    nonce=nonce,
-                )
-                if chain_status == "failed":
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "code": "TRANSACTION_FAILED",
-                            "message": "链上交易已确认失败，请检查钱包和交易参数。",
-                            "details": {"tx_hash": payload.tx_hash},
-                        },
-                    )
-                broadcast_status = chain_status
+            broadcast_status = chain_status
         # Re-check and register under the per-thread lock.  This closes the
         # duplicate-provider-call window when a wallet retries the same hash.
         async with graph_lock(session.thread_id):
@@ -1210,6 +1317,7 @@ def create_app(
                     expected_revision=session.revision,
                     status=broadcast_status,
                     stage=broadcast_status,
+                    broadcast_status=broadcast_status,
                     broadcast_tx_hash=payload.tx_hash,
                     provider_order=None,
                 )
@@ -1241,6 +1349,7 @@ def create_app(
                 expected_revision=session.revision,
                 status=broadcast_status,
                 stage=broadcast_status,
+                broadcast_status=broadcast_status,
                 broadcast_tx_hash=payload.tx_hash,
                 provider_order=order,
             )
@@ -1461,49 +1570,48 @@ def create_app(
                     "details": {"chain": chain},
                 },
             )
-        registry = app.state.chain_registry
-        if registry is None:
-            raise HTTPException(status_code=503, detail="chain registry unavailable")
-        try:
-            adapter = (
-                registry.get_adapter(chain)
-                if hasattr(registry, "get_adapter")
-                else registry.get(chain)
-            )
-            status = await adapter.get_transaction_status(tx_hash)
-            status_value = getattr(status, "value", str(status))
-            messages = {
-                "pending": "交易已提交，正在等待链上确认。",
-                "confirmed": "交易已确认。",
-                "failed": "交易执行失败或已回滚。",
-                "dropped": "交易可能已被节点丢弃，请检查钱包或重新提交。",
-                "unknown": "暂时无法确定交易状态。",
-            }
-            result: dict[str, Any] = {
-                "chain": chain.upper(),
-                "tx_hash": tx_hash,
-                "status": status_value,
-                "message": messages.get(status_value, messages["unknown"]),
-            }
-            if hasattr(adapter, "get_transaction_receipt"):
-                receipt = await adapter.get_transaction_receipt(tx_hash)
-                if receipt is not None:
-                    result["receipt"] = _jsonable(receipt)
-            return result
-        except ChainCapabilityUnavailable as exc:
+        explorer = app.state.explorer_provider
+        if explorer is not None and hasattr(explorer, "get_transaction_detail"):
+            try:
+                detail = await explorer.get_transaction_detail(chain, tx_hash)
+                result: dict[str, Any] = {
+                    "chain": chain.upper(),
+                    "tx_hash": tx_hash,
+                    "status": detail.status.value,
+                    "message": {
+                        "pending": "交易已提交，正在等待链上确认。",
+                        "confirmed": "交易已确认。",
+                        "failed": "交易执行失败或已回滚。",
+                        "unknown": "暂时无法确定交易状态。",
+                    }.get(detail.status.value, "暂时无法确定交易状态。"),
+                    "source": detail.source or "okx",
+                    "transaction": _jsonable(detail),
+                }
+                return result
+            except OkxExplorerError as exc:
+                raise HTTPException(
+                    status_code=(
+                        422
+                        if exc.code in {"OKX_INVALID_ARGUMENT", "OKX_CHAIN_UNSUPPORTED"}
+                        else 502
+                    ),
+                    detail={"code": exc.code, "message": exc.message},
+                ) from exc
+        if app.state.explorer_provider is None:
             raise HTTPException(
-                status_code=422,
-                detail=exc.to_agent_error().model_dump(mode="json"),
-            ) from exc
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502,
+                status_code=503,
                 detail={
-                    "code": "TRANSACTION_STATUS_FAILED",
-                    "message": str(exc),
-                    "details": {"chain": chain, "tx_hash": tx_hash},
+                    "code": "OKX_CAPABILITY_UNAVAILABLE",
+                    "message": "OKX transaction explorer unavailable.",
                 },
-            ) from exc
+            )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "OKX_CAPABILITY_UNAVAILABLE",
+                "message": "OKX transaction explorer unavailable.",
+            },
+        )
 
     @app.get("/v1/prices/token")
     async def token_prices(
@@ -1689,22 +1797,56 @@ def create_app(
         return _jsonable(await owned_session(session_id, authenticated))
 
     async def wallet_operation(address: str, chain: str, operation: str, limit: int = 20) -> Any:
-        registry = app.state.chain_registry
-        if registry is None:
-            raise HTTPException(status_code=503, detail="chain registry unavailable")
-        try:
-            adapter = (
-                registry.get_adapter(chain)
-                if hasattr(registry, "get_adapter")
-                else registry.get(chain)
-            )
-            if operation == "balances":
+        wallet_provider = app.state.wallet_provider
+        if operation == "balances" and wallet_provider is not None and hasattr(
+            wallet_provider, "get_token_balances"
+        ):
+            try:
+                indexes = _okx_chain_indexes(chain)
+                balances = await wallet_provider.get_token_balances(address, indexes)
+                native = [item for item in balances if item.asset.address is None]
+                tokens = [item for item in balances if item.asset.address is not None]
                 return {
-                    "native": _jsonable(await adapter.get_native_balance(address)),
-                    "tokens": _jsonable(await adapter.get_token_balances(address)),
+                    "native": _jsonable(native[0]) if native else None,
+                    "tokens": _jsonable(tokens),
+                    "source": "okx",
                 }
-            if operation == "transactions":
-                return _jsonable(await adapter.get_transaction_history(address, limit=limit))
+            except OkxWalletError as exc:
+                raise HTTPException(
+                    status_code=422
+                    if exc.code in {"OKX_CHAIN_UNSUPPORTED", "OKX_INVALID_ARGUMENT"}
+                    else 502,
+                    detail={"code": exc.code, "message": exc.message, "details": exc.details},
+                ) from exc
+        explorer = app.state.explorer_provider
+        if operation == "transactions" and explorer is not None and hasattr(
+            explorer, "get_transaction_history"
+        ):
+            try:
+                page = await explorer.get_transaction_history(address, chain, limit=limit)
+                return {
+                    "source": "okx",
+                    "history_kind": "full",
+                    "cursor": page.next_cursor,
+                    **_jsonable(page),
+                }
+            except OkxExplorerError as exc:
+                raise HTTPException(
+                    status_code=422
+                    if exc.code in {"OKX_CHAIN_UNSUPPORTED", "OKX_INVALID_ARGUMENT"}
+                    else 502,
+                    detail={"code": exc.code, "message": exc.message},
+                ) from exc
+        if operation in {"balances", "transactions"}:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "OKX_CAPABILITY_UNAVAILABLE",
+                    "message": "OKX wallet data provider unavailable.",
+                },
+            )
+        try:
+            adapter = execution_adapter(chain)
             return _jsonable(await adapter.estimate_fee())
         except ChainCapabilityUnavailable as exc:
             raise HTTPException(
@@ -1730,69 +1872,67 @@ def create_app(
     @app.get("/v1/wallet/{address}/portfolio")
     async def portfolio(request: Request, address: str, chain: str) -> Any:
         await authenticated_user(request, verifier=token_verifier, required=require_auth)
-        registry = app.state.chain_registry
-        if registry is None:
-            raise HTTPException(status_code=503, detail="chain registry unavailable")
-        try:
-            adapter = (
-                registry.get_adapter(chain)
-                if hasattr(registry, "get_adapter")
-                else registry.get(chain)
-            )
-            balances = [await adapter.get_native_balance(address)]
-            if hasattr(adapter, "get_token_balances"):
-                balances.extend(await adapter.get_token_balances(address))
-            prices = []
-            if app.state.price_provider is not None:
-                try:
-                    prices = await app.state.price_provider.get_prices(
-                        [balance.asset for balance in balances]
+        wallet_provider = app.state.wallet_provider
+        if wallet_provider is not None and hasattr(wallet_provider, "get_token_balances"):
+            try:
+                indexes = _okx_chain_indexes(chain)
+                balances = await wallet_provider.get_token_balances(address, indexes)
+                prices = []
+                if app.state.price_provider is not None:
+                    try:
+                        prices = await app.state.price_provider.get_prices(
+                            [balance.asset for balance in balances]
+                        )
+                    except Exception:
+                        prices = []
+                price_map = {
+                    (
+                        str(price.asset.chain).upper(),
+                        str(price.asset.symbol).upper(),
+                        str(price.asset.address or "").lower(),
+                    ): price
+                    for price in prices
+                }
+                assets = []
+                total_usd = 0
+                has_value = False
+                for balance in balances:
+                    item = _jsonable(balance)
+                    key = (
+                        str(balance.asset.chain).upper(),
+                        str(balance.asset.symbol).upper(),
+                        str(balance.asset.address or "").lower(),
                     )
-                except Exception:
-                    prices = []
-            price_map = {
-                (
-                    str(price.asset.chain).upper(),
-                    str(price.asset.symbol).upper(),
-                    str(price.asset.address or "").lower(),
-                ): price
-                for price in prices
-            }
-            assets = []
-            total_usd = 0
-            has_value = False
-            for balance in balances:
-                item = _jsonable(balance)
-                key = (
-                    str(balance.asset.chain).upper(),
-                    str(balance.asset.symbol).upper(),
-                    str(balance.asset.address or "").lower(),
-                )
-                price = price_map.get(key)
-                if price is not None:
-                    usd_value = balance.amount * price.usd_price
-                    item["usd_value"] = str(usd_value)
-                    total_usd += usd_value
-                    has_value = True
-                assets.append(item)
-            return {
-                "address": address,
-                "chain": chain.upper(),
-                "assets": assets,
-                "total_usd_value": str(total_usd) if has_value else None,
-                "price_status": "available" if prices else "unavailable",
-                "price_snapshots": [_jsonable(price) for price in prices],
-            }
-        except ChainCapabilityUnavailable as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=exc.to_agent_error().model_dump(mode="json"),
-            ) from exc
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail={"code": "PORTFOLIO_QUERY_FAILED", "message": str(exc)},
-            ) from exc
+                    price = price_map.get(key)
+                    if price is not None:
+                        usd_value = balance.amount * price.usd_price
+                        item["usd_value"] = str(usd_value)
+                        total_usd += usd_value
+                        has_value = True
+                    assets.append(item)
+                return {
+                    "address": address,
+                    "chain": chain.upper(),
+                    "assets": assets,
+                    "total_usd_value": str(total_usd) if has_value else None,
+                    "price_status": "available" if prices else "unavailable",
+                    "price_snapshots": [_jsonable(price) for price in prices],
+                    "source": "okx",
+                }
+            except OkxWalletError as exc:
+                raise HTTPException(
+                    status_code=422
+                    if exc.code in {"OKX_CHAIN_UNSUPPORTED", "OKX_INVALID_ARGUMENT"}
+                    else 502,
+                    detail={"code": exc.code, "message": exc.message, "details": exc.details},
+                ) from exc
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "OKX_CAPABILITY_UNAVAILABLE",
+                "message": "OKX wallet data provider unavailable.",
+            },
+        )
 
     @app.get("/v1/wallet/{address}/total-value")
     async def total_value(
@@ -1862,20 +2002,29 @@ def create_app(
         data: str | None = None,
     ) -> Any:
         await authenticated_user(request, verifier=token_verifier, required=require_auth)
-        registry = app.state.chain_registry
-        if registry is None:
-            raise HTTPException(status_code=503, detail="chain registry unavailable")
-        try:
-            adapter = (
-                registry.get_adapter(chain)
-                if hasattr(registry, "get_adapter")
-                else registry.get(chain)
+        wallet_provider = app.state.wallet_provider
+        if wallet_provider is None or not hasattr(wallet_provider, "get_token_balances"):
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "OKX_CAPABILITY_UNAVAILABLE",
+                    "message": "OKX wallet data provider unavailable.",
+                },
             )
+        try:
+            adapter = execution_adapter(chain)
             try:
                 fee = await adapter.estimate_fee(to=to, data=data, from_address=address)
             except TypeError:
                 fee = await adapter.estimate_fee(to=to, data=data)
-            native = await adapter.get_native_balance(address)
+            balances = await wallet_provider.get_token_balances(
+                address, _okx_chain_indexes(chain)
+            )
+            native = next((item for item in balances if item.asset.address is None), None)
+            if native is None:
+                raise OkxWalletError(
+                    "OKX_MALFORMED_RESPONSE", "OKX native balance is unavailable."
+                )
             fee_raw = int(fee.amount_raw)
             balance_raw = int(native.amount_raw)
             sufficient = balance_raw >= fee_raw

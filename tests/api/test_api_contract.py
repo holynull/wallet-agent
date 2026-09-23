@@ -3,11 +3,12 @@ import pytest
 from langgraph.types import Command, Interrupt
 
 from wallet_agent.api import create_app
-from wallet_agent.domain.errors import ChainCapabilityUnavailable
+from wallet_agent.domain.models import UnsignedTransaction
+from wallet_agent.persistence import InMemorySessionStore, SwapSessionRecord
 
 
-async def client_for(*, graph=None, chain_registry=None):
-    app = create_app(graph=graph, chain_registry=chain_registry)
+async def client_for(*, graph=None, chain_registry=None, **kwargs):
+    app = create_app(graph=graph, chain_registry=chain_registry, **kwargs)
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
     return app, client
 
@@ -57,6 +58,33 @@ async def test_sse_completion_and_missing_run_contract():
     assert "event: complete" in stream.text
     assert "RUN_NOT_FOUND" in missing.text
     assert "run not found" in missing.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_sse_forwards_custom_graph_progress_events():
+    class ProgressGraph:
+        async def astream(self, _value, *, config, stream_mode):
+            del config
+            assert stream_mode == ["updates", "custom"]
+            yield ("custom", {"stage": "slot_extraction", "status": "started", "elapsed_ms": 0})
+            yield ("updates", {"response": {"kind": "clarification"}})
+
+        async def aget_state(self, _config):
+            class Snapshot:
+                values = {"response": {"kind": "clarification"}}
+                tasks = ()
+                next = ()
+
+            return Snapshot()
+
+    app, client = await client_for(graph=ProgressGraph())
+    async with client:
+        turn = await client.post("/v1/agent/turn", json={"user_id": "alice", "message": "hello"})
+        await app.state.runs[turn.json()["run_id"]]["task"]
+        stream = await client.get(f"/v1/agent/stream/{turn.json()['run_id']}")
+
+    assert "event: progress" in stream.text
+    assert '"stage": "slot_extraction"' in stream.text
 
 
 @pytest.mark.asyncio
@@ -483,6 +511,77 @@ async def test_failed_swap_quote_session_is_not_marked_completed():
 
 
 @pytest.mark.asyncio
+async def test_transfer_error_clears_stale_unsigned_transaction_from_session():
+    stale_transaction = UnsignedTransaction(
+        chain="BASE",
+        chain_id=8453,
+        to="0x" + "2" * 40,
+        data="0x",
+        value="1000000",
+    )
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="stale-transfer-session",
+            user_id="alice",
+            thread_id="stale-transfer-thread",
+            status="transfer_ready",
+            stage="transfer_ready",
+            pending_transaction=stale_transaction,
+            approval_transaction={"to": "0x" + "3" * 40},
+            confirmation_state={"status": "requested"},
+        )
+    )
+
+    class FailedTransferGraph:
+        async def astream(self, _value, *, config, stream_mode):
+            del config, stream_mode
+            yield {"response": {"kind": "error"}}
+
+        def get_state(self, _config):
+            class Snapshot:
+                values = {
+                    "intent": "transfer",
+                    "active_task": {"kind": "transfer", "stage": "ready_for_prepare"},
+                    "task_stage": "ready_for_prepare",
+                    "preflight": {"ok": False},
+                    "response": {
+                        "kind": "error",
+                        "errors": [{"code": "TRANSACTION_PREFLIGHT_FAILED"}],
+                    },
+                }
+                tasks = ()
+                next = ()
+
+            return Snapshot()
+
+    app, client = await client_for(graph=FailedTransferGraph(), store=store)
+    async with client:
+        response = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "session_id": "stale-transfer-session",
+                "conversation_id": "stale-transfer-thread",
+                "message": "转一些 ETH 到这个地址",
+            },
+        )
+        await app.state.runs[response.json()["run_id"]]["task"]
+        session = await client.get(
+            "/v1/swap/stale-transfer-session", params={"user_id": "alice"}
+        )
+
+    assert session.status_code == 200
+    body = session.json()
+    assert body["status"] == "failed"
+    assert body["stage"] == "failed"
+    assert body["pending_transaction"] is None
+    assert body["approval_transaction"] is None
+    assert body["confirmation_state"] is None
+    assert body["preflight"] == {"ok": False}
+
+
+@pytest.mark.asyncio
 async def test_parameter_clarification_projects_collecting_session_status():
     class ClarificationGraph:
         async def astream(self, _value, *, config, stream_mode):
@@ -522,42 +621,39 @@ async def test_parameter_clarification_projects_collecting_session_status():
 
 @pytest.mark.asyncio
 async def test_unsupported_chain_error_is_stable():
-    class Registry:
-        def get_adapter(self, chain):
-            raise ChainCapabilityUnavailable(chain, "balances")
-
-    _app, client = await client_for(chain_registry=Registry())
+    _app, client = await client_for()
     async with client:
         response = await client.get("/v1/wallet/address/balances", params={"chain": "SUI"})
-    assert response.status_code == 422
+    assert response.status_code == 503
     body = response.json()
-    assert body["code"] == "CHAIN_CAPABILITY_UNAVAILABLE"
-    assert body["details"]["chain"] == "SUI"
+    assert body["code"] == "OKX_CAPABILITY_UNAVAILABLE"
 
 
 @pytest.mark.asyncio
 async def test_transaction_status_endpoint_returns_user_readable_status():
-    class Adapter:
-        async def get_transaction_status(self, _tx_hash):
-            from wallet_agent.domain.models import TransactionStatus
+    from wallet_agent.domain.models import TransactionDetail, TransactionStatus
 
-            return TransactionStatus.CONFIRMED
+    class Explorer:
+        async def get_transaction_detail(self, chain, tx_hash):
+            return TransactionDetail(
+                chain=chain,
+                chain_id="8453",
+                tx_hash=tx_hash,
+                status=TransactionStatus.CONFIRMED,
+                source="okx",
+                history_kind="full",
+                block_number=16,
+            )
 
-        async def get_transaction_receipt(self, _tx_hash):
-            return {"status": "0x1", "blockNumber": "0x10"}
-
-    class Registry:
-        def get_adapter(self, _chain):
-            return Adapter()
-
-    _app, client = await client_for(chain_registry=Registry())
+    _app, client = await client_for(explorer_provider=Explorer())
     tx_hash = "0x" + "a" * 64
     async with client:
         response = await client.get(f"/v1/transactions/BASE/{tx_hash}")
     assert response.status_code == 200
     assert response.json()["status"] == "confirmed"
     assert response.json()["message"] == "交易已确认。"
-    assert response.json()["receipt"]["status"] == "0x1"
+    assert response.json()["source"] == "okx"
+    assert response.json()["transaction"]["history_kind"] == "full"
 
 
 @pytest.mark.asyncio
@@ -672,13 +768,6 @@ async def test_portfolio_and_gas_endpoints_return_structured_results():
     from wallet_agent.domain.models import Asset, FeeEstimate, TokenBalance, TokenPrice
 
     class Adapter:
-        async def get_native_balance(self, _address):
-            asset = Asset(chain="BASE", symbol="ETH", decimals=18)
-            return TokenBalance(asset=asset, amount=Decimal("1"), amount_raw="100")
-
-        async def get_token_balances(self, _address):
-            return []
-
         async def estimate_fee(self, *, to=None, data=None):
             asset = Asset(chain="BASE", symbol="ETH", decimals=18)
             return FeeEstimate(
@@ -692,11 +781,19 @@ async def test_portfolio_and_gas_endpoints_return_structured_results():
         def get_adapter(self, _chain):
             return Adapter()
 
+    class WalletProvider:
+        async def get_token_balances(self, _address, chain_indexes):
+            assert chain_indexes == ["8453"]
+            asset = Asset(chain="BASE", chain_id=8453, symbol="ETH", decimals=18)
+            return [TokenBalance(asset=asset, amount=Decimal("1"), amount_raw="100")]
+
     class Prices:
         async def get_prices(self, assets):
             return [TokenPrice(asset=asset, usd_price=Decimal("2")) for asset in assets]
 
-    app, client = await client_for(chain_registry=Registry())
+    app, client = await client_for(
+        chain_registry=Registry(), wallet_provider=WalletProvider()
+    )
     app.state.price_provider = Prices()
     address = "0x" + "1" * 40
     async with client:

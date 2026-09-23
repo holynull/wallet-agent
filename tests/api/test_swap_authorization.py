@@ -7,6 +7,7 @@ import pytest
 from langgraph.types import Command
 
 from wallet_agent.api import create_app
+from wallet_agent.chains.execution_observer import ExecutionObserver
 from wallet_agent.chains.registry import ChainAdapterRegistry
 from wallet_agent.domain.models import (
     AllowanceRequirement,
@@ -135,10 +136,16 @@ async def test_select_quote_requires_confirmation_before_allowance_and_prepare()
         )
     )
     graph = build_graph(model=Model(), providers=[provider], chains={"BASE": adapter})
+
+    class RegistryMustNotBeUsed:
+        def get_adapter(self, _chain):
+            raise AssertionError("execution observer must own adapter lookup")
+
     app = create_app(
         graph=graph,
         providers={"bridgers": provider},
-        chain_registry=ChainAdapterRegistry({"BASE": adapter}),
+        chain_registry=RegistryMustNotBeUsed(),
+        execution_observer=ExecutionObserver(ChainAdapterRegistry({"BASE": adapter})),
         store=store,
     )
     async with httpx.AsyncClient(
@@ -605,11 +612,16 @@ async def test_status_turn_after_broadcast_polls_order_without_reopening_approva
     assert provider.status_calls == 1
     assert final_state["response"]["kind"] == "swap_status"
     assert final_state["response"]["status"]["status"] == "processing"
+    assert final_state["response"]["broadcast_status"] == "confirmed"
+    assert final_state["response"]["tx_hash"] == "0x" + "b" * 64
+    assert final_state["response"]["confirmation_status"] == "confirmed"
+    assert "源链交易已确认" in final_state["response"]["message"]
     assert final_state.get("approval_transaction") is None
     assert final_state.get("pending_transaction") is None
     assert session is not None
     assert session.status == "processing"
     assert session.stage == "processing"
+    assert session.broadcast_status == "confirmed"
     assert session.order_status is not None
     assert session.order_status.status == "processing"
 

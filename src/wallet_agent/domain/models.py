@@ -467,10 +467,9 @@ class TokenTransfer(DomainModel):
     to_address: str | None = None
 
 
-class TransactionDetail(DomainModel):
+class TransactionDetail(TransactionRecord):
     """Normalized transaction detail and the explorer record it extends."""
 
-    record: TransactionRecord
     gas_limit: str | None = None
     gas_used: str | None = None
     nonce: str | None = None

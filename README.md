@@ -70,17 +70,21 @@ intent `portfolio_query`、`gas_check` 调用。Token 资产发现提供
 
 Set `OKX_ENABLED=true` plus `OKX_API_KEY`, `OKX_SECRET_KEY`,
 `OKX_PASSPHRASE`, and `OKX_PROJECT_ID` to enable the signed OKX Onchain OS
-read-only enhancement. When disabled, the existing RPC/CoinGecko behavior is
-unchanged. OKX supplies portfolio totals/token balances, current and detailed
-prices, history/candles, gas-limit estimates, and transaction simulation.
-CoinGecko fills only assets for which OKX did not return a price; providers are
-never averaged. Direct chain RPC remains the source of truth for spendable
-balance, allowance, receipt, nonce, and transaction visibility.
+read-only integration. OKX is the primary wallet/market data source and supplies
+portfolio totals/token balances, transaction history/detail/status, current and
+detailed prices, history/candles, gas-limit estimates, and transaction simulation.
+If an OKX price is unavailable, USD
+enrichment is omitted without blocking the underlying swap quote. Direct chain
+RPC is isolated to execution-critical allowance, receipt, nonce, fee, approval,
+and browser-broadcast visibility checks.
 
 The integration uses only these documented `/api/v6` endpoints:
 
 - `/api/v6/dex/balance/total-value-by-address`
 - `/api/v6/dex/balance/all-token-balances-by-address`
+- `/api/v6/dex/balance/token-balances-by-address`
+- `/api/v6/dex/post-transaction/transactions-by-address`
+- `/api/v6/dex/post-transaction/transaction-detail-by-txhash`
 - `/api/v6/dex/market/price`
 - `/api/v6/dex/market/price-info`
 - `/api/v6/dex/index/historical-price`

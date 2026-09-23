@@ -94,3 +94,19 @@ def test_identical_status_response_is_rendered_once_per_agent_run(demo_page: Pag
     )
     demo_page.wait_for_function("state.typingQueue.then(() => true)")
     assert demo_page.locator(".message.assistant", has_text="兑换订单仍在处理中。").count() == 2
+
+
+@pytest.mark.browser
+def test_demo_shows_confirmed_source_chain_while_provider_is_processing(demo_page: Page):
+    demo_page.evaluate(
+        """() => renderResponse({
+            kind: 'swap_status',
+            status: { status: 'processing' },
+            broadcast_status: 'confirmed',
+            confirmation_status: 'confirmed',
+            provider_status: 'processing',
+            tx_hash: '0x' + '2'.repeat(64)
+        })"""
+    )
+    demo_page.wait_for_function("state.typingQueue.then(() => true)")
+    assert "源链交易已确认" in demo_page.locator("body").inner_text()

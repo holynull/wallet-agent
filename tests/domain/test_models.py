@@ -270,3 +270,46 @@ def test_price_and_authorization_contracts_serialize_nested_wallet_actions():
 
     assert price.model_dump(mode="json")["usd_price"] == "1.00"
     assert state.model_dump(mode="json")["approval_transaction"]["data"] == "0x095ea7b3"
+
+
+def test_quote_round_trip_preserves_okx_price_snapshot_provider():
+    quote_payload = {
+        "provider": "omnibridge",
+        "source_asset": {
+            "chain": "ETH",
+            "chain_id": 1,
+            "symbol": "USDC",
+            "decimals": 6,
+            "address": "0x" + "1" * 40,
+        },
+        "destination_asset": {
+            "chain": "BSC",
+            "chain_id": 56,
+            "symbol": "BNB",
+            "decimals": 18,
+            "address": None,
+        },
+        "input_amount": "10",
+        "input_amount_raw": "10000000",
+        "expected_output": "0.0127",
+        "expected_output_raw": "12700000000000000",
+        "provider_reference": "quote-with-okx-price",
+        "price_snapshots": [
+            {
+                "asset": {
+                    "chain": "BSC",
+                    "chain_id": 56,
+                    "symbol": "BNB",
+                    "decimals": 18,
+                    "address": None,
+                },
+                "usd_price": "783.82",
+                "provider": "okx",
+            }
+        ],
+    }
+
+    quote = NormalizedQuote.model_validate(quote_payload)
+    serialized = quote.model_dump(mode="json")
+
+    assert serialized["price_snapshots"][0]["provider"] == "okx"

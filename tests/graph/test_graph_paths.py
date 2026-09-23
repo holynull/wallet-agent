@@ -84,6 +84,12 @@ class AssetDiscoveryProvider(FakeProvider):
         return self.assets
 
 
+class EmptyAssetDiscoveryProvider(FakeProvider):
+    async def list_assets(self, query):
+        self.calls.append(("list_assets", query))
+        return []
+
+
 class ZeroOutputProvider(FakeProvider):
     async def quote(self, request):
         quote = await super().quote(request)
@@ -104,6 +110,64 @@ def quote_request():
 
 
 @pytest.mark.asyncio
+async def test_swap_intent_streams_slot_and_provider_progress():
+    class Model:
+        async def classify(self, _request):
+            return {"intent": "swap_quote"}
+
+        async def extract(self, _task_kind, _request):
+            return {
+                "source_chain": "ETH",
+                "source_symbol": "UDC",
+                "destination_chain": "BSC",
+                "destination_symbol": "BNB",
+                "input_amount": "10",
+                "amount_mode": "exact_in",
+            }
+
+    graph = build_graph(
+        model=Model(),
+        providers=[EmptyAssetDiscoveryProvider("catalog")],
+    )
+    progress = []
+    async for chunk in graph.astream(
+        {
+            "conversation_id": "c-progress",
+            "user_id": "u1",
+            "request": {"message": "以太上 10udc 换成 bnb"},
+        },
+        config={"configurable": {"thread_id": "t-progress"}},
+        stream_mode="custom",
+    ):
+        progress.append(chunk)
+
+    assert any(
+        item["stage"] == "slot_extraction" and item["status"] == "started"
+        for item in progress
+    )
+    assert any(
+        item["stage"] == "slot_extraction"
+        and item["status"] == "completed"
+        and item["elapsed_ms"] >= 0
+        for item in progress
+    )
+    assert any(
+        item["stage"] == "asset_discovery"
+        and item["status"] == "started"
+        and item["provider"] == "catalog"
+        and item["side"] == "source"
+        for item in progress
+    )
+    assert any(
+        item["stage"] == "asset_discovery"
+        and item["status"] == "completed"
+        and item["provider"] == "catalog"
+        and item["elapsed_ms"] >= 0
+        for item in progress
+    )
+
+
+@pytest.mark.asyncio
 async def test_quote_path_fans_out_and_reduces_candidates():
     graph = build_graph(
         model=FakeModel(),
@@ -120,6 +184,67 @@ async def test_quote_path_fans_out_and_reduces_candidates():
         config={"configurable": {"thread_id": "t-1"}},
     )
     assert {quote["provider"] for quote in result["quote_candidates"]} == {"bridgers", "omnibridge"}
+
+
+@pytest.mark.asyncio
+async def test_quote_provider_streams_progress_with_duration():
+    graph = build_graph(
+        model=FakeModel(),
+        providers=[FakeProvider("bridgers")],
+    )
+    progress = []
+    async for chunk in graph.astream(
+        {
+            "conversation_id": "c-quote-progress",
+            "user_id": "u1",
+            "intent": "swap_quote",
+            "swap_request": quote_request(),
+        },
+        config={"configurable": {"thread_id": "t-quote-progress"}},
+        stream_mode="custom",
+    ):
+        progress.append(chunk)
+
+    assert any(
+        item["stage"] == "quote_provider"
+        and item["status"] == "started"
+        and item["provider"] == "bridgers"
+        for item in progress
+    )
+    assert any(
+        item["stage"] == "quote_provider"
+        and item["status"] == "completed"
+        and item["provider"] == "bridgers"
+        and item["elapsed_ms"] >= 0
+        for item in progress
+    )
+
+
+@pytest.mark.asyncio
+async def test_forced_intent_does_not_emit_an_unfinished_progress_stage():
+    graph = build_graph(model=FakeModel(), providers=[])
+    progress = []
+    async for chunk in graph.astream(
+        {
+            "conversation_id": "c-forced-progress",
+            "user_id": "u1",
+            "request": {"message": "test"},
+            "intent": "unsupported",
+            "forced_intent": "unsupported",
+        },
+        config={"configurable": {"thread_id": "t-forced-progress"}},
+        stream_mode="custom",
+    ):
+        progress.append(chunk)
+
+    terminal_stages = {
+        item["stage"]
+        for item in progress
+        if item["status"] in {"completed", "completed_with_errors", "failed"}
+    }
+    assert {
+        item["stage"] for item in progress if item["status"] == "started"
+    } <= terminal_stages
 
 
 @pytest.mark.asyncio
@@ -493,6 +618,33 @@ async def test_quote_path_preserves_all_candidates_and_price_snapshots_without_s
 
 
 @pytest.mark.asyncio
+async def test_quote_path_continues_when_okx_price_enrichment_is_unavailable():
+    class UnavailableOkxPrices:
+        async def get_prices(self, _assets):
+            raise RuntimeError("OKX price service unavailable")
+
+    graph = build_graph(
+        model=FakeModel(),
+        providers=[FakeProvider("bridgers")],
+        price_provider=UnavailableOkxPrices(),
+    )
+
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "c-price-unavailable",
+            "user_id": "u1",
+            "intent": "swap_quote",
+            "swap_request": quote_request(),
+        },
+        config={"configurable": {"thread_id": "t-price-unavailable"}},
+    )
+
+    assert result["response"]["kind"] == "swap_quote"
+    assert result["selected_quote"]["provider"] == "bridgers"
+    assert result["selected_quote"]["price_snapshots"] == {}
+
+
+@pytest.mark.asyncio
 async def test_malformed_model_output_routes_to_clarification():
     class BadModel:
         async def ainvoke(self, value):
@@ -813,7 +965,24 @@ async def test_conversational_transfer_asks_for_missing_recipient():
 
 @pytest.mark.asyncio
 async def test_transaction_status_node_returns_human_readable_result():
-    graph = build_graph(model=FakeModel(), chains={"BASE": TransferAdapter()})
+    from wallet_agent.domain.models import TransactionDetail, TransactionStatus
+
+    class Explorer:
+        async def get_transaction_detail(self, chain, tx_hash):
+            return TransactionDetail(
+                chain=chain,
+                chain_id="8453",
+                tx_hash=tx_hash,
+                status=TransactionStatus.CONFIRMED,
+                source="okx",
+                history_kind="full",
+            )
+
+    graph = build_graph(
+        model=FakeModel(),
+        chains={"BASE": TransferAdapter()},
+        explorer_provider=Explorer(),
+    )
     result = await graph.ainvoke(
         {
             "conversation_id": "tx-1",
@@ -926,6 +1095,20 @@ class PortfolioPriceProvider:
         ]
 
 
+class OkxWalletProvider:
+    chain_index_by_name = {"BASE": "8453"}
+
+    async def get_token_balances(self, _address, chain_indexes):
+        assert chain_indexes == ["8453"]
+        return [
+            TokenBalance(
+                asset=Asset(chain="BASE", chain_id=8453, symbol="ETH", decimals=18),
+                amount=Decimal("2"),
+                amount_raw="2000000000000000000",
+            )
+        ]
+
+
 class AssetProvider:
     provider_name = "bridgers"
 
@@ -951,6 +1134,7 @@ async def test_portfolio_query_returns_balances_and_usd_snapshot():
     graph = build_graph(
         model=FakeModel(),
         chains={"BASE": TransferAdapter()},
+        wallet_provider=OkxWalletProvider(),
         price_provider=PortfolioPriceProvider(),
     )
     result = await graph.ainvoke(

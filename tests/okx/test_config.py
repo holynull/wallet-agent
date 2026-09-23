@@ -6,7 +6,7 @@ from wallet_agent.config import Settings
 
 def test_okx_is_disabled_without_credentials(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
-    settings = Settings()
+    settings = Settings(_env_file=None)
     assert settings.okx_enabled is False
     assert settings.okx_base_url == "https://web3.okx.com"
     assert settings.okx_max_attempts == 3
@@ -20,7 +20,7 @@ def test_enabled_okx_requires_all_credentials(monkeypatch):
     monkeypatch.setenv("OKX_SECRET_KEY", "secret")
     monkeypatch.setenv("OKX_PASSPHRASE", "passphrase")
     with pytest.raises(ValidationError, match="OKX_PROJECT_ID"):
-        Settings()
+        Settings(_env_file=None)
 
 
 def test_enabled_okx_uses_secret_types_and_redacts_repr(monkeypatch):

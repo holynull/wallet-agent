@@ -86,20 +86,27 @@ def merge_task_patch(
 ) -> TaskMergeResult:
     updated = _copy_task(task)
     raw_patch = patch.model_dump(exclude_none=True) if hasattr(patch, "model_dump") else dict(patch)
+    slots = dict(updated.get("slots") or {})
+    cleared = frozenset(
+        str(key) for key, value in raw_patch.items() if value is None and str(key) in slots
+    )
     normalized = {
         str(key): _normalize_slot_value(str(key), value)
         for key, value in raw_patch.items()
         if value is not None
     }
-    slots = dict(updated.get("slots") or {})
-    changed = frozenset(key for key, value in normalized.items() if slots.get(key) != value)
+    changed = frozenset(
+        {*cleared, *(key for key, value in normalized.items() if slots.get(key) != value)}
+    )
     if not changed:
         return TaskMergeResult(updated, changed, {})
 
-    slots.update({key: normalized[key] for key in changed})
+    for key in cleared:
+        slots.pop(key, None)
+    slots.update({key: value for key, value in normalized.items() if key in changed})
     _clear_derived_slots(updated["kind"], slots, changed, normalized)
     sources = dict(updated.get("slot_sources") or {})
-    sources.update({key: source for key in changed})
+    sources.update({key: source for key in changed if key in normalized})
     for key in tuple(sources):
         if key not in slots:
             sources.pop(key, None)

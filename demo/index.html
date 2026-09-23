@@ -142,7 +142,7 @@
     provider: null, providerInfo: null, address: null, chainId: null, chain: null,
     conversationId: null, sessionId: null, runId: null, streamAbort: null,
     requestBusy: false, requestCancelled: false, lastUserMessage: null,
-    quotes: [], selectedProviderReference: null, lastResponse: null, boundProvider: null,
+    quotes: [], selectedProviderReference: null, lastResponsesByRun: new Map(), boundProvider: null,
     debugLog: [], agentTestResults: {}, typingQueue: Promise.resolve(), messageFollowEnabled: true
   };
   const $ = (id) => document.getElementById(id);
@@ -279,7 +279,7 @@
   }
   function resetWalletSession() {
     state.conversationId = null; state.sessionId = null; state.runId = null;
-    state.quotes = []; state.selectedProviderReference = null; state.lastResponse = null;
+    state.quotes = []; state.selectedProviderReference = null; state.lastResponsesByRun.clear();
     if (state.streamAbort) state.streamAbort.abort();
     state.requestBusy = false; state.requestCancelled = false; state.lastUserMessage = null;
     setRequestBusy(false); setRetryVisible(false);
@@ -452,7 +452,7 @@
         const event = (frame.match(/^event: (.+)$/m) || [])[1] || 'message'; const data = (frame.match(/^data: (.+)$/m) || [])[1] || '{}';
         let parsed; try { parsed = JSON.parse(data); } catch { parsed = { data }; }
         recordDebug(`SSE ${event}`, parsed);
-        const current = applyEvent(event, parsed, options.apply !== false);
+        const current = applyEvent(event, parsed, options.apply !== false, runId);
         events.push({ event, payload: parsed, state: current });
       }
     }
@@ -466,12 +466,23 @@
     }
     return current;
   }
-  function applyEvent(event, data, shouldRender = true) {
+  function applyEvent(event, data, shouldRender = true, responseRunId = state.runId) {
+    if (event === 'progress') {
+      const progress = data?.data || data || {};
+      if (shouldRender) {
+        const label = progress.message || progress.stage || '后端处理中';
+        const elapsed = progress.status === 'started' || progress.elapsed_ms == null
+          ? '' : `（${progress.elapsed_ms} ms）`;
+        addSystem(`${label}${elapsed}`);
+        updateMeta();
+      }
+      return progress;
+    }
     const current = responseState(data);
     if (shouldRender && current?.session_id) state.sessionId = current.session_id;
     if (shouldRender && Array.isArray(current?.quote_candidates)) { state.quotes = current.quote_candidates; renderQuotes(); }
     if (shouldRender && current?.selected_provider_reference) state.selectedProviderReference = current.selected_provider_reference;
-    if (shouldRender && current?.response) renderResponse(current.response);
+    if (shouldRender && current?.response) renderResponse(current.response, responseRunId);
     if (shouldRender && (current?.preflight || current?.response?.preflight)) {
       renderPreflight(current.preflight || current.response.preflight);
     }
@@ -491,8 +502,14 @@
     if (shouldRender) updateMeta();
     return current;
   }
-  function renderResponse(response) {
-    const fingerprint = `${state.runId || 'direct'}:${json(response)}`; if (fingerprint === state.lastResponse) return; state.lastResponse = fingerprint;
+  function renderResponse(response, responseRunId = state.runId) {
+    const fingerprint = json(response);
+    const responseScope = responseRunId || 'direct';
+    if (fingerprint === state.lastResponsesByRun.get(responseScope)) return;
+    state.lastResponsesByRun.set(responseScope, fingerprint);
+    if (state.lastResponsesByRun.size > 100) {
+      state.lastResponsesByRun.delete(state.lastResponsesByRun.keys().next().value);
+    }
     if (response.kind === 'clarification') {
       const missing = (response.missing_fields || []).join('、');
       addTypingMessage(response.message || (
@@ -528,13 +545,16 @@
         timed_out: '暂时还没有等到 Provider 的最终结果，可以稍后再次查询。',
         unknown: '暂时无法确定交易状态，建议稍后重试查询。'
       };
-      addTypingMessage(response.message || messages[status] || `交易状态：${status}`);
+      const sourceLabel = response.source ? `（来源：${response.source.toUpperCase()}${response.history_kind ? `，${response.history_kind}` : ''}）` : '';
+      addTypingMessage(`${response.message || messages[status] || `交易状态：${status}`}${sourceLabel}`);
     }
     else if (response.kind === 'swap_status') {
       const status = typeof response.status === 'object'
         ? (response.status.status || response.status.state || 'unknown')
         : (response.status || 'unknown');
       const broadcastStatus = response.broadcast_status || (typeof response.status === 'object' ? response.status.broadcast_status : null);
+      const providerStatus = response.provider_status || status;
+      const confirmationStatus = response.confirmation_status || broadcastStatus;
       const messages = {
         pending: '兑换订单已提交，Provider 仍在处理中。',
         broadcast_pending: '交易已被节点看到，正在等待链上确认。',
@@ -546,7 +566,13 @@
         timed_out: 'Provider 暂时没有返回最终结果，订单可能仍在处理中，建议稍后查询。',
         unknown: '暂时拿不到兑换订单的最新状态，建议稍后重新查询。'
       };
-      addTypingMessage(response.message || messages[status] || `兑换订单状态：${status}`);
+      const providerMessage = messages[providerStatus] || `兑换订单状态：${providerStatus}`;
+      const displayMessage = response.message || (
+        confirmationStatus === 'confirmed'
+          ? `源链交易已确认；${providerMessage}`
+          : providerMessage
+      );
+      addTypingMessage(displayMessage);
       if (broadcastStatus || response.tx_hash) renderBroadcastStatus({ ...response, broadcast_status: broadcastStatus || status });
     }
     else if (response.kind === 'wallet_query') {
@@ -559,7 +585,7 @@
     }
     else if (response.kind === 'portfolio_query') {
       const portfolio = response.portfolio || {};
-      addTypingMessage(`你在 ${portfolio.chain || '当前网络'} 上共有 ${portfolio.assets?.length || 0} 项资产，USD 估值为 ${portfolio.total_usd_value ?? '暂不可用'}。`);
+      addTypingMessage(`你在 ${portfolio.chain || '当前网络'} 上共有 ${portfolio.assets?.length || 0} 项资产，USD 估值为 ${portfolio.total_usd_value ?? '暂不可用'}。${portfolio.source ? `（来源：${String(portfolio.source).toUpperCase()}）` : ''}`);
       renderPortfolio(portfolio);
     }
     else if (response.kind === 'price_query') {
@@ -650,7 +676,7 @@
     const card = document.createElement('div'); card.className = 'card';
     const title = document.createElement('h3'); title.textContent = '资产组合';
     const summary = document.createElement('p');
-    summary.textContent = `${portfolio.chain || '-'} · ${portfolio.assets?.length || 0} 项资产 · USD 估值：${portfolio.total_usd_value ?? '暂不可用'}`;
+    summary.textContent = `${portfolio.chain || '-'} · ${portfolio.assets?.length || 0} 项资产 · USD 估值：${portfolio.total_usd_value ?? '暂不可用'}${portfolio.source ? ` · 来源：${String(portfolio.source).toUpperCase()}` : ''}`;
     const pre = document.createElement('pre'); pre.textContent = json(portfolio.assets || []);
     card.append(title, summary, pre); addCard('portfolio', card);
   }

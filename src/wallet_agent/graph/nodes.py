@@ -13,6 +13,7 @@ from time import perf_counter
 from typing import Any
 
 from langchain_core.messages import AIMessage
+from langgraph.config import get_stream_writer
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 
@@ -54,6 +55,8 @@ class GraphRuntime:
     providers: dict[str, Any]
     chains: dict[str, Any]
     wallet_provider: Any | None = None
+    explorer_provider: Any | None = None
+    execution_observer: Any | None = None
     price_provider: Any | None = None
     max_poll_attempts: int = 3
     confirmation_ttl_seconds: int = 900
@@ -99,6 +102,31 @@ _USER_SWAP_FIELDS = frozenset(
         "slippage_bps",
     }
 )
+
+
+def _emit_progress(
+    stage: str,
+    status: str,
+    *,
+    started: float | None = None,
+    message: str,
+    **details: Any,
+) -> None:
+    """Emit a safe, checkpoint-free progress event when running in LangGraph."""
+    elapsed_ms = 0.0 if started is None else (perf_counter() - started) * 1000
+    payload = {
+        "stage": stage,
+        "status": status,
+        "elapsed_ms": round(elapsed_ms, 2),
+        "message": message,
+        **details,
+    }
+    try:
+        get_stream_writer()(payload)
+    except RuntimeError:
+        # Nodes are also called directly in unit tests and utility code, where
+        # no LangGraph streaming context exists.
+        return
 
 
 def _task_patch(kind: str, value: Any) -> dict[str, Any]:
@@ -1343,6 +1371,12 @@ async def _resolve_swap_assets(
     draft: dict[str, Any], providers: dict[str, Any]
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     """Fill token metadata when a provider has exactly one matching asset."""
+    resolution_started = perf_counter()
+    _emit_progress(
+        "asset_resolution",
+        "started",
+        message="正在解析兑换资产。",
+    )
     resolved = dict(draft)
     candidates: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -1392,6 +1426,13 @@ async def _resolve_swap_assets(
         )
     ]
     if resolvable_sides and not asset_providers:
+        _emit_progress(
+            "asset_resolution",
+            "failed",
+            started=resolution_started,
+            message="没有可用的 Token 元数据源。",
+            error_code="ASSET_PROVIDER_UNAVAILABLE",
+        )
         return (
             resolved,
             candidates,
@@ -1410,9 +1451,38 @@ async def _resolve_swap_assets(
         matches: list[Asset] = []
         query = AssetQuery(chain=canonical_chain(str(chain)), search=canonical_symbol(str(symbol)))
         for provider_name, provider in asset_providers.items():
+            provider_started = perf_counter()
+            _emit_progress(
+                "asset_discovery",
+                "started",
+                message=f"正在通过 {provider_name} 查询 {chain} 上的 {symbol}。",
+                provider=provider_name,
+                side=side,
+                chain=canonical_chain(str(chain)),
+                symbol=canonical_symbol(str(symbol)),
+            )
             try:
-                matches.extend(await provider.list_assets(query))
+                provider_matches = await provider.list_assets(query)
+                matches.extend(provider_matches)
+                _emit_progress(
+                    "asset_discovery",
+                    "completed",
+                    started=provider_started,
+                    message=f"{provider_name} 资产查询完成。",
+                    provider=provider_name,
+                    side=side,
+                    result_count=len(provider_matches),
+                )
             except Exception as exc:
+                _emit_progress(
+                    "asset_discovery",
+                    "failed",
+                    started=provider_started,
+                    message=f"{provider_name} 资产查询失败。",
+                    provider=provider_name,
+                    side=side,
+                    error_code="ASSET_DISCOVERY_FAILED",
+                )
                 errors.append(
                     _error(
                         "ASSET_DISCOVERY_FAILED",
@@ -1462,68 +1532,100 @@ async def _resolve_swap_assets(
                     details={"side": side, "chain": str(chain), "symbol": str(symbol)},
                 )
             )
+    _emit_progress(
+        "asset_resolution",
+        "completed" if not errors else "completed_with_errors",
+        started=resolution_started,
+        message="兑换资产解析完成。",
+        candidate_count=len(candidates),
+        error_count=len(errors),
+    )
     return resolved, candidates, errors
 
 
 def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
+    def okx_chain_index(chain: str) -> str | None:
+        mapping = getattr(runtime.wallet_provider, "chain_index_by_name", {})
+        return mapping.get(str(chain).upper())
+
+    def execution_adapter(chain: str) -> Any:
+        observer = runtime.execution_observer
+        if observer is not None and hasattr(observer, "adapter"):
+            try:
+                return observer.adapter(chain)
+            except Exception:
+                return None
+        return runtime.chains.get(str(chain).upper())
+
     async def wallet_balance_tool(
         chain: str,
         address: str,
     ) -> dict[str, Any]:
         """Read native and token balances for a connected wallet."""
-        adapter = runtime.chains.get(str(chain).upper())
-        if adapter is None:
-            return {
-                "ok": False,
-                "error": f"当前暂不支持 {chain} 链的余额查询。",
-                "code": "CHAIN_CAPABILITY_UNAVAILABLE",
-            }
-        try:
-            if hasattr(adapter, "validate_address") and not await adapter.validate_address(address):
-                return {"ok": False, "error": "钱包地址格式无效。", "code": "INVALID_ADDRESS"}
-            result: dict[str, Any] = {"address": address, "chain": chain}
-            if hasattr(adapter, "get_native_balance"):
-                result["native_balance"] = _dump(await adapter.get_native_balance(address))
-            if hasattr(adapter, "get_token_balances"):
-                result["token_balances"] = [
-                    _dump(item) for item in await adapter.get_token_balances(address)
-                ]
-            return {"ok": True, "wallet": result}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc), "code": "WALLET_QUERY_FAILED"}
+        if runtime.wallet_provider is not None and hasattr(
+            runtime.wallet_provider, "get_token_balances"
+        ):
+            index = okx_chain_index(chain)
+            if index is None:
+                return {
+                    "ok": False,
+                    "error": f"当前暂不支持 {chain} 链的余额查询。",
+                    "code": "OKX_CHAIN_UNSUPPORTED",
+                }
+            try:
+                balances = await runtime.wallet_provider.get_token_balances(address, [index])
+                native = next((item for item in balances if item.asset.address is None), None)
+                return {
+                    "ok": True,
+                    "wallet": {
+                        "address": address,
+                        "chain": chain,
+                        "native_balance": _dump(native) if native else None,
+                        "token_balances": [
+                            _dump(item) for item in balances if item.asset.address is not None
+                        ],
+                        "source": "okx",
+                    },
+                }
+            except Exception as exc:
+                return {"ok": False, "error": str(exc), "code": "WALLET_QUERY_FAILED"}
+        return {
+            "ok": False,
+            "error": "OKX 钱包数据服务暂不可用。",
+            "code": "OKX_CAPABILITY_UNAVAILABLE",
+        }
 
     wallet_tool_node = ToolNode([wallet_balance_tool], name="wallet_tools")
 
     async def transaction_status_tool(chain: str, tx_hash: str) -> dict[str, Any]:
         """Read a transaction status from the configured chain adapter."""
-        adapter = runtime.chains.get(str(chain).upper())
-        if adapter is None:
-            return {
-                "ok": False,
-                "code": "CHAIN_CAPABILITY_UNAVAILABLE",
-                "error": f"当前暂不支持 {chain}。",
-            }
-        try:
-            status = await adapter.get_transaction_status(tx_hash)
-            value = getattr(status, "value", str(status))
-            messages = {
-                "pending": "交易已提交，正在等待链上确认。",
-                "confirmed": "交易已确认。",
-                "failed": "交易执行失败或已回滚。",
-                "dropped": "交易可能已被节点丢弃。",
-                "unknown": "暂时无法确定交易状态。",
-            }
-            return {
-                "ok": True,
-                "transaction": {
-                    "chain": str(chain).upper(),
-                    "tx_hash": tx_hash,
-                    "status": value,
-                    "message": messages.get(value, messages["unknown"]),
-                },
-            }
-        except Exception as exc:
-            return {"ok": False, "code": "TRANSACTION_STATUS_FAILED", "error": str(exc)}
+        explorer = runtime.explorer_provider
+        if explorer is not None and hasattr(explorer, "get_transaction_detail"):
+            try:
+                detail = await explorer.get_transaction_detail(chain, tx_hash)
+                value = getattr(detail.status, "value", str(detail.status))
+                return {
+                    "ok": True,
+                    "transaction": {
+                        "chain": str(chain).upper(),
+                        "tx_hash": tx_hash,
+                        "status": value,
+                        "message": {
+                            "confirmed": "交易已确认。",
+                            "pending": "交易已提交，正在等待链上确认。",
+                            "failed": "交易执行失败或已回滚。",
+                        }.get(value, "暂时无法确定交易状态。"),
+                        "source": "okx",
+                        "detail": _dump(detail),
+                    },
+                }
+            except Exception as exc:
+                return {"ok": False, "code": "TRANSACTION_STATUS_FAILED", "error": str(exc)}
+        return {
+            "ok": False,
+            "code": "OKX_CAPABILITY_UNAVAILABLE",
+            "error": "OKX 交易查询服务暂不可用。",
+        }
 
     async def gas_estimate_tool(
         chain: str,
@@ -1532,7 +1634,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         data: str | None = None,
     ) -> dict[str, Any]:
         """Read a network fee estimate without signing or broadcasting."""
-        adapter = runtime.chains.get(str(chain).upper())
+        adapter = execution_adapter(chain)
         if adapter is None:
             return {
                 "ok": False,
@@ -1666,6 +1768,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
     async def supervisor(state: dict[str, Any]) -> dict[str, Any]:
         """Plan one turn; execution remains in the existing graph nodes."""
         started = perf_counter()
+        _emit_progress(
+            "supervisor",
+            "started",
+            message="正在识别请求类型。",
+        )
         request = _mapping(state.get("request"))
         forced = state.get("forced_intent")
         if _looks_like_cancel_message(str(request.get("message", ""))) and (
@@ -1696,6 +1803,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             model_request["active_task"] = state.get("active_task")
             model_request["swap_draft"] = state.get("swap_draft")
             model_request["transfer_draft"] = state.get("transfer_draft")
+            model_request["conversation_history"] = state.get("conversation_history") or []
             model_request["available_capabilities"] = {
                 "read_tools": [
                     "wallet_balance",
@@ -1768,6 +1876,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "predicted_intent": decision["intent"],
                 "route": decision["intent"],
             },
+            error_code=error.get("code") if isinstance(error, dict) else None,
+        )
+        _emit_progress(
+            "supervisor",
+            "failed" if error else "completed",
+            started=started,
+            message="请求类型识别完成。" if not error else "请求类型识别失败。",
+            intent=decision["intent"],
             error_code=error.get("code") if isinstance(error, dict) else None,
         )
         return update
@@ -1954,9 +2070,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         source_chain = source_asset.get("chain") if isinstance(source_asset, Mapping) else None
         if not source_chain:
             return None
-        adapter = runtime.chains.get(str(source_chain).upper())
+        adapter = execution_adapter(str(source_chain))
         if adapter is None:
-            adapter = runtime.chains.get(canonical_chain(str(source_chain)).upper())
+            adapter = execution_adapter(canonical_chain(str(source_chain)))
         if adapter is None or not hasattr(adapter, "estimate_fee"):
             return None
         try:
@@ -2202,6 +2318,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "id": f"quote-{name}",
             "type": "tool_call",
         }
+        quote_started = perf_counter()
+        _emit_progress(
+            "quote_provider",
+            "started",
+            message=f"正在向 {name} 请求兑换报价。",
+            provider=str(name),
+        )
         result = await quote_tool_node.ainvoke(
             {"messages": [AIMessage(content="", tool_calls=[call])]}
         )
@@ -2214,6 +2337,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "error": str(result["messages"][-1].content),
             }
         if not payload.get("ok"):
+            _emit_progress(
+                "quote_provider",
+                "failed",
+                started=quote_started,
+                message=f"{name} 报价请求失败。",
+                provider=str(name),
+                error_code=payload.get("code", "TOOL_FAILED"),
+            )
             return {
                 "quote_candidates": [],
                 "errors": [
@@ -2224,6 +2355,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     )
                 ],
             }
+        _emit_progress(
+            "quote_provider",
+            "completed",
+            started=quote_started,
+            message=f"{name} 报价请求完成。",
+            provider=str(name),
+        )
         return {"quote_candidates": [payload["quote"]]}
 
     async def intent(state: dict[str, Any]) -> dict[str, Any]:
@@ -2361,12 +2499,30 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 extraction_request["wallet_context"] = state.get("wallet_context")
                 extraction_request["active_task"] = active_task
                 extraction_request["conversation_state"] = state.get("conversation_state")
+                extraction_request["conversation_history"] = state.get(
+                    "conversation_history"
+                ) or []
+                extraction_started = perf_counter()
+                _emit_progress(
+                    "slot_extraction",
+                    "started",
+                    message="正在提取兑换参数。",
+                    task_kind=task_kind,
+                )
                 try:
                     patch_source = runtime.model.extract(task_kind, extraction_request)
                     patch_source = (
                         await patch_source if hasattr(patch_source, "__await__") else patch_source
                     )
                 except Exception as exc:
+                    _emit_progress(
+                        "slot_extraction",
+                        "failed",
+                        started=extraction_started,
+                        message="请求参数提取失败。",
+                        task_kind=task_kind,
+                        error_code="SLOT_EXTRACTION_FAILED",
+                    )
                     return {
                         "intent": "clarification",
                         "route": "clarification",
@@ -2379,6 +2535,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         },
                         "max_poll_attempts": runtime.max_poll_attempts,
                     }
+                _emit_progress(
+                    "slot_extraction",
+                    "completed",
+                    started=extraction_started,
+                    message="请求参数提取完成。",
+                    task_kind=task_kind,
+                )
             task_patch = _task_patch(task_kind, patch_source)
             if task_kind == "swap":
                 explicit_slippage = _parse_slippage_bps(message)
@@ -2393,12 +2556,23 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         if canonical_symbol(str(task_patch.get(opposite) or "")) == value:
                             task_patch.pop(opposite, None)
                     task_patch[key] = value
+                if (
+                    "source_chain" in direction_hints
+                    and "destination_symbol" in direction_hints
+                    and "destination_chain" not in direction_hints
+                ):
+                    inferred_destination_chain = _unique_native_chain(
+                        direction_hints["destination_symbol"],
+                        task_patch.get("destination_token_address"),
+                    )
+                    if inferred_destination_chain is not None:
+                        task_patch["destination_chain"] = inferred_destination_chain
             amount_key = "amount" if task_kind == "transfer" else "input_amount"
             explicit_amount = mentioned_amount_with_unit(message)
             parsed_amount = unambiguous_amount_with_unit(message)
+            prior_slots = active_task.get("slots", {})
             if task_kind == "swap" and explicit_amount is not None:
                 explicit_value, explicit_unit = explicit_amount
-                prior_slots = active_task.get("slots", {})
                 known_source = canonical_symbol(
                     str(
                         task_patch.get("source_symbol")
@@ -2424,12 +2598,29 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 elif explicit_unit == known_source and explicit_unit != known_destination:
                     task_patch[amount_key] = explicit_value
                     task_patch["amount_mode"] = "exact_in"
+            elif task_kind == "transfer" and explicit_amount is not None:
+                explicit_value, explicit_unit = explicit_amount
+                known_symbol = canonical_symbol(
+                    str(task_patch.get("symbol") or prior_slots.get("symbol") or "")
+                )
+                if not known_symbol or explicit_unit == known_symbol:
+                    task_patch[amount_key] = explicit_value
             elif amount_key not in task_patch and parsed_amount is not None:
                 fallback_amount, amount_unit = parsed_amount
                 if task_kind == "transfer" or amount_unit is None:
                     task_patch[amount_key] = fallback_amount
                     if task_kind == "swap":
                         task_patch["amount_mode"] = "exact_in"
+            if task_kind == "transfer" and amount_key not in task_patch:
+                prior_symbol = canonical_symbol(str(prior_slots.get("symbol") or ""))
+                next_symbol = canonical_symbol(str(task_patch.get("symbol") or prior_symbol))
+                if prior_symbol and next_symbol != prior_symbol:
+                    # A human amount belongs to the asset it qualified.  When
+                    # the user changes assets with wording such as “一些 ETH”,
+                    # reusing the old USDC amount is unsafe; require a fresh,
+                    # explicit amount instead.
+                    task_patch["amount"] = None
+                    task_patch["amount_raw"] = None
             merged = merge_task_patch(active_task, task_patch)
             active_task = merged.task
             task_update = {"active_task": active_task, **merged.invalidation}
@@ -3034,8 +3225,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "errors": [_error("INVALID_TRANSFER_PARAMETERS", str(exc))],
                 }
             }
-        adapter = runtime.chains.get(req.chain.upper())
-        if adapter is None:
+        adapter = execution_adapter(req.chain)
+        if adapter is None and not (
+            runtime.wallet_provider is not None
+            and hasattr(runtime.wallet_provider, "get_token_balances")
+        ):
             return {
                 "response": {
                     "kind": "error",
@@ -3142,7 +3336,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             request = state.get("swap_request") or {}
             source_asset = request.get("source_asset") or selected.get("source_asset") or {}
             source_chain = str(source_asset.get("chain") or getattr(prepared, "chain", ""))
-            adapter = runtime.chains.get(source_chain.upper())
+            adapter = execution_adapter(source_chain)
             if isinstance(prepared, DepositOrder):
                 if adapter is None:
                     raise ValueError(f"Chain adapter unavailable for {source_chain} deposit")
@@ -3196,8 +3390,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     **({"preflight": preflight} if preflight is not None else {}),
                 ),
             }
-        adapter = runtime.chains.get(requirement.token.chain.upper())
-        if adapter is None:
+        adapter = execution_adapter(requirement.token.chain)
+        if adapter is None and not (
+            runtime.wallet_provider is not None
+            and hasattr(runtime.wallet_provider, "get_token_balances")
+        ):
             return {
                 "response": {
                     "stage": "failed",
@@ -3292,7 +3489,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         request = state.get("swap_request") or {}
         source_asset = request.get("source_asset") or selected.get("source_asset") or {}
         source_chain = str(source_asset.get("chain") or getattr(prepared, "chain", ""))
-        adapter = runtime.chains.get(source_chain.upper())
+        adapter = execution_adapter(source_chain)
         if isinstance(prepared, DepositOrder):
             if adapter is None:
                 raise ValueError(f"Chain adapter unavailable for {source_chain} deposit")
@@ -3352,49 +3549,54 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         request = state.get("request", {})
         chain = str(request.get("chain", ""))
         address = str(request.get("address", ""))
-        adapter = runtime.chains.get(chain.upper())
-        if adapter is None:
-            return {
-                "errors": [
-                    _error(
-                        "CHAIN_CAPABILITY_UNAVAILABLE",
-                        f"Chain {chain} is unavailable.",
-                        details={"chain": chain},
-                    )
-                ]
-            }
-        try:
-            if hasattr(adapter, "validate_address") and not await adapter.validate_address(address):
-                return {"errors": [_error("INVALID_ADDRESS", "The wallet address is invalid.")]}
-            snapshot = {"address": address, "chain": chain}
-            if hasattr(adapter, "get_native_balance"):
-                snapshot["native_balance"] = _dump(await adapter.get_native_balance(address))
-            if hasattr(adapter, "get_token_balances"):
-                snapshot["token_balances"] = [
-                    _dump(item) for item in await adapter.get_token_balances(address)
-                ]
-            return {
-                "wallet_context": snapshot,
-                "response": {"kind": "wallet_query", "wallet": snapshot},
-            }
-        except Exception as exc:
-            return {"errors": [_error("WALLET_QUERY_FAILED", str(exc))]}
+        if runtime.wallet_provider is not None and hasattr(
+            runtime.wallet_provider, "get_token_balances"
+        ):
+            index = okx_chain_index(chain)
+            if index is None:
+                return {
+                    "errors": [_error("OKX_CHAIN_UNSUPPORTED", f"Chain {chain} is unavailable.")]
+                }
+            try:
+                balances = await runtime.wallet_provider.get_token_balances(address, [index])
+                native = next((item for item in balances if item.asset.address is None), None)
+                snapshot = {
+                    "address": address,
+                    "chain": chain,
+                    "native_balance": _dump(native) if native else None,
+                    "token_balances": [
+                        _dump(item) for item in balances if item.asset.address is not None
+                    ],
+                    "source": "okx",
+                }
+                return {
+                    "wallet_context": snapshot,
+                    "response": {"kind": "wallet_query", "wallet": snapshot},
+                }
+            except Exception as exc:
+                return {"errors": [_error("WALLET_QUERY_FAILED", str(exc))]}
+        return {
+            "errors": [
+                _error("OKX_CAPABILITY_UNAVAILABLE", "OKX wallet data provider unavailable.")
+            ]
+        }
 
     async def portfolio_query(state: dict[str, Any]) -> dict[str, Any]:
         raw = state.get("portfolio_request") or {}
         context = state.get("wallet_context") or {}
         chain = str(raw.get("chain") or context.get("chain") or "").upper()
         address = str(raw.get("address") or context.get("address") or "")
-        adapter = runtime.chains.get(chain)
-        if adapter is None:
+        adapter = None
+        if runtime.wallet_provider is None or not hasattr(
+            runtime.wallet_provider, "get_token_balances"
+        ):
             return {
                 "response": {
                     "kind": "error",
                     "errors": [
                         _error(
-                            "CHAIN_CAPABILITY_UNAVAILABLE",
-                            f"Chain {chain} is unavailable.",
-                            details={"chain": chain},
+                            "OKX_CAPABILITY_UNAVAILABLE",
+                            "OKX wallet data provider unavailable.",
                         )
                     ],
                 }
@@ -3407,12 +3609,36 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "missing_fields": ["wallet_address"],
                 }
             }
-        try:
+        if runtime.wallet_provider is not None and hasattr(
+            runtime.wallet_provider, "get_token_balances"
+        ):
+            index = okx_chain_index(chain)
+            if index is None:
+                return {
+                    "response": {
+                        "kind": "error",
+                        "errors": [
+                            _error("OKX_CHAIN_UNSUPPORTED", f"Chain {chain} is unavailable.")
+                        ],
+                    }
+                }
+            try:
+                balances = await runtime.wallet_provider.get_token_balances(address, [index])
+            except Exception as exc:
+                return {
+                    "response": {
+                        "kind": "error",
+                        "errors": [_error("PORTFOLIO_QUERY_FAILED", str(exc), retryable=True)],
+                    }
+                }
+        else:
             balances = []
-            native = await adapter.get_native_balance(address)
-            balances.append(native)
-            if hasattr(adapter, "get_token_balances"):
-                balances.extend(await adapter.get_token_balances(address))
+        try:
+            if adapter is not None:
+                native = await adapter.get_native_balance(address)
+                balances.append(native)
+                if hasattr(adapter, "get_token_balances"):
+                    balances.extend(await adapter.get_token_balances(address))
             assets = [_dump(balance) for balance in balances]
             prices: list[Any] = []
             price_status = "unavailable"
@@ -3473,6 +3699,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "total_usd_value": str(total_usd) if has_usd_value else None,
                 "price_status": price_status,
                 "price_snapshots": [_dump(price) for price in prices],
+                "source": "okx" if runtime.wallet_provider is not None else "chain",
             }
             if price_error:
                 snapshot["price_error"] = "价格服务暂时不可用。"
@@ -3495,7 +3722,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         address = str(raw.get("address") or context.get("address") or "")
         to = raw.get("to")
         data = raw.get("data")
-        adapter = runtime.chains.get(chain)
+        adapter = execution_adapter(chain)
         if adapter is None:
             return {
                 "response": {
@@ -3660,61 +3887,54 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             }
         chain = str(raw.get("chain") or raw.get("transaction_chain") or "").upper()
         tx_hash = str(raw.get("tx_hash") or raw.get("transaction_hash") or raw.get("hash") or "")
-        adapter = runtime.chains.get(chain)
-        if adapter is None:
-            return {
-                "response": {
-                    "kind": "error",
-                    "errors": [
-                        _error(
-                            "CHAIN_CAPABILITY_UNAVAILABLE",
-                            f"Chain {chain} is unavailable.",
-                            details={"chain": chain},
-                        )
-                    ],
+        explorer = runtime.explorer_provider
+        if explorer is not None and hasattr(explorer, "get_transaction_detail"):
+            try:
+                detail = await explorer.get_transaction_detail(chain, tx_hash)
+                status_value = getattr(detail.status, "value", str(detail.status))
+                snapshot = {
+                    "chain": chain,
+                    "tx_hash": tx_hash,
+                    "status": status_value,
+                    "message": {
+                        "pending": "交易已提交，正在等待链上确认。",
+                        "confirmed": "交易已确认。",
+                        "failed": "交易执行失败或已回滚。",
+                        "unknown": "暂时无法确定交易状态。",
+                    }.get(status_value, "暂时无法确定交易状态。"),
+                    "source": "okx",
+                    "detail": _dump(detail),
                 }
-            }
-        try:
-            status = await adapter.get_transaction_status(tx_hash)
-            status_value = getattr(status, "value", str(status))
-            messages = {
-                "pending": "交易已提交，正在等待链上确认。",
-                "confirmed": "交易已确认。",
-                "failed": "交易执行失败或已回滚。",
-                "dropped": "交易可能已被节点丢弃，请检查钱包或重新提交。",
-                "unknown": "暂时无法确定交易状态。",
-            }
-            snapshot: dict[str, Any] = {
-                "chain": chain,
-                "tx_hash": tx_hash,
-                "status": status_value,
-                "message": messages.get(status_value, messages["unknown"]),
-            }
-            if hasattr(adapter, "get_transaction_receipt"):
-                try:
-                    receipt = await adapter.get_transaction_receipt(tx_hash)
-                    if receipt is not None:
-                        snapshot["receipt"] = _dump(receipt)
-                except Exception:
-                    pass
-            return {
-                "transaction_status_snapshot": snapshot,
-                "response": {"kind": "transaction_status", **snapshot},
-            }
-        except Exception as exc:
-            return {
-                "response": {
-                    "kind": "error",
-                    "errors": [
-                        _error(
-                            "TRANSACTION_STATUS_FAILED",
-                            str(exc),
-                            retryable=True,
-                            details={"chain": chain, "tx_hash": tx_hash},
-                        )
-                    ],
+                return {
+                    "transaction_status_snapshot": snapshot,
+                    "response": {"kind": "transaction_status", **snapshot},
                 }
+            except Exception as exc:
+                return {
+                    "response": {
+                        "kind": "error",
+                        "errors": [
+                            _error(
+                                "TRANSACTION_STATUS_FAILED",
+                                str(exc),
+                                retryable=True,
+                                details={"chain": chain, "tx_hash": tx_hash},
+                            )
+                        ],
+                    }
+                }
+        return {
+            "response": {
+                "kind": "error",
+                "errors": [
+                    _error(
+                        "OKX_CAPABILITY_UNAVAILABLE",
+                        "OKX transaction explorer unavailable.",
+                        details={"chain": chain, "tx_hash": tx_hash},
+                    )
+                ],
             }
+        }
 
     async def prepare(state: dict[str, Any]) -> dict[str, Any]:
         selected = state.get("selected_quote")
@@ -3769,7 +3989,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             request = state.get("swap_request") or {}
             source_asset = request.get("source_asset") or selected.get("source_asset") or {}
             source_chain = str(source_asset.get("chain") or selected.get("chain") or "")
-            adapter = runtime.chains.get(source_chain.upper())
+            adapter = execution_adapter(source_chain)
             if isinstance(prepared, DepositOrder):
                 if adapter is None:
                     raise ValueError(f"Chain adapter unavailable for {source_chain} deposit")
@@ -3968,15 +4188,31 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "max_poll_attempts", runtime.max_poll_attempts
             ):
                 dumped = {**dumped, "status": "timed_out"}
+            provider_status = dumped.get("status", "unknown")
+            broadcast_message = {
+                "broadcast_seen": "源链已收到交易广播",
+                "broadcast_pending": "源链交易已广播，正在等待链上确认",
+                "confirmed": "源链交易已确认",
+            }.get(broadcast_status)
+            provider_message = status_messages.get(
+                provider_status, "兑换订单状态已更新，建议稍后重新查询。"
+            )
+            message = (
+                f"{broadcast_message}；{provider_message}"
+                if broadcast_message
+                else provider_message
+            )
             return {
                 "status_snapshot": dumped,
                 "poll_attempts": attempts,
                 "response": {
                     "kind": "swap_status",
                     "status": dumped,
-                    "message": status_messages.get(
-                        dumped.get("status"), "兑换订单状态已更新，建议稍后重新查询。"
-                    ),
+                    "provider_status": provider_status,
+                    "broadcast_status": broadcast_status,
+                    "confirmation_status": broadcast_status,
+                    "tx_hash": state.get("broadcast_tx_hash"),
+                    "message": message,
                 },
             }
         except Exception as exc:

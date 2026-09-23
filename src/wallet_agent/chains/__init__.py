@@ -1,6 +1,7 @@
 """Read-only blockchain adapters."""
 
 from .evm import EVMAdapter, EVMChain, EVMChainAdapter
+from .execution_observer import ExecutionObserver
 from .registry import ChainAdapterRegistry, ChainRegistry, build_default_registry
 from .solana import SolanaAdapter, SolanaChain, SolanaChainAdapter
 from .stubs import UnsupportedChainAdapter
@@ -13,6 +14,7 @@ __all__ = [
     "EVMAdapter",
     "EVMChain",
     "EVMChainAdapter",
+    "ExecutionObserver",
     "SolanaAdapter",
     "SolanaChain",
     "SolanaChainAdapter",

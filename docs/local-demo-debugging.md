@@ -62,7 +62,7 @@ OMNIBRIDGE_SPENDER_BY_CHAIN='{"BASE":"0x..."}'
 
 ### 可选：配置 OKX 钱包和价格增强
 
-OKX 默认关闭；关闭时 RPC、CoinGecko 和现有兑换流程保持不变。启用时填写：
+OKX 默认关闭；关闭时 RPC 和现有兑换流程保持不变。启用时填写：
 
 ```dotenv
 OKX_ENABLED=true
@@ -73,7 +73,8 @@ OKX_PASSPHRASE=...
 OKX_PROJECT_ID=...
 ```
 
-OKX 只用于余额/总价值、价格/市场历史、gas-limit 和 simulation 增强。
+OKX 是钱包与市场数据主来源，用于余额/总价值、交易历史/详情/状态、价格/市场历史、gas-limit 和
+simulation 增强；价格查询失败时只跳过 USD 增强，不阻断兑换报价。
 浏览器钱包仍是唯一签名和广播方；OmniBridge/Bridgers 仍是兑换 Provider。
 随时可设置 `OKX_ENABLED=false` 安全回退。若要运行只读真实契约测试，还需
 设置 `OKX_INTEGRATION=1`、`OKX_INTEGRATION_ADDRESS` 和

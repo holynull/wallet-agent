@@ -85,7 +85,7 @@ async def test_omnibridge_list_assets_maps_documented_array_shape_and_filters():
                     "coinImageUrl": "https://example.invalid/usdt.png",
                 },
                 {
-                    "mainNetwork": "BSC",
+                    "mainNetwork": "ETH",
                     "coinCode": "USDC",
                     "coinDecimal": 18,
                     "contact": "0x0000000000000000000000000000000000000022",
@@ -96,6 +96,7 @@ async def test_omnibridge_list_assets_maps_documented_array_shape_and_filters():
     provider = OmniBridgeProvider.from_transport(transport, source_flag="wallet-agent")
 
     assets = await provider.list_assets(AssetQuery(chain="Ethereum", search="usdt"))
+    cached_assets = await provider.list_assets(AssetQuery(chain="Ethereum", search="USDC"))
 
     assert assets == [
         Asset(
@@ -106,6 +107,8 @@ async def test_omnibridge_list_assets_maps_documented_array_shape_and_filters():
             logo_url="https://example.invalid/usdt.png",
         )
     ]
+    assert [asset.symbol for asset in cached_assets] == ["USDC"]
+    assert len(transport.calls) == 1
     assert transport.calls[0]["payload"] == {
         "sourceFlag": "wallet-agent",
         "mainNetwork": "ETH",

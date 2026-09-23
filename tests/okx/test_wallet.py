@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from wallet_agent.domain.models import TransactionContext
+from wallet_agent.domain.models import Asset, TransactionContext
 from wallet_agent.okx.errors import OkxClientError
 from wallet_agent.okx.wallet import OkxWalletAdapter, OkxWalletError
 
@@ -95,6 +95,86 @@ async def test_token_balances_construct_native_and_token_assets_with_risk_flags(
 
 
 @pytest.mark.asyncio
+async def test_token_balances_fill_missing_decimals_from_okx_token_metadata():
+    token_address = "0x" + "a" * 40
+    client = FakeClient(
+        {
+            "/api/v6/dex/balance/all-token-balances-by-address": {
+                "code": "0",
+                "data": [
+                    {
+                        "tokenAssets": [
+                            {
+                                "chainIndex": "1",
+                                "symbol": "USDC",
+                                "tokenContractAddress": token_address,
+                                "balance": "12.5",
+                                "rawBalance": "12500000",
+                                "tokenPrice": "1",
+                                "isRiskToken": False,
+                            }
+                        ]
+                    }
+                ],
+            },
+            "/api/v6/dex/aggregator/all-tokens": {
+                "code": "0",
+                "data": [
+                    {
+                        "tokenContractAddress": token_address,
+                        "tokenSymbol": "USDC",
+                        "decimals": "6",
+                    }
+                ],
+            },
+        }
+    )
+    adapter = OkxWalletAdapter(client, {"ETH": "1"})
+
+    balances = await adapter.get_token_balances(ADDRESS, ["ETH"])
+
+    assert balances[0].asset.decimals == 6
+    assert client.calls[1] == (
+        "GET",
+        "/api/v6/dex/aggregator/all-tokens",
+        {"chainIndex": "1"},
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_token_balances_infer_missing_decimals_only_from_exact_raw_amount():
+    token_address = "0x" + "a" * 40
+    client = FakeClient(
+        {
+            "/api/v6/dex/balance/all-token-balances-by-address": {
+                "code": "0",
+                "data": [
+                    {
+                        "tokenAssets": [
+                            {
+                                "chainIndex": "1",
+                                "symbol": "USDC",
+                                "tokenContractAddress": token_address,
+                                "balance": "12.5",
+                                "rawBalance": "12500000",
+                                "isRiskToken": False,
+                            }
+                        ]
+                    }
+                ],
+            },
+            "/api/v6/dex/aggregator/all-tokens": {"code": "0", "data": []},
+        }
+    )
+    adapter = OkxWalletAdapter(client, {"ETH": "1"})
+
+    balances = await adapter.get_token_balances(ADDRESS, ["ETH"])
+
+    assert balances[0].asset.decimals == 6
+
+
+@pytest.mark.asyncio
 async def test_pretransaction_calls_use_exact_documented_body_fields():
     client = FakeClient(
         {
@@ -179,7 +259,8 @@ async def test_erc20_balance_requires_documented_decimals_and_raw_balance():
                         ]
                     }
                 ],
-            }
+            },
+            "/api/v6/dex/aggregator/all-tokens": {"code": "0", "data": []},
         }
     )
     adapter = OkxWalletAdapter(client, {"ETH": "1"})
@@ -236,3 +317,42 @@ async def test_provider_errors_are_sanitized_and_not_retried_by_adapter():
     assert raised.value.code == "OKX_PROVIDER_ERROR"
     assert "50101" not in str(raised.value)
     assert raised.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_specific_balances_posts_selected_assets_in_batches():
+    client = FakeClient(
+        {
+            "/api/v6/dex/balance/token-balances-by-address": {
+                "code": "0",
+                "data": [
+                    {
+                        "chainIndex": "1",
+                        "tokenContractAddress": "0x" + "a" * 40,
+                        "balance": "2",
+                        "rawBalance": "2000000",
+                    }
+                ],
+            }
+        }
+    )
+    adapter = OkxWalletAdapter(client, {"ETH": "1"})
+    asset = Asset(
+        chain="ETH", symbol="USDC", decimals=6, address="0x" + "a" * 40
+    )
+
+    balances = await adapter.get_specific_balances(ADDRESS, [asset])
+
+    assert balances[0].asset.symbol == "USDC"
+    assert client.calls[0] == (
+        "POST",
+        "/api/v6/dex/balance/token-balances-by-address",
+        None,
+        {
+            "address": ADDRESS,
+            "tokenContractAddresses": [
+                {"chainIndex": "1", "tokenContractAddress": "0x" + "a" * 40}
+            ],
+            "excludeRiskToken": "0",
+        },
+    )

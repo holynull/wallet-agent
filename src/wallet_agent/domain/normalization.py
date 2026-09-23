@@ -66,6 +66,12 @@ _CHAIN_NAME = (
     r"(?:Ethereum|ETH|ERC20|Base|BSC|BEP20|Arbitrum(?:\s+One)?|Optimism|Polygon|"
     r"以太坊主网|以太坊|以太|币安智能链|币安链)"
 )
+_SOURCE_CHAIN_ASSET_SWAP_PATTERN = re.compile(
+    rf"(?:^|\s)(?:用\s*)?({_CHAIN_NAME})\s*(?:链|网络)?\s*上(?:的)?\s*"
+    rf"(?:(?:\d+(?:\.\d*)?|\.\d+)\s*)?{_TOKEN_SYMBOL}(?:\s*来)?\s*"
+    rf"(?:兑换|换)(?:成|为)?\s*{_TOKEN_SYMBOL}\s*$",
+    re.IGNORECASE,
+)
 _ALL_SWAP_CHAINS_PATTERN = re.compile(
     rf"都在\s*({_CHAIN_NAME})\s*(?:链|网络)?", re.IGNORECASE
 )
@@ -144,6 +150,11 @@ def swap_direction_hints(value: str) -> dict[str, str]:
     """Extract only swap directions made explicit by stable Chinese grammar."""
     message = str(value).strip()
     hints: dict[str, str] = {}
+    source_chain_asset_match = _SOURCE_CHAIN_ASSET_SWAP_PATTERN.search(message)
+    if source_chain_asset_match:
+        hints["source_chain"] = canonical_chain(source_chain_asset_match.group(1))
+        hints["source_symbol"] = canonical_symbol(source_chain_asset_match.group(2))
+        hints["destination_symbol"] = canonical_symbol(source_chain_asset_match.group(3))
     all_chains_match = _ALL_SWAP_CHAINS_PATTERN.search(message)
     if all_chains_match:
         chain = canonical_chain(all_chains_match.group(1))

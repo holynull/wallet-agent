@@ -27,7 +27,7 @@ def _model_input(request: Mapping[str, Any]) -> list[HumanMessage]:
                 "参数不完整的转账仍然是 transfer，参数不完整的兑换仍然是 swap_quote。"
                 "兑换请求即使只写了类似“帮我兑换 1USDT”的紧凑格式，也要识别为 swap_quote。"
                 "不要提取参数；不要因为缺少链、Token、金额、地址或钱包连接而改变任务类型。\n\n"
-                f"请求 JSON：\n{payload}"
+                f"请求 JSON（conversation_history 包含当前 thread 的完整公开对话历史）：\n{payload}"
             )
         )
     ]
@@ -70,7 +70,11 @@ def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanM
         )
     else:
         raise ValueError(f"unsupported task extractor: {task_kind}")
-    return [HumanMessage(content=f"{instructions}\n\n请求和已有任务 JSON：\n{payload}")]
+    return [
+        HumanMessage(
+            content=(f"{instructions}\n\n请求、完整对话历史和已有任务 JSON：\n{payload}")
+        )
+    ]
 
 
 class ModelRegistry:

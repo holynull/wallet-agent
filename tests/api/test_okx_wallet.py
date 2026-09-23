@@ -4,7 +4,14 @@ import httpx
 import pytest
 
 from wallet_agent.api import StaticTokenVerifier, create_app
-from wallet_agent.domain.models import WalletTotalValue
+from wallet_agent.domain.models import (
+    Asset,
+    TokenBalance,
+    TransactionHistoryPage,
+    TransactionRecord,
+    TransactionStatus,
+    WalletTotalValue,
+)
 
 
 class WalletProvider:
@@ -22,6 +29,31 @@ class WalletProvider:
             asset_type=asset_type,
             exclude_risk_tokens=exclude_risk_tokens,
             total_value=Decimal("123.45"),
+        )
+
+    async def get_token_balances(self, address, chain_indexes, **kwargs):
+        return [
+            TokenBalance(
+                asset=Asset(chain="ETH", symbol="ETH", decimals=18),
+                amount=Decimal("1"),
+                amount_raw="1000000000000000000",
+            )
+        ]
+
+
+class ExplorerProvider:
+    async def get_transaction_history(self, address, chain, *, limit=20):
+        return TransactionHistoryPage(
+            transactions=[
+                TransactionRecord(
+                    chain=chain,
+                    tx_hash="0x" + "a" * 64,
+                    status=TransactionStatus.CONFIRMED,
+                    source="okx",
+                    history_kind="full",
+                )
+            ],
+            next_cursor="next",
         )
 
 
@@ -88,3 +120,24 @@ async def test_total_value_rejects_unknown_chain_without_provider_call():
         )
     assert response.status_code == 422
     assert response.json()["code"] == "OKX_CHAIN_UNSUPPORTED"
+
+
+@pytest.mark.asyncio
+async def test_balances_and_history_use_okx_providers():
+    app = create_app(wallet_provider=WalletProvider(), explorer_provider=ExplorerProvider())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        balances = await client.get(
+            "/v1/wallet/0x1111111111111111111111111111111111111111/balances",
+            params={"chain": "ETH"},
+        )
+        history = await client.get(
+            "/v1/wallet/0x1111111111111111111111111111111111111111/transactions",
+            params={"chain": "ETH", "limit": 2},
+        )
+    assert balances.status_code == 200
+    assert balances.json()["source"] == "okx"
+    assert history.status_code == 200
+    assert history.json()["history_kind"] == "full"
+    assert history.json()["transactions"][0]["source"] == "okx"

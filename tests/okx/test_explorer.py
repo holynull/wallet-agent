@@ -68,6 +68,24 @@ async def test_history_maps_okx_transaction_list_and_cursor():
 
 
 @pytest.mark.asyncio
+async def test_history_treats_null_transactions_as_empty_page():
+    client = FakeClient(
+        {
+            "/api/v6/dex/post-transaction/transactions-by-address": {
+                "code": "0",
+                "data": [{"cursor": "", "transactions": None}],
+            }
+        }
+    )
+    adapter = OkxExplorerAdapter(client, {"ETH": "1"})
+
+    page = await adapter.get_transaction_history(ADDRESS, "ETH", limit=1)
+
+    assert page.transactions == []
+    assert page.next_cursor is None
+
+
+@pytest.mark.asyncio
 async def test_detail_maps_status_and_transaction_fields():
     client = FakeClient(
         {
@@ -96,7 +114,7 @@ async def test_detail_maps_status_and_transaction_fields():
 
     detail = await adapter.get_transaction_detail("ETH", TX_HASH)
 
-    assert detail.record.status is TransactionStatus.FAILED
+    assert detail.status is TransactionStatus.FAILED
     assert detail.gas_limit == "45528"
     assert detail.nonce == "4"
     assert detail.token_transfers[0].token == "USDC"
@@ -116,3 +134,28 @@ async def test_history_rejects_invalid_limit_and_unknown_chain():
         await adapter.get_transaction_history(ADDRESS, "ETH", limit=101)
     with pytest.raises(Exception, match="supported"):
         await adapter.get_transaction_history(ADDRESS, "NOPE")
+
+
+@pytest.mark.asyncio
+async def test_successful_history_and_detail_calls_are_cached_by_complete_query():
+    client = FakeClient(
+        {
+            "/api/v6/dex/post-transaction/transactions-by-address": {
+                "code": "0",
+                "data": [{"cursor": "", "transactionList": []}],
+            },
+            "/api/v6/dex/post-transaction/transaction-detail-by-txhash": {
+                "code": "0",
+                "data": [{"chainIndex": "1", "txHash": TX_HASH, "txStatus": "1"}],
+            },
+        }
+    )
+    adapter = OkxExplorerAdapter(client, {"ETH": "1"})
+
+    await adapter.get_transaction_history(ADDRESS, "ETH", limit=2)
+    await adapter.get_transaction_history(ADDRESS, "ETH", limit=2)
+    await adapter.get_transaction_history(ADDRESS, "ETH", limit=3)
+    await adapter.get_transaction_detail("ETH", TX_HASH)
+    await adapter.get_transaction_detail("ETH", TX_HASH)
+
+    assert len(client.calls) == 3

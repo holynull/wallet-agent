@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from wallet_agent.api import create_app
+from wallet_agent.chains.execution_observer import ExecutionObserver
 from wallet_agent.chains.registry import ChainAdapterRegistry
 from wallet_agent.domain.models import (
     Asset,
@@ -13,6 +14,7 @@ from wallet_agent.domain.models import (
     NormalizedQuote,
     ProviderOrder,
     SwapQuoteRequest,
+    TokenPrice,
     UnsignedTransaction,
 )
 from wallet_agent.graph.build import build_graph
@@ -122,6 +124,45 @@ async def test_turn_quote_interrupt_confirm_prepare_and_session_projection():
         assert confirmed.status_code == 200
         assert confirmed.json()["pending_transaction"]["to"] == "0xrouter"
         assert provider.prepare_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_okx_price_enrichment_survives_session_projection_and_confirmation_interrupt():
+    class OkxPriceProvider:
+        async def get_prices(self, assets):
+            return [
+                TokenPrice(asset=asset, usd_price=Decimal("1"), provider="okx")
+                for asset in assets
+            ]
+
+    provider = FakeProvider()
+    graph = build_graph(
+        model=FakeModel(),
+        providers=[provider],
+        price_provider=OkxPriceProvider(),
+    )
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        price_provider=OkxPriceProvider(),
+        store=InMemorySessionStore(),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/v1/agent/turn", json=request_payload())
+        assert response.status_code == 200
+        body = response.json()
+        await app.state.runs[body["run_id"]]["task"]
+        session = await client.get(
+            f"/v1/swap/{body['session_id']}", params={"user_id": "alice"}
+        )
+
+    assert app.state.runs[body["run_id"]]["status"] == "awaiting_confirmation"
+    assert session.status_code == 200
+    assert session.json()["status"] == "awaiting_confirmation"
+    assert session.json()["quote_candidates"][0]["price_snapshots"][0]["provider"] == "okx"
 
 
 @pytest.mark.asyncio
@@ -285,7 +326,10 @@ async def test_broadcast_records_hash_missing_from_chain_without_provider_pollin
             return None
 
     app, client, provider = await make_client()
-    app.state.chain_registry = ChainAdapterRegistry({"BASE": BroadcastAdapter()})
+    app.state.chain_registry = None
+    app.state.execution_observer = ExecutionObserver(
+        ChainAdapterRegistry({"BASE": BroadcastAdapter()})
+    )
     async with client:
         response = await client.post("/v1/agent/turn", json=request_payload())
         body = response.json()
@@ -306,6 +350,98 @@ async def test_broadcast_records_hash_missing_from_chain_without_provider_pollin
     assert broadcast.json()["broadcast_tx_hash"] == tx_hash
     assert "not yet visible" in broadcast.json()["message"]
     assert provider.broadcast_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_broadcast_pending_stage_is_not_regressed_by_follow_up_agent_turn():
+    class ConversationModel(FakeModel):
+        async def ainvoke(self, value):
+            if value.get("message") == "hello":
+                return {"intent": "clarification"}
+            return await super().ainvoke(value)
+
+    provider = FakeProvider()
+    graph = build_graph(model=ConversationModel(), providers=[provider])
+    app = create_app(graph=graph, providers={"bridgers": provider}, store=InMemorySessionStore())
+
+    class BroadcastAdapter:
+        async def get_transaction_receipt(self, _tx_hash):
+            return None
+
+        async def get_transaction(self, _tx_hash):
+            return {"hash": _tx_hash}
+
+    app.state.chain_registry = ChainAdapterRegistry({"BASE": BroadcastAdapter()})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = await client.post("/v1/agent/turn", json=request_payload())
+        await app.state.runs[first.json()["run_id"]]["task"]
+        session_id = first.json()["session_id"]
+        await client.post(
+            f"/v1/swap/{session_id}/confirm", json={"user_id": "alice", "approved": True}
+        )
+        tx_hash = "0x" + "f" * 64
+        broadcast = await client.post(
+            f"/v1/swap/{session_id}/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": tx_hash},
+        )
+        assert broadcast.json()["status"] == "broadcast_pending"
+
+        follow_up = await client.post(
+            "/v1/agent/turn",
+            json={
+                "conversation_id": first.json()["conversation_id"],
+                "session_id": session_id,
+                "user_id": "alice",
+                "message": "hello",
+            },
+        )
+        await app.state.runs[follow_up.json()["run_id"]]["task"]
+        session = await client.get(f"/v1/swap/{session_id}", params={"user_id": "alice"})
+
+    assert session.status_code == 200
+    assert session.json()["status"] == "broadcast_pending"
+    assert session.json()["stage"] == "broadcast_pending"
+
+
+@pytest.mark.asyncio
+async def test_follow_up_agent_turn_receives_complete_thread_history():
+    class HistoryModel:
+        def __init__(self):
+            self.requests = []
+
+        async def ainvoke(self, value):
+            self.requests.append(value)
+            return {"intent": "clarification"}
+
+    model = HistoryModel()
+    graph = build_graph(model=model)
+    app = create_app(graph=graph, store=InMemorySessionStore())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = await client.post(
+            "/v1/agent/turn",
+            json={"conversation_id": "history-thread", "user_id": "alice", "message": "first"},
+        )
+        await app.state.runs[first.json()["run_id"]]["task"]
+        first_state = next(
+            event["state"]
+            for event in app.state.runs[first.json()["run_id"]]["events"]
+            if event["event"] == "complete"
+        )
+        assistant_message = first_state["response"]["message"]
+        second = await client.post(
+            "/v1/agent/turn",
+            json={"conversation_id": "history-thread", "user_id": "alice", "message": "second"},
+        )
+        await app.state.runs[second.json()["run_id"]]["task"]
+
+    assert len(model.requests) == 2
+    history = model.requests[-1]["conversation_history"]
+    assert [item["role"] for item in history] == ["user", "assistant", "user"]
+    assert [item["content"] for item in history] == ["first", assistant_message, "second"]
 
 
 @pytest.mark.asyncio

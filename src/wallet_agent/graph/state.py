@@ -91,6 +91,14 @@ def _merge_errors(
     return [*(existing or []), *(incoming or [])]
 
 
+def _merge_conversation_history(
+    existing: list[dict[str, Any]] | None,
+    incoming: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Append public user/assistant turns while preserving checkpoint history."""
+    return [*(existing or []), *(incoming or [])]
+
+
 class AgentState(TypedDict, total=False):
     """Checkpoint-safe state. Runtime clients are deliberately not part of this type."""
 
@@ -144,6 +152,7 @@ class AgentState(TypedDict, total=False):
     response: NotRequired[dict[str, Any] | None]
     tool_result: NotRequired[dict[str, Any] | None]
     messages: NotRequired[list[Any]]
+    conversation_history: Annotated[list[dict[str, Any]], _merge_conversation_history]
     route: NotRequired[str | None]
     approval_transaction: NotRequired[dict[str, Any] | None]
     allowance_requirement: NotRequired[dict[str, Any] | None]

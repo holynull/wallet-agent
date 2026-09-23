@@ -34,6 +34,7 @@ class SwapSessionRecord(DomainModel):
     provider_order: ProviderOrder | None = None
     order_status: NormalizedOrderStatus | None = None
     broadcast_tx_hash: str | None = None
+    broadcast_status: str | None = None
     stage: str | None = None
     selected_provider_reference: str | None = None
     approval_transaction: dict | None = None

@@ -140,6 +140,20 @@ class Chain:
         )
 
 
+class OkxWalletProvider:
+    chain_index_by_name = {"BASE": "8453"}
+
+    async def get_token_balances(self, _address, chain_indexes):
+        assert chain_indexes == ["8453"]
+        return [
+            TokenBalance(
+                asset=Asset(chain="BASE", chain_id=8453, symbol="ETH", decimals=18),
+                amount=Decimal("2"),
+                amount_raw="2000000000000000000",
+            )
+        ]
+
+
 def wallet_context():
     return {"address": WALLET, "chain": "BASE", "chain_id": 8453, "native_symbol": "ETH"}
 
@@ -175,6 +189,35 @@ async def test_transfer_clarification_retains_known_slots_in_active_task():
         "amount": "0.01",
     }
     assert result["transfer_draft"]["transfer_amount"] == "0.01"
+
+
+@pytest.mark.asyncio
+async def test_transfer_asset_change_without_explicit_amount_does_not_reuse_previous_amount():
+    model = UnderstandingModel(
+        ["transfer", "transfer"],
+        transfer=[
+            TransferSlotPatch(
+                chain="BASE",
+                symbol="USDC",
+                amount="1",
+                recipient=RECIPIENT,
+            ),
+            TransferSlotPatch(chain="BASE", symbol="ETH", recipient=RECIPIENT),
+        ],
+    )
+    graph = build_graph(model=model, providers=[Provider()], chains={"BASE": Chain()})
+    config = {"configurable": {"thread_id": "task-transfer-asset-without-amount"}}
+
+    first = await graph.ainvoke(turn(f"转 1 USDC 给 {RECIPIENT}"), config=config)
+    assert first["active_task"]["slots"]["amount"] == "1"
+
+    second = await graph.ainvoke(turn("转一些 ETH 到这个地址"), config=config)
+
+    assert second["response"]["kind"] == "clarification"
+    assert "transfer_amount" in second["response"]["missing_fields"]
+    assert "amount" not in second["active_task"]["slots"]
+    assert "amount_raw" not in second["active_task"]["slots"]
+    assert second.get("pending_transaction") is None
 
 
 @pytest.mark.asyncio
@@ -366,6 +409,35 @@ async def test_swap_infers_unique_native_destination_chain_after_source_chain_fo
 
 
 @pytest.mark.asyncio
+async def test_swap_corrects_extractor_chain_leak_for_unique_native_destination():
+    model = UnderstandingModel(
+        ["swap_quote"],
+        swap=[
+            SwapSlotPatch(
+                source_chain="ETH",
+                source_symbol="USDC",
+                destination_chain="ETH",
+                destination_symbol="BNB",
+                input_amount="10",
+            )
+        ],
+    )
+    provider = EthereumCatalogProvider()
+    graph = build_graph(model=model, providers=[provider])
+
+    result = await graph.ainvoke(
+        turn("以太上 10 USDC 换 BNB"),
+        config={"configurable": {"thread_id": "source-chain-does-not-leak-to-native-target"}},
+    )
+
+    assert result["response"]["kind"] == "swap_quote"
+    assert result["active_task"]["slots"]["source_chain"] == "ETH"
+    assert result["active_task"]["slots"]["destination_chain"] == "BSC"
+    assert result["swap_request"]["destination_asset"]["chain"] == "BSC"
+    assert provider.quote_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_swap_does_not_infer_ambiguous_eth_destination_chain():
     model = UnderstandingModel(
         ["swap_quote"],
@@ -428,7 +500,12 @@ async def test_transient_balance_query_preserves_active_swap_task():
         ["swap_quote", "wallet_query"],
         swap=[SwapSlotPatch(source_symbol="USDC", destination_symbol="USDT", input_amount="1")],
     )
-    graph = build_graph(model=model, providers=[Provider()], chains={"BASE": Chain()})
+    graph = build_graph(
+        model=model,
+        providers=[Provider()],
+        chains={"BASE": Chain()},
+        wallet_provider=OkxWalletProvider(),
+    )
     config = {"configurable": {"thread_id": "task-transient-balance"}}
 
     first = await graph.ainvoke(turn("用 1 USDC 换 USDT"), config=config)

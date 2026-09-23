@@ -72,8 +72,11 @@ async def test_bridgers_list_assets_normalizes_chain_and_filters_search():
     provider = BridgersProvider.from_transport(transport)
 
     assets = await provider.list_assets(AssetQuery(chain="Ethereum", search="USDT"))
+    cached_assets = await provider.list_assets(AssetQuery(chain="Ethereum", search="USDC"))
 
     assert [asset.symbol for asset in assets] == ["USDT(ERC20)"]
+    assert [asset.symbol for asset in cached_assets] == ["USDC"]
+    assert len(transport.calls) == 1
     assert transport.calls[0]["payload"] == {"chain": "ETH"}
 
 
@@ -284,6 +287,58 @@ async def test_bridgers_quote_converts_units_and_preserves_raw_amounts():
 
 
 @pytest.mark.asyncio
+async def test_bridgers_quote_resolves_native_asset_addresses_from_catalog():
+    transport = FakeTransport(
+        {
+            "resCode": 100,
+            "data": {
+                "tokens": [
+                    {
+                        "chain": "BSC",
+                        "symbol": "BNB(BSC)",
+                        "address": "0x00000000000000000000000000000000000000bb",
+                        "decimals": 18,
+                    }
+                ]
+            },
+        },
+        quote_response(),
+        quote_response(),
+    )
+    provider = BridgersProvider.from_transport(transport, source_flag="wallet-agent")
+    request = valid_quote_request().model_copy(
+        update={
+            "destination_asset": valid_quote_request().destination_asset.model_copy(
+                update={
+                    "symbol": "BNB",
+                    "chain": "BSC",
+                    "chain_id": 56,
+                    "address": None,
+                    "decimals": 18,
+                }
+            )
+        }
+    )
+
+    quote = await provider.quote(request)
+
+    assert transport.calls[0] == {
+        "path": "/api/exchangeRecord/getToken",
+        "payload": {"chain": "BSC"},
+        "idempotency_key": None,
+    }
+    assert transport.calls[1]["path"] == "/api/sswap/quote"
+    assert transport.calls[1]["payload"]["toTokenAddress"] == (
+        "0x00000000000000000000000000000000000000bb"
+    )
+    provider._quotes.clear()
+    await provider.prepare(quote)
+    assert transport.calls[2]["payload"]["toTokenAddress"] == (
+        "0x00000000000000000000000000000000000000bb"
+    )
+
+
+@pytest.mark.asyncio
 async def test_bridgers_reverse_quote_binary_searches_source_amount():
     transport = DynamicQuoteTransport()
     provider = BridgersProvider.from_transport(transport)
@@ -347,6 +402,8 @@ async def test_bridgers_quote_payload_contains_only_normalized_resume_metadata()
         "source_flag": "wallet-agent",
         "sender_address": "0x1234567890abcdef1234567890abcdef12345678",
         "recipient_address": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "from_token_address": "0x0000000000000000000000000000000000000011",
+        "to_token_address": "0x0000000000000000000000000000000000000022",
         "slippage_bps": 100,
         "amount_out_min_raw": "9700000",
     }
