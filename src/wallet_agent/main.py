@@ -18,6 +18,7 @@ from wallet_agent.models import (
     ModelRouter,
     RouteDecision,
     SwapSlotPatch,
+    TransactionStatusSlotPatch,
     TransferSlotPatch,
 )
 from wallet_agent.okx import (
@@ -62,6 +63,12 @@ def build_application(settings: Settings | None = None) -> Any:
         },
         "swap": {
             model_id: client.with_structured_output(SwapSlotPatch, method="json_mode")
+            for model_id, client in base_clients.items()
+        },
+        "transaction_status": {
+            model_id: client.with_structured_output(
+                TransactionStatusSlotPatch, method="json_mode"
+            )
             for model_id, client in base_clients.items()
         },
     }

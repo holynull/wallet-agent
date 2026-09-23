@@ -141,10 +141,13 @@ are missing. A successful response includes `response.kind:
 checks and warnings before signing. Sign and broadcast only in the App. The
 wallet must be on the transfer's `chain` / `chain_id`; request
 `wallet_switchEthereumChain` before signing when needed. Transfer hashes are
-not sent to the swap provider broadcast endpoint. Query a broadcast hash via
-`GET /v1/transactions/{chain}/{tx_hash}`. Token USD prices are advisory quote
-context, not a price guarantee; display their source timestamp and refresh
-policy to users.
+not sent to the swap provider broadcast endpoint. Register the wallet-returned
+hash with `POST /v1/transfer/{session_id}/broadcast` using only `user_id`,
+`chain`, and `tx_hash`. Repeating the same hash is idempotent. This lets a later
+conversation turn such as “到账了吗” reuse the registered chain and hash. Apps
+can also query directly through `GET /v1/transactions/{chain}/{tx_hash}`. Token
+USD prices are advisory quote context, not a price guarantee; display their
+source timestamp and refresh policy to users.
 
 The full capability roadmap is in
 [docs/wallet-agent-capability-roadmap.md](wallet-agent-capability-roadmap.md).

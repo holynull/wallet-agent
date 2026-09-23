@@ -125,7 +125,11 @@ class OkxExplorerAdapter:
                 query={"txHash": tx_hash, "chainIndex": chain_index},
             )
             item = self._first_item(payload, "transaction detail")
-            record = self._record(item, history_kind="full")
+            record = self._record(
+                item,
+                history_kind="full",
+                fallback_tx_hash=tx_hash,
+            )
             token_transfers = item.get("tokenTransfers", item.get("tokenTransfer", []))
             if token_transfers is None:
                 token_transfers = []
@@ -233,10 +237,19 @@ class OkxExplorerAdapter:
             raise OkxExplorerError("OKX_MALFORMED_RESPONSE", f"OKX {kind} is empty or malformed")
         return item
 
-    def _record(self, item: dict[str, Any], *, history_kind: str) -> TransactionRecord:
+    def _record(
+        self,
+        item: dict[str, Any],
+        *,
+        history_kind: str,
+        fallback_tx_hash: str | None = None,
+    ) -> TransactionRecord:
         chain_index = self._optional_string(item.get("chainIndex", item.get("chainIndexId")))
         chain = self.chain_name_by_index.get(chain_index or "", chain_index or "UNKNOWN")
-        tx_hash = self._optional_string(item.get("txHash", item.get("hash")))
+        tx_hash = (
+            self._optional_string(item.get("txHash", item.get("hash")))
+            or fallback_tx_hash
+        )
         if not tx_hash:
             raise OkxExplorerError("OKX_MALFORMED_RESPONSE", "OKX transaction hash is missing")
         status = self._status(item.get("txStatus", item.get("status")))

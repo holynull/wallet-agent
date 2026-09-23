@@ -110,3 +110,48 @@ def test_demo_shows_confirmed_source_chain_while_provider_is_processing(demo_pag
     )
     demo_page.wait_for_function("state.typingQueue.then(() => true)")
     assert "源链交易已确认" in demo_page.locator("body").inner_text()
+
+
+@pytest.mark.browser
+def test_demo_registers_transfer_hash_after_wallet_broadcast(demo_page: Page):
+    tx_hash = "0x" + "a" * 64
+    captured = []
+
+    def handle(route):
+        captured.append(route.request.post_data_json)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=(
+                '{"broadcast_status":"broadcast_pending",'
+                f'"broadcast_tx_hash":"{tx_hash}"}}'
+            ),
+        )
+
+    demo_page.route("**/v1/transfer/transfer-session/broadcast", handle)
+    demo_page.evaluate(
+        """(txHash) => {
+            state.sessionId = 'transfer-session';
+            state.address = '0x' + '1'.repeat(40);
+            state.provider = {
+              request: async ({ method }) => {
+                if (method === 'eth_chainId') return '0x2105';
+                if (method === 'eth_sendTransaction') return txHash;
+                throw new Error(`unexpected wallet method: ${method}`);
+              }
+            };
+            renderTransfer({
+              chain: 'BASE', chain_id: 8453,
+              to: '0x' + '2'.repeat(40), data: '0x', value: '1'
+            });
+        }""",
+        tx_hash,
+    )
+
+    demo_page.get_by_role("button", name="钱包签名并广播转账").click()
+    demo_page.wait_for_timeout(100)
+
+    assert captured == [
+        {"user_id": "browser-demo", "chain": "BASE", "tx_hash": tx_hash}
+    ]
+    assert "转账已广播并登记" in demo_page.locator("body").inner_text()

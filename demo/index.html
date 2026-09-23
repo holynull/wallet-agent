@@ -852,7 +852,13 @@
       sign.disabled = true;
       try {
         const hash = await sendUnsignedTransaction(transaction);
-        addMessage('assistant', `转账已广播：${hash}`);
+        const result = await api(`/v1/transfer/${state.sessionId}/broadcast`, {
+          method: 'POST', headers: jsonHeaders(), body: JSON.stringify({
+            user_id: 'browser-demo', chain: transaction.chain, tx_hash: hash
+          })
+        });
+        addMessage('assistant', `转账已广播并登记：${hash}`);
+        renderBroadcastStatus({ ...result, tx_hash: hash });
         status.disabled = false;
         status.onclick = async () => {
           try {

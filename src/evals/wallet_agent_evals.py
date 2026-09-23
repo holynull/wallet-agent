@@ -767,6 +767,7 @@ async def run_online_evals() -> dict[str, Any]:
         ModelRouter,
         RouteDecision,
         SwapSlotPatch,
+        TransactionStatusSlotPatch,
         TransferSlotPatch,
     )
 
@@ -780,6 +781,9 @@ async def run_online_evals() -> dict[str, Any]:
     classifier = base_client.with_structured_output(RouteDecision, method="json_mode")
     transfer = base_client.with_structured_output(TransferSlotPatch, method="json_mode")
     swap = base_client.with_structured_output(SwapSlotPatch, method="json_mode")
+    transaction_status = base_client.with_structured_output(
+        TransactionStatusSlotPatch, method="json_mode"
+    )
     router = ModelRouter(
         ModelRegistry(
             {settings.openai_model: classifier},
@@ -787,6 +791,7 @@ async def run_online_evals() -> dict[str, Any]:
             extractors={
                 "transfer": {settings.openai_model: transfer},
                 "swap": {settings.openai_model: swap},
+                "transaction_status": {settings.openai_model: transaction_status},
             },
         )
     )

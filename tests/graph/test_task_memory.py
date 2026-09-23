@@ -34,6 +34,21 @@ class UnderstandingModel:
         return next(self.patches[task_kind])
 
 
+class TransactionStatusModel:
+    def __init__(self, patches):
+        self.patches = iter(patches)
+
+    async def classify(self, _request):
+        return RouteDecision(intent="transaction_status")
+
+    async def extract(self, task_kind, _request):
+        assert task_kind == "transaction_status"
+        patch = next(self.patches)
+        if isinstance(patch, Exception):
+            raise patch
+        return patch
+
+
 class Provider:
     provider_name = "bridgers"
 
@@ -158,6 +173,20 @@ def wallet_context():
     return {"address": WALLET, "chain": "BASE", "chain_id": 8453, "native_symbol": "ETH"}
 
 
+class TransactionExplorer:
+    async def get_transaction_detail(self, chain, tx_hash):
+        from wallet_agent.domain.models import TransactionDetail, TransactionStatus
+
+        return TransactionDetail(
+            chain=chain,
+            chain_id="1",
+            tx_hash=tx_hash,
+            status=TransactionStatus.CONFIRMED,
+            source="okx",
+            history_kind="full",
+        )
+
+
 def turn(message):
     return {
         "conversation_id": "task-memory",
@@ -189,6 +218,235 @@ async def test_transfer_clarification_retains_known_slots_in_active_task():
         "amount": "0.01",
     }
     assert result["transfer_draft"]["transfer_amount"] == "0.01"
+
+
+@pytest.mark.asyncio
+async def test_transaction_status_followups_merge_hash_then_chain_across_turns():
+    tx_hash = "0x" + "d" * 64
+    graph = build_graph(
+        model=TransactionStatusModel(
+            [
+                {},
+                {},
+                {},
+            ]
+        ),
+        explorer_provider=TransactionExplorer(),
+    )
+    config = {"configurable": {"thread_id": "transaction-status-followups"}}
+
+    first = await graph.ainvoke(turn("到账了吗"), config=config)
+    assert first["response"]["kind"] == "clarification"
+    assert first["response"]["missing_fields"] == [
+        "transaction_chain",
+        "transaction_hash",
+    ]
+
+    second = await graph.ainvoke(turn(tx_hash), config=config)
+    assert second["response"]["kind"] == "clarification"
+    assert second["response"]["missing_fields"] == ["transaction_chain"]
+    assert second["transaction_query"]["tx_hash"] == tx_hash
+
+    third = await graph.ainvoke(turn("以太"), config=config)
+    assert third["response"]["kind"] == "transaction_status"
+    assert third["response"]["status"] == "confirmed"
+    assert third["transaction_query"] == {"chain": "ETH", "tx_hash": tx_hash}
+
+
+@pytest.mark.asyncio
+async def test_transaction_status_uses_registered_transfer_broadcast():
+    tx_hash = "0x" + "e" * 64
+    graph = build_graph(
+        model=TransactionStatusModel([{}]),
+        explorer_provider=TransactionExplorer(),
+    )
+
+    result = await graph.ainvoke(
+        {
+            **turn("到账了吗"),
+            "broadcast_tx_hash": tx_hash,
+            "pending_transaction": {
+                "chain": "ETH",
+                "chain_id": 1,
+                "to": RECIPIENT,
+                "data": "0x",
+                "value": "1",
+            },
+        },
+        config={"configurable": {"thread_id": "registered-transfer-status"}},
+    )
+
+    assert result["response"]["kind"] == "transaction_status"
+    assert result["response"]["status"] == "confirmed"
+    assert result["transaction_query"] == {"chain": "ETH", "tx_hash": tx_hash}
+
+
+@pytest.mark.asyncio
+async def test_transaction_status_uses_local_not_propagated_broadcast_before_explorer():
+    tx_hash = "0x" + "f" * 64
+
+    class BrokenExplorer:
+        async def get_transaction_detail(self, _chain, _tx_hash):
+            raise RuntimeError("OKX transaction hash is missing")
+
+    graph = build_graph(
+        model=TransactionStatusModel([{}]),
+        explorer_provider=BrokenExplorer(),
+    )
+
+    result = await graph.ainvoke(
+        {
+            **turn("转完了吗"),
+            "broadcast_tx_hash": tx_hash,
+            "broadcast_status": "not_propagated",
+            "pending_transaction": {
+                "chain": "ETH",
+                "chain_id": 1,
+                "to": RECIPIENT,
+                "data": "0x",
+                "value": "1",
+            },
+        },
+        config={"configurable": {"thread_id": "local-broadcast-status"}},
+    )
+
+    assert result["response"] == {
+        "kind": "transaction_status",
+        "chain": "ETH",
+        "tx_hash": tx_hash,
+        "status": "pending",
+        "broadcast_status": "not_propagated",
+        "source": "local",
+        "message": "交易哈希暂时还没有在源链上出现，请稍后重试。",
+    }
+
+
+@pytest.mark.asyncio
+async def test_transaction_status_reports_prepared_transfer_has_not_been_broadcast():
+    class UnexpectedExplorer:
+        async def get_transaction_detail(self, _chain, _tx_hash):
+            raise AssertionError("prepared transfers must not call the explorer")
+
+    graph = build_graph(
+        model=TransactionStatusModel([{}]),
+        explorer_provider=UnexpectedExplorer(),
+    )
+
+    result = await graph.ainvoke(
+        {
+            **turn("转完了吗"),
+            "pending_transaction": {
+                "chain": "ETH",
+                "chain_id": 1,
+                "to": RECIPIENT,
+                "data": "0x",
+                "value": "1",
+            },
+        },
+        config={"configurable": {"thread_id": "prepared-transfer-status"}},
+    )
+
+    assert result["response"] == {
+        "kind": "transaction_status",
+        "chain": "ETH",
+        "status": "not_broadcast",
+        "source": "local",
+        "message": "交易尚未广播，请先在钱包中签名并广播。",
+    }
+
+
+@pytest.mark.asyncio
+async def test_registered_transfer_replaces_stale_transaction_query():
+    old_hash = "0x" + "a" * 64
+    registered_hash = "0x" + "b" * 64
+    graph = build_graph(
+        model=TransactionStatusModel([{}]),
+        explorer_provider=TransactionExplorer(),
+    )
+
+    result = await graph.ainvoke(
+        {
+            **turn("到账了吗"),
+            "transaction_query": {"chain": "BASE", "tx_hash": old_hash},
+            "broadcast_tx_hash": registered_hash,
+            "pending_transaction": {
+                "chain": "ETH",
+                "chain_id": 1,
+                "to": RECIPIENT,
+                "data": "0x",
+                "value": "1",
+            },
+        },
+        config={"configurable": {"thread_id": "registered-transfer-replaces-stale"}},
+    )
+
+    assert result["transaction_query"] == {
+        "chain": "ETH",
+        "tx_hash": registered_hash,
+    }
+
+
+@pytest.mark.asyncio
+async def test_new_transfer_clears_previous_transaction_lifecycle_state():
+    old_hash = "0x" + "a" * 64
+    model = UnderstandingModel(
+        ["transfer"],
+        transfer=[
+            TransferSlotPatch(
+                chain="BASE",
+                symbol="ETH",
+                amount="0.0001",
+                recipient=RECIPIENT,
+            )
+        ],
+    )
+    graph = build_graph(model=model, chains={"BASE": Chain()})
+
+    result = await graph.ainvoke(
+        {
+            **turn(f"转 0.0001 ETH 给 {RECIPIENT}"),
+            "broadcast_tx_hash": old_hash,
+            "broadcast_status": "not_propagated",
+            "transaction_query": {"chain": "ETH", "tx_hash": old_hash},
+            "transaction_status_snapshot": {
+                "chain": "ETH",
+                "tx_hash": old_hash,
+                "status": "pending",
+            },
+            "pending_transaction": {
+                "chain": "ETH",
+                "chain_id": 1,
+                "to": RECIPIENT,
+                "data": "0x",
+                "value": "1",
+            },
+        },
+        config={"configurable": {"thread_id": "new-transfer-clears-old-status"}},
+    )
+
+    assert result["response"]["kind"] == "transfer_prepare"
+    assert result["pending_transaction"]["chain"] == "BASE"
+    assert result.get("broadcast_tx_hash") is None
+    assert result.get("broadcast_status") is None
+    assert result.get("transaction_query") is None
+    assert result.get("transaction_status_snapshot") is None
+
+
+@pytest.mark.asyncio
+async def test_explicit_transaction_hints_survive_extractor_failure():
+    tx_hash = "0x" + "c" * 64
+    graph = build_graph(
+        model=TransactionStatusModel([RuntimeError("model unavailable")]),
+        explorer_provider=TransactionExplorer(),
+    )
+
+    result = await graph.ainvoke(
+        turn(f"以太，{tx_hash}"),
+        config={"configurable": {"thread_id": "transaction-hints-model-failure"}},
+    )
+
+    assert result["response"]["kind"] == "transaction_status"
+    assert result["transaction_query"] == {"chain": "ETH", "tx_hash": tx_hash}
 
 
 @pytest.mark.asyncio

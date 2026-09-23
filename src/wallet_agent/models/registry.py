@@ -8,7 +8,12 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage
 
-from .contracts import RouteDecision, SwapSlotPatch, TransferSlotPatch
+from .contracts import (
+    RouteDecision,
+    SwapSlotPatch,
+    TransactionStatusSlotPatch,
+    TransferSlotPatch,
+)
 
 
 def _model_input(request: Mapping[str, Any]) -> list[HumanMessage]:
@@ -67,6 +72,15 @@ def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanM
             "指定来源数量时输出 amount_mode=exact_in。"
             "‘来源也在 Base 链’只输出 source_chain=Base；‘目标也在 Base 链’只输出"
             "destination_chain=Base，其余字段为 null。"
+        )
+    elif task_kind == "transaction_status":
+        instructions = (
+            "你是 Wallet Agent 的 transaction_status 参数提取器。"
+            "只返回合法 JSON，允许且必须仅使用这些 key：transaction_chain、"
+            "transaction_hash。只提取本轮用户明确提供的值；未提供的值返回 null，"
+            "不要重复对话历史中的旧值，也不要猜测网络或交易哈希。"
+            "示例：‘以太，0xabc...’应分别提取 transaction_chain=ETH 和完整的 "
+            "transaction_hash；只发送哈希时 transaction_chain 必须为 null。"
         )
     else:
         raise ValueError(f"unsupported task extractor: {task_kind}")
@@ -137,14 +151,22 @@ class ModelRouter:
 
     async def extract(
         self, task_kind: str, request: Mapping[str, Any]
-    ) -> TransferSlotPatch | SwapSlotPatch:
+    ) -> TransferSlotPatch | SwapSlotPatch | TransactionStatusSlotPatch:
         model = self.registry.get_extractor(task_kind, request.get("model_id"))
         model_request = _slot_model_input(task_kind, request)
         if hasattr(model, "ainvoke"):
             result = await model.ainvoke(model_request)
         else:
             result = model.invoke(model_request)
-        contract = TransferSlotPatch if task_kind == "transfer" else SwapSlotPatch
+        contracts = {
+            "transfer": TransferSlotPatch,
+            "swap": SwapSlotPatch,
+            "transaction_status": TransactionStatusSlotPatch,
+        }
+        try:
+            contract = contracts[task_kind]
+        except KeyError as exc:
+            raise ValueError(f"unsupported task extractor: {task_kind}") from exc
         return result if isinstance(result, contract) else contract.model_validate(result)
 
     async def ainvoke(self, request: Mapping[str, Any]) -> dict[str, Any]:

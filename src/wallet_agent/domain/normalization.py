@@ -42,6 +42,60 @@ _AMOUNT_WITH_UNIT_MENTION = re.compile(
     r"([A-Za-z][A-Za-z0-9()'`\-]*)"
 )
 _AMOUNT_ONLY = re.compile(r"^\s*((?:\d+(?:\.\d*)?|\.\d+))\s*$")
+_TRANSACTION_HASH_MENTION = re.compile(
+    r"(?<![0-9a-f])0x[0-9a-f]{64}(?![0-9a-f])", re.IGNORECASE
+)
+_TRANSACTION_CHAIN_MENTIONS = (
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])(?:ethereum|erc20|eth)(?![A-Za-z0-9])|"
+            r"以太坊主网|以太坊|以太",
+            re.IGNORECASE,
+        ),
+        "ETH",
+    ),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])(?:binance\s*smart\s*chain|bsc|bep20)"
+            r"(?![A-Za-z0-9])|币安智能链|币安链",
+            re.IGNORECASE,
+        ),
+        "BSC",
+    ),
+    (re.compile(r"(?<![A-Za-z0-9])base(?![A-Za-z0-9])", re.IGNORECASE), "BASE"),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])arbitrum(?:\s+one)?(?![A-Za-z0-9])",
+            re.IGNORECASE,
+        ),
+        "ARBITRUM",
+    ),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])(?:optimism|op\s*mainnet)(?![A-Za-z0-9])",
+            re.IGNORECASE,
+        ),
+        "OPTIMISM",
+    ),
+    (
+        re.compile(r"(?<![A-Za-z0-9])polygon(?![A-Za-z0-9])", re.IGNORECASE),
+        "POLYGON",
+    ),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])(?:tron|trx)(?![A-Za-z0-9])|波场",
+            re.IGNORECASE,
+        ),
+        "TRON",
+    ),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])(?:solana|sol)(?![A-Za-z0-9])|索拉纳",
+            re.IGNORECASE,
+        ),
+        "SOLANA",
+    ),
+)
 _TOKEN_SYMBOL = r"([A-Za-z][A-Za-z0-9()'`\-]*)"
 _NETWORK_QUALIFIER = (
     r"(?:(?:[A-Za-z]+(?:\s+[A-Za-z]+)?|[\u4e00-\u9fff]+)\s*上的)?"
@@ -140,6 +194,20 @@ def mentioned_amount_with_unit(value: str) -> tuple[str, str] | None:
         return None
     match = matches[0]
     return match.group(1), canonical_symbol(match.group(2))
+
+
+def transaction_query_hints(value: str) -> dict[str, str]:
+    """Extract explicit transaction lookup fields without inferring missing values."""
+    message = str(value).strip()
+    hints: dict[str, str] = {}
+    hash_match = _TRANSACTION_HASH_MENTION.search(message)
+    if hash_match:
+        hints["transaction_hash"] = hash_match.group(0)
+    for pattern, chain in _TRANSACTION_CHAIN_MENTIONS:
+        if pattern.search(message):
+            hints["transaction_chain"] = chain
+            break
+    return hints
 
 
 def chain_id_for(value: str) -> int | None:

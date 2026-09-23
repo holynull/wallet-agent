@@ -37,6 +37,7 @@ from wallet_agent.domain.normalization import (
     chain_id_for,
     mentioned_amount_with_unit,
     swap_direction_hints,
+    transaction_query_hints,
     unambiguous_amount_with_unit,
 )
 from wallet_agent.observability import wallet_event
@@ -1597,13 +1598,56 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
 
     wallet_tool_node = ToolNode([wallet_balance_tool], name="wallet_tools")
 
-    async def transaction_status_tool(chain: str, tx_hash: str) -> dict[str, Any]:
+    def local_transaction_status(
+        chain: str,
+        tx_hash: str,
+        broadcast_status: str | None,
+    ) -> dict[str, Any] | None:
+        if not broadcast_status:
+            return None
+        status = {
+            "not_propagated": "pending",
+            "broadcast_seen": "pending",
+            "broadcast_pending": "pending",
+            "confirmed": "confirmed",
+            "failed": "failed",
+            "dropped_or_replaced": "failed",
+            "unknown": "unknown",
+        }.get(broadcast_status)
+        if status is None:
+            return None
+        message = {
+            "not_propagated": "交易哈希暂时还没有在源链上出现，请稍后重试。",
+            "broadcast_seen": "源链已收到交易广播，正在等待链上确认。",
+            "broadcast_pending": "交易已广播，正在等待链上确认。",
+            "confirmed": "交易已确认。",
+            "failed": "交易执行失败或已回滚。",
+            "dropped_or_replaced": "交易可能已被丢弃或替换，请检查钱包 nonce。",
+            "unknown": "暂时无法确定交易状态。",
+        }[broadcast_status]
+        return {
+            "chain": str(chain).upper(),
+            "tx_hash": tx_hash,
+            "status": status,
+            "broadcast_status": broadcast_status,
+            "source": "local",
+            "message": message,
+        }
+
+    async def transaction_status_tool(
+        chain: str,
+        tx_hash: str,
+        broadcast_status: str | None = None,
+    ) -> dict[str, Any]:
         """Read a transaction status from the configured chain adapter."""
+        local = local_transaction_status(chain, tx_hash, broadcast_status)
         explorer = runtime.explorer_provider
         if explorer is not None and hasattr(explorer, "get_transaction_detail"):
             try:
                 detail = await explorer.get_transaction_detail(chain, tx_hash)
                 value = getattr(detail.status, "value", str(detail.status))
+                if value == "unknown" and local is not None:
+                    return {"ok": True, "transaction": local}
                 return {
                     "ok": True,
                     "transaction": {
@@ -1620,7 +1664,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     },
                 }
             except Exception as exc:
+                if local is not None:
+                    return {"ok": True, "transaction": local}
                 return {"ok": False, "code": "TRANSACTION_STATUS_FAILED", "error": str(exc)}
+        if local is not None:
+            return {"ok": True, "transaction": local}
         return {
             "ok": False,
             "code": "OKX_CAPABILITY_UNAVAILABLE",
@@ -1952,6 +2000,15 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             or state.get("request", {}).get("chain")
         )
         tx_hash = raw.get("tx_hash") or raw.get("transaction_hash")
+        pending = _mapping(state.get("pending_transaction"))
+        if not tx_hash and pending:
+            transaction = {
+                "chain": str(chain or pending.get("chain") or "").upper(),
+                "status": "not_broadcast",
+                "source": "local",
+                "message": "交易尚未广播，请先在钱包中签名并广播。",
+            }
+            return {"tool_result": {"ok": True, "transaction": transaction}}
         if not chain or not tx_hash:
             return {
                 "tool_result": {
@@ -1960,9 +2017,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "error": "请提供交易所在的链和交易哈希。",
                 }
             }
+        registered_hash = state.get("broadcast_tx_hash")
+        broadcast_status = None
+        if registered_hash and str(registered_hash).lower() == str(tx_hash).lower():
+            broadcast_status = state.get("broadcast_status")
         call = {
             "name": "transaction_status_tool",
-            "args": {"chain": str(chain), "tx_hash": str(tx_hash)},
+            "args": {
+                "chain": str(chain),
+                "tx_hash": str(tx_hash),
+                "broadcast_status": broadcast_status,
+            },
             "id": "transaction-status-1",
             "type": "tool_call",
         }
@@ -2624,6 +2689,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             merged = merge_task_patch(active_task, task_patch)
             active_task = merged.task
             task_update = {"active_task": active_task, **merged.invalidation}
+            if task_kind == "transfer" and any(
+                state.get(field) is not None
+                for field in (
+                    "broadcast_tx_hash",
+                    "broadcast_status",
+                    "transaction_query",
+                    "transaction_status_snapshot",
+                )
+            ):
+                task_update.update(
+                    broadcast_tx_hash=None,
+                    broadcast_status=None,
+                    transaction_query=None,
+                    transaction_status_snapshot=None,
+                )
             wallet_event(
                 "slot_merge",
                 "updated" if merged.changed_slots else "unchanged",
@@ -2897,24 +2977,125 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             }
         if intent_value == "transaction_status":
             draft = dict(state.get("transaction_query") or {})
-            draft.update(
-                {key: parsed[key] for key in _TRANSACTION_QUERY_KEYS if parsed.get(key) is not None}
+            previous_chain = draft.pop("transaction_chain", None)
+            previous_hash = draft.pop("transaction_hash", None)
+            if previous_chain is not None:
+                draft["chain"] = previous_chain
+            if previous_hash is not None:
+                draft["tx_hash"] = previous_hash
+
+            current_patch: dict[str, Any] = {}
+            extraction_error: Exception | None = None
+            patch_source: Any = parsed
+            if hasattr(runtime.model, "extract"):
+                extraction_request = dict(request)
+                extraction_request["conversation_history"] = state.get(
+                    "conversation_history"
+                ) or []
+                extraction_started = perf_counter()
+                _emit_progress(
+                    "slot_extraction",
+                    "started",
+                    message="正在提取交易查询参数。",
+                    task_kind="transaction_status",
+                )
+                try:
+                    patch_source = runtime.model.extract(
+                        "transaction_status", extraction_request
+                    )
+                    patch_source = (
+                        await patch_source
+                        if hasattr(patch_source, "__await__")
+                        else patch_source
+                    )
+                except Exception as exc:
+                    extraction_error = exc
+                    _emit_progress(
+                        "slot_extraction",
+                        "failed",
+                        started=extraction_started,
+                        message="交易查询参数提取失败。",
+                        task_kind="transaction_status",
+                        error_code="SLOT_EXTRACTION_FAILED",
+                    )
+                else:
+                    _emit_progress(
+                        "slot_extraction",
+                        "completed",
+                        started=extraction_started,
+                        message="交易查询参数提取完成。",
+                        task_kind="transaction_status",
+                    )
+            if extraction_error is None:
+                extracted = _dump(patch_source)
+                if isinstance(extracted, dict):
+                    current_patch.update(
+                        {
+                            key: extracted[key]
+                            for key in _TRANSACTION_QUERY_KEYS
+                            if extracted.get(key) not in (None, "")
+                        }
+                    )
+            current_patch.update(
+                {
+                    key: value
+                    for key, value in transaction_query_hints(message).items()
+                    if value not in (None, "")
+                }
             )
-            draft.setdefault("chain", draft.pop("transaction_chain", None))
-            draft.setdefault("tx_hash", draft.pop("transaction_hash", None))
-            missing = [field for field in ("chain", "tx_hash") if not draft.get(field)]
-            if missing:
+
+            explicit_chain = current_patch.get("transaction_chain")
+            explicit_hash = current_patch.get("transaction_hash")
+            if explicit_chain is not None:
+                draft["chain"] = explicit_chain
+            if explicit_hash is not None:
+                draft["tx_hash"] = explicit_hash
+
+            registered_hash = state.get("broadcast_tx_hash")
+            if registered_hash and explicit_hash is None:
+                draft["tx_hash"] = str(registered_hash)
+            if registered_hash and explicit_chain is None:
+                pending = _mapping(state.get("pending_transaction"))
+                if pending.get("chain"):
+                    draft["chain"] = str(pending["chain"])
+            if draft.get("chain"):
+                draft["chain"] = canonical_chain(str(draft["chain"]))
+            pending = _mapping(state.get("pending_transaction"))
+            if not registered_hash and explicit_hash is None and pending:
+                if not draft.get("chain") and pending.get("chain"):
+                    draft["chain"] = canonical_chain(str(pending["chain"]))
                 return {
+                    "intent": intent_value,
+                    "route": intent_value,
+                    "transaction_query": draft,
+                    "max_poll_attempts": runtime.max_poll_attempts,
+                }
+            missing = [field for field in ("chain", "tx_hash") if not draft.get(field)]
+            missing_fields = [
+                "transaction_chain" if field == "chain" else "transaction_hash"
+                for field in missing
+            ]
+            if missing:
+                result: dict[str, Any] = {
                     "intent": "clarification",
                     "route": "clarification",
                     "transaction_query": draft,
-                    "missing_fields": [f"transaction_{field}" for field in missing],
+                    "missing_fields": missing_fields,
                     "response": {
                         "kind": "clarification",
                         "message": "请提供交易所在链和交易哈希。",
-                        "missing_fields": [f"transaction_{field}" for field in missing],
+                        "missing_fields": missing_fields,
                     },
                 }
+                if extraction_error is not None:
+                    result["errors"] = [
+                        _error(
+                            "SLOT_EXTRACTION_FAILED",
+                            str(extraction_error),
+                            retryable=True,
+                        )
+                    ]
+                return result
             return {
                 "intent": intent_value,
                 "route": intent_value,

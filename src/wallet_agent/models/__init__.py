@@ -1,4 +1,9 @@
-from .contracts import RouteDecision, SwapSlotPatch, TransferSlotPatch
+from .contracts import (
+    RouteDecision,
+    SwapSlotPatch,
+    TransactionStatusSlotPatch,
+    TransferSlotPatch,
+)
 from .registry import ModelRegistry, ModelRouter
 
 __all__ = [
@@ -6,5 +11,6 @@ __all__ = [
     "ModelRouter",
     "RouteDecision",
     "SwapSlotPatch",
+    "TransactionStatusSlotPatch",
     "TransferSlotPatch",
 ]

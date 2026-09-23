@@ -5,6 +5,7 @@ from wallet_agent.domain.normalization import (
     chain_id_for,
     mentioned_amount_with_unit,
     swap_direction_hints,
+    transaction_query_hints,
     unambiguous_amount,
     unambiguous_amount_with_unit,
 )
@@ -75,3 +76,13 @@ def test_swap_direction_hints_understand_explicit_chinese_swap_grammar():
         "source_symbol": "USDC",
         "destination_symbol": "BNB",
     }
+
+
+def test_transaction_query_hints_match_chain_tokens_without_substrings():
+    tx_hash = "0x" + "a" * 64
+
+    assert transaction_query_hints(f"以太，{tx_hash}") == {
+        "transaction_chain": "ETH",
+        "transaction_hash": tx_hash,
+    }
+    assert transaction_query_hints("method coinbase resolution") == {}

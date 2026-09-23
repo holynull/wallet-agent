@@ -507,11 +507,20 @@ def create_app(
             return None
         state = {str(key): _jsonable(value) for key, value in state.items()}
         changes: dict[str, Any] = {}
+        effective_broadcast_tx_hash = (
+            state["broadcast_tx_hash"]
+            if "broadcast_tx_hash" in state
+            else current.broadcast_tx_hash
+        )
+        effective_broadcast_status = (
+            state["broadcast_status"]
+            if "broadcast_status" in state
+            else current.broadcast_status
+        )
         broadcast_lifecycle_active = bool(
-            current.broadcast_tx_hash
+            effective_broadcast_tx_hash
             or current.provider_order
             or current.order_status
-            or state.get("broadcast_tx_hash")
             or state.get("provider_orders")
             or state.get("status_snapshot")
         )
@@ -528,9 +537,11 @@ def create_app(
                 item if isinstance(item, NormalizedQuote) else NormalizedQuote.model_validate(item)
                 for item in candidates
             ]
-        pending = state.get("pending_transaction")
-        if pending:
-            if isinstance(pending, (UnsignedTransaction, DepositOrder)):
+        if "pending_transaction" in state:
+            pending = state["pending_transaction"]
+            if pending is None:
+                changes["pending_transaction"] = None
+            elif isinstance(pending, (UnsignedTransaction, DepositOrder)):
                 changes["pending_transaction"] = pending
             else:
                 try:
@@ -552,17 +563,27 @@ def create_app(
                 if isinstance(snapshot, NormalizedOrderStatus)
                 else NormalizedOrderStatus.model_validate(snapshot)
             )
-        tx_hash = state.get("broadcast_tx_hash")
-        if tx_hash:
-            changes["broadcast_tx_hash"] = str(tx_hash)
-        if state.get("broadcast_status") is not None:
-            changes["broadcast_status"] = str(state["broadcast_status"])
+        if "broadcast_tx_hash" in state:
+            changes["broadcast_tx_hash"] = (
+                str(effective_broadcast_tx_hash) if effective_broadcast_tx_hash else None
+            )
+        if "broadcast_status" in state:
+            changes["broadcast_status"] = (
+                str(effective_broadcast_status) if effective_broadcast_status else None
+            )
         if not broadcast_lifecycle_active:
             if state.get("authorization_stage") is not None:
                 changes["stage"] = state["authorization_stage"]
             elif state.get("task_stage") is not None:
                 changes["stage"] = state["task_stage"]
         response = state.get("response") or {}
+        if response.get("kind") == "transfer_prepare":
+            changes.update(
+                broadcast_tx_hash=None,
+                broadcast_status=None,
+                stage="transfer_ready",
+            )
+            broadcast_lifecycle_active = False
         if response.get("kind") == "swap_status":
             raw_status = response.get("status")
             order_state = (
@@ -1547,6 +1568,69 @@ def create_app(
         response = result.get("response") or {}
         status = "transfer_ready" if response.get("kind") == "transfer_prepare" else "failed"
         return _jsonable(await project_session(session_id, result, status=status) or result)
+
+    @app.post("/v1/transfer/{session_id}/broadcast")
+    async def broadcast_transfer(
+        request: Request, session_id: str, payload: BroadcastRequest
+    ) -> dict[str, Any]:
+        user_id = await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id=payload.user_id,
+        )
+        session = await owned_session(session_id, user_id)
+        if not _qualified_hash(payload.chain, payload.tx_hash):
+            raise HTTPException(
+                status_code=422, detail="tx_hash must be a chain-qualified transaction hash"
+            )
+        if session.quote is not None or session.provider_order is not None:
+            raise HTTPException(status_code=409, detail="session is not a transfer session")
+        pending = session.pending_transaction
+        if pending is None:
+            raise HTTPException(status_code=409, detail="transfer transaction is not prepared")
+        pending_chain = str(getattr(pending, "chain", ""))
+        if pending_chain.upper() != payload.chain.upper():
+            raise HTTPException(
+                status_code=409, detail="broadcast chain does not match prepared transfer"
+            )
+        if session.broadcast_tx_hash:
+            if session.broadcast_tx_hash == payload.tx_hash:
+                return _broadcast_response(session)
+            raise HTTPException(
+                status_code=409, detail="session already has a different broadcast hash"
+            )
+
+        try:
+            adapter = execution_adapter(payload.chain)
+        except Exception:
+            adapter = None
+        broadcast_status: BroadcastStatus = "unknown"
+        if adapter is not None and hasattr(adapter, "get_transaction_receipt"):
+            broadcast_status = await _chain_broadcast_status(
+                adapter,
+                payload.tx_hash,
+                sender=_display_text(session, "from", "sender", "sender_address"),
+                nonce=_display_int(session, "nonce", "transaction_nonce", "source_nonce"),
+            )
+        async with graph_lock(session.thread_id):
+            session = await owned_session(session_id, user_id)
+            if session.broadcast_tx_hash:
+                if session.broadcast_tx_hash == payload.tx_hash:
+                    return _broadcast_response(session)
+                raise HTTPException(
+                    status_code=409,
+                    detail="session already has a different broadcast hash",
+                )
+            updated = await session_store.update(
+                session_id,
+                expected_revision=session.revision,
+                status=broadcast_status,
+                stage=broadcast_status,
+                broadcast_status=broadcast_status,
+                broadcast_tx_hash=payload.tx_hash,
+            )
+        return _broadcast_response(updated, broadcast_status)
 
     @app.get("/v1/transactions/{chain}/{tx_hash}")
     async def transaction_status(

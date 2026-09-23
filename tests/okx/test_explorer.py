@@ -128,6 +128,24 @@ async def test_detail_maps_status_and_transaction_fields():
 
 
 @pytest.mark.asyncio
+async def test_detail_uses_requested_hash_when_okx_omits_hash_and_marks_unknown():
+    client = FakeClient(
+        {
+            "/api/v6/dex/post-transaction/transaction-detail-by-txhash": {
+                "code": "0",
+                "data": [{"chainIndex": "1"}],
+            }
+        }
+    )
+    adapter = OkxExplorerAdapter(client, {"ETH": "1"})
+
+    detail = await adapter.get_transaction_detail("ETH", TX_HASH)
+
+    assert detail.tx_hash == TX_HASH
+    assert detail.status is TransactionStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
 async def test_history_rejects_invalid_limit_and_unknown_chain():
     adapter = OkxExplorerAdapter(FakeClient({}), {"ETH": "1"})
     with pytest.raises(Exception, match="limit"):

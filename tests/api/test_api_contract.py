@@ -582,6 +582,79 @@ async def test_transfer_error_clears_stale_unsigned_transaction_from_session():
 
 
 @pytest.mark.asyncio
+async def test_new_transfer_prepare_clears_previous_broadcast_projection():
+    old_hash = "0x" + "a" * 64
+    new_transaction = UnsignedTransaction(
+        chain="ETH",
+        chain_id=1,
+        to="0x" + "2" * 40,
+        data="0x",
+        value="100000000000000",
+    )
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="new-transfer-session",
+            user_id="alice",
+            thread_id="new-transfer-thread",
+            status="not_propagated",
+            stage="not_propagated",
+            broadcast_tx_hash=old_hash,
+            broadcast_status="not_propagated",
+            pending_transaction=UnsignedTransaction(
+                chain="ETH", chain_id=1, to="0x" + "3" * 40, data="0x", value="1"
+            ),
+        )
+    )
+
+    class TransferGraph:
+        async def astream(self, _value, *, config, stream_mode):
+            del config, stream_mode
+            yield {"response": {"kind": "transfer_prepare"}}
+
+        def get_state(self, _config):
+            class Snapshot:
+                values = {
+                    "intent": "transfer",
+                    "response": {
+                        "kind": "transfer_prepare",
+                        "pending_transaction": new_transaction.model_dump(mode="json"),
+                    },
+                    "pending_transaction": new_transaction.model_dump(mode="json"),
+                    "preflight": {"ok": True},
+                    "task_stage": "ready_for_prepare",
+                }
+                tasks = ()
+                next = ()
+
+            return Snapshot()
+
+    app, client = await client_for(graph=TransferGraph(), store=store)
+    async with client:
+        response = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "session_id": "new-transfer-session",
+                "conversation_id": "new-transfer-thread",
+                "message": "转 0.0001 ETH",
+            },
+        )
+        await app.state.runs[response.json()["run_id"]]["task"]
+        session = await client.get(
+            "/v1/swap/new-transfer-session", params={"user_id": "alice"}
+        )
+
+    assert session.status_code == 200
+    body = session.json()
+    assert body["status"] == "transfer_ready"
+    assert body["stage"] == "transfer_ready"
+    assert body["broadcast_tx_hash"] is None
+    assert body["broadcast_status"] is None
+    assert body["pending_transaction"]["value"] == "100000000000000"
+
+
+@pytest.mark.asyncio
 async def test_parameter_clarification_projects_collecting_session_status():
     class ClarificationGraph:
         async def astream(self, _value, *, config, stream_mode):

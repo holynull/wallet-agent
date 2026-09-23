@@ -59,6 +59,13 @@ class TransferSlotPatch(UnderstandingModel):
     recipient: str | None = Field(default=None, description="用户明确指定的收款地址")
 
 
+class TransactionStatusSlotPatch(UnderstandingModel):
+    """Transaction lookup fields explicitly stated in the current message."""
+
+    transaction_chain: str | None = Field(default=None, description="交易所在网络")
+    transaction_hash: str | None = Field(default=None, description="用户提供的交易哈希")
+
+
 class SwapSlotPatch(UnderstandingModel):
     """Swap fields explicitly stated in the current user message."""
 

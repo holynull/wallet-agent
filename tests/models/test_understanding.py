@@ -20,7 +20,7 @@ class CapturingClient:
         return self.output
 
 
-def router_with_clients(*, classifier=None, transfer=None, swap=None):
+def router_with_clients(*, classifier=None, transfer=None, swap=None, transaction_status=None):
     classifier = classifier or CapturingClient(RouteDecision(intent="clarification"))
     return ModelRouter(
         ModelRegistry(
@@ -29,6 +29,9 @@ def router_with_clients(*, classifier=None, transfer=None, swap=None):
             extractors={
                 "transfer": {"deepseek-chat": transfer or CapturingClient(TransferSlotPatch())},
                 "swap": {"deepseek-chat": swap or CapturingClient(SwapSlotPatch())},
+                "transaction_status": {
+                    "deepseek-chat": transaction_status or CapturingClient({})
+                },
             },
         )
     )
@@ -107,6 +110,26 @@ async def test_swap_extractor_receives_existing_slots_and_explicit_schema():
     assert '"source_symbol": "USDC"' in prompt
     assert "‘换一些 USDT’" in prompt
     assert "destination_symbol，不是 source_symbol" in prompt
+
+
+@pytest.mark.asyncio
+async def test_transaction_status_extractor_preserves_chain_and_hash():
+    tx_hash = "0x" + "a" * 64
+    client = CapturingClient(
+        {"transaction_chain": "ETH", "transaction_hash": tx_hash}
+    )
+    router = router_with_clients(transaction_status=client)
+
+    patch = await router.extract(
+        "transaction_status",
+        {"message": f"以太，{tx_hash}"},
+    )
+
+    assert patch.transaction_chain == "ETH"
+    assert patch.transaction_hash == tx_hash
+    prompt = client.inputs[0][0].content
+    assert "transaction_chain" in prompt
+    assert "transaction_hash" in prompt
 
 
 @pytest.mark.asyncio

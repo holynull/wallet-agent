@@ -53,11 +53,12 @@ backend, set `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_BASE_URL` instead.
 The HTTP API is rooted at `/v1`: agent turns and SSE streaming, explicit swap
 quote selection (`/swap/{session_id}/select-quote`), expiring confirmation state,
 allowance/approval gating
-(`/approve-broadcast` then `/continue`), transfer preparation, token prices, and
-read-only wallet balances, transactions, fee estimates, and transaction status
-lookup (`/transactions/{chain}/{tx_hash}`). Transfer and swap preparation return
-machine-readable preflight checks before signing. The app must choose the
-returned `provider_reference`; the service never picks a quote silently.
+(`/approve-broadcast` then `/continue`), transfer preparation and broadcast-hash
+registration (`/transfer/{session_id}/broadcast`), token prices, and read-only
+wallet balances, transactions, fee estimates, and transaction status lookup
+(`/transactions/{chain}/{tx_hash}`). Transfer and swap preparation return
+machine-readable preflight checks before signing. The app must choose the returned
+`provider_reference`; the service never picks a quote silently.
 Use a stable `conversation_id` as the LangGraph `thread_id` when reconnecting.
 
 能力扩展路线见 [docs/wallet-agent-capability-roadmap.md](docs/wallet-agent-capability-roadmap.md)。
@@ -116,7 +117,8 @@ they are not presented as partially implemented capabilities.
 
 Do not put private keys, seed phrases, signer objects, wallet clients, or
 provider credentials in requests, prompts, checkpoints, logs, or issue
-reports. `/v1/swap/{session_id}/broadcast` accepts only a hash and chain.
+reports. `/v1/swap/{session_id}/broadcast` and
+`/v1/transfer/{session_id}/broadcast` accept only a hash and chain.
 The backend distinguishes `not_propagated` from `broadcast_pending`: a hash
 that is still absent from source-chain RPC is saved for retry, but Provider
 registration/polling does not start until the transaction is visible.
