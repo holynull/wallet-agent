@@ -1,9 +1,10 @@
 "use client";
 
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { classifyAgentTest, formatResponseSummary, parseSseFrames, providerPriority as getProviderPriority, responseMessage, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
+import { classifyAgentTest, formatProcessingDuration, formatResponseSummary, parseSseFrames, providerPriority as getProviderPriority, responseMessage, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
 
-type Message = { role: "user" | "assistant" | "system"; content: string };
+type Message = { id?: string; role: "user" | "assistant" | "system"; content: string; suggestions?: any[] };
+type ProgressEntry = { text: string; elapsed?: number };
 type Conversation = { conversation_id: string; session_id?: string; summary: string; status: string; updated_at: string };
 type Provider = { request: (args: { method: string; params?: unknown[] }) => Promise<any>; on?: (event: string, callback: (...args: any[]) => void) => void; providers?: Provider[]; name?: string; providerName?: string; walletName?: string; _name?: string; isMetaMask?: boolean; isCatWallet?: boolean; isCatwallet?: boolean; _isCatWallet?: boolean };
 type Quote = { provider?: string; provider_reference?: string; input_amount?: string; expected_output?: string; source_asset?: { symbol?: string }; destination_asset?: { symbol?: string } };
@@ -64,6 +65,9 @@ export default function Home() {
   const [message, setMessage] = useState("");
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [processing, setProcessing] = useState<{ label: string; startedAt: number } | null>(null);
+  const [processingElapsed, setProcessingElapsed] = useState(0);
   const [lastMessage, setLastMessage] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const [debug, setDebug] = useState<string[]>([]);
@@ -86,7 +90,9 @@ export default function Home() {
   const [assetsData, setAssetsData] = useState<any>(null);
   const [suggestions, setSuggestions] = useState<any[]>([]);
   const [tokenCandidates, setTokenCandidates] = useState<any[]>([]);
-  const [progress, setProgress] = useState<string[]>([]);
+  const [progress, setProgress] = useState<ProgressEntry[]>([]);
+  const [backendDuration, setBackendDuration] = useState<number | null>(null);
+  const [backendStage, setBackendStage] = useState("等待请求");
   const [agentTests, setAgentTests] = useState<Record<string, string>>({});
   const [historyOpen, setHistoryOpen] = useState(false);
   const messagesRef = useRef<HTMLDivElement>(null);
@@ -109,7 +115,33 @@ export default function Home() {
     try { await requestApi(`/v1/agent/conversations/${encodeURIComponent(id)}?user_id=browser-demo`, { method: "DELETE", headers }); if (id === conversationId) startNew(); await loadHistory(); }
     catch (error) { setMessages((current) => [...current, { role: "assistant", content: `删除对话失败：${error instanceof Error ? error.message : String(error)}` }]); }
   }
-  function clearConversationState() { abortRef.current?.abort(); abortRef.current = null; setBusy(false); setConversationId(null); setSessionId(null); setQuotes([]); setSelectedQuote(null); setPendingTransaction(null); setPendingKind("swap"); setBroadcastHash(null); setConfirmation(null); setApproval(null); setPreflight(null); setStatus(null); setWalletData(null); setPortfolioData(null); setPriceData(null); setGasData(null); setAssetsData(null); setSuggestions([]); setTokenCandidates([]); setProgress([]); responseKeysRef.current.clear(); }
+  function beginProcessing(label: string) { setProcessing({ label, startedAt: Date.now() }); setProcessingElapsed(0); }
+  function endProcessing() { setProcessing(null); setProcessingElapsed(0); }
+  async function runCardAction<T>(key: string, label: string, action: () => Promise<T>): Promise<T | undefined> {
+    if (actionLoading) return undefined;
+    setActionLoading(key);
+    beginProcessing(label);
+    try { return await action(); }
+    finally { setActionLoading(null); endProcessing(); }
+  }
+  function clearConversationState() { abortRef.current?.abort(); abortRef.current = null; setBusy(false); setActionLoading(null); endProcessing(); setConversationId(null); setSessionId(null); setQuotes([]); setSelectedQuote(null); setPendingTransaction(null); setPendingKind("swap"); setBroadcastHash(null); setConfirmation(null); setApproval(null); setPreflight(null); setStatus(null); setWalletData(null); setPortfolioData(null); setPriceData(null); setGasData(null); setAssetsData(null); setSuggestions([]); setTokenCandidates([]); setProgress([]); setBackendDuration(null); setBackendStage("等待请求"); responseKeysRef.current.clear(); }
+  function appendAssistantMessage(content: string, suggestions: any[] = []) {
+    const id = `assistant-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    let position = 0;
+    setMessages((current) => [...current, { id, role: "assistant", content: content.slice(0, 1), suggestions }]);
+    position = Math.min(1, content.length);
+    const timer = window.setInterval(() => {
+      position += 1;
+      setMessages((current) => {
+        const next = [...current];
+        const index = next.findIndex((item) => item.id === id);
+        if (index < 0) return current;
+        next[index] = { ...next[index], content: content.slice(0, position) };
+        return next;
+      });
+      if (position >= content.length) window.clearInterval(timer);
+    }, 18);
+  }
   function startNew() { clearConversationState(); setAgentTests({}); setDebug([]); setMessages([{ role: "assistant", content: "你好，我可以帮你查询余额、比较兑换报价，并准备未签名交易。告诉我你想做什么。" }]); }
   function chainName(id: string) { return ({ "0x1": "ETH", "0x38": "BSC", "0x89": "POLYGON", "0xa": "OPTIMISM", "0x2105": "BASE", "0xa4b1": "ARBITRUM" } as Record<string, string>)[id.toLowerCase()] ?? `EVM(${id})`; }
   function txValue(value: unknown) { if (value == null || value === "") return "0x0"; const text = String(value); return text.startsWith("0x") ? text : `0x${BigInt(text).toString(16)}`; }
@@ -253,6 +285,10 @@ export default function Home() {
     }
   }
   async function sendText(text: string, display = false, extraMetadata: Record<string, unknown> = {}) {
+    // Each request owns its own progress timeline; do not mix it with the prior turn.
+    setProgress([]);
+    setBackendDuration(null);
+    setBackendStage("正在处理请求");
     const body = await requestApi("/v1/agent/turn", { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", conversation_id: conversationId ?? undefined, session_id: sessionId ?? undefined, message: text, address: wallet?.address, chain: wallet?.chain, metadata: { ...(wallet ? { wallet_chain_id: wallet.chainId } : {}), ...extraMetadata } }), signal: abortRef.current?.signal });
     setConversationId(body.conversation_id); setSessionId(body.session_id ?? sessionId); log("API POST /v1/agent/turn", body); await readStream(body.run_id, true);
     if (display) setMessages((current) => [...current, { role: "system", content: "联调检查完成。" }]);
@@ -261,7 +297,7 @@ export default function Home() {
     const response = await fetch(`${API_BASE}/v1/agent/stream/${runId}`, { headers, signal: abortRef.current?.signal });
     if (!response.ok) { const raw = await response.text(); throw new Error(`SSE ${response.status}: ${raw || response.statusText}`); }
     if (!response.body) throw new Error("SSE stream unavailable");
-    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let assistant = ""; const events: any[] = [];
+    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let assistant = ""; let finalResponse: any = null; const events: any[] = [];
     const processFrame = (frame: string) => {
       const eventName = frame.match(/^event:\s*(.+)$/m)?.[1] || "message";
       const data = frame.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
@@ -271,9 +307,17 @@ export default function Home() {
         log(`SSE ${eventName}`, payload);
         const current = payload?.state || payload?.data?.state || payload?.data || payload;
         events.push({ event: eventName, payload, state: current });
+        const streamedResponse = ["response", "complete", "action_required"].includes(eventName)
+          ? current?.response?.response || current?.response || payload?.response
+          : null;
+        if (streamedResponse?.kind && eventName !== "progress") finalResponse = streamedResponse;
+        const progressValue = current?.progress || (eventName === "progress" ? current?.data || current : null);
+        const elapsed = Number(progressValue?.elapsed_ms);
+        if (progressValue && Number.isFinite(elapsed)) setBackendDuration(elapsed);
+        if (progressValue?.message || progressValue?.stage) setBackendStage(String(progressValue.message || progressValue.stage));
         if (render) applyState({ ...payload, event: eventName });
-        const content = current?.response?.message ?? payload?.response?.message;
-        if (content) assistant = content;
+        const content = streamedResponse?.message || current?.response?.message || payload?.response?.message;
+        if (content && eventName !== "progress") assistant = content;
       } catch { /* ignore malformed keepalive */ }
     };
     while (true) {
@@ -284,13 +328,43 @@ export default function Home() {
     }
     buffer += decoder.decode();
     if (buffer.trim()) processFrame(buffer);
-    if (render && assistant && !responseKeysRef.current.has(`fallback:${assistant}`)) { responseKeysRef.current.add(`fallback:${assistant}`); setMessages((current) => [...current, { role: "assistant", content: assistant }]); }
+    if (render && assistant && !finalResponse && !responseKeysRef.current.has(`fallback:${assistant}`)) { responseKeysRef.current.add(`fallback:${assistant}`); setMessages((current) => [...current, { role: "assistant", content: assistant }]); }
     return events;
   }
   async function selectQuote(reference: string) {
     if (!sessionId) { setMessages((current) => [...current, { role: "assistant", content: "当前没有兑换 session。请重新发起兑换。" }]); return; }
-    try { const body = await requestApi(`/v1/swap/${sessionId}/select-quote`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", provider_reference: reference }) }); setSelectedQuote(reference); applyState(body); setMessages((current) => [...current, { role: "system", content: "报价已选择，正在检查余额和 Allowance。" }]); }
-    catch (error) { setMessages((current) => [...current, { role: "assistant", content: `选择报价失败：${error instanceof Error ? error.message : String(error)}` }]); }
+    await runCardAction(`quote:${reference}`, "正在选择报价", async () => {
+      try { const body = await requestApi(`/v1/swap/${sessionId}/select-quote`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", provider_reference: reference }) }); setSelectedQuote(reference); applyState(body); setMessages((current) => [...current, { role: "system", content: "报价已选择，正在检查余额和 Allowance。" }]); }
+      catch (error) { setMessages((current) => [...current, { role: "assistant", content: `选择报价失败：${error instanceof Error ? error.message : String(error)}` }]); }
+    });
+  }
+  async function confirmSwap(approved: boolean) {
+    if (!sessionId) return;
+    await runCardAction(approved ? "confirm" : "cancel-confirmation", approved ? "正在确认兑换" : "正在取消兑换", async () => {
+      try { const body = await requestApi(`/v1/swap/${sessionId}/confirm`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", approved }) }); applyState(body); }
+      catch (error) { setMessages((current) => [...current, { role: "assistant", content: `${approved ? "确认" : "取消"}兑换失败：${error instanceof Error ? error.message : String(error)}` }]); }
+    });
+  }
+  async function approveSwap() {
+    if (!approval) return;
+    await runCardAction("approve", "正在提交 Approve", async () => {
+      try { const hash = await sendTransaction(approval); const body = await requestApi(`/v1/swap/${sessionId}/approve-broadcast`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", chain: approval.chain, approve_tx_hash: hash }) }); applyState(body); await waitForApproval(); }
+      catch (error) { setMessages((current) => [...current, { role: "assistant", content: `Approve 失败：${error instanceof Error ? error.message : String(error)}` }]); }
+    });
+  }
+  async function broadcastPendingTransaction() {
+    if (!pendingTransaction) return;
+    await runCardAction("broadcast", pendingKind === "transfer" ? "正在广播转账" : "正在广播兑换交易", async () => {
+      try { const hash = await sendTransaction(pendingTransaction); const path = pendingKind === "transfer" ? `/v1/transfer/${sessionId}/broadcast` : `/v1/swap/${sessionId}/broadcast`; const body = await requestApi(path, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", chain: pendingTransaction.chain, tx_hash: hash }) }); setBroadcastHash(hash); applyState({ ...body, tx_hash: hash }); }
+      catch (error) { setMessages((current) => [...current, { role: "assistant", content: `${pendingKind === "transfer" ? "转账" : "Swap"} 失败：${error instanceof Error ? error.message : String(error)}` }]); }
+    });
+  }
+  async function queryPendingTransaction() {
+    if (!pendingTransaction || !broadcastHash) return;
+    await runCardAction("transaction-status", "正在查询交易状态", async () => {
+      try { const body = await requestApi(`/v1/transactions/${encodeURIComponent(pendingTransaction.chain)}/${encodeURIComponent(broadcastHash)}`, { headers }); applyState({ kind: "transaction_status", ...body }); }
+      catch (error) { setMessages((current) => [...current, { role: "assistant", content: `查询交易状态失败：${error instanceof Error ? error.message : String(error)}` }]); }
+    });
   }
   function applyState(value: any) {
     const eventName = value?.event;
@@ -298,7 +372,14 @@ export default function Home() {
     if (eventName === "progress" || current?.progress) {
       const progressValue = current?.progress || current?.data || current;
       const progressText = progressValue?.message || progressValue?.stage;
-      if (progressText) setProgress((items) => [...items, String(progressText)].slice(-20));
+      const elapsed = Number(progressValue?.elapsed_ms);
+      if (Number.isFinite(elapsed)) setBackendDuration(elapsed);
+      if (progressText) {
+        const text = String(progressText);
+        const line = `${text}${Number.isFinite(elapsed) ? ` · ${elapsed} ms` : ""}`;
+        setBackendStage(text);
+        setProgress((items) => items.some((item) => item.text === text) ? items : [...items, { text, elapsed: Number.isFinite(elapsed) ? elapsed : undefined }].slice(-20));
+      }
     }
     if (current?.quote_candidates) setQuotes(current.quote_candidates);
     if (current?.selected_provider_reference) setSelectedQuote(current.selected_provider_reference);
@@ -307,7 +388,9 @@ export default function Home() {
     if (current?.approval_transaction) setApproval(current.approval_transaction);
     if (current?.confirmation_state) setConfirmation(current.confirmation_state);
     if (current?.preflight) setPreflight(current.preflight);
-    const response = current?.response?.response || current?.response || current;
+    const response = ["response", "complete", "action_required"].includes(eventName)
+      ? current?.response?.response || current?.response || current
+      : null;
     if (eventName === "error") setMessages((previous) => [...previous, { role: "assistant", content: current?.error?.message || responseMessage(current?.error) || "Agent 执行失败。" }]);
     if (response?.kind === "confirmation_required" && response.confirmation) setConfirmation(response.confirmation);
     if (response?.kind === "wallet_query") setWalletData(response.wallet || response);
@@ -315,23 +398,28 @@ export default function Home() {
     if (response?.kind === "price_query") setPriceData(response);
     if (response?.kind === "gas_check") setGasData(response);
     if (response?.kind === "asset_discovery") setAssetsData(response);
-    if (response?.kind === "clarification") { setSuggestions(response.suggestions || []); setTokenCandidates(response.token_candidates || []); }
+    if (response?.kind === "clarification") {
+      const nextSuggestions = response.suggestions || [];
+      setSuggestions(nextSuggestions);
+      setTokenCandidates(response.token_candidates || []);
+    }
     if (response?.kind === "swap_status" || response?.kind === "transaction_status") setStatus(response);
     const summary = response?.kind === "swap_quote"
       ? (response.quotes?.length ? `我找到了 ${response.quotes.length} 个兑换报价，请比较后选择一个 Provider。` : "暂时没有找到可用的兑换报价。")
       : formatResponseSummary(response);
-    if (summary) {
-      const key = `${response.kind || "response"}:${summary}`;
+    const finalMessage = response?.message || summary;
+    if (finalMessage) {
+      const key = `${response.kind || "response"}:${finalMessage}`;
       if (!responseKeysRef.current.has(key)) {
         responseKeysRef.current.add(key);
-        setMessages((previous) => [...previous, { role: "assistant", content: summary }]);
+        appendAssistantMessage(finalMessage, response?.kind === "clarification" ? response.suggestions || [] : []);
       }
     }
   }
   async function send(event?: FormEvent) {
     event?.preventDefault();
     const text = message.trim(); if (!text || busy) return;
-    setMessages((current) => [...current, { role: "user", content: text }]); setMessage(""); setLastMessage(text); setBusy(true); abortRef.current = new AbortController();
+    setMessages((current) => [...current, { role: "user", content: text }]); setMessage(""); setLastMessage(text); setBusy(true); beginProcessing("正在处理请求"); abortRef.current = new AbortController();
     try {
       if (/^(取消|停止|退出)(兑换|交易)?$/.test(text)) {
         if (sessionId) await requestApi(`/v1/swap/${sessionId}/cancel`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo" }) });
@@ -339,45 +427,50 @@ export default function Home() {
       } else if (/^(选|选择)(第)?一|1号|第一个/.test(text) && quotes.length) {
         await selectQuote(quotes[0].provider_reference || "");
       } else await sendText(text);
-    } catch (error) { if ((error as Error).name !== "AbortError") setMessages((current) => [...current, { role: "assistant", content: `请求失败：${error instanceof Error ? error.message : String(error)}` }]); } finally { setBusy(false); abortRef.current = null; }
+    } catch (error) { if ((error as Error).name !== "AbortError") setMessages((current) => [...current, { role: "assistant", content: `请求失败：${error instanceof Error ? error.message : String(error)}` }]); } finally { setBusy(false); endProcessing(); abortRef.current = null; }
+  }
+  function handleComposerKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void send(event);
+    }
   }
   async function cancelRequest() {
     if (sessionId) {
       try { await requestApi(`/v1/swap/${sessionId}/cancel`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo" }) }); }
       catch (error) { setMessages((current) => [...current, { role: "assistant", content: `取消兑换失败：${error instanceof Error ? error.message : String(error)}` }]); return; }
     }
-    abortRef.current?.abort(); setBusy(false); setMessages((current) => [...current, { role: "system", content: sessionId ? "已取消当前兑换和请求。" : "已取消本次请求。" }]);
+    abortRef.current?.abort(); setBusy(false); endProcessing(); setMessages((current) => [...current, { role: "system", content: sessionId ? "已取消当前兑换和请求。" : "已取消本次请求。" }]);
   }
-  async function chooseSuggestion(text: string, data?: Record<string, unknown>) { if (busy) return; setMessage(text); setMessages((current) => [...current, { role: "user", content: text }]); setLastMessage(text); setBusy(true); abortRef.current = new AbortController(); try { await sendText(text, false, data ? { suggestion_data: data } : {}); } catch (error) { if ((error as Error).name !== "AbortError") setMessages((current) => [...current, { role: "assistant", content: `请求失败：${error instanceof Error ? error.message : String(error)}` }]); } finally { setBusy(false); abortRef.current = null; setMessage(""); } }
+  async function chooseSuggestion(text: string, data?: Record<string, unknown>) { if (busy || actionLoading) return; setMessage(text); setMessages((current) => [...current, { role: "user", content: text }]); setLastMessage(text); setBusy(true); beginProcessing("正在处理请求"); abortRef.current = new AbortController(); try { await sendText(text, false, data ? { suggestion_data: data } : {}); } catch (error) { if ((error as Error).name !== "AbortError") setMessages((current) => [...current, { role: "assistant", content: `请求失败：${error instanceof Error ? error.message : String(error)}` }]); } finally { setBusy(false); endProcessing(); abortRef.current = null; setMessage(""); } }
   async function chooseToken(candidate: any) {
     const side = candidate.side === "source" ? "来源" : "目标";
     await chooseSuggestion(`${side} Token 合约地址是 ${candidate.address}，精度是 ${candidate.decimals}`);
   }
   async function retryLastMessage() {
     if (!lastMessage || busy) return;
-    setBusy(true); abortRef.current = new AbortController();
+    setBusy(true); beginProcessing("正在重试请求"); abortRef.current = new AbortController();
     try { await sendText(lastMessage); }
     catch (error) { if ((error as Error).name !== "AbortError") setMessages((current) => [...current, { role: "assistant", content: `请求失败：${error instanceof Error ? error.message : String(error)}` }]); }
-    finally { setBusy(false); abortRef.current = null; }
+    finally { setBusy(false); endProcessing(); abortRef.current = null; }
   }
   useEffect(() => {
     if (!messagesRef.current) return;
-    const nearBottom = messagesRef.current.scrollHeight - messagesRef.current.scrollTop - messagesRef.current.clientHeight < 64;
-    if (nearBottom) messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
+    messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
   }, [messages]);
-  return <main>
-    <header><h1>Wallet Agent Demo</h1><p>通过自然语言查询余额、兑换报价并准备交易。私钥不会发送到服务端。</p><div className="wallet-bar"><span className="wallet-status">{wallet ? `已连接：${wallet.chain} ${wallet.address.slice(0, 6)}…${wallet.address.slice(-4)}` : "未连接浏览器钱包"}</span><input className="token" type="password" placeholder="Bearer token（可选）" value={token} onChange={(event) => setToken(event.target.value)} /><button onClick={() => void connectWallet()}>{wallet ? "重新连接" : "连接钱包"}</button><button className="secondary" onClick={() => void refreshSession()}>刷新</button><button className="secondary" onClick={() => { setHistoryOpen(!historyOpen); if (!historyOpen) void loadHistory(); }}>历史</button></div></header>
-    {historyOpen && <section className="panel"><div className="toolbar"><button className="secondary" onClick={() => void loadHistory()}>重新加载</button><button className="secondary" onClick={startNew}>新建对话</button></div><div className="list">{conversations.length === 0 ? <p className="muted">暂无已保存的对话。</p> : conversations.map((item) => <div key={item.conversation_id} className="conversation"><button onClick={() => void loadConversation(item.conversation_id)}><strong>{item.summary}</strong><span>{new Date(item.updated_at).toLocaleString()} · {item.status}</span></button><button className="danger delete" onClick={() => void removeConversation(item.conversation_id)}>删除</button></div>)}</div></section>}
-    <section className="panel"><div className="toolbar"><button className="secondary" onClick={() => void runDebugSmoke()}>联调检查</button><button className="secondary" onClick={() => void runAgentTests()}>测试全部 Agent 功能</button></div>{Object.keys(agentTests).length > 0 && <div className="list">{AGENT_TESTS.map((item) => <div className="conversation" key={item.id}><strong>{item.name} · {item.intent}</strong><span>{agentTests[item.id] || "未运行"}</span></div>)}</div>}</section>
-    <div ref={messagesRef} id="messages">
-      {messages.map((item, index) => <div className={`message ${item.role}`} key={`${index}-${item.content}`}><div className="bubble">{item.content}</div></div>)}
-      {quotes.length > 0 && <section className="card"><h3>报价列表</h3>{quotes.map((quote) => <div className="quote" key={quote.provider_reference}><strong>{quote.provider} · {quote.provider_reference}</strong><span>{quote.input_amount} {quote.source_asset?.symbol} → {quote.expected_output} {quote.destination_asset?.symbol}</span><button className="secondary" disabled={!quote.provider_reference} onClick={() => void selectQuote(quote.provider_reference!)}>{selectedQuote === quote.provider_reference ? "已选择" : "选择此报价"}</button></div>)}</section>}
-      {confirmation?.status === "requested" && <section className="card"><h3>请确认兑换</h3><p>{confirmation.summary?.input_amount} {confirmation.summary?.source_asset?.symbol} → {confirmation.summary?.expected_output} {confirmation.summary?.destination_asset?.symbol}{confirmation.summary?.provider ? `\nProvider：${confirmation.summary.provider}` : ""}{confirmation.expires_at ? `\n有效期至：${confirmation.expires_at}` : ""}</p><div className="card-actions"><button onClick={async () => { try { const body = await requestApi(`/v1/swap/${sessionId}/confirm`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", approved: true }) }); applyState(body); } catch (error) { setMessages((current) => [...current, { role: "assistant", content: `确认兑换失败：${error instanceof Error ? error.message : String(error)}` }]); } }}>确认兑换</button><button className="secondary" onClick={async () => { try { const body = await requestApi(`/v1/swap/${sessionId}/confirm`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", approved: false }) }); applyState(body); } catch (error) { setMessages((current) => [...current, { role: "assistant", content: `取消兑换失败：${error instanceof Error ? error.message : String(error)}` }]); } }}>取消</button></div></section>}
+  useEffect(() => {
+    if (!processing) return;
+    const timer = window.setInterval(() => setProcessingElapsed(Date.now() - processing.startedAt), 100);
+    return () => window.clearInterval(timer);
+  }, [processing]);
+  const lastAssistantIndex = messages.map((item) => item.role).lastIndexOf("assistant");
+  function renderConversationCards() {
+    return <>
+      {quotes.length > 0 && <section className="card"><h3>报价列表</h3>{quotes.map((quote) => <div className="quote" key={quote.provider_reference}><strong>{quote.provider} · {quote.provider_reference}</strong><span>{quote.input_amount} {quote.source_asset?.symbol} → {quote.expected_output} {quote.destination_asset?.symbol}</span><button className="secondary" disabled={!quote.provider_reference || Boolean(actionLoading) || busy} onClick={() => void selectQuote(quote.provider_reference!)}>{actionLoading === `quote:${quote.provider_reference}` ? <><i className="loading-spinner" />处理中…</> : selectedQuote === quote.provider_reference ? "已选择" : "选择此报价"}</button></div>)}</section>}
+      {confirmation?.status === "requested" && <section className="card"><h3>请确认兑换</h3><p>{confirmation.summary?.input_amount} {confirmation.summary?.source_asset?.symbol} → {confirmation.summary?.expected_output} {confirmation.summary?.destination_asset?.symbol}{confirmation.summary?.provider ? `\nProvider：${confirmation.summary.provider}` : ""}{confirmation.expires_at ? `\n有效期至：${confirmation.expires_at}` : ""}</p><div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void confirmSwap(true)}>{actionLoading === "confirm" ? <><i className="loading-spinner" />处理中…</> : "确认兑换"}</button><button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void confirmSwap(false)}>{actionLoading === "cancel-confirmation" ? <><i className="loading-spinner" />处理中…</> : "取消"}</button></div></section>}
       {preflight && <section className="card"><h3>{preflight.ok ? "交易预检查通过" : "交易预检查未通过"}</h3><p>{preflight.gas_sources ? `Gas 来源：${Object.entries(preflight.gas_sources).map(([name, used]) => `${name}=${used ? "已用" : "未用"}`).join("、")}\n` : ""}{preflight.simulation?.success === false ? `模拟警告：${preflight.simulation.error || preflight.simulation.fail_reason || "simulation failed"}\n` : ""}{(preflight.checks || []).map((item: any) => `${item.status === "passed" ? "✓" : item.status === "warning" ? "!" : "×"} ${item.message}`).join("\n")}</p></section>}
-      {approval && <section className="card"><h3>需要 Approve 授权</h3><p>请确认授权额度，浏览器钱包会在本地弹窗签名。</p><pre className="debug">{JSON.stringify(approval, null, 2)}</pre><button onClick={async () => { try { const hash = await sendTransaction(approval); const body = await requestApi(`/v1/swap/${sessionId}/approve-broadcast`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", chain: approval.chain, approve_tx_hash: hash }) }); applyState(body); await waitForApproval(); } catch (error) { setMessages((current) => [...current, { role: "assistant", content: `Approve 失败：${error instanceof Error ? error.message : String(error)}` }]); } }}>钱包签名并广播 Approve</button></section>}
-      {pendingTransaction && <section className="card"><h3>{pendingKind === "transfer" ? "转账交易已准备好" : "兑换交易已准备好"}</h3><p>{pendingKind === "transfer" ? "请确认收款地址和金额，钱包会在当前转账链本地签名并广播。" : "请在钱包中确认未签名交易。"}</p><pre className="debug">{JSON.stringify(pendingTransaction, null, 2)}</pre><div className="card-actions"><button onClick={async () => { try { const hash = await sendTransaction(pendingTransaction); const path = pendingKind === "transfer" ? `/v1/transfer/${sessionId}/broadcast` : `/v1/swap/${sessionId}/broadcast`; const body = await requestApi(path, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", chain: pendingTransaction.chain, tx_hash: hash }) }); setBroadcastHash(hash); applyState({ ...body, tx_hash: hash }); } catch (error) { setMessages((current) => [...current, { role: "assistant", content: `${pendingKind === "transfer" ? "转账" : "Swap"} 失败：${error instanceof Error ? error.message : String(error)}` }]); } }}>钱包签名并广播{pendingKind === "transfer" ? "转账" : " Swap"}</button>{pendingKind === "transfer" && broadcastHash && <button className="secondary" onClick={async () => { try { const body = await requestApi(`/v1/transactions/${encodeURIComponent(pendingTransaction.chain)}/${encodeURIComponent(broadcastHash)}`, { headers }); applyState({ kind: "transaction_status", ...body }); } catch (error) { setMessages((current) => [...current, { role: "assistant", content: `查询交易状态失败：${error instanceof Error ? error.message : String(error)}` }]); } }}>查询交易状态</button>}</div></section>}
-      {progress.length > 0 && <section className="card"><h3>处理过程</h3><p>{progress.join("\n")}</p></section>}
-      {suggestions.length > 0 && <section className="card"><h3>建议</h3><div className="card-actions">{suggestions.map((item, index) => <button className="secondary" key={`${item.label || item.message}-${index}`} onClick={() => void chooseSuggestion(item.message || item.label || "", item.data)}>{item.label || item.message}</button>)}</div></section>}
+      {approval && <section className="card"><h3>需要 Approve 授权</h3><p>请确认授权额度，浏览器钱包会在本地弹窗签名。</p><pre className="debug">{JSON.stringify(approval, null, 2)}</pre><button disabled={Boolean(actionLoading) || busy} onClick={() => void approveSwap()}>{actionLoading === "approve" ? <><i className="loading-spinner" />处理中…</> : "钱包签名并广播 Approve"}</button></section>}
+      {pendingTransaction && <section className="card"><h3>{pendingKind === "transfer" ? "转账交易已准备好" : "兑换交易已准备好"}</h3><p>{pendingKind === "transfer" ? "请确认收款地址和金额，钱包会在当前转账链本地签名并广播。" : "请在钱包中确认未签名交易。"}</p><pre className="debug">{JSON.stringify(pendingTransaction, null, 2)}</pre><div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void broadcastPendingTransaction()}>{actionLoading === "broadcast" ? <><i className="loading-spinner" />处理中…</> : `钱包签名并广播${pendingKind === "transfer" ? "转账" : " Swap"}`}</button>{pendingKind === "transfer" && broadcastHash && <button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void queryPendingTransaction()}>{actionLoading === "transaction-status" ? <><i className="loading-spinner" />处理中…</> : "查询交易状态"}</button>}</div></section>}
       {tokenCandidates.length > 0 && <section className="card"><h3>请选择 Token</h3><div className="card-actions">{tokenCandidates.map((item, index) => <button className="secondary" key={`${item.address}-${index}`} onClick={() => void chooseToken(item)}>{index + 1}. {item.symbol} · {item.chain} · {String(item.address).slice(0, 8)}…</button>)}</div></section>}
       {walletData && <section className="card"><h3>钱包余额</h3><pre className="debug">{JSON.stringify(walletData, null, 2)}</pre></section>}
       {portfolioData && <section className="card"><h3>资产组合</h3><pre className="debug">{JSON.stringify(portfolioData, null, 2)}</pre></section>}
@@ -385,8 +478,20 @@ export default function Home() {
       {gasData && <section className="card"><h3>Gas 检查</h3><pre className="debug">{JSON.stringify(gasData, null, 2)}</pre></section>}
       {assetsData && <section className="card"><h3>Token 资产发现</h3><pre className="debug">{JSON.stringify(assetsData, null, 2)}</pre></section>}
       {status && <section className="card"><h3>订单状态</h3><p>{status.message || responseMessage(status) || status.status?.status || "处理中"}</p><pre className="debug">{JSON.stringify(status, null, 2)}</pre></section>}
+    </>;
+  }
+  return <main>
+    <header className="app-header"><div className="brand"><span className="brand-mark">W</span><div><h1>Wallet Agent</h1><p>智能钱包操作台 · 安全地查询、报价与准备交易</p></div></div><div className="wallet-bar"><span className={`wallet-status ${wallet ? "connected" : ""}`}><i />{wallet ? `${wallet.chain} · ${wallet.address.slice(0, 6)}…${wallet.address.slice(-4)}` : "未连接钱包"}</span><input className="token" type="password" placeholder="Bearer token（可选）" value={token} onChange={(event) => setToken(event.target.value)} /><button onClick={() => void connectWallet()}>{wallet ? "重新连接" : "连接钱包"}</button><button className="secondary" onClick={() => void refreshSession()}>刷新</button><button className="secondary" onClick={() => { setHistoryOpen(!historyOpen); if (!historyOpen) void loadHistory(); }}>历史</button></div></header>
+    <div className="workspace">
+      <section className="main-column">
+        {historyOpen && <section className="panel"><div className="toolbar"><button className="secondary" onClick={() => void loadHistory()}>重新加载</button><button className="secondary" onClick={startNew}>新建对话</button></div><div className="list">{conversations.length === 0 ? <p className="muted">暂无已保存的对话。</p> : conversations.map((item) => <div key={item.conversation_id} className="conversation"><button onClick={() => void loadConversation(item.conversation_id)}><strong>{item.summary}</strong><span>{new Date(item.updated_at).toLocaleString()} · {item.status}</span></button><button className="danger delete" onClick={() => void removeConversation(item.conversation_id)}>删除</button></div>)}</div></section>}
+        <section className="action-strip"><span>工具</span><button className="secondary" onClick={() => void runDebugSmoke()}>联调检查</button><button className="secondary" onClick={() => void runAgentTests()}>测试全部 Agent 功能</button></section>
+        <div ref={messagesRef} id="messages">
+      {messages.map((item, index) => <div className="message-group" key={item.id || `${index}-${item.content}`}><div className={`message ${item.role}`}><div className="message-stack">{item.role !== "system" && <div className="bubble">{item.content}</div>}{item.suggestions?.length ? <div className="inline-suggestions"><span>建议操作</span><div className="card-actions">{item.suggestions.map((suggestion, suggestionIndex) => <button className="secondary" disabled={busy || Boolean(actionLoading)} key={`${suggestion.label || suggestion.message}-${suggestionIndex}`} onClick={() => void chooseSuggestion(suggestion.message || suggestion.label || "", suggestion.data)}>{busy || actionLoading ? <><i className="loading-spinner" />处理中…</> : suggestion.label || suggestion.message}</button>)}</div></div> : null}</div></div>{item.role === "assistant" && index === lastAssistantIndex && renderConversationCards()}</div>)}
+        </div>
+        <form className="composer" onSubmit={send}><div className="composer-row"><textarea onKeyDown={handleComposerKeyDown} value={message} onChange={(event) => setMessage(event.target.value)} placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled={busy || Boolean(actionLoading)} /><button disabled={busy || Boolean(actionLoading)}>{busy ? <><i className="loading-spinner" />处理中…</> : "发送"}</button></div><div className="toolbar"><span className="muted">{processing ? `${processing.label} · ${formatProcessingDuration(processingElapsed)}` : "就绪"}</span>{busy && <button type="button" className="secondary" onClick={cancelRequest}>取消请求</button>}{!busy && !actionLoading && lastMessage && <button type="button" className="secondary" onClick={() => void retryLastMessage()}>重试</button>}</div><div className="meta"><span>conversation: {conversationId ?? "新会话"}</span><span>session: {sessionId ?? "未创建"}</span></div></form>
+      </section>
+      <aside className="side-column"><div className="side-card"><div className="side-title"><span>运行状态</span><b className={processing ? "busy" : "ready"}>{processing ? "处理中" : "就绪"}</b></div><div className="stat"><span>网络</span><strong>{wallet?.chain || "未连接"}</strong></div><div className="stat"><span>会话</span><strong>{sessionId ? "已建立" : "新会话"}</strong></div><div className="stat"><span>请求耗时</span><strong>{processing ? formatProcessingDuration(processingElapsed) : "--"}</strong></div><div className="stat"><span>后端耗时</span><strong>{backendDuration == null ? "--" : `${backendDuration} ms`}</strong></div><div className="stat"><span>当前阶段</span><strong className="stage-value">{processing?.label || backendStage}</strong></div></div>{progress.length > 0 && <section className="side-card progress-card"><div className="progress-heading"><h3>处理过程</h3><span>{backendDuration == null ? "进行中" : `${backendDuration} ms`}</span></div><ol className="progress-list">{progress.map((item, index) => <li key={`${item.text}-${index}`}><i /> <span>{item.text}{item.elapsed != null ? ` · ${item.elapsed} ms` : ""}</span></li>)}</ol></section>}<details className="panel debug-panel"><summary>后端调试数据（{debug.length} 条）</summary><div className="toolbar"><button className="secondary" onClick={() => navigator.clipboard?.writeText(debug.join("\n\n"))}>复制</button><button className="secondary" onClick={() => setDebug([])}>清空</button></div><pre className="debug">{debug.join("\n\n") || "等待后端响应…"}</pre></details>{Object.keys(agentTests).length > 0 && <div className="side-card test-card"><div className="side-title"><span>Agent 测试</span><b>{Object.values(agentTests).filter((value) => value.startsWith("通过")).length}/{AGENT_TESTS.length}</b></div><div className="test-list">{AGENT_TESTS.map((item) => <div key={item.id}><span>{item.name}</span><em>{agentTests[item.id] || "未运行"}</em></div>)}</div></div>}</aside>
     </div>
-    <details className="panel"><summary>后端调试数据（{debug.length} 条）</summary><div className="toolbar"><button className="secondary" onClick={() => navigator.clipboard?.writeText(debug.join("\n\n"))}>复制调试数据</button><button className="secondary" onClick={() => setDebug([])}>清空</button></div><pre className="debug">{debug.join("\n\n") || "等待后端响应…"}</pre></details>
-    <form className="composer" onSubmit={send}><div className="composer-row"><textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="例如：把 1 USDC 从 Base 换成 BSC 上的 USDT" disabled={busy} /><button disabled={busy}>{busy ? "处理中…" : "发送"}</button></div><div className="toolbar"><span className="muted">{busy ? "正在处理…" : "就绪"}</span>{busy && <button type="button" className="secondary" onClick={cancelRequest}>取消请求</button>}{!busy && lastMessage && <button type="button" className="secondary" onClick={() => void retryLastMessage()}>重试</button>}</div><div className="meta"><span>conversation: {conversationId ?? "新会话"}</span><span>session: {sessionId ?? "未创建"}</span></div></form>
   </main>;
 }

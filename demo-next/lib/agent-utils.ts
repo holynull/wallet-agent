@@ -3,6 +3,12 @@ export function parseSseFrames(buffer: string): { frames: string[]; remainder: s
   return { frames: frames.slice(0, -1), remainder: frames.at(-1) || "" };
 }
 
+export function formatProcessingDuration(milliseconds: number): string {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return "0 ms";
+  if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`;
+  return `${(milliseconds / 1000).toFixed(1)} s`;
+}
+
 export function responseMessage(response: any): string {
   if (!response || typeof response !== "object") return "";
   if (response.kind === "error" && Array.isArray(response.errors)) {

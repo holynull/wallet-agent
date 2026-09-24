@@ -14,6 +14,7 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.types import Command
@@ -409,6 +410,16 @@ def create_app(
                     await close()
 
     app = FastAPI(title="Wallet Agent", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     session_store = store or InMemorySessionStore()
     provider_map = dict(providers or {})
     app.state.graph = graph
@@ -833,11 +844,18 @@ def create_app(
                             # Compatibility with graph doubles and older graph
                             # implementations that return update chunks directly.
                             mode, event = "updates", streamed
+                        # Keep transport semantics explicit: custom writer payloads
+                        # are progress, while graph state responses are user-facing
+                        # only when they contain a typed response object.
+                        if mode == "updates" and isinstance(event, Mapping):
+                            response_value = event.get("response")
+                            if isinstance(response_value, Mapping):
+                                event = {"response": _jsonable(response_value)}
+                        event_name = "progress" if mode == "custom" else (
+                            "response" if isinstance(event, Mapping) and isinstance(event.get("response"), Mapping) else "update"
+                        )
                         app.state.runs[run_id]["events"].append(
-                            {
-                                "event": "progress" if mode == "custom" else "update",
-                                "data": event,
-                            }
+                            {"event": event_name, "data": event}
                         )
                     snapshot = await get_snapshot()
                     return dict(snapshot.values)

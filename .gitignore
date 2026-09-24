@@ -6,6 +6,9 @@ __pycache__/
 .venv/
 demo-next/node_modules/
 demo-next/.next/
+*.tsbuildinfo
+.playwright-mcp/
+artifacts/
 *.py[cod]
 .env
 .env.local

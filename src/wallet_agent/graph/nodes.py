@@ -97,6 +97,8 @@ def _response_fallback(intent: str, missing: list[str], language: str) -> str:
             labels = [phrases[item] for item in missing if item in phrases]
             return f"请补充{'、'.join(labels) or '这笔转账所需的信息'}。"
         if intent == "swap_quote":
+            if missing == ["input_amount"]:
+                return "你要使用的 USDC 数量是多少？"
             return "请告诉我想换出的资产、目标资产和数量。"
         return "请再告诉我一些具体信息。"
     if intent == "transfer":
@@ -769,6 +771,9 @@ def _clarification_message(
         "recipient_address": "接收地址",
     }
     if swap and missing:
+        if missing == ["input_amount"] and message is None:
+            source_symbol = "USDC"
+            return f"你要使用的 {source_symbol} 数量是多少？"
         readable = [labels.get(item, item) for item in missing]
         return f"可以帮你兑换。还需要确认：{'、'.join(readable)}。"
     if message:

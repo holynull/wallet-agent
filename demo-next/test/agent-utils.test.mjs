@@ -3,12 +3,19 @@ import test from "node:test";
 import {
   classifyAgentTest,
   formatResponseSummary,
+  formatProcessingDuration,
   parseSseFrames,
   providerPriority,
   responseMessage,
   sanitizeDebug,
   transactionChainId,
 } from "../lib/agent-utils.ts";
+
+test("formats processing duration for an active request", () => {
+  assert.equal(formatProcessingDuration(0), "0 ms");
+  assert.equal(formatProcessingDuration(438), "438 ms");
+  assert.equal(formatProcessingDuration(1542), "1.5 s");
+});
 
 test("parses complete SSE frames and preserves partial remainder", () => {
   assert.deepEqual(parseSseFrames("event: update\ndata: {}\n\nevent: complete\ndata:"), {
