@@ -44,14 +44,17 @@ function providerText(entry: any): string {
     entry?.provider?.name,
     entry?.provider?.providerName,
     entry?.provider?.walletName,
+    entry?.provider?._name,
+    entry?.provider?._isMetaMask,
+    entry?.provider?._isCatWallet,
   ].filter(Boolean).join(" ").toLowerCase();
 }
 
 export function providerPriority(entry: any): number {
   const text = providerText(entry);
   const provider = entry?.provider || {};
-  if (provider.isMetaMask === true || text.includes("metamask") || text.includes("io.metamask")) return 0;
-  if (provider.isCatWallet === true || provider.isCatwallet === true || text.includes("catwallet") || text.includes("cat wallet")) return 1;
+  if (provider.isMetaMask === true || provider._isMetaMask === true || text.includes("metamask") || text.includes("io.metamask")) return 0;
+  if (provider.isCatWallet === true || provider.isCatwallet === true || provider._isCatWallet === true || text.includes("catwallet") || text.includes("cat wallet")) return 1;
   if (entry?.source === "window.ethereum") return 2;
   if (entry?.source === "window.ethereum.providers") return 3;
   if (entry?.source === "eip6963") return 4;

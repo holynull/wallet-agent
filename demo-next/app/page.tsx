@@ -5,7 +5,7 @@ import { classifyAgentTest, formatResponseSummary, parseSseFrames, providerPrior
 
 type Message = { role: "user" | "assistant" | "system"; content: string };
 type Conversation = { conversation_id: string; session_id?: string; summary: string; status: string; updated_at: string };
-type Provider = { request: (args: { method: string; params?: unknown[] }) => Promise<any>; on?: (event: string, callback: (...args: any[]) => void) => void; providers?: Provider[]; name?: string; providerName?: string; walletName?: string; isCatWallet?: boolean; isCatwallet?: boolean };
+type Provider = { request: (args: { method: string; params?: unknown[] }) => Promise<any>; on?: (event: string, callback: (...args: any[]) => void) => void; providers?: Provider[]; name?: string; providerName?: string; walletName?: string; _name?: string; isMetaMask?: boolean; isCatWallet?: boolean; isCatwallet?: boolean; _isCatWallet?: boolean };
 type Quote = { provider?: string; provider_reference?: string; input_amount?: string; expected_output?: string; source_asset?: { symbol?: string }; destination_asset?: { symbol?: string } };
 type AgentTest = {
   id: string;
@@ -69,6 +69,7 @@ export default function Home() {
   const [debug, setDebug] = useState<string[]>([]);
   const [wallet, setWallet] = useState<{ provider: Provider; address: string; chainId: string; chain: string } | null>(null);
   const [walletProviders, setWalletProviders] = useState<Array<{ info?: any; provider: Provider; source?: string }>>([]);
+  const walletProvidersRef = useRef<Array<{ info?: any; provider: Provider; source?: string }>>([]);
   const [quotes, setQuotes] = useState<Quote[]>([]);
   const [selectedQuote, setSelectedQuote] = useState<string | null>(null);
   const [pendingTransaction, setPendingTransaction] = useState<any>(null);
@@ -118,7 +119,14 @@ export default function Home() {
   useEffect(() => {
     const announce = (event: Event) => {
       const detail = (event as CustomEvent).detail;
-      if (detail?.provider) setWalletProviders((items) => items.some((item) => item.provider === detail.provider) ? items : [...items, { ...detail, source: "eip6963" }]);
+      if (detail?.provider) setWalletProviders((items) => {
+        const existing = items.find((item) => item.provider === detail.provider);
+        const next = existing
+          ? items.map((item) => item === existing ? { ...item, info: item.info || detail.info, source: [item.source, "eip6963"].filter(Boolean).join(" ") } : item)
+          : [...items, { ...detail, source: "eip6963" }];
+        walletProvidersRef.current = next;
+        return next;
+      });
     };
     window.addEventListener("eip6963:announceProvider", announce);
     window.dispatchEvent(new Event("eip6963:requestProvider"));
@@ -130,11 +138,33 @@ export default function Home() {
     const injectedProviders = injected?.providers ?? [];
     if (injectedProviders.length) candidates.push(...injectedProviders.map((provider: Provider) => ({ provider, source: "window.ethereum.providers" })));
     if (injected) candidates.push({ provider: injected, source: "window.ethereum" });
-    candidates.forEach((candidate) => setWalletProviders((items) => items.some((item) => item.provider === candidate.provider) ? items : [...items, candidate]));
+    candidates.forEach((candidate) => setWalletProviders((items) => {
+      const next = items.some((item) => item.provider === candidate.provider) ? items : [...items, candidate];
+      walletProvidersRef.current = next;
+      return next;
+    }));
     return () => window.removeEventListener("eip6963:announceProvider", announce);
   }, []);
   async function connectWallet() {
-    const provider = walletProviders.slice().sort((left, right) => providerPriority(left) - providerPriority(right))[0]?.provider || (window as any).ethereum as Provider | undefined;
+    const injectedWindow = window as any;
+    const rememberInjected = () => {
+      const candidates: Array<{ provider: Provider; source: string }> = [];
+      if (injectedWindow.catWallet) candidates.push({ provider: injectedWindow.catWallet, source: "window.catWallet" });
+      if (injectedWindow.catwallet) candidates.push({ provider: injectedWindow.catwallet, source: "window.catwallet" });
+      const injected = injectedWindow.ethereum as Provider | undefined;
+      if (injected && Array.isArray(injected.providers)) candidates.push(...injected.providers.map((provider: Provider) => ({ provider, source: "window.ethereum.providers" })));
+      if (injected) candidates.push({ provider: injected, source: "window.ethereum" });
+      if (candidates.length) setWalletProviders((items) => {
+        const next = candidates.reduce((all, candidate) => all.some((item) => item.provider === candidate.provider) ? all : [...all, candidate], items);
+        walletProvidersRef.current = next;
+        return next;
+      });
+    };
+    rememberInjected();
+    injectedWindow.dispatchEvent(new Event("eip6963:requestProvider"));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    rememberInjected();
+    const provider = walletProvidersRef.current.slice().sort((left, right) => providerPriority(left) - providerPriority(right))[0]?.provider || injectedWindow.ethereum as Provider | undefined;
     if (!provider) { setMessages((current) => [...current, { role: "assistant", content: "没有检测到浏览器钱包插件。" }]); return; }
     try {
       const accounts = await provider.request({ method: "eth_requestAccounts" }); const chainId = await provider.request({ method: "eth_chainId" });

@@ -35,6 +35,7 @@ test("prioritizes MetaMask over CatWallet and generic injected providers", () =>
   const generic = { provider: {}, source: "window.ethereum" };
   assert.ok(providerPriority(metamask) < providerPriority(catwallet));
   assert.ok(providerPriority(metamask) < providerPriority(generic));
+  assert.ok(providerPriority({ provider: { _isMetaMask: true }, source: "window.ethereum" }) < providerPriority(catwallet));
 });
 
 test("formats readable response summaries for wallet and gas results", () => {
