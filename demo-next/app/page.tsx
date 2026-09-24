@@ -29,7 +29,7 @@ export default function Home() {
   function log(label: string, value: unknown) {
     setDebug((current) => [...current, `[${new Date().toISOString()}] ${label}\n${JSON.stringify(value, null, 2)}`].slice(-100));
   }
-  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
   async function loadHistory() {
     const body = await requestApi("/v1/agent/conversations?user_id=browser-demo", { headers });
     setConversations(body.conversations ?? []); log("CONVERSATIONS", body);
