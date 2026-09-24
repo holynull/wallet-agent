@@ -29,6 +29,13 @@ header p { margin: 5px 0 12px; color: #9aa8bb; font-size: 12px; }
 .bubble { max-width: 88%; padding: 11px 13px; border-radius: 14px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .user .bubble { background: #2f5fc9; border-bottom-right-radius: 4px; }
 .assistant .bubble { background: #202a37; border: 1px solid #304055; border-bottom-left-radius: 4px; }
+.card { margin: 10px 0; padding: 13px; border: 1px solid #344256; border-radius: 12px; background: #18212d; }
+.card h3 { margin: 0 0 9px; font-size: 14px; }
+.card p { margin: 6px 0; color: #bdc8d7; font-size: 12px; white-space: pre-line; }
+.card pre { max-height: 220px; margin: 8px 0; padding: 10px; overflow: auto; border-radius: 8px; background: #0a0f15; color: #c9d5e5; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.quote { display: grid; gap: 6px; margin-top: 8px; padding: 10px; border: 1px solid #3b4b63; border-radius: 9px; background: #121a24; }
+.quote span { color: #afbdcf; font-size: 12px; }
+.card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .system .bubble { width: 100%; color: #9aa8bb; background: transparent; font-size: 12px; text-align: center; }
 .composer { position: sticky; bottom: 0; padding: 10px 12px 14px; border-top: 1px solid #283242; background: #111821; }
 textarea { flex: 1; min-height: 42px; max-height: 130px; resize: vertical; padding: 11px; border: 1px solid #3b4b63; border-radius: 9px; color: white; background: #0d141d; }
