@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+demo-next/node_modules/
+demo-next/.next/
 *.py[cod]
 .env
 .env.local
