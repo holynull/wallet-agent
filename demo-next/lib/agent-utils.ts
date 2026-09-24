@@ -35,6 +35,29 @@ export function transactionChainId(transaction: any): number | string | undefine
   return chainIds[chain];
 }
 
+function providerText(entry: any): string {
+  return [
+    entry?.source,
+    entry?.info?.name,
+    entry?.info?.rdns,
+    entry?.info?.uuid,
+    entry?.provider?.name,
+    entry?.provider?.providerName,
+    entry?.provider?.walletName,
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+export function providerPriority(entry: any): number {
+  const text = providerText(entry);
+  const provider = entry?.provider || {};
+  if (provider.isMetaMask === true || text.includes("metamask") || text.includes("io.metamask")) return 0;
+  if (provider.isCatWallet === true || provider.isCatwallet === true || text.includes("catwallet") || text.includes("cat wallet")) return 1;
+  if (entry?.source === "window.ethereum") return 2;
+  if (entry?.source === "window.ethereum.providers") return 3;
+  if (entry?.source === "eip6963") return 4;
+  return 5;
+}
+
 export function formatResponseSummary(response: any): string {
   if (!response || typeof response !== "object") return "";
   if (response.kind === "wallet_query") {

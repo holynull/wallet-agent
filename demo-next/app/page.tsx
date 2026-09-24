@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { classifyAgentTest, formatResponseSummary, parseSseFrames, responseMessage, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
+import { classifyAgentTest, formatResponseSummary, parseSseFrames, providerPriority as getProviderPriority, responseMessage, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
 
 type Message = { role: "user" | "assistant" | "system"; content: string };
 type Conversation = { conversation_id: string; session_id?: string; summary: string; status: string; updated_at: string };
@@ -112,19 +112,8 @@ export default function Home() {
   function startNew() { clearConversationState(); setAgentTests({}); setDebug([]); setMessages([{ role: "assistant", content: "你好，我可以帮你查询余额、比较兑换报价，并准备未签名交易。告诉我你想做什么。" }]); }
   function chainName(id: string) { return ({ "0x1": "ETH", "0x38": "BSC", "0x89": "POLYGON", "0xa": "OPTIMISM", "0x2105": "BASE", "0xa4b1": "ARBITRUM" } as Record<string, string>)[id.toLowerCase()] ?? `EVM(${id})`; }
   function txValue(value: unknown) { if (value == null || value === "") return "0x0"; const text = String(value); return text.startsWith("0x") ? text : `0x${BigInt(text).toString(16)}`; }
-  function providerText(entry: { info?: any; provider: Provider; source?: string }) {
-    return [entry.info?.name, entry.info?.rdns, entry.info?.uuid, entry.provider?.name, entry.provider?.providerName, entry.provider?.walletName, entry.source]
-      .filter(Boolean).join(" ").toLowerCase();
-  }
-  function isCatWallet(entry: { info?: any; provider: Provider; source?: string }) {
-    return providerText(entry).includes("catwallet") || providerText(entry).includes("cat wallet")
-      || entry.provider?.isCatWallet === true || entry.provider?.isCatwallet === true;
-  }
   function providerPriority(entry: { info?: any; provider: Provider; source?: string }) {
-    if (isCatWallet(entry)) return 0;
-    if (entry.source === "window.ethereum") return 2;
-    if (entry.source === "window.ethereum.providers") return 3;
-    return 4;
+    return getProviderPriority(entry);
   }
   useEffect(() => {
     const announce = (event: Event) => {

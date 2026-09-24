@@ -4,6 +4,7 @@ import {
   classifyAgentTest,
   formatResponseSummary,
   parseSseFrames,
+  providerPriority,
   responseMessage,
   sanitizeDebug,
   transactionChainId,
@@ -26,6 +27,14 @@ test("maps status responses to user-facing text", () => {
 test("derives transaction chain id from a named chain when chain_id is absent", () => {
   assert.equal(transactionChainId({ chain: "BASE" }), 8453);
   assert.equal(transactionChainId({ chain: "BSC", chain_id: 56 }), 56);
+});
+
+test("prioritizes MetaMask over CatWallet and generic injected providers", () => {
+  const metamask = { info: { name: "MetaMask", rdns: "io.metamask" }, provider: { isMetaMask: true }, source: "eip6963" };
+  const catwallet = { info: { name: "CatWallet" }, provider: { isCatWallet: true }, source: "window.catWallet" };
+  const generic = { provider: {}, source: "window.ethereum" };
+  assert.ok(providerPriority(metamask) < providerPriority(catwallet));
+  assert.ok(providerPriority(metamask) < providerPriority(generic));
 });
 
 test("formats readable response summaries for wallet and gas results", () => {
