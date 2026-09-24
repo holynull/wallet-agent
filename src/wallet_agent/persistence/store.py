@@ -66,6 +66,8 @@ class SessionRevisionConflict(RuntimeError):
 class SessionStore(Protocol):
     async def save(self, session: SwapSessionRecord) -> SwapSessionRecord: ...
     async def get(self, session_id: str) -> SwapSessionRecord | None: ...
+    async def list_for_user(self, user_id: str, *, limit: int = 50) -> list[SwapSessionRecord]: ...
+    async def delete(self, session_id: str, *, user_id: str) -> bool: ...
     async def update(
         self,
         session_id: str,
@@ -89,6 +91,22 @@ class InMemorySessionStore:
         async with self._lock:
             session = self._sessions.get(session_id)
             return session.model_copy(deep=True) if session is not None else None
+
+    async def list_for_user(self, user_id: str, *, limit: int = 50) -> list[SwapSessionRecord]:
+        async with self._lock:
+            sessions = [
+                session for session in self._sessions.values() if session.user_id == user_id
+            ]
+            sessions.sort(key=lambda item: item.updated_at, reverse=True)
+            return [session.model_copy(deep=True) for session in sessions[:limit]]
+
+    async def delete(self, session_id: str, *, user_id: str) -> bool:
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or session.user_id != user_id:
+                return False
+            del self._sessions[session_id]
+            return True
 
     async def update(
         self,
@@ -167,6 +185,33 @@ class SqliteSessionStore:
         async with self.session_factory() as db:
             row = await db.get(self.row_model, session_id)
             return SwapSessionRecord.model_validate_json(row.payload) if row else None
+
+    async def list_for_user(self, user_id: str, *, limit: int = 50) -> list[SwapSessionRecord]:
+        from sqlalchemy import select
+
+        await self._ensure_init()
+        async with self.session_factory() as db:
+            rows = await db.execute(
+                select(self.row_model)
+                .where(self.row_model.user_id == user_id)
+                .order_by(self.row_model.revision.desc())
+                .limit(limit)
+            )
+            return [SwapSessionRecord.model_validate_json(row.payload) for row in rows.scalars()]
+
+    async def delete(self, session_id: str, *, user_id: str) -> bool:
+        from sqlalchemy import delete
+
+        await self._ensure_init()
+        async with self.session_factory() as db:
+            result = await db.execute(
+                delete(self.row_model).where(
+                    self.row_model.session_id == session_id,
+                    self.row_model.user_id == user_id,
+                )
+            )
+            await db.commit()
+            return result.rowcount == 1
 
     async def update(
         self,

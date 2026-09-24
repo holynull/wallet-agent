@@ -58,12 +58,8 @@ class Provider:
 
     async def list_assets(self, query: AssetQuery):
         assets = {
-            "USDC": Asset(
-                chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address=USDC
-            ),
-            "USDT": Asset(
-                chain="BASE", chain_id=8453, symbol="USDT", decimals=6, address=USDT
-            ),
+            "USDC": Asset(chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address=USDC),
+            "USDT": Asset(chain="BASE", chain_id=8453, symbol="USDT", decimals=6, address=USDT),
         }
         asset = assets.get(str(query.search).upper())
         return [asset] if asset and str(query.chain).upper() == "BASE" else []
@@ -529,6 +525,7 @@ async def test_ethereum_swap_resolves_provider_metadata_then_quotes_amount_with_
     assert first["active_task"]["slots"] == {"destination_symbol": "USDT"}
     assert "destination_symbol" not in first["response"]["missing_fields"]
     assert first["response"]["suggestions"][0]["message"] == "用当前网络上的 USDC 换"
+    assert first["response"]["suggestions"][0]["data"]["destination_symbol"] == "USDT"
     await graph.ainvoke(
         {
             "conversation_id": "task-ethereum-catalog",
@@ -555,7 +552,19 @@ async def test_ethereum_swap_resolves_provider_metadata_then_quotes_amount_with_
     assert third["response"]["kind"] == "clarification"
     assert third["response"]["missing_fields"] == ["input_amount"]
     assert third["response"]["suggestions"] == [
-        {"label": "填写 USDC 数量", "message": "请输入 USDC 数量"}
+        {
+            "label": "填写 USDC 数量",
+            "message": "请输入 USDC 数量",
+            "data": {
+                "intent": "swap_quote",
+                "destination_symbol": "USDT",
+                "destination_chain": "ETH",
+                "destination_token_address": USDT,
+                "source_chain": "ETH",
+                "source_symbol": "USDC",
+                "source_token_address": USDC,
+            },
+        }
     ]
     assert third["active_task"]["revision"] == 3
     assert third["active_task"]["slots"] == {
@@ -626,6 +635,13 @@ async def test_swap_suggests_known_source_chain_instead_of_different_wallet_chai
     assert result["response"]["suggestions"][0] == {
         "label": "目标也在 ETH 网络",
         "message": "目标也在 ETH 链",
+        "data": {
+            "intent": "swap_quote",
+            "source_chain": "ETH",
+            "source_symbol": "USDC",
+            "destination_symbol": "USDT",
+            "source_token_address": USDC,
+        },
     }
 
 

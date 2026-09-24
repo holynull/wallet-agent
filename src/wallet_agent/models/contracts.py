@@ -27,6 +27,18 @@ class UnderstandingModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ResponseSuggestion(UnderstandingModel):
+    label: str = Field(min_length=1, max_length=120)
+    message: str = Field(min_length=1, max_length=500)
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentResponseDraft(UnderstandingModel):
+    language: str = Field(min_length=2, max_length=16)
+    message: str = Field(min_length=1, max_length=2000)
+    suggestions: list[ResponseSuggestion] = Field(default_factory=list, max_length=3)
+
+
 class RouteDecision(UnderstandingModel):
     """Task classification only; capability slots use separate schemas."""
 
@@ -47,15 +59,11 @@ class TransferSlotPatch(UnderstandingModel):
 
     chain: str | None = Field(default=None, description="用户指定的转账网络")
     symbol: str | None = Field(default=None, description="用户要转出的资产符号")
-    token_address: str | None = Field(
-        default=None, description="用户明确提供的 Token 合约地址"
-    )
+    token_address: str | None = Field(default=None, description="用户明确提供的 Token 合约地址")
     decimals: int | None = Field(
         default=None, ge=0, le=255, description="用户明确提供的 Token 精度"
     )
-    amount: str | None = Field(
-        default=None, description="人类可读转账数量，不要换算为 raw amount"
-    )
+    amount: str | None = Field(default=None, description="人类可读转账数量，不要换算为 raw amount")
     recipient: str | None = Field(default=None, description="用户明确指定的收款地址")
 
 

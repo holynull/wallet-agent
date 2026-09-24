@@ -14,6 +14,7 @@ from wallet_agent.chains import ExecutionObserver, build_default_registry
 from wallet_agent.config import Settings
 from wallet_agent.graph import build_graph
 from wallet_agent.models import (
+    AgentResponseDraft,
     ModelRegistry,
     ModelRouter,
     RouteDecision,
@@ -66,16 +67,19 @@ def build_application(settings: Settings | None = None) -> Any:
             for model_id, client in base_clients.items()
         },
         "transaction_status": {
-            model_id: client.with_structured_output(
-                TransactionStatusSlotPatch, method="json_mode"
-            )
+            model_id: client.with_structured_output(TransactionStatusSlotPatch, method="json_mode")
             for model_id, client in base_clients.items()
         },
+    }
+    response_models = {
+        model_id: client.with_structured_output(AgentResponseDraft, method="json_mode")
+        for model_id, client in base_clients.items()
     }
     model_registry = ModelRegistry(
         model_clients,
         default_model_id=settings.openai_model,
         extractors=extractors,
+        responses=response_models,
     )
     model = ModelRouter(model_registry)
     providers: dict[str, Any] = {}

@@ -74,6 +74,11 @@
     .debug-panel pre { max-height: 300px; margin: 0; padding: 10px 11px; overflow: auto; border-top: 1px solid #283242; color: #b9c8dc; font-size: 11px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
     .agent-test-hint { margin: 0; padding: 0 11px 9px; color: #8493a7; font-size: 11px; line-height: 1.45; }
     .agent-test-list { border-top: 1px solid #283242; }
+    .conversation-list { max-height: 260px; overflow: auto; border-top: 1px solid #283242; }
+    .conversation-row { display: flex; width: 100%; flex-direction: column; align-items: flex-start; gap: 3px; padding: 10px 12px; border: 0; border-bottom: 1px solid #202b39; border-radius: 0; background: transparent; text-align: left; }
+    .conversation-row strong { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .conversation-row span { color: #8493a7; font-size: 11px; font-weight: 400; }
+    .conversation-delete { align-self: flex-end; margin-top: -20px; padding: 3px 7px; border-color: #65434b; background: #3a2730; font-size: 11px; }
     .agent-test-row { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; gap: 8px; align-items: start; padding: 9px 11px; border-bottom: 1px solid #202b39; }
     .agent-test-row:last-child { border-bottom: 0; }
     .agent-test-dot { width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: #66758a; }
@@ -97,8 +102,15 @@
       <input id="token" class="token-input" type="password" autocomplete="off" placeholder="Bearer token（可选）" aria-label="Bearer token">
       <button id="connectButton">连接钱包</button>
       <button id="refreshButton" class="secondary" hidden>刷新</button>
+      <button id="historyButton" class="secondary" type="button">历史</button>
     </div>
   </header>
+
+  <details id="historyPanel" class="debug-panel">
+    <summary>对话历史</summary>
+    <div class="debug-actions"><button id="newConversationButton" class="secondary" type="button">新建对话</button><button id="reloadHistoryButton" class="secondary" type="button">重新加载</button></div>
+    <div id="conversationList" class="conversation-list"><p class="agent-test-hint">暂无已保存的对话。</p></div>
+  </details>
 
   <details id="debugPanel" class="debug-panel">
     <summary>后端调试数据（0 条）</summary>
@@ -285,6 +297,43 @@
     setRequestBusy(false); setRetryVisible(false);
     disableWalletActions(); updateMeta();
   }
+  function clearConversationView() {
+    messages.replaceChildren();
+    state.debugLog = [];
+    $('debugOutput').textContent = '等待后端响应…';
+    addMessage('assistant', '你好，我可以帮你查询余额、比较兑换报价，并准备未签名交易。告诉我你想做什么。');
+  }
+  function formatHistoryDate(value) {
+    if (!value) return '';
+    try { return new Date(value).toLocaleString(); } catch { return String(value); }
+  }
+  function renderConversationList(items) {
+    const list = $('conversationList'); list.replaceChildren();
+    if (!items.length) { const empty = document.createElement('p'); empty.className = 'agent-test-hint'; empty.textContent = '暂无已保存的对话。'; list.append(empty); return; }
+    items.forEach((item) => {
+      const row = document.createElement('button'); row.type = 'button'; row.className = 'conversation-row';
+      row.innerHTML = `<strong>${item.summary || 'Wallet Agent 对话'}</strong><span>${formatHistoryDate(item.updated_at)} · ${item.status || ''}</span>`;
+      row.onclick = () => loadConversation(item.conversation_id); list.append(row);
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'conversation-delete'; remove.textContent = '删除';
+      remove.onclick = async (event) => { event.stopPropagation(); if (!window.confirm('删除这条对话及其历史记录？')) return; try { await api(`/v1/agent/conversations/${encodeURIComponent(item.conversation_id)}?user_id=browser-demo`, { method: 'DELETE', headers: authHeaders() }); if (state.conversationId === item.conversation_id) startNewConversation(); await loadConversationHistory(); } catch (error) { addMessage('assistant', `删除对话失败：${error.message}`); } };
+      row.append(remove);
+    });
+  }
+  async function loadConversation(conversationId) {
+    if (state.requestBusy) return;
+    try {
+      const body = await api(`/v1/agent/conversations/${encodeURIComponent(conversationId)}?user_id=browser-demo`);
+      state.conversationId = body.conversation_id; state.sessionId = body.session_id || null; state.quotes = [];
+      clearConversationView();
+      (body.messages || []).forEach((item) => addMessage(item.role === 'user' ? 'user' : 'assistant', item.content));
+      updateMeta(); $('historyPanel').open = false; addSystem('已重新加载对话历史。');
+    } catch (error) { addMessage('assistant', `加载对话失败：${error.message}`); }
+  }
+  async function loadConversationHistory() {
+    try { renderConversationList((await api('/v1/agent/conversations?user_id=browser-demo')).conversations || []); }
+    catch (error) { addMessage('assistant', `读取对话历史失败：${error.message}`); }
+  }
+  function startNewConversation() { resetWalletSession(); clearConversationView(); updateMeta(); }
   function authHeaders() {
     const token = $('token').value.trim();
     return token ? { Authorization: `Bearer ${token}` } : {};
@@ -612,7 +661,15 @@
       const button = document.createElement('button'); button.type = 'button';
       button.textContent = suggestion.label || suggestion.message;
       button.title = suggestion.message;
-      button.onclick = () => { $('composer').value = suggestion.message; sendMessage(); };
+      button.onclick = () => {
+        if (suggestion.data && Object.keys(suggestion.data).length) {
+          $('composer').value = suggestion.message;
+          $('composer').dataset.suggestionData = JSON.stringify(suggestion.data);
+        } else {
+          $('composer').value = suggestion.message;
+        }
+        sendMessage();
+      };
       actions.append(button);
     });
     const row = addMessage('assistant', '', actions); row.dataset.suggestions = 'true';
@@ -877,6 +934,7 @@
     const input = $('composer');
     const options = arguments[0] || {};
     const message = (options.message ?? input.value).trim();
+    const suggestionData = input.dataset.suggestionData || null;
     const addUserMessage = options.addUserMessage !== false;
     if (!message || state.requestBusy) return;
     if (addUserMessage) { addMessage('user', message); state.lastUserMessage = message; input.value = ''; }
@@ -898,7 +956,12 @@
       setRequestBusy(false); input.focus(); return;
     }
     try {
-      const body = { user_id: 'browser-demo', conversation_id: state.conversationId || undefined, session_id: state.sessionId || undefined, message, address: state.address || undefined, chain: state.chain || undefined, metadata: walletMetadata() };
+      const metadata = walletMetadata();
+      if (suggestionData) {
+        try { metadata.suggestion_data = JSON.parse(suggestionData); } catch { /* Ignore malformed optional suggestion data. */ }
+        delete input.dataset.suggestionData;
+      }
+      const body = { user_id: 'browser-demo', conversation_id: state.conversationId || undefined, session_id: state.sessionId || undefined, message, address: state.address || undefined, chain: state.chain || undefined, metadata };
       const turn = await api('/v1/agent/turn', { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(body), signal: controller.signal }); state.runId = turn.run_id; state.conversationId = turn.conversation_id; state.sessionId = turn.session_id || state.sessionId; updateMeta(); setRequestBusy(true, '正在读取 Agent 响应…'); await readSse(state.runId, { signal: controller.signal });
     } catch (error) {
       if (error.name === 'AbortError') {
@@ -1222,6 +1285,8 @@
   }
   renderAgentTestList(); updateAgentTestSummary();
   $('connectButton').onclick = connectWallet; $('refreshButton').onclick = refreshSession; $('sendButton').onclick = sendMessage;
+  $('historyButton').onclick = () => { $('historyPanel').open = !$('historyPanel').open; if ($('historyPanel').open) loadConversationHistory(); };
+  $('reloadHistoryButton').onclick = loadConversationHistory; $('newConversationButton').onclick = startNewConversation;
   $('cancelRequestButton').onclick = cancelActiveRequest; $('retryButton').onclick = retryLastMessage;
   $('debugSmokeButton').onclick = runDebugSmoke; $('debugCopyButton').onclick = copyDebugData; $('debugClearButton').onclick = clearDebug;
   $('runAgentTestsButton').onclick = runAgentTests;

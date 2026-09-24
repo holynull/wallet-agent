@@ -29,9 +29,7 @@ def router_with_clients(*, classifier=None, transfer=None, swap=None, transactio
             extractors={
                 "transfer": {"deepseek-chat": transfer or CapturingClient(TransferSlotPatch())},
                 "swap": {"deepseek-chat": swap or CapturingClient(SwapSlotPatch())},
-                "transaction_status": {
-                    "deepseek-chat": transaction_status or CapturingClient({})
-                },
+                "transaction_status": {"deepseek-chat": transaction_status or CapturingClient({})},
             },
         )
     )
@@ -43,9 +41,7 @@ def test_route_decision_rejects_transaction_slot_fields():
 
 
 def test_route_decision_accepts_deepseek_json_object_marker():
-    decision = RouteDecision.model_validate(
-        {"type": "json_object", "intent": "wallet_query"}
-    )
+    decision = RouteDecision.model_validate({"type": "json_object", "intent": "wallet_query"})
 
     assert decision.intent == "wallet_query"
     assert decision.model_dump() == {"intent": "wallet_query"}
@@ -113,11 +109,32 @@ async def test_swap_extractor_receives_existing_slots_and_explicit_schema():
 
 
 @pytest.mark.asyncio
+async def test_swap_extractor_prompt_includes_clicked_structured_suggestion():
+    client = CapturingClient(SwapSlotPatch(source_chain="ETH", destination_chain="ETH"))
+    router = router_with_clients(swap=client)
+
+    await router.extract(
+        "swap",
+        {
+            "message": "都在 ETH 链",
+            "suggestion_data": {
+                "source_symbol": "ETH",
+                "destination_symbol": "USDT",
+                "output_amount": "10",
+                "amount_mode": "exact_out",
+            },
+        },
+    )
+
+    prompt = client.inputs[0][0].content
+    assert "suggestion_data" in prompt
+    assert '"output_amount": "10"' in prompt
+
+
+@pytest.mark.asyncio
 async def test_transaction_status_extractor_preserves_chain_and_hash():
     tx_hash = "0x" + "a" * 64
-    client = CapturingClient(
-        {"transaction_chain": "ETH", "transaction_hash": tx_hash}
-    )
+    client = CapturingClient({"transaction_chain": "ETH", "transaction_hash": tx_hash})
     router = router_with_clients(transaction_status=client)
 
     patch = await router.extract(

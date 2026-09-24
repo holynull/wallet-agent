@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -48,6 +49,167 @@ from .tasks import (
     new_active_task,
     project_legacy_draft,
 )
+
+_RESPONSE_DATA_KEYS = {
+    "swap_quote": {
+        "intent",
+        "source_chain",
+        "destination_chain",
+        "source_symbol",
+        "destination_symbol",
+        "source_token_address",
+        "destination_token_address",
+        "input_amount",
+        "output_amount",
+        "amount_mode",
+        "slippage_bps",
+    },
+    "transfer": {"intent", "chain", "symbol", "token_address", "decimals", "amount", "recipient"},
+}
+
+
+def _suggestion_data_for_model(value: Any) -> dict[str, Any] | None:
+    """Expose only user-confirmable slot fields from UI suggestion metadata."""
+    if not isinstance(value, Mapping):
+        return None
+    allowed = _RESPONSE_DATA_KEYS["swap_quote"] | _RESPONSE_DATA_KEYS["transfer"]
+    clean = {str(key): _dump(item) for key, item in value.items() if str(key) in allowed}
+    return clean or None
+
+
+def _response_language(message: str) -> str:
+    return "zh" if re.search(r"[\u3400-\u9fff]", message) else "en"
+
+
+def _response_fallback(intent: str, missing: list[str], language: str) -> str:
+    if language == "zh":
+        if intent == "clarification" and not missing:
+            return "你好！我可以帮你查询余额、比较兑换报价、发起转账或兑换。请告诉我具体需求。"
+        if intent == "transfer":
+            phrases = {
+                "transfer_recipient": "收款地址",
+                "transfer_amount": "转账金额",
+                "transfer_chain": "转账网络",
+                "transfer_symbol": "转账资产",
+                "transfer_token_address": "Token 合约地址",
+                "transfer_decimals": "Token 精度",
+            }
+            labels = [phrases[item] for item in missing if item in phrases]
+            return f"请补充{'、'.join(labels) or '这笔转账所需的信息'}。"
+        if intent == "swap_quote":
+            return "请告诉我想换出的资产、目标资产和数量。"
+        return "请再告诉我一些具体信息。"
+    if intent == "transfer":
+        phrases = {
+            "transfer_recipient": "the recipient address",
+            "transfer_amount": "the transfer amount",
+            "transfer_chain": "the network",
+            "transfer_symbol": "the asset",
+            "transfer_token_address": "the token contract address",
+            "transfer_decimals": "the token precision",
+        }
+        labels = [phrases[item] for item in missing if item in phrases]
+        return f"Please provide {', '.join(labels) or 'the missing transfer details'}."
+    if intent == "clarification" and not missing:
+        return (
+            "Hi! I can help check balances, compare swap quotes, or prepare transfers and swaps. "
+            "What would you like to do?"
+        )
+    if intent == "swap_quote":
+        return "What asset would you like to swap, and what would you like to receive?"
+    return "Please provide a little more detail about what you need."
+
+
+def _sanitize_response_suggestions(
+    suggestions: Any,
+    *,
+    intent: str,
+    facts: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    allowed = _RESPONSE_DATA_KEYS.get(intent, set())
+    chains = {str(value).upper() for value in facts.get("supported_chains", [])}
+    asset_keys = {
+        (str(item.get("chain", "")).upper(), str(item.get("symbol", "")).upper())
+        for item in facts.get("supported_assets", [])
+        if isinstance(item, Mapping)
+    }
+    balance_keys = {
+        (str(item.get("chain", "")).upper(), str(item.get("symbol", "")).upper())
+        for item in facts.get("balances", [])
+        if isinstance(item, Mapping)
+    }
+    output: list[dict[str, Any]] = []
+    for suggestion in suggestions or []:
+        item = _dump(suggestion)
+        if not isinstance(item, Mapping):
+            continue
+        data = item.get("data")
+        if not isinstance(data, Mapping):
+            continue
+        clean = {str(key): value for key, value in data.items() if key in allowed}
+        clean_intent = "swap_quote" if intent == "swap_quote" else intent
+        if clean.get("intent") not in (None, clean_intent):
+            continue
+        clean["intent"] = clean_intent
+        invalid = False
+        for key in ("source_chain", "destination_chain", "chain"):
+            if clean.get(key) is not None and chains and str(clean[key]).upper() not in chains:
+                invalid = True
+        if invalid:
+            continue
+        for side in ("source", "destination"):
+            chain_key = f"{side}_chain"
+            symbol_key = f"{side}_symbol"
+            if clean.get(symbol_key) and clean.get(chain_key) and asset_keys:
+                asset_key = (str(clean[chain_key]).upper(), str(clean[symbol_key]).upper())
+                if asset_key not in asset_keys:
+                    invalid = True
+                if (
+                    side == "source"
+                    and balance_keys
+                    and (str(clean[chain_key]).upper(), str(clean[symbol_key]).upper())
+                    not in balance_keys
+                ):
+                    invalid = True
+            amount = clean.get("input_amount")
+            if (
+                side == "source"
+                and amount is not None
+                and clean.get(symbol_key)
+                and clean.get(chain_key)
+            ):
+                balance = next(
+                    (
+                        item
+                        for item in facts.get("balances", [])
+                        if isinstance(item, Mapping)
+                        and str(item.get("chain", "")).upper() == str(clean[chain_key]).upper()
+                        and str(item.get("symbol", "")).upper() == str(clean[symbol_key]).upper()
+                    ),
+                    None,
+                )
+                try:
+                    if balance is not None and Decimal(str(amount)) > Decimal(
+                        str(balance["amount"])
+                    ):
+                        invalid = True
+                except Exception:
+                    invalid = True
+        if clean.get("symbol") and clean.get("chain") and (asset_keys or intent == "transfer"):
+            if (str(clean["chain"]).upper(), str(clean["symbol"]).upper()) not in asset_keys:
+                invalid = True
+        if invalid:
+            continue
+        output.append(
+            {
+                "label": str(item.get("label") or "")[:120],
+                "message": str(item.get("message") or "")[:500],
+                "data": clean,
+            }
+        )
+        if len(output) == 3:
+            break
+    return [item for item in output if item["label"] and item["message"]]
 
 
 @dataclass(frozen=True)
@@ -392,11 +554,7 @@ def _swap_confirmation_summary(
         "slippage_bps": (
             slippage_bps
             if slippage_bps is not None
-            else (
-                selected.get("slippage_bps")
-                if selected.get("slippage_bps") is not None
-                else 100
-            )
+            else (selected.get("slippage_bps") if selected.get("slippage_bps") is not None else 100)
         ),
     }
 
@@ -680,9 +838,7 @@ def _swap_suggestions(
         else:
             message = f"请输入 {source_symbol} 数量"
             label = f"填写 {source_symbol} 数量"
-        suggestions.append(
-            {"label": label, "message": message}
-        )
+        suggestions.append({"label": label, "message": message})
     return suggestions[:3]
 
 
@@ -825,11 +981,7 @@ async def _resolve_transfer_asset(
     """Fill transfer token metadata from trusted common assets or providers."""
     resolved = dict(draft)
     context = wallet_context or {}
-    chain = (
-        resolved.get("transfer_chain")
-        or resolved.get("chain")
-        or context.get("chain")
-    )
+    chain = resolved.get("transfer_chain") or resolved.get("chain") or context.get("chain")
     symbol = resolved.get("transfer_symbol") or resolved.get("symbol")
     if not chain or not symbol:
         return resolved
@@ -1211,9 +1363,7 @@ async def _transaction_preflight(
         "sender": sender,
         "recipient": recipient,
         "fee_estimate": (
-            fee
-            if isinstance(fee, dict)
-            else (_fee_dump(fee) if fee is not None else None)
+            fee if isinstance(fee, dict) else (_fee_dump(fee) if fee is not None else None)
         ),
         "gas_sources": gas_sources,
         **({"simulation": _dump(simulation)} if simulation is not None else {}),
@@ -1389,9 +1539,7 @@ async def _resolve_swap_assets(
         symbol = resolved.get(f"{side}_symbol")
         if resolved.get(chain_key) or not symbol:
             continue
-        inferred_chain = _unique_native_chain(
-            str(symbol), resolved.get(f"{side}_token_address")
-        )
+        inferred_chain = _unique_native_chain(str(symbol), resolved.get(f"{side}_token_address"))
         if inferred_chain is not None:
             resolved[chain_key] = inferred_chain
     for side in ("source", "destination"):
@@ -1413,17 +1561,15 @@ async def _resolve_swap_assets(
     resolvable_sides = [
         side
         for side in ("source", "destination")
-        if resolved.get(f"{side}_chain") and resolved.get(f"{side}_symbol")
+        if resolved.get(f"{side}_chain")
+        and resolved.get(f"{side}_symbol")
         and (
             _explicit_token_address(resolved.get(f"{side}_token_address"))
-            or _native_swap_asset(
-                str(resolved[f"{side}_chain"]), str(resolved[f"{side}_symbol"])
-            )
+            or _native_swap_asset(str(resolved[f"{side}_chain"]), str(resolved[f"{side}_symbol"]))
             is None
         )
         and not (
-            resolved.get(f"{side}_token_address")
-            and resolved.get(f"{side}_decimals") is not None
+            resolved.get(f"{side}_token_address") and resolved.get(f"{side}_decimals") is not None
         )
     ]
     if resolvable_sides and not asset_providers:
@@ -1557,6 +1703,278 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             except Exception:
                 return None
         return runtime.chains.get(str(chain).upper())
+
+    def canonical_state(state: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(state)
+        result["request"] = dict(state.get("request") or {})
+        if not result["request"].get("message") and state.get("message"):
+            result["request"]["message"] = state["message"]
+        result["wallet_context"] = dict(state.get("wallet_context") or {})
+        return result
+
+    async def response_facts(
+        state: Mapping[str, Any], *, intent: str, missing: list[str], include_portfolio: bool
+    ) -> dict[str, Any]:
+        request = dict(state.get("request") or {})
+        context = dict(state.get("wallet_context") or {})
+        message = str(request.get("message") or "")
+        supported_chains = sorted(
+            set(getattr(runtime.wallet_provider, "chain_index_by_name", {}) or {})
+            | set(runtime.chains)
+        )
+        facts: dict[str, Any] = {
+            "intent": intent,
+            "missing_fields": list(missing),
+            "user_message": message,
+            "language_hint": _response_language(message),
+            "wallet": {
+                "address": context.get("address") or request.get("address"),
+                "chain": context.get("chain") or request.get("chain"),
+            },
+            "supported_chains": supported_chains,
+            "task": _dump(state.get("active_task") or {}),
+        }
+        draft = state.get("swap_draft") or state.get("transfer_draft") or {}
+        if isinstance(draft, Mapping) and draft:
+            facts["known_slots"] = {
+                key: value
+                for key, value in draft.items()
+                if not any(part in key.lower() for part in ("address", "raw", "decimals"))
+            }
+        if not include_portfolio:
+            if intent == "transfer":
+                draft = state.get("transfer_draft") or {}
+                chain = draft.get("transfer_chain") or draft.get("chain") or context.get("chain")
+                symbol = draft.get("transfer_symbol") or draft.get("symbol")
+                facts["supported_assets"] = (
+                    [
+                        {
+                            "chain": chain,
+                            "symbol": symbol,
+                            "address": draft.get("transfer_token_address"),
+                            "decimals": draft.get("transfer_decimals"),
+                        }
+                    ]
+                    if chain and symbol
+                    else []
+                )
+            return facts
+
+        address = str(context.get("address") or request.get("address") or "")
+        indexes = sorted(
+            {
+                str(index)
+                for index in (
+                    getattr(runtime.wallet_provider, "chain_index_by_name", {}) or {}
+                ).values()
+            }
+        )
+        balances: list[Any] = []
+        assets: list[Asset] = []
+        if address and indexes and hasattr(runtime.wallet_provider, "get_token_balances"):
+            try:
+                balances = await runtime.wallet_provider.get_token_balances(address, indexes)
+                assets = [balance.asset for balance in balances]
+            except Exception:
+                balances = []
+        supported_assets: dict[tuple[str, str], Asset] = {
+            (str(asset.chain).upper(), str(asset.symbol).upper()): asset for asset in assets
+        }
+        if intent == "swap_quote":
+            draft = state.get("swap_draft") or {}
+            existing_assets = list(facts.get("supported_assets") or [])
+            for side in ("source", "destination"):
+                chain = draft.get(f"{side}_chain")
+                symbol = draft.get(f"{side}_symbol")
+                if chain and symbol:
+                    supported_assets.setdefault(
+                        (str(chain).upper(), str(symbol).upper()),
+                        Asset(
+                            chain=str(chain),
+                            symbol=str(symbol),
+                            decimals=int(draft.get(f"{side}_decimals") or 18),
+                            address=draft.get(f"{side}_token_address"),
+                        ),
+                    )
+            existing_assets.extend(
+                {
+                    "chain": asset.chain,
+                    "symbol": asset.symbol,
+                    "address": asset.address,
+                    "decimals": asset.decimals,
+                }
+                for asset in supported_assets.values()
+            )
+            facts["supported_assets"] = existing_assets
+
+            async def provider_assets(provider: Any) -> list[Asset]:
+                if not hasattr(provider, "list_assets"):
+                    return []
+                try:
+                    return await provider.list_assets(AssetQuery())
+                except Exception:
+                    return []
+
+            catalog_results = await asyncio.gather(
+                *(provider_assets(provider) for provider in runtime.providers.values())
+            )
+            for group in catalog_results:
+                for asset in group:
+                    supported_assets.setdefault(
+                        (str(asset.chain).upper(), str(asset.symbol).upper()), asset
+                    )
+            facts["supported_assets"] = [
+                {
+                    "chain": asset.chain,
+                    "symbol": asset.symbol,
+                    "address": asset.address,
+                    "decimals": asset.decimals,
+                }
+                for asset in list(supported_assets.values())[:100]
+            ]
+        price_map: dict[tuple[str, str, str], Any] = {}
+        if runtime.price_provider is not None and assets:
+            try:
+                prices = await runtime.price_provider.get_prices(assets[:50])
+                price_map = {
+                    (
+                        str(price.asset.chain).upper(),
+                        str(price.asset.symbol).upper(),
+                        str(price.asset.address or "").lower(),
+                    ): price
+                    for price in prices
+                }
+            except Exception:
+                price_map = {}
+        balance_facts = []
+        for balance in balances:
+            asset = balance.asset
+            price = price_map.get(
+                (
+                    str(asset.chain).upper(),
+                    str(asset.symbol).upper(),
+                    str(asset.address or "").lower(),
+                )
+            )
+            balance_facts.append(
+                {
+                    "chain": asset.chain,
+                    "symbol": asset.symbol,
+                    "address": asset.address,
+                    "decimals": asset.decimals,
+                    "amount": str(balance.amount),
+                    "usd_price": str(price.usd_price) if price else None,
+                }
+            )
+        facts["balances"] = balance_facts[:50]
+        facts["supported_assets"] = [
+            {
+                "chain": asset.chain,
+                "symbol": asset.symbol,
+                "address": asset.address,
+                "decimals": asset.decimals,
+            }
+            for asset in list(supported_assets.values())[:100]
+        ]
+        facts["prices"] = [
+            {
+                "chain": price.asset.chain,
+                "symbol": price.asset.symbol,
+                "usd_price": str(price.usd_price),
+                "observed_at": price.observed_at.isoformat() if price.observed_at else None,
+            }
+            for price in price_map.values()
+        ]
+        return facts
+
+    async def generate_clarification(
+        state: Mapping[str, Any],
+        *,
+        intent: str,
+        missing: list[str],
+        include_portfolio: bool = False,
+    ) -> dict[str, Any]:
+        request = dict(state.get("request") or {})
+        if not request.get("message") and state.get("message"):
+            request["message"] = state.get("message")
+        facts = await response_facts(
+            state, intent=intent, missing=missing, include_portfolio=include_portfolio
+        )
+        message = _response_fallback(intent, missing, str(facts["language_hint"]))
+        suggestions: list[dict[str, Any]] = []
+        responder = getattr(runtime.model, "respond", None)
+        if callable(responder):
+            try:
+                draft = await responder(request, facts)
+                draft = _dump(draft) or {}
+                if isinstance(draft, Mapping) and str(draft.get("message") or "").strip():
+                    response_language = str(draft.get("language") or facts["language_hint"])
+                    if response_language.split("-")[0].lower() == facts["language_hint"]:
+                        message = str(draft["message"]).strip()
+                    suggestions = _sanitize_response_suggestions(
+                        draft.get("suggestions"), intent=intent, facts=facts
+                    )
+            except Exception:
+                pass
+        if not suggestions and intent == "swap_quote":
+            suggestions = _swap_suggestions(
+                state.get("swap_draft") or {},
+                missing,
+                state.get("wallet_context"),
+                runtime.providers,
+            )
+            suggestions = [
+                {
+                    **suggestion,
+                    "data": {
+                        "intent": "swap_quote",
+                        **{
+                            key: value
+                            for key, value in (state.get("swap_draft") or {}).items()
+                            if key in _RESPONSE_DATA_KEYS["swap_quote"]
+                        },
+                    },
+                }
+                for suggestion in suggestions
+            ]
+            suggestions = _sanitize_response_suggestions(suggestions, intent=intent, facts=facts)
+        if not suggestions and intent == "transfer":
+            suggestions = await transfer_suggestions(state, missing)
+        return {
+            "kind": "clarification",
+            "message": message,
+            "missing_fields": list(missing),
+            "suggestions": suggestions,
+        }
+
+    async def transfer_suggestions(
+        state: Mapping[str, Any], missing: list[str]
+    ) -> list[dict[str, Any]]:
+        draft = state.get("transfer_draft") or {}
+        facts = await response_facts(
+            state, intent="transfer", missing=missing, include_portfolio=False
+        )
+        suggestion = {
+            "label": "填写收款地址" if facts["language_hint"] == "zh" else "Provide recipient",
+            "message": (
+                "收款地址是 0x..." if facts["language_hint"] == "zh" else "Send it to 0x..."
+            ),
+            "data": {
+                key: value
+                for key, value in {
+                    "intent": "transfer",
+                    "chain": (
+                        draft.get("transfer_chain")
+                        or draft.get("chain")
+                        or (state.get("wallet_context") or {}).get("chain")
+                    ),
+                    "symbol": draft.get("transfer_symbol") or draft.get("symbol"),
+                    "amount": draft.get("transfer_amount") or draft.get("amount"),
+                }.items()
+                if value is not None
+            },
+        }
+        return _sanitize_response_suggestions([suggestion], intent="transfer", facts=facts)
 
     async def wallet_balance_tool(
         chain: str,
@@ -1832,10 +2250,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             decision = {"intent": "clarification", "source": "command_guard"}
         elif forced in _VALID_INTENTS:
             decision = {"intent": forced, "source": "api"}
-        elif (
-            state.get("intent") in _VALID_INTENTS
-            and not request.get("message")
-        ):
+        elif state.get("intent") in _VALID_INTENTS and not request.get("message"):
             decision = {"intent": state["intent"], "source": "graph_resume"}
         else:
             # Models receive a JSON-safe view, while the original structured
@@ -1852,6 +2267,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             model_request["swap_draft"] = state.get("swap_draft")
             model_request["transfer_draft"] = state.get("transfer_draft")
             model_request["conversation_history"] = state.get("conversation_history") or []
+            metadata = request.get("metadata")
+            suggestion_data = _suggestion_data_for_model(
+                metadata.get("suggestion_data") if isinstance(metadata, Mapping) else None
+            )
+            if suggestion_data is not None:
+                model_request["suggestion_data"] = suggestion_data
             model_request["available_capabilities"] = {
                 "read_tools": [
                     "wallet_balance",
@@ -2564,9 +2985,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 extraction_request["wallet_context"] = state.get("wallet_context")
                 extraction_request["active_task"] = active_task
                 extraction_request["conversation_state"] = state.get("conversation_state")
-                extraction_request["conversation_history"] = state.get(
-                    "conversation_history"
-                ) or []
+                extraction_request["conversation_history"] = state.get("conversation_history") or []
+                metadata = request.get("metadata")
+                suggestion_data = _suggestion_data_for_model(
+                    metadata.get("suggestion_data") if isinstance(metadata, Mapping) else None
+                )
+                if suggestion_data is not None:
+                    extraction_request["suggestion_data"] = suggestion_data
                 extraction_started = perf_counter()
                 _emit_progress(
                     "slot_extraction",
@@ -2639,11 +3064,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             if task_kind == "swap" and explicit_amount is not None:
                 explicit_value, explicit_unit = explicit_amount
                 known_source = canonical_symbol(
-                    str(
-                        task_patch.get("source_symbol")
-                        or prior_slots.get("source_symbol")
-                        or ""
-                    )
+                    str(task_patch.get("source_symbol") or prior_slots.get("source_symbol") or "")
                 )
                 known_destination = canonical_symbol(
                     str(
@@ -2729,6 +3150,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     or state.get("missing_fields")
                     or [],
                 )
+            response_state = canonical_state(state)
+            response_state["swap_draft"] = state.get("swap_draft") or {}
+            response_state["transfer_draft"] = state.get("transfer_draft") or {}
+            if active_task:
+                if active_task.get("kind") == "swap":
+                    response_state["swap_draft"] = project_legacy_draft(active_task)
+                elif active_task.get("kind") == "transfer":
+                    response_state["transfer_draft"] = project_legacy_draft(active_task)
             return {
                 "intent": "clarification",
                 "route": "clarification",
@@ -2736,15 +3165,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "response_action": "clarification",
                 "max_poll_attempts": runtime.max_poll_attempts,
                 **state_update,
-                "response": {
-                    "kind": "clarification",
-                    "message": _clarification_message(
-                        message=parsed.get("message"),
-                        swap=looks_like_swap,
-                        missing=parsed.get("missing_fields"),
-                    ),
-                    "missing_fields": parsed.get("missing_fields") or [],
-                },
+                "response": await generate_clarification(
+                    response_state,
+                    intent="swap_quote" if looks_like_swap else "clarification",
+                    missing=parsed.get("missing_fields") or [],
+                    include_portfolio=looks_like_swap,
+                ),
             }
         if intent_value == "swap_quote":
             draft = (
@@ -2855,14 +3281,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 if user_missing:
                     return {
                         **common_update,
-                        "response": {
-                            "kind": "clarification",
-                            "message": _clarification_message(missing=user_missing, swap=True),
-                            "missing_fields": user_missing,
-                            "suggestions": _swap_suggestions(
-                                draft, user_missing, state.get("wallet_context"), runtime.providers
+                        "response": await generate_clarification(
+                            {
+                                **canonical_state(state),
+                                "active_task": active_task,
+                                "swap_draft": draft,
+                            },
+                            intent="swap_quote",
+                            missing=user_missing,
+                            include_portfolio=not bool(
+                                draft.get("source_symbol") or draft.get("destination_symbol")
                             ),
-                        },
+                        ),
                     }
                 errors = resolution_errors or [
                     _error(
@@ -2921,7 +3351,6 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             )
             request_model, missing = _transfer_draft_request(draft, state.get("wallet_context"))
             if request_model is None:
-                labels = ", ".join(missing)
                 canonical_slots = dict((active_task or {}).get("slots") or {})
                 active_task = _task_progress(
                     active_task,
@@ -2946,9 +3375,19 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     ),
                     "max_poll_attempts": runtime.max_poll_attempts,
                     "response": {
-                        "kind": "clarification",
-                        "message": f"还需要这些转账信息：{labels}。",
-                        "missing_fields": missing,
+                        **await generate_clarification(
+                            {
+                                **canonical_state(state),
+                                "active_task": active_task,
+                                "transfer_draft": draft,
+                            },
+                            intent="transfer",
+                            missing=missing,
+                            include_portfolio=False,
+                        ),
+                        "suggestions": await transfer_suggestions(
+                            {**canonical_state(state), "transfer_draft": draft}, missing
+                        ),
                     },
                 }
             active_task = _task_progress(
@@ -2989,9 +3428,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             patch_source: Any = parsed
             if hasattr(runtime.model, "extract"):
                 extraction_request = dict(request)
-                extraction_request["conversation_history"] = state.get(
-                    "conversation_history"
-                ) or []
+                extraction_request["conversation_history"] = state.get("conversation_history") or []
                 extraction_started = perf_counter()
                 _emit_progress(
                     "slot_extraction",
@@ -3000,13 +3437,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     task_kind="transaction_status",
                 )
                 try:
-                    patch_source = runtime.model.extract(
-                        "transaction_status", extraction_request
-                    )
+                    patch_source = runtime.model.extract("transaction_status", extraction_request)
                     patch_source = (
-                        await patch_source
-                        if hasattr(patch_source, "__await__")
-                        else patch_source
+                        await patch_source if hasattr(patch_source, "__await__") else patch_source
                     )
                 except Exception as exc:
                     extraction_error = exc
@@ -3072,8 +3505,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             missing = [field for field in ("chain", "tx_hash") if not draft.get(field)]
             missing_fields = [
-                "transaction_chain" if field == "chain" else "transaction_hash"
-                for field in missing
+                "transaction_chain" if field == "chain" else "transaction_hash" for field in missing
             ]
             if missing:
                 result: dict[str, Any] = {
@@ -3267,8 +3699,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "response": {
                         "kind": "clarification",
                         "message": (
-                            "当前兑换服务不能按目标到账数量反向询价，"
-                            "请直接提供要换出的数量。"
+                            "当前兑换服务不能按目标到账数量反向询价，请直接提供要换出的数量。"
                         ),
                         "missing_fields": ["input_amount"],
                         "errors": state["errors"],
@@ -3284,9 +3715,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             try:
                 expected_output = Decimal(str(quote.get("expected_output", "0")))
                 minimum_output = quote.get("minimum_output")
-                minimum_value = (
-                    Decimal(str(minimum_output)) if minimum_output is not None else None
-                )
+                minimum_value = Decimal(str(minimum_output)) if minimum_output is not None else None
             except (ArithmeticError, TypeError, ValueError):
                 expected_output = Decimal("0")
                 minimum_value = Decimal("0")
@@ -4284,9 +4713,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 if isinstance(pending, Mapping)
                 else getattr(pending, "provider_reference", None)
             ) or selected.get("provider_reference", "")
-            order = await provider.register_broadcast(
-                str(provider_reference), tx_hash
-            )
+            order = await provider.register_broadcast(str(provider_reference), tx_hash)
             value = _dump(order)
             return {
                 "provider_order_ids": {provider_name: order.provider_order_id},
@@ -4413,9 +4840,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "errors": state.get("errors", []),
             }
             if not response["errors"] and not state.get("missing_fields"):
-                response["message"] = (
-                    "你好！我可以帮你查询余额、比较兑换报价、发起转账或兑换。"
-                    "请先连接钱包，再告诉我你的需求。"
+                response["message"] = _response_fallback(
+                    "clarification",
+                    [],
+                    _response_language(
+                        str(
+                            (state.get("request") or {}).get("message")
+                            or state.get("message")
+                            or ""
+                        )
+                    ),
                 )
             return {"response": response}
         if state.get("errors"):

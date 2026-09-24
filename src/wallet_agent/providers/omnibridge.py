@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any
 
 from wallet_agent.domain.models import (
@@ -43,6 +43,14 @@ def _raw(amount: Decimal, decimals: int) -> str:
 
 def _raw_up(amount: Decimal, decimals: int) -> str:
     return str(int((amount * (Decimal(10) ** decimals)).to_integral_value(rounding=ROUND_CEILING)))
+
+
+def _output_meets_target(actual: Decimal, target: Decimal, decimals: int) -> bool:
+    """Compare provider decimals after truncating to representable raw units."""
+    scale = Decimal(10) ** decimals
+    actual_raw = int((actual * scale).to_integral_value(rounding=ROUND_DOWN))
+    target_raw = int((target * scale).to_integral_value(rounding=ROUND_DOWN))
+    return actual_raw >= target_raw
 
 
 def _coin_code(asset: Asset) -> str:
@@ -273,7 +281,9 @@ class OmniBridgeProvider:
             )
         forward = request.model_copy(update={"input_amount": input_amount, "input_amount_raw": raw})
         quote = await self.quote(forward)
-        if quote.expected_output < output_amount:
+        if not _output_meets_target(
+            quote.expected_output, output_amount, request.destination_asset.decimals
+        ):
             raise ValueError(
                 f"Omni verified output {quote.expected_output} is below requested {output_amount}"
             )

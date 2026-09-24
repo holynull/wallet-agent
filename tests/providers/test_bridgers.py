@@ -351,6 +351,23 @@ async def test_bridgers_reverse_quote_binary_searches_source_amount():
 
 
 @pytest.mark.asyncio
+async def test_bridgers_reverse_quote_accepts_decimal_noise_within_raw_unit():
+    class NoiseTransport(DynamicQuoteTransport):
+        async def post(self, path, payload, *, idempotency_key=None):
+            result = await super().post(path, payload, idempotency_key=idempotency_key)
+            tx = result["data"]["txData"]
+            raw = int(payload["fromTokenAmount"])
+            if raw >= 5_000_000:
+                    tx["toTokenAmount"] = "4.0000000000000001"
+            return result
+
+    provider = BridgersProvider.from_transport(NoiseTransport())
+    quote = await provider.reverse_quote(valid_quote_request(), Decimal("4"))
+
+    assert quote.expected_output_raw == "4000000"
+
+
+@pytest.mark.asyncio
 async def test_bridgers_evm_quote_exposes_allowance_requirement():
     transport = FakeTransport(quote_response())
     provider = BridgersProvider.from_transport(transport, source_flag="wallet-agent")

@@ -492,6 +492,76 @@ def create_app(
             raise HTTPException(status_code=503, detail="agent graph is not configured")
         return {"status": "ready"}
 
+    @app.get("/v1/agent/conversations")
+    async def list_conversations(
+        request: Request, user_id: str = "browser-demo", limit: int = 50
+    ) -> dict[str, Any]:
+        owner = await authenticated_user(
+            request, verifier=token_verifier, required=require_auth, fallback_user_id=user_id
+        )
+        limit = max(1, min(limit, 100))
+        sessions = await session_store.list_for_user(owner, limit=limit)
+        return {
+            "conversations": [
+                {
+                    "conversation_id": session.thread_id,
+                    "session_id": session.session_id,
+                    "status": session.status,
+                    "stage": session.stage,
+                    "updated_at": session.updated_at,
+                    "created_at": session.created_at,
+                    "summary": (
+                        f"{session.quote.source_asset.symbol} → "
+                        f"{session.quote.destination_asset.symbol}"
+                        if session.quote is not None
+                        else "Wallet Agent 对话"
+                    ),
+                }
+                for session in sessions
+            ]
+        }
+
+    @app.get("/v1/agent/conversations/{conversation_id}")
+    async def get_conversation(
+        conversation_id: str, request: Request, user_id: str = "browser-demo"
+    ) -> dict[str, Any]:
+        owner = await authenticated_user(
+            request, verifier=token_verifier, required=require_auth, fallback_user_id=user_id
+        )
+        sessions = await session_store.list_for_user(owner, limit=100)
+        session = next((item for item in sessions if item.thread_id == conversation_id), None)
+        if session is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        graph = app.state.graph
+        state: Mapping[str, Any] = {}
+        if graph is not None and hasattr(graph, "aget_state"):
+            snapshot = await graph.aget_state({"configurable": {"thread_id": conversation_id}})
+            state = getattr(snapshot, "values", None) or {}
+        return {
+            "conversation_id": conversation_id,
+            "session_id": session.session_id,
+            "session": _jsonable(session),
+            "messages": _jsonable(state.get("conversation_history") or []),
+        }
+
+    @app.delete("/v1/agent/conversations/{conversation_id}")
+    async def delete_conversation(
+        conversation_id: str, request: Request, user_id: str = "browser-demo"
+    ) -> dict[str, Any]:
+        owner = await authenticated_user(
+            request, verifier=token_verifier, required=require_auth, fallback_user_id=user_id
+        )
+        sessions = await session_store.list_for_user(owner, limit=100)
+        session = next((item for item in sessions if item.thread_id == conversation_id), None)
+        if session is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        deleted = await session_store.delete(session.session_id, user_id=owner)
+        graph = app.state.graph
+        checkpointer = getattr(graph, "checkpointer", None)
+        if checkpointer is not None and hasattr(checkpointer, "adelete_thread"):
+            await checkpointer.adelete_thread(conversation_id)
+        return {"conversation_id": conversation_id, "deleted": deleted}
+
     async def project_session(
         session_id: str | None,
         state: Mapping[str, Any],

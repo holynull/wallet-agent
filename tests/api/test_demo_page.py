@@ -58,7 +58,8 @@ async def test_mobile_demo_page_is_served_by_api_app():
     assert "当前任务：${status}" not in response.text
     assert "function renderSuggestions" in response.text
     assert "response.suggestions" in response.text
-    assert "suggestion.message; sendMessage()" in response.text
+    assert "suggestion.data" in response.text
+    assert "metadata.suggestion_data" in response.text
     assert "request.gas = transactionValue(transaction.gas_limit)" in response.text
     assert "request.maxFeePerGas = transactionValue(transaction.max_fee_per_gas)" in response.text
     assert (

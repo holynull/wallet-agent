@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any
 
 from wallet_agent.domain.models import (
@@ -55,6 +55,14 @@ def _equipment(address: str) -> str:
 
 def _raw_decimal(value: Decimal, decimals: int) -> str:
     return str(int(value * (Decimal(10) ** decimals)))
+
+
+def _output_meets_target(actual: Decimal, target: Decimal, decimals: int) -> bool:
+    """Compare exact-output quotes after truncating to destination raw units."""
+    scale = Decimal(10) ** decimals
+    actual_raw = int((actual * scale).to_integral_value(rounding=ROUND_DOWN))
+    target_raw = int((target * scale).to_integral_value(rounding=ROUND_DOWN))
+    return actual_raw >= target_raw
 
 
 def _quote_decimal(value: Any, field: str, *, nonnegative: bool = True) -> Decimal:
@@ -304,7 +312,9 @@ class BridgersProvider:
             }
         )
         high_quote = await self.quote(high_request)
-        if high_quote.expected_output < output_amount:
+        if not _output_meets_target(
+            high_quote.expected_output, output_amount, request.destination_asset.decimals
+        ):
             raise ValueError(
                 f"Bridgers cannot reach requested output {output_amount} within source bounds"
             )
@@ -320,7 +330,11 @@ class BridgersProvider:
                 }
             )
             mid_quote = await self.quote(mid)
-            if mid_quote.expected_output >= output_amount:
+            if _output_meets_target(
+                mid_quote.expected_output,
+                output_amount,
+                request.destination_asset.decimals,
+            ):
                 hi_raw = mid_raw
             else:
                 lo_raw = mid_raw + 1
@@ -332,7 +346,9 @@ class BridgersProvider:
             }
         )
         final_quote = await self.quote(final_request)
-        if final_quote.expected_output < output_amount:
+        if not _output_meets_target(
+            final_quote.expected_output, output_amount, request.destination_asset.decimals
+        ):
             raise ValueError("Bridgers reverse quote verification fell below target output")
         return final_quote
 

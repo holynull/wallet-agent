@@ -9,6 +9,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 
 from .contracts import (
+    AgentResponseDraft,
     RouteDecision,
     SwapSlotPatch,
     TransactionStatusSlotPatch,
@@ -46,6 +47,8 @@ def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanM
             "只返回合法 JSON，允许且必须仅使用这些 key：chain、symbol、token_address、"
             "decimals、amount、recipient。只提取本轮用户明确提供或明确修改的值；"
             "未提供的值返回 null，不要重复旧值。amount 保留人类可读字符串，不要计算 raw amount。"
+            "如果 request.suggestion_data 存在，它是用户点击建议明确确认的槽位输入，"
+            "优先使用其中的值，仍须遵守本规则。"
             "不要猜测 Token 地址、精度、金额、链或收款地址。"
             "示例：‘在 Base 给 0x2222...2222 转 0.01 ETH’对应 "
             '{"chain":"Base","symbol":"ETH","token_address":null,'
@@ -59,6 +62,8 @@ def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanM
             "source_symbol、destination_symbol、source_token_address、"
             "destination_token_address、input_amount、output_amount、amount_mode、slippage_bps。只提取本轮用户明确提供或明确修改的值；"
             "未提供的值返回 null，不要重复旧值。input_amount/output_amount 保留人类可读字符串。"
+            "如果 request.suggestion_data 存在，它是用户点击建议明确确认的槽位输入，"
+            "优先使用其中的值，仍须遵守本规则。"
             "滑点使用基点整数：1% 写 100，0.5% 写 50，25 bps 写 25。"
             "不要猜测 Token 地址、精度、金额或链。"
             "中文里‘换一些 USDT’、‘兑换一点 USDT’表示目标资产是 USDT，必须写入"
@@ -85,10 +90,32 @@ def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanM
     else:
         raise ValueError(f"unsupported task extractor: {task_kind}")
     return [
-        HumanMessage(
-            content=(f"{instructions}\n\n请求、完整对话历史和已有任务 JSON：\n{payload}")
-        )
+        HumanMessage(content=(f"{instructions}\n\n请求、完整对话历史和已有任务 JSON：\n{payload}"))
     ]
+
+
+def _response_model_input(
+    request: Mapping[str, Any], facts: Mapping[str, Any]
+) -> list[HumanMessage]:
+    payload = json.dumps(
+        {"request": dict(request), "facts": dict(facts)}, ensure_ascii=False, default=str
+    )
+    instructions = (
+        "你是 Wallet Agent 的用户回复生成器。根据用户本轮语言与给定 facts，生成简洁、自然的回复；"
+        "用户用英文就全程英文，用户用中文就全程中文，不要中英混排。"
+        "不要输出 Markdown、代码块或解释模型自身。"
+        "你只能复述 facts 中明确提供的余额、支持链、资产和价格，不能编造或推断事实。"
+        "需要补充信息时，提出自然的问题，并可提供最多 3 个建议。"
+        "每条建议必须包含 label、message、data；"
+        "data 只能填写 facts 或已确认任务中可核验的结构化槽位。"
+        "建议只是供用户选择的输入，不代表同意执行。"
+        "若建议为兑换，先从 balances 中选择有余额的来源资产，并从 supported_assets 中选择目标资产；"
+        "只选择 supported_chains 中的链。"
+        "数量不得超过对应余额；有价格时建议考虑 USD 价值并在措辞中保持准确。"
+        "绝不调用工具、不执行查询、签名、授权、广播或转账/兑换；不要生成交易数据、私钥或签名内容。"
+        "仅返回符合结构化输出 schema 的 JSON。"
+    )
+    return [HumanMessage(content=f"{instructions}\n\nrequest 和 facts JSON：\n{payload}")]
 
 
 class ModelRegistry:
@@ -98,6 +125,7 @@ class ModelRegistry:
         *,
         default_model_id: str,
         extractors: Mapping[str, Mapping[str, Any]] | None = None,
+        responses: Mapping[str, Any] | None = None,
     ) -> None:
         if default_model_id not in models:
             raise ValueError(f"default model is not configured: {default_model_id}")
@@ -105,6 +133,7 @@ class ModelRegistry:
         self._extractors = {
             str(kind): dict(kind_models) for kind, kind_models in (extractors or {}).items()
         }
+        self._responses = dict(responses or {})
         self.default_model_id = default_model_id
 
     @property
@@ -126,6 +155,13 @@ class ModelRegistry:
             raise ValueError(
                 f"extractor is not configured: task={task_kind}, model={selected}"
             ) from exc
+
+    def get_response_model(self, model_id: str | None = None) -> Any:
+        selected = model_id or self.default_model_id
+        try:
+            return self._responses[selected]
+        except KeyError as exc:
+            raise ValueError(f"response model is not configured: model={selected}") from exc
 
     def validate(self, model_id: str | None = None) -> str:
         selected = model_id or self.default_model_id
@@ -168,6 +204,21 @@ class ModelRouter:
         except KeyError as exc:
             raise ValueError(f"unsupported task extractor: {task_kind}") from exc
         return result if isinstance(result, contract) else contract.model_validate(result)
+
+    async def respond(
+        self, request: Mapping[str, Any], facts: Mapping[str, Any]
+    ) -> AgentResponseDraft:
+        model = self.registry.get_response_model(request.get("model_id"))
+        model_request = _response_model_input(request, facts)
+        if hasattr(model, "ainvoke"):
+            result = await model.ainvoke(model_request)
+        else:
+            result = model.invoke(model_request)
+        return (
+            result
+            if isinstance(result, AgentResponseDraft)
+            else AgentResponseDraft.model_validate(result)
+        )
 
     async def ainvoke(self, request: Mapping[str, Any]) -> dict[str, Any]:
         """Compatibility facade for graph callers that only classify requests."""
