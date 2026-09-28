@@ -24,7 +24,9 @@ _TRANSFER_TO_LEGACY = {
 _TRANSFER_FROM_LEGACY = {legacy: canonical for canonical, legacy in _TRANSFER_TO_LEGACY.items()}
 _CHAIN_SLOT_KEYS = frozenset({"chain", "source_chain", "destination_chain"})
 _SYMBOL_SLOT_KEYS = frozenset({"symbol", "source_symbol", "destination_symbol"})
-_AMOUNT_SLOT_KEYS = frozenset({"amount", "input_amount", "output_amount"})
+_AMOUNT_SLOT_KEYS = frozenset(
+    {"amount", "input_amount", "output_amount", "target_value_amount"}
+)
 
 
 @dataclass(frozen=True)
@@ -216,5 +218,30 @@ def _clear_derived_slots(
         slots.pop("output_amount_raw", None)
     if "input_amount" in changed:
         slots.pop("output_amount", None)
+        slots.pop("target_value_amount", None)
+        slots.pop("target_value_currency", None)
+        slots.pop("target_value_price_usd", None)
+        slots.pop("target_value_observed_at", None)
     if "output_amount" in changed:
         slots.pop("input_amount", None)
+        slots.pop("target_value_amount", None)
+        slots.pop("target_value_currency", None)
+        slots.pop("target_value_price_usd", None)
+        slots.pop("target_value_observed_at", None)
+    if changed & {"target_value_amount", "target_value_currency"}:
+        slots.pop("input_amount", None)
+        slots.pop("input_amount_raw", None)
+        slots.pop("output_amount", None)
+        slots.pop("amount_mode", None)
+        slots.pop("target_value_price_usd", None)
+        slots.pop("target_value_observed_at", None)
+    destination_changed = changed & {
+        "destination_chain",
+        "destination_symbol",
+        "destination_token_address",
+    }
+    if destination_changed and slots.get("target_value_amount"):
+        slots.pop("output_amount", None)
+        slots.pop("amount_mode", None)
+        slots.pop("target_value_price_usd", None)
+        slots.pop("target_value_observed_at", None)

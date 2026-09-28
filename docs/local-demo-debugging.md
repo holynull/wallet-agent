@@ -17,10 +17,13 @@ cp .env.example .env
 ```dotenv
 DEEPSEEK_API_KEY=你的-DeepSeek-API-Key
 OPENAI_MODEL=deepseek-v4-pro
+INTENT_MODEL=deepseek-chat
+SLOT_EXTRACTION_MODEL=deepseek-chat
+RESPONSE_MODEL=deepseek-chat
 OPENAI_BASE_URL=https://api.deepseek.com
 ```
 
-`OPENAI_MODEL` 必须包含在 `ALLOWED_MODEL_IDS` 中。默认模型是 `deepseek-v4-pro`，同时保留 `deepseek-chat` 和 `deepseek-reasoner` 兼容选项。
+`OPENAI_MODEL` 是复杂请求的默认模型；意图识别、参数提取和自然语言回复默认使用响应更快的 `deepseek-chat`。客户端显式传入 `model_id` 时仍会覆盖这些节点默认值。所有模型都必须由服务端配置并纳入允许列表。
 
 ### 配置 EVM RPC
 

@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     deepseek_api_key: str | None = None
     openai_api_key: str | None = None
     openai_model: str = "deepseek-v4-pro"
+    intent_model: str = "deepseek-chat"
+    slot_extraction_model: str = "deepseek-chat"
+    response_model: str = "deepseek-chat"
     openai_base_url: str | None = "https://api.deepseek.com"
     allowed_model_ids: list[str] = Field(
         default_factory=lambda: ["deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]

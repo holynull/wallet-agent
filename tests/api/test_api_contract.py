@@ -3,6 +3,7 @@ import pytest
 from langgraph.types import Command, Interrupt
 
 from wallet_agent.api import create_app
+from wallet_agent.api.app import _assistant_history_entry, _conversation_artifacts, _stream_state
 from wallet_agent.domain.models import UnsignedTransaction
 from wallet_agent.persistence import InMemorySessionStore, SwapSessionRecord
 
@@ -23,6 +24,64 @@ async def test_health_and_readiness_endpoints():
     assert health.json() == {"status": "ok"}
     assert ready.status_code == 200
     assert ready.json() == {"status": "ready"}
+
+
+def test_conversation_artifacts_are_scoped_to_the_current_response():
+    state = {
+        "quote_candidates": [{"provider_reference": "stale-quote"}],
+        "approval_transaction": {"to": "0xapprove"},
+        "pending_transaction": {"to": "0xswap"},
+        "response": {"kind": "swap_status", "status": {"status": "pending"}},
+    }
+
+    artifacts = _conversation_artifacts(state)
+
+    assert artifacts == {
+        "response": {"kind": "swap_status", "status": {"status": "pending"}},
+        "status": {"kind": "swap_status", "status": {"status": "pending"}},
+    }
+    assert _conversation_artifacts(
+        {
+            "authorization_stage": "swap_ready",
+            "pending_transaction": {"to": "0xstale"},
+            "response": {
+                "kind": "clarification",
+                "errors": [{"code": "MISSING_PRICE_PARAMETERS"}],
+            },
+        }
+    ) is None
+
+
+def test_assistant_history_entry_persists_card_snapshot():
+    state = {
+        "response": {
+            "kind": "swap_quote",
+            "quotes": [{"provider": "bridgers", "provider_reference": "quote-1"}],
+        }
+    }
+
+    entry = _assistant_history_entry(state)
+
+    assert entry["content"] == "我找到了 1 个兑换报价，请比较后选择一个 Provider。"
+    assert entry["artifacts"]["quotes"][0]["provider_reference"] == "quote-1"
+
+
+def test_sse_state_does_not_duplicate_persisted_card_payloads():
+    state = {
+        "response": {"kind": "swap_quote", "quotes": []},
+        "conversation_history": [
+            {
+                "role": "assistant",
+                "content": "报价",
+                "artifacts": {"response": {"kind": "swap_quote"}, "quotes": []},
+            }
+        ],
+    }
+
+    public = _stream_state(state)
+
+    assert public["conversation_history"] == [{"role": "assistant", "content": "报价"}]
+    assert public["response"] == state["response"]
 
 
 @pytest.mark.asyncio

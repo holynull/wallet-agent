@@ -70,6 +70,26 @@ async def test_preflight_uses_maximum_rpc_okx_and_simulation_gas_with_sources():
 
 
 @pytest.mark.asyncio
+async def test_preflight_converts_hex_transaction_value_for_okx():
+    observed = []
+
+    class CapturingOkx(Okx):
+        async def estimate_gas_limit(self, transaction):
+            observed.append(transaction.native_amount)
+            return await super().estimate_gas_limit(transaction)
+
+    tx = UnsignedTransaction(chain="BSC", to=RECIPIENT, data="0x", value="0x31ef")
+    result = await _transaction_preflight(
+        adapter=Adapter(), chain="BSC", sender=OWNER, recipient=RECIPIENT,
+        amount_raw="12783", token=None, transaction=tx,
+        wallet_context={"address": OWNER, "chain": "ETH"}, wallet_provider=CapturingOkx(),
+    )
+
+    assert result["ok"] is True
+    assert observed == ["12783"]
+
+
+@pytest.mark.asyncio
 async def test_preflight_blocks_explicit_simulation_failure_but_warns_when_unavailable():
     class FailedOkx(Okx):
         async def simulate_transaction(self, transaction):

@@ -3,7 +3,7 @@
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 IntentName = Literal[
     "wallet_query",
@@ -96,9 +96,22 @@ class SwapSlotPatch(UnderstandingModel):
     amount_mode: Literal["exact_in", "exact_out"] | None = Field(
         default=None, description="数量模式：exact_in 表示指定换出，exact_out 表示指定换入"
     )
+    target_value_amount: str | None = Field(
+        default=None, description="用户明确指定的目标资产美元价值，例如‘价值 10u’中的 10"
+    )
+    target_value_currency: Literal["USD"] | None = Field(
+        default=None, description="目标法币价值的币种，目前仅支持 USD"
+    )
     slippage_bps: int | None = Field(
         default=None,
         ge=0,
         le=10_000,
         description="用户设置的滑点，使用基点；1% = 100 bps",
     )
+
+    @field_validator("target_value_amount", mode="before")
+    @classmethod
+    def normalize_target_value_amount(cls, value: Any) -> Any:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+        return value

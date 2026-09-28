@@ -42,6 +42,11 @@ _AMOUNT_WITH_UNIT_MENTION = re.compile(
     r"([A-Za-z][A-Za-z0-9()'`\-]*)"
 )
 _AMOUNT_ONLY = re.compile(r"^\s*((?:\d+(?:\.\d*)?|\.\d+))\s*$")
+_FIAT_VALUE_MENTION = re.compile(
+    r"(?:价值|等值|worth)\s*((?:\d+(?:\.\d*)?|\.\d+))\s*"
+    r"(u|usd|usdt|美元|美金)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
 _TRANSACTION_HASH_MENTION = re.compile(
     r"(?<![0-9a-f])0x[0-9a-f]{64}(?![0-9a-f])", re.IGNORECASE
 )
@@ -143,6 +148,11 @@ _DESTINATION_CHAIN_PATTERNS = (
     ),
     re.compile(rf"目标(?:也)?在\s*({_CHAIN_NAME})\s*(?:链|网络)?", re.IGNORECASE),
 )
+_DESTINATION_CHAIN_ASSET_PATTERN = re.compile(
+    rf"(?:换|兑换).*?(?:到|成|为|的)\s*({_CHAIN_NAME})\s*"
+    rf"(?:链|网络)?\s+{_TOKEN_SYMBOL}\s*$",
+    re.IGNORECASE,
+)
 
 
 def canonical_chain(value: str) -> str:
@@ -196,6 +206,14 @@ def mentioned_amount_with_unit(value: str) -> tuple[str, str] | None:
     return match.group(1), canonical_symbol(match.group(2))
 
 
+def mentioned_fiat_value(value: str) -> tuple[str, str] | None:
+    """Extract an explicit USD-value target without treating it as a token amount."""
+    matches = list(_FIAT_VALUE_MENTION.finditer(str(value)))
+    if len(matches) != 1:
+        return None
+    return matches[0].group(1), "USD"
+
+
 def transaction_query_hints(value: str) -> dict[str, str]:
     """Extract explicit transaction lookup fields without inferring missing values."""
     message = str(value).strip()
@@ -218,6 +236,12 @@ def swap_direction_hints(value: str) -> dict[str, str]:
     """Extract only swap directions made explicit by stable Chinese grammar."""
     message = str(value).strip()
     hints: dict[str, str] = {}
+    destination_chain_asset_match = _DESTINATION_CHAIN_ASSET_PATTERN.search(message)
+    if destination_chain_asset_match:
+        hints["destination_chain"] = canonical_chain(destination_chain_asset_match.group(1))
+        hints["destination_symbol"] = canonical_symbol(
+            destination_chain_asset_match.group(2)
+        )
     source_chain_asset_match = _SOURCE_CHAIN_ASSET_SWAP_PATTERN.search(message)
     if source_chain_asset_match:
         hints["source_chain"] = canonical_chain(source_chain_asset_match.group(1))

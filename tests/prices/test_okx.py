@@ -4,7 +4,11 @@ from decimal import Decimal
 import pytest
 
 from wallet_agent.domain.models import Asset
-from wallet_agent.prices.okx import OkxPriceProvider, PriceProviderError
+from wallet_agent.prices.okx import (
+    OKX_NATIVE_TOKEN_ADDRESS,
+    OkxPriceProvider,
+    PriceProviderError,
+)
 
 ETH = Asset(chain="ETH", symbol="ETH", decimals=18)
 USDC = Asset(chain="ETH", symbol="USDC", decimals=6, address="0xAb" + "1" * 38)
@@ -30,7 +34,11 @@ async def test_current_prices_batch_normalizes_provider_and_empty_results():
             "/api/v6/dex/market/price": {
                 "code": "0",
                 "data": [
-                    {"chainIndex": "1", "tokenContractAddress": "", "price": "2500.25"},
+                    {
+                        "chainIndex": "1",
+                        "tokenContractAddress": OKX_NATIVE_TOKEN_ADDRESS,
+                        "price": "2500.25",
+                    },
                     {
                         "chainIndex": "1",
                         "tokenContractAddress": USDC.address.lower(),
@@ -50,7 +58,7 @@ async def test_current_prices_batch_normalizes_provider_and_empty_results():
     assert prices[1].observed_at == datetime(2024, 9, 20, 22, 22, 3, tzinfo=timezone.utc)
     assert client.calls[0][0:2] == ("POST", "/api/v6/dex/market/price")
     assert client.calls[0][3] == [
-        {"chainIndex": "1", "tokenContractAddress": ""},
+        {"chainIndex": "1", "tokenContractAddress": OKX_NATIVE_TOKEN_ADDRESS},
         {"chainIndex": "1", "tokenContractAddress": USDC.address.lower()},
     ]
 
@@ -64,7 +72,7 @@ async def test_market_details_normalizes_decimal_metrics():
                 "data": [
                     {
                         "chainIndex": "1",
-                        "tokenContractAddress": "",
+                        "tokenContractAddress": OKX_NATIVE_TOKEN_ADDRESS,
                         "price": "2500",
                         "marketCap": "1000000.5",
                         "volume24h": "123.4",
@@ -143,7 +151,13 @@ async def test_price_provider_rejects_invalid_limits_and_malformed_responses():
 
     client.responses["/api/v6/dex/market/price"] = {
         "code": "0",
-        "data": [{"chainIndex": "1", "tokenContractAddress": "", "price": "NaN"}],
+        "data": [
+            {
+                "chainIndex": "1",
+                "tokenContractAddress": OKX_NATIVE_TOKEN_ADDRESS,
+                "price": "NaN",
+            }
+        ],
     }
     with pytest.raises(PriceProviderError):
         await provider.get_prices([ETH])

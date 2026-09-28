@@ -88,7 +88,9 @@ def _merge_errors(
     existing: list[dict[str, Any]] | None,
     incoming: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
-    return [*(existing or []), *(incoming or [])]
+    incoming_items = [item for item in (incoming or []) if not item.get("__clear__")]
+    base = [] if any(item.get("__clear__") for item in (incoming or [])) else (existing or [])
+    return [*base, *incoming_items]
 
 
 def _merge_conversation_history(

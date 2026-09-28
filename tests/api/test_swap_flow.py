@@ -127,6 +127,34 @@ async def test_turn_quote_interrupt_confirm_prepare_and_session_projection():
 
 
 @pytest.mark.asyncio
+async def test_natural_cancel_updates_business_session_projection():
+    app, client, _provider = await make_client()
+    async with client:
+        first = await client.post("/v1/agent/turn", json=request_payload())
+        first_body = first.json()
+        await app.state.runs[first_body["run_id"]]["task"]
+
+        cancelled = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "conversation_id": first_body["conversation_id"],
+                "session_id": first_body["session_id"],
+                "message": "算了，放弃吧",
+            },
+        )
+        await app.state.runs[cancelled.json()["run_id"]]["task"]
+        session = await client.get(
+            f"/v1/swap/{first_body['session_id']}", params={"user_id": "alice"}
+        )
+
+    assert session.json()["status"] == "cancelled"
+    assert session.json()["stage"] == "cancelled"
+    assert session.json()["pending_transaction"] is None
+    assert session.json()["confirmation_state"] is None
+
+
+@pytest.mark.asyncio
 async def test_okx_price_enrichment_survives_session_projection_and_confirmation_interrupt():
     class OkxPriceProvider:
         async def get_prices(self, assets):
@@ -158,11 +186,24 @@ async def test_okx_price_enrichment_survives_session_projection_and_confirmation
         session = await client.get(
             f"/v1/swap/{body['session_id']}", params={"user_id": "alice"}
         )
+        conversation = await client.get(
+            f"/v1/agent/conversations/{body['conversation_id']}",
+            params={"user_id": "alice"},
+        )
 
     assert app.state.runs[body["run_id"]]["status"] == "awaiting_confirmation"
     assert session.status_code == 200
     assert session.json()["status"] == "awaiting_confirmation"
     assert session.json()["quote_candidates"][0]["price_snapshots"][0]["provider"] == "okx"
+    assert session.json()["quote"]["price_snapshots"][0]["provider"] == "okx"
+    assert session.json()["quote"]["usd_input_value"] == "10"
+    assert session.json()["selected_provider_reference"] == "quote-ref"
+    card_kinds = [
+        next(iter(item["artifacts"].keys() - {"response"}))
+        for item in conversation.json()["messages"]
+        if item.get("role") == "assistant" and item.get("artifacts")
+    ]
+    assert card_kinds == ["quotes", "confirmation"]
 
 
 @pytest.mark.asyncio
@@ -213,10 +254,20 @@ async def test_select_quote_requires_confirmation_before_no_approval_prepare():
             "/v1/swap/s-no-approval-confirm/confirm",
             json={"user_id": "alice", "approved": True},
         )
+        history = await client.get(
+            "/v1/agent/conversations/t-no-approval-confirm",
+            params={"user_id": "alice"},
+        )
 
     assert confirmed.status_code == 200
     assert confirmed.json()["stage"] == "swap_ready"
     assert provider.prepare_calls == 1
+    assert history.status_code == 200
+    assistant_messages = [
+        item for item in history.json()["messages"] if item["role"] == "assistant"
+    ]
+    assert assistant_messages[0]["artifacts"]["confirmation"]["status"] == "requested"
+    assert assistant_messages[1]["artifacts"]["pending_transaction"]["to"] == "0xrouter"
 
 
 @pytest.mark.asyncio

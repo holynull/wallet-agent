@@ -20,6 +20,7 @@ from wallet_agent.domain.models import (
 
 PricePeriod = Literal["1m", "5m", "30m", "1h", "1d"]
 CandleBar = str
+OKX_NATIVE_TOKEN_ADDRESS = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 
 
 class PriceProviderError(Exception):
@@ -245,13 +246,13 @@ class OkxPriceProvider:
     def _asset_body(self, asset: Asset) -> dict[str, str]:
         return {
             "chainIndex": self._chain_index(asset),
-            "tokenContractAddress": (asset.address or "").lower(),
+            "tokenContractAddress": self._provider_address(asset).lower(),
         }
 
     def _history_query(self, asset, period, begin_ms, end_ms, cursor, limit):
         query = {
             "chainIndex": self._chain_index(asset),
-            "tokenContractAddress": asset.address or "",
+            "tokenContractAddress": self._provider_address(asset),
             "period": period,
             "limit": str(limit),
         }
@@ -265,7 +266,7 @@ class OkxPriceProvider:
 
     def _find_row(self, rows, asset):
         chain = self._chain_index(asset)
-        address = asset.address or ""
+        address = self._provider_address(asset)
         return next(
             (
                 row
@@ -286,7 +287,11 @@ class OkxPriceProvider:
             ) from exc
 
     def _candle_address(self, asset: Asset) -> str:
-        return (asset.address or "").lower()
+        return self._provider_address(asset).lower()
+
+    @staticmethod
+    def _provider_address(asset: Asset) -> str:
+        return asset.address or OKX_NATIVE_TOKEN_ADDRESS
 
     @staticmethod
     def _asset_key(asset):

@@ -1,9 +1,9 @@
 "use client";
 
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { classifyAgentTest, formatProcessingDuration, formatResponseSummary, parseSseFrames, providerPriority as getProviderPriority, responseMessage, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
+import { classifyAgentTest, ConversationArtifacts, extractConversationArtifacts, formatProcessingDuration, formatResponseSummary, latestProgressText, parseSseFrames, providerPriority as getProviderPriority, responseMessage, restoreConversationMessages, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
 
-type Message = { id?: string; role: "user" | "assistant" | "system"; content: string; suggestions?: any[] };
+type Message = { id?: string; role: "user" | "assistant" | "system"; content: string; fullContent?: string; typing?: boolean; suggestions?: any[]; artifacts?: ConversationArtifacts; responseKey?: string };
 type ProgressEntry = { text: string; elapsed?: number };
 type Conversation = { conversation_id: string; session_id?: string; summary: string; status: string; updated_at: string };
 type Provider = { request: (args: { method: string; params?: unknown[] }) => Promise<any>; on?: (event: string, callback: (...args: any[]) => void) => void; providers?: Provider[]; name?: string; providerName?: string; walletName?: string; _name?: string; isMetaMask?: boolean; isCatWallet?: boolean; isCatwallet?: boolean; _isCatWallet?: boolean };
@@ -107,7 +107,17 @@ export default function Home() {
     catch (error) { setMessages((current) => [...current, { role: "assistant", content: `读取历史失败：${error instanceof Error ? error.message : String(error)}` }]); }
   }
   async function loadConversation(id: string) {
-    try { clearConversationState(); const body = await requestApi(`/v1/agent/conversations/${encodeURIComponent(id)}?user_id=browser-demo`, { headers }); setConversationId(body.conversation_id); setSessionId(body.session_id ?? null); setMessages(body.messages ?? []); setHistoryOpen(false); log("CONVERSATION", body); }
+    try {
+      clearConversationState();
+      const body = await requestApi(`/v1/agent/conversations/${encodeURIComponent(id)}?user_id=browser-demo`, { headers });
+      const latestArtifacts = body.latest_artifacts || extractConversationArtifacts(body.session);
+      setConversationId(body.conversation_id);
+      setSessionId(body.session_id ?? null);
+      setMessages(restoreConversationMessages(body.messages ?? [], latestArtifacts));
+      applyActiveArtifacts(latestArtifacts);
+      setHistoryOpen(false);
+      log("CONVERSATION", body);
+    }
     catch (error) { setMessages((current) => [...current, { role: "assistant", content: `加载对话失败：${error instanceof Error ? error.message : String(error)}` }]); }
   }
   async function removeConversation(id: string) {
@@ -125,22 +135,39 @@ export default function Home() {
     finally { setActionLoading(null); endProcessing(); }
   }
   function clearConversationState() { abortRef.current?.abort(); abortRef.current = null; setBusy(false); setActionLoading(null); endProcessing(); setConversationId(null); setSessionId(null); setQuotes([]); setSelectedQuote(null); setPendingTransaction(null); setPendingKind("swap"); setBroadcastHash(null); setConfirmation(null); setApproval(null); setPreflight(null); setStatus(null); setWalletData(null); setPortfolioData(null); setPriceData(null); setGasData(null); setAssetsData(null); setSuggestions([]); setTokenCandidates([]); setProgress([]); setBackendDuration(null); setBackendStage("等待请求"); responseKeysRef.current.clear(); }
-  function appendAssistantMessage(content: string, suggestions: any[] = []) {
+  function applyActiveArtifacts(artifacts?: ConversationArtifacts | null) {
+    setQuotes(artifacts?.quotes || []);
+    setConfirmation(artifacts?.confirmation || null);
+    setPreflight(artifacts?.preflight || null);
+    setApproval(artifacts?.approval || null);
+    setPendingTransaction(artifacts?.pending_transaction || null);
+    setPendingKind(artifacts?.pending_kind || "swap");
+    setTokenCandidates(artifacts?.token_candidates || []);
+    setWalletData(artifacts?.wallet || null);
+    setPortfolioData(artifacts?.portfolio || null);
+    setPriceData(artifacts?.price || null);
+    setGasData(artifacts?.gas || null);
+    setAssetsData(artifacts?.assets || null);
+    setStatus(artifacts?.status || null);
+    setBroadcastHash(artifacts?.broadcast_hash || null);
+  }
+  function appendAssistantMessage(content: string, suggestions: any[] = [], artifacts?: ConversationArtifacts | null, responseKey?: string) {
+    if (responseKey && responseKeysRef.current.has(responseKey)) {
+      setMessages((current) => current.map((item) => item.responseKey === responseKey ? { ...item, artifacts: artifacts || item.artifacts, suggestions: suggestions.length ? suggestions : item.suggestions } : item));
+      return;
+    }
     const id = `assistant-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    let position = 0;
-    setMessages((current) => [...current, { id, role: "assistant", content: content.slice(0, 1), suggestions }]);
-    position = Math.min(1, content.length);
-    const timer = window.setInterval(() => {
-      position += 1;
-      setMessages((current) => {
-        const next = [...current];
-        const index = next.findIndex((item) => item.id === id);
-        if (index < 0) return current;
-        next[index] = { ...next[index], content: content.slice(0, position) };
-        return next;
-      });
-      if (position >= content.length) window.clearInterval(timer);
-    }, 18);
+    if (responseKey) responseKeysRef.current.add(responseKey);
+    setMessages((current) => [...current, {
+      id,
+      role: "assistant",
+      content: content.slice(0, 1),
+      fullContent: content,
+      typing: content.length > 1,
+      suggestions,
+      artifacts: artifacts || undefined,
+      responseKey,
+    }]);
   }
   function startNew() { clearConversationState(); setAgentTests({}); setDebug([]); setMessages([{ role: "assistant", content: "你好，我可以帮你查询余额、比较兑换报价，并准备未签名交易。告诉我你想做什么。" }]); }
   function chainName(id: string) { return ({ "0x1": "ETH", "0x38": "BSC", "0x89": "POLYGON", "0xa": "OPTIMISM", "0x2105": "BASE", "0xa4b1": "ARBITRUM" } as Record<string, string>)[id.toLowerCase()] ?? `EVM(${id})`; }
@@ -289,11 +316,12 @@ export default function Home() {
     setProgress([]);
     setBackendDuration(null);
     setBackendStage("正在处理请求");
+    const requestStartedAt = performance.now();
     const body = await requestApi("/v1/agent/turn", { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", conversation_id: conversationId ?? undefined, session_id: sessionId ?? undefined, message: text, address: wallet?.address, chain: wallet?.chain, metadata: { ...(wallet ? { wallet_chain_id: wallet.chainId } : {}), ...extraMetadata } }), signal: abortRef.current?.signal });
-    setConversationId(body.conversation_id); setSessionId(body.session_id ?? sessionId); log("API POST /v1/agent/turn", body); await readStream(body.run_id, true);
+    setConversationId(body.conversation_id); setSessionId(body.session_id ?? sessionId); log("API POST /v1/agent/turn", body); await readStream(body.run_id, true, requestStartedAt);
     if (display) setMessages((current) => [...current, { role: "system", content: "联调检查完成。" }]);
   }
-  async function readStream(runId: string, render = true) {
+  async function readStream(runId: string, render = true, requestStartedAt = performance.now()) {
     const response = await fetch(`${API_BASE}/v1/agent/stream/${runId}`, { headers, signal: abortRef.current?.signal });
     if (!response.ok) { const raw = await response.text(); throw new Error(`SSE ${response.status}: ${raw || response.statusText}`); }
     if (!response.body) throw new Error("SSE stream unavailable");
@@ -315,7 +343,7 @@ export default function Home() {
         const elapsed = Number(progressValue?.elapsed_ms);
         if (progressValue && Number.isFinite(elapsed)) setBackendDuration(elapsed);
         if (progressValue?.message || progressValue?.stage) setBackendStage(String(progressValue.message || progressValue.stage));
-        if (render) applyState({ ...payload, event: eventName });
+        if (render) applyState({ ...payload, event: eventName, runId });
         const content = streamedResponse?.message || current?.response?.message || payload?.response?.message;
         if (content && eventName !== "progress") assistant = content;
       } catch { /* ignore malformed keepalive */ }
@@ -328,6 +356,7 @@ export default function Home() {
     }
     buffer += decoder.decode();
     if (buffer.trim()) processFrame(buffer);
+    if (render) setBackendDuration(Math.max(0, performance.now() - requestStartedAt));
     if (render && assistant && !finalResponse && !responseKeysRef.current.has(`fallback:${assistant}`)) { responseKeysRef.current.add(`fallback:${assistant}`); setMessages((current) => [...current, { role: "assistant", content: assistant }]); }
     return events;
   }
@@ -381,39 +410,30 @@ export default function Home() {
         setProgress((items) => items.some((item) => item.text === text) ? items : [...items, { text, elapsed: Number.isFinite(elapsed) ? elapsed : undefined }].slice(-20));
       }
     }
-    if (current?.quote_candidates) setQuotes(current.quote_candidates);
     if (current?.selected_provider_reference) setSelectedQuote(current.selected_provider_reference);
-    if (current?.pending_transaction) { setPendingTransaction(current.pending_transaction); setPendingKind(current?.response?.kind === "transfer_prepare" ? "transfer" : "swap"); }
-    if (current?.broadcast_tx_hash || current?.tx_hash) setBroadcastHash(current.broadcast_tx_hash || current.tx_hash);
-    if (current?.approval_transaction) setApproval(current.approval_transaction);
-    if (current?.confirmation_state) setConfirmation(current.confirmation_state);
-    if (current?.preflight) setPreflight(current.preflight);
-    const response = ["response", "complete", "action_required"].includes(eventName)
+    let response = ["response", "complete", "action_required"].includes(eventName)
       ? current?.response?.response || current?.response || current
       : null;
+    if (!eventName && current && typeof current === "object") {
+      response = current.response?.response || current.response || (current.kind ? current : null);
+      const stage = current.stage || current.status;
+      if (!response && current.confirmation_state?.status === "requested") response = { kind: "confirmation_required", confirmation: current.confirmation_state };
+      else if (!response && stage === "approval_required") response = { kind: "approval_required", stage, approval_transaction: current.approval_transaction };
+      else if (!response && current.pending_transaction) response = { kind: current.intent === "transfer" ? "transfer_prepare" : "swap_prepare", stage, transaction: current.pending_transaction, preflight: current.preflight };
+      else if (!response && current.broadcast_status) response = { kind: "swap_status", status: current.broadcast_status, tx_hash: current.broadcast_tx_hash };
+    }
     if (eventName === "error") setMessages((previous) => [...previous, { role: "assistant", content: current?.error?.message || responseMessage(current?.error) || "Agent 执行失败。" }]);
-    if (response?.kind === "confirmation_required" && response.confirmation) setConfirmation(response.confirmation);
-    if (response?.kind === "wallet_query") setWalletData(response.wallet || response);
-    if (response?.kind === "portfolio_query") setPortfolioData(response.portfolio || response);
-    if (response?.kind === "price_query") setPriceData(response);
-    if (response?.kind === "gas_check") setGasData(response);
-    if (response?.kind === "asset_discovery") setAssetsData(response);
     if (response?.kind === "clarification") {
       const nextSuggestions = response.suggestions || [];
       setSuggestions(nextSuggestions);
-      setTokenCandidates(response.token_candidates || []);
     }
-    if (response?.kind === "swap_status" || response?.kind === "transaction_status") setStatus(response);
-    const summary = response?.kind === "swap_quote"
-      ? (response.quotes?.length ? `我找到了 ${response.quotes.length} 个兑换报价，请比较后选择一个 Provider。` : "暂时没有找到可用的兑换报价。")
-      : formatResponseSummary(response);
+    const artifacts = response ? extractConversationArtifacts({ ...current, response }) : null;
+    if (response) applyActiveArtifacts(artifacts);
+    const summary = formatResponseSummary(response);
     const finalMessage = response?.message || summary;
     if (finalMessage) {
-      const key = `${response.kind || "response"}:${finalMessage}`;
-      if (!responseKeysRef.current.has(key)) {
-        responseKeysRef.current.add(key);
-        appendAssistantMessage(finalMessage, response?.kind === "clarification" ? response.suggestions || [] : []);
-      }
+      const key = eventName ? `${value?.runId || "stream"}:${response.kind || "response"}:${finalMessage}` : undefined;
+      appendAssistantMessage(finalMessage, response?.kind === "clarification" ? response.suggestions || [] : [], artifacts, key);
     }
   }
   async function send(event?: FormEvent) {
@@ -455,8 +475,29 @@ export default function Home() {
     finally { setBusy(false); endProcessing(); abortRef.current = null; }
   }
   useEffect(() => {
+    const active = messages.find((item) => item.typing && item.fullContent && item.content.length < item.fullContent.length);
+    if (!active?.id || !active.fullContent) return;
+    const timer = window.setTimeout(() => {
+      setMessages((current) => current.map((item) => {
+        if (item.id !== active.id || !item.fullContent) return item;
+        const nextLength = Math.min(item.content.length + 1, item.fullContent.length);
+        return {
+          ...item,
+          content: item.fullContent.slice(0, nextLength),
+          typing: nextLength < item.fullContent.length,
+        };
+      }));
+    }, 18);
+    return () => window.clearTimeout(timer);
+  }, [messages]);
+  useEffect(() => {
     if (!messagesRef.current) return;
-    messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
+    const firstFrame = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (messagesRef.current) messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
+      });
+    });
+    return () => window.cancelAnimationFrame(firstFrame);
   }, [messages]);
   useEffect(() => {
     if (!processing) return;
@@ -464,20 +505,28 @@ export default function Home() {
     return () => window.clearInterval(timer);
   }, [processing]);
   const lastAssistantIndex = messages.map((item) => item.role).lastIndexOf("assistant");
-  function renderConversationCards() {
+  function renderConversationCards(artifacts: ConversationArtifacts, interactive: boolean) {
+    const cardQuotes = artifacts.quotes || [];
+    const cardConfirmation = artifacts.confirmation;
+    const cardPreflight = artifacts.preflight;
+    const cardApproval = artifacts.approval;
+    const cardTransaction = artifacts.pending_transaction;
+    const cardPendingKind = artifacts.pending_kind || "swap";
+    const cardTokenCandidates = artifacts.token_candidates || [];
+    const cardStatus = artifacts.status;
     return <>
-      {quotes.length > 0 && <section className="card"><h3>报价列表</h3>{quotes.map((quote) => <div className="quote" key={quote.provider_reference}><strong>{quote.provider} · {quote.provider_reference}</strong><span>{quote.input_amount} {quote.source_asset?.symbol} → {quote.expected_output} {quote.destination_asset?.symbol}</span><button className="secondary" disabled={!quote.provider_reference || Boolean(actionLoading) || busy} onClick={() => void selectQuote(quote.provider_reference!)}>{actionLoading === `quote:${quote.provider_reference}` ? <><i className="loading-spinner" />处理中…</> : selectedQuote === quote.provider_reference ? "已选择" : "选择此报价"}</button></div>)}</section>}
-      {confirmation?.status === "requested" && <section className="card"><h3>请确认兑换</h3><p>{confirmation.summary?.input_amount} {confirmation.summary?.source_asset?.symbol} → {confirmation.summary?.expected_output} {confirmation.summary?.destination_asset?.symbol}{confirmation.summary?.provider ? `\nProvider：${confirmation.summary.provider}` : ""}{confirmation.expires_at ? `\n有效期至：${confirmation.expires_at}` : ""}</p><div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void confirmSwap(true)}>{actionLoading === "confirm" ? <><i className="loading-spinner" />处理中…</> : "确认兑换"}</button><button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void confirmSwap(false)}>{actionLoading === "cancel-confirmation" ? <><i className="loading-spinner" />处理中…</> : "取消"}</button></div></section>}
-      {preflight && <section className="card"><h3>{preflight.ok ? "交易预检查通过" : "交易预检查未通过"}</h3><p>{preflight.gas_sources ? `Gas 来源：${Object.entries(preflight.gas_sources).map(([name, used]) => `${name}=${used ? "已用" : "未用"}`).join("、")}\n` : ""}{preflight.simulation?.success === false ? `模拟警告：${preflight.simulation.error || preflight.simulation.fail_reason || "simulation failed"}\n` : ""}{(preflight.checks || []).map((item: any) => `${item.status === "passed" ? "✓" : item.status === "warning" ? "!" : "×"} ${item.message}`).join("\n")}</p></section>}
-      {approval && <section className="card"><h3>需要 Approve 授权</h3><p>请确认授权额度，浏览器钱包会在本地弹窗签名。</p><pre className="debug">{JSON.stringify(approval, null, 2)}</pre><button disabled={Boolean(actionLoading) || busy} onClick={() => void approveSwap()}>{actionLoading === "approve" ? <><i className="loading-spinner" />处理中…</> : "钱包签名并广播 Approve"}</button></section>}
-      {pendingTransaction && <section className="card"><h3>{pendingKind === "transfer" ? "转账交易已准备好" : "兑换交易已准备好"}</h3><p>{pendingKind === "transfer" ? "请确认收款地址和金额，钱包会在当前转账链本地签名并广播。" : "请在钱包中确认未签名交易。"}</p><pre className="debug">{JSON.stringify(pendingTransaction, null, 2)}</pre><div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void broadcastPendingTransaction()}>{actionLoading === "broadcast" ? <><i className="loading-spinner" />处理中…</> : `钱包签名并广播${pendingKind === "transfer" ? "转账" : " Swap"}`}</button>{pendingKind === "transfer" && broadcastHash && <button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void queryPendingTransaction()}>{actionLoading === "transaction-status" ? <><i className="loading-spinner" />处理中…</> : "查询交易状态"}</button>}</div></section>}
-      {tokenCandidates.length > 0 && <section className="card"><h3>请选择 Token</h3><div className="card-actions">{tokenCandidates.map((item, index) => <button className="secondary" key={`${item.address}-${index}`} onClick={() => void chooseToken(item)}>{index + 1}. {item.symbol} · {item.chain} · {String(item.address).slice(0, 8)}…</button>)}</div></section>}
-      {walletData && <section className="card"><h3>钱包余额</h3><pre className="debug">{JSON.stringify(walletData, null, 2)}</pre></section>}
-      {portfolioData && <section className="card"><h3>资产组合</h3><pre className="debug">{JSON.stringify(portfolioData, null, 2)}</pre></section>}
-      {priceData && <section className="card"><h3>价格与市场数据</h3><pre className="debug">{JSON.stringify(priceData, null, 2)}</pre></section>}
-      {gasData && <section className="card"><h3>Gas 检查</h3><pre className="debug">{JSON.stringify(gasData, null, 2)}</pre></section>}
-      {assetsData && <section className="card"><h3>Token 资产发现</h3><pre className="debug">{JSON.stringify(assetsData, null, 2)}</pre></section>}
-      {status && <section className="card"><h3>订单状态</h3><p>{status.message || responseMessage(status) || status.status?.status || "处理中"}</p><pre className="debug">{JSON.stringify(status, null, 2)}</pre></section>}
+      {cardQuotes.length > 0 && <section className="card" data-card-kind="quotes"><h3>报价列表</h3>{cardQuotes.map((quote: Quote) => <div className="quote" key={quote.provider_reference}><strong>{quote.provider} · {quote.provider_reference}</strong><span>{quote.input_amount} {quote.source_asset?.symbol} → {quote.expected_output} {quote.destination_asset?.symbol}</span>{interactive && <button className="secondary" disabled={!quote.provider_reference || Boolean(actionLoading) || busy} onClick={() => void selectQuote(quote.provider_reference!)}>{actionLoading === `quote:${quote.provider_reference}` ? <><i className="loading-spinner" />处理中…</> : selectedQuote === quote.provider_reference ? "已选择" : "选择此报价"}</button>}</div>)}</section>}
+      {cardConfirmation?.status === "requested" && <section className="card" data-card-kind="confirmation"><h3>请确认兑换</h3><p>{cardConfirmation.summary?.input_amount} {cardConfirmation.summary?.source_asset?.symbol} → {cardConfirmation.summary?.expected_output} {cardConfirmation.summary?.destination_asset?.symbol}{cardConfirmation.summary?.provider ? `\nProvider：${cardConfirmation.summary.provider}` : ""}{cardConfirmation.expires_at ? `\n有效期至：${cardConfirmation.expires_at}` : ""}</p>{interactive && <div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void confirmSwap(true)}>{actionLoading === "confirm" ? <><i className="loading-spinner" />处理中…</> : "确认兑换"}</button><button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void confirmSwap(false)}>{actionLoading === "cancel-confirmation" ? <><i className="loading-spinner" />处理中…</> : "取消"}</button></div>}</section>}
+      {cardPreflight && <section className="card" data-card-kind="preflight"><h3>{cardPreflight.ok ? "交易预检查通过" : "交易预检查未通过"}</h3><p>{cardPreflight.gas_sources ? `Gas 来源：${Object.entries(cardPreflight.gas_sources).map(([name, used]) => `${name}=${used ? "已用" : "未用"}`).join("、")}\n` : ""}{cardPreflight.simulation?.success === false ? `模拟警告：${cardPreflight.simulation.error || cardPreflight.simulation.fail_reason || "simulation failed"}\n` : ""}{(cardPreflight.checks || []).map((item: any) => `${item.status === "passed" ? "✓" : item.status === "warning" ? "!" : "×"} ${item.message}`).join("\n")}</p></section>}
+      {cardApproval && <section className="card" data-card-kind="approval"><h3>需要 Approve 授权</h3><p>请确认授权额度，浏览器钱包会在本地弹窗签名。</p><pre className="debug">{JSON.stringify(cardApproval, null, 2)}</pre>{interactive && <button disabled={Boolean(actionLoading) || busy} onClick={() => void approveSwap()}>{actionLoading === "approve" ? <><i className="loading-spinner" />处理中…</> : "钱包签名并广播 Approve"}</button>}</section>}
+      {cardTransaction && <section className="card" data-card-kind="transaction"><h3>{cardPendingKind === "transfer" ? "转账交易已准备好" : "兑换交易已准备好"}</h3><p>{cardPendingKind === "transfer" ? "请确认收款地址和金额，钱包会在当前转账链本地签名并广播。" : "请在钱包中确认未签名交易。"}</p><pre className="debug">{JSON.stringify(cardTransaction, null, 2)}</pre>{interactive && <div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void broadcastPendingTransaction()}>{actionLoading === "broadcast" ? <><i className="loading-spinner" />处理中…</> : `钱包签名并广播${cardPendingKind === "transfer" ? "转账" : " Swap"}`}</button>{cardPendingKind === "transfer" && broadcastHash && <button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void queryPendingTransaction()}>{actionLoading === "transaction-status" ? <><i className="loading-spinner" />处理中…</> : "查询交易状态"}</button>}</div>}</section>}
+      {cardTokenCandidates.length > 0 && <section className="card" data-card-kind="tokens"><h3>请选择 Token</h3><div className="card-actions">{cardTokenCandidates.map((item, index) => interactive ? <button className="secondary" key={`${item.address}-${index}`} onClick={() => void chooseToken(item)}>{index + 1}. {item.symbol} · {item.chain} · {String(item.address).slice(0, 8)}…</button> : <span key={`${item.address}-${index}`}>{index + 1}. {item.symbol} · {item.chain}</span>)}</div></section>}
+      {artifacts.wallet && <section className="card" data-card-kind="wallet"><h3>钱包余额</h3><pre className="debug">{JSON.stringify(artifacts.wallet, null, 2)}</pre></section>}
+      {artifacts.portfolio && <section className="card" data-card-kind="portfolio"><h3>资产组合</h3><pre className="debug">{JSON.stringify(artifacts.portfolio, null, 2)}</pre></section>}
+      {artifacts.price && <section className="card" data-card-kind="price"><h3>价格与市场数据</h3><pre className="debug">{JSON.stringify(artifacts.price, null, 2)}</pre></section>}
+      {artifacts.gas && <section className="card" data-card-kind="gas"><h3>Gas 检查</h3><pre className="debug">{JSON.stringify(artifacts.gas, null, 2)}</pre></section>}
+      {artifacts.assets && <section className="card" data-card-kind="assets"><h3>Token 资产发现</h3><pre className="debug">{JSON.stringify(artifacts.assets, null, 2)}</pre></section>}
+      {cardStatus && <section className="card" data-card-kind="status"><h3>订单状态</h3><p>{cardStatus.message || responseMessage(cardStatus) || cardStatus.status?.status || "处理中"}</p><pre className="debug">{JSON.stringify(cardStatus, null, 2)}</pre></section>}
     </>;
   }
   return <main>
@@ -487,11 +536,11 @@ export default function Home() {
         {historyOpen && <section className="panel"><div className="toolbar"><button className="secondary" onClick={() => void loadHistory()}>重新加载</button><button className="secondary" onClick={startNew}>新建对话</button></div><div className="list">{conversations.length === 0 ? <p className="muted">暂无已保存的对话。</p> : conversations.map((item) => <div key={item.conversation_id} className="conversation"><button onClick={() => void loadConversation(item.conversation_id)}><strong>{item.summary}</strong><span>{new Date(item.updated_at).toLocaleString()} · {item.status}</span></button><button className="danger delete" onClick={() => void removeConversation(item.conversation_id)}>删除</button></div>)}</div></section>}
         <section className="action-strip"><span>工具</span><button className="secondary" onClick={() => void runDebugSmoke()}>联调检查</button><button className="secondary" onClick={() => void runAgentTests()}>测试全部 Agent 功能</button></section>
         <div ref={messagesRef} id="messages">
-      {messages.map((item, index) => <div className="message-group" key={item.id || `${index}-${item.content}`}><div className={`message ${item.role}`}><div className="message-stack">{item.role !== "system" && <div className="bubble">{item.content}</div>}{item.suggestions?.length ? <div className="inline-suggestions"><span>建议操作</span><div className="card-actions">{item.suggestions.map((suggestion, suggestionIndex) => <button className="secondary" disabled={busy || Boolean(actionLoading)} key={`${suggestion.label || suggestion.message}-${suggestionIndex}`} onClick={() => void chooseSuggestion(suggestion.message || suggestion.label || "", suggestion.data)}>{busy || actionLoading ? <><i className="loading-spinner" />处理中…</> : suggestion.label || suggestion.message}</button>)}</div></div> : null}</div></div>{item.role === "assistant" && index === lastAssistantIndex && renderConversationCards()}</div>)}
+      {messages.map((item, index) => <div className="message-group" key={item.id || `${index}-${item.content}`}><div className={`message ${item.role}`}><div className="message-stack">{item.role !== "system" && <div className="bubble">{item.content}</div>}{item.suggestions?.length ? <div className="inline-suggestions"><span>建议操作</span><div className="card-actions">{item.suggestions.map((suggestion, suggestionIndex) => <button className="secondary" disabled={busy || Boolean(actionLoading)} key={`${suggestion.label || suggestion.message}-${suggestionIndex}`} onClick={() => void chooseSuggestion(suggestion.message || suggestion.label || "", suggestion.data)}>{busy || actionLoading ? <><i className="loading-spinner" />处理中…</> : suggestion.label || suggestion.message}</button>)}</div></div> : null}{item.role === "assistant" && item.artifacts && renderConversationCards(item.artifacts, index === lastAssistantIndex)}</div></div></div>)}
         </div>
         <form className="composer" onSubmit={send}><div className="composer-row"><textarea onKeyDown={handleComposerKeyDown} value={message} onChange={(event) => setMessage(event.target.value)} placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled={busy || Boolean(actionLoading)} /><button disabled={busy || Boolean(actionLoading)}>{busy ? <><i className="loading-spinner" />处理中…</> : "发送"}</button></div><div className="toolbar"><span className="muted">{processing ? `${processing.label} · ${formatProcessingDuration(processingElapsed)}` : "就绪"}</span>{busy && <button type="button" className="secondary" onClick={cancelRequest}>取消请求</button>}{!busy && !actionLoading && lastMessage && <button type="button" className="secondary" onClick={() => void retryLastMessage()}>重试</button>}</div><div className="meta"><span>conversation: {conversationId ?? "新会话"}</span><span>session: {sessionId ?? "未创建"}</span></div></form>
       </section>
-      <aside className="side-column"><div className="side-card"><div className="side-title"><span>运行状态</span><b className={processing ? "busy" : "ready"}>{processing ? "处理中" : "就绪"}</b></div><div className="stat"><span>网络</span><strong>{wallet?.chain || "未连接"}</strong></div><div className="stat"><span>会话</span><strong>{sessionId ? "已建立" : "新会话"}</strong></div><div className="stat"><span>请求耗时</span><strong>{processing ? formatProcessingDuration(processingElapsed) : "--"}</strong></div><div className="stat"><span>后端耗时</span><strong>{backendDuration == null ? "--" : `${backendDuration} ms`}</strong></div><div className="stat"><span>当前阶段</span><strong className="stage-value">{processing?.label || backendStage}</strong></div></div>{progress.length > 0 && <section className="side-card progress-card"><div className="progress-heading"><h3>处理过程</h3><span>{backendDuration == null ? "进行中" : `${backendDuration} ms`}</span></div><ol className="progress-list">{progress.map((item, index) => <li key={`${item.text}-${index}`}><i /> <span>{item.text}{item.elapsed != null ? ` · ${item.elapsed} ms` : ""}</span></li>)}</ol></section>}<details className="panel debug-panel"><summary>后端调试数据（{debug.length} 条）</summary><div className="toolbar"><button className="secondary" onClick={() => navigator.clipboard?.writeText(debug.join("\n\n"))}>复制</button><button className="secondary" onClick={() => setDebug([])}>清空</button></div><pre className="debug">{debug.join("\n\n") || "等待后端响应…"}</pre></details>{Object.keys(agentTests).length > 0 && <div className="side-card test-card"><div className="side-title"><span>Agent 测试</span><b>{Object.values(agentTests).filter((value) => value.startsWith("通过")).length}/{AGENT_TESTS.length}</b></div><div className="test-list">{AGENT_TESTS.map((item) => <div key={item.id}><span>{item.name}</span><em>{agentTests[item.id] || "未运行"}</em></div>)}</div></div>}</aside>
+      <aside className="side-column"><div className="side-card"><div className="side-title"><span>运行状态</span><b className={processing ? "busy" : "ready"}>{processing ? "处理中" : "就绪"}</b></div><div className="stat"><span>网络</span><strong>{wallet?.chain || "未连接"}</strong></div><div className="stat"><span>会话</span><strong>{sessionId ? "已建立" : "新会话"}</strong></div><div className="stat"><span>请求耗时</span><strong>{processing ? formatProcessingDuration(processingElapsed) : "--"}</strong></div><div className="stat"><span>后端耗时</span><strong>{backendDuration == null ? "--" : `${backendDuration} ms`}</strong></div><div className="stat"><span>当前阶段</span><strong className="stage-value">{processing?.label || latestProgressText(progress, backendStage)}</strong></div></div>{progress.length > 0 && <section className="side-card progress-card"><div className="progress-heading"><h3>处理过程</h3><span>{backendDuration == null ? "进行中" : `${backendDuration} ms`}</span></div><ol className="progress-list">{progress.map((item, index) => <li key={`${item.text}-${index}`}><i /> <span>{item.text}{item.elapsed != null ? ` · ${item.elapsed} ms` : ""}</span></li>)}</ol></section>}<details className="panel debug-panel"><summary>后端调试数据（{debug.length} 条）</summary><div className="toolbar"><button className="secondary" onClick={() => navigator.clipboard?.writeText(debug.join("\n\n"))}>复制</button><button className="secondary" onClick={() => setDebug([])}>清空</button></div><pre className="debug">{debug.join("\n\n") || "等待后端响应…"}</pre></details>{Object.keys(agentTests).length > 0 && <div className="side-card test-card"><div className="side-title"><span>Agent 测试</span><b>{Object.values(agentTests).filter((value) => value.startsWith("通过")).length}/{AGENT_TESTS.length}</b></div><div className="test-list">{AGENT_TESTS.map((item) => <div key={item.id}><span>{item.name}</span><em>{agentTests[item.id] || "未运行"}</em></div>)}</div></div>}</aside>
     </div>
   </main>;
 }

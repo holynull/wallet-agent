@@ -8,6 +8,7 @@ from wallet_agent.domain.models import (
     FeeEstimate,
     NormalizedQuote,
     TokenBalance,
+    TokenPrice,
     UnsignedTransaction,
 )
 from wallet_agent.graph import build_graph
@@ -93,6 +94,16 @@ class Provider:
             ),
             provider_reference=f"reverse-{self.quote_calls}",
         )
+
+
+class FixedPrices:
+    async def get_prices(self, assets):
+        values = {"BNB": Decimal("500"), "ETH": Decimal("2000")}
+        return [
+            TokenPrice(asset=asset, usd_price=values[asset.symbol], provider="okx")
+            for asset in assets
+            if asset.symbol in values
+        ]
 
 
 class EthereumCatalogProvider(Provider):
@@ -500,6 +511,170 @@ async def test_swap_follow_up_classified_as_clarification_still_merges_chain_pat
 
 
 @pytest.mark.asyncio
+async def test_active_swap_followup_skips_reclassification_and_uses_deterministic_reply():
+    class NoResponseModel(UnderstandingModel):
+        async def respond(self, _request, _facts):
+            raise AssertionError("parameter collection must not call the response model")
+
+    model = NoResponseModel(
+        ["swap_quote"],
+        swap=[
+            SwapSlotPatch(destination_symbol="ETH"),
+            SwapSlotPatch(source_symbol="BNB", destination_symbol="ETH"),
+        ],
+    )
+    graph = build_graph(model=model)
+    config = {"configurable": {"thread_id": "fast-active-swap-followup"}}
+
+    await graph.ainvoke(turn("我想兑换 ETH"), config=config)
+    result = await graph.ainvoke(
+        turn("用 BNB 兑换成以太坊 ETH"), config=config
+    )
+
+    assert result["supervisor_decision"] == {
+        "intent": "swap_quote",
+        "source": "active_task",
+    }
+    assert result["active_task"]["slots"]["source_chain"] == "BSC"
+    assert result["active_task"]["slots"]["destination_chain"] == "ETH"
+    assert result["response"]["missing_fields"] == ["input_amount"]
+    assert "用 BNB 兑换 ETH" in result["response"]["message"]
+    assert "准备投入多少 BNB" in result["response"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_usd_value_target_converts_to_exact_output_and_reverse_quotes_source_amount():
+    model = UnderstandingModel(
+        ["swap_quote"],
+        swap=[
+            SwapSlotPatch(
+                source_chain="BSC",
+                destination_chain="ETH",
+                source_symbol="BNB",
+                destination_symbol="ETH",
+            )
+        ],
+    )
+    provider = Provider()
+    graph = build_graph(model=model, providers=[provider], price_provider=FixedPrices())
+
+    result = await graph.ainvoke(
+        turn("用 BNB 兑换价值 10u 的以太坊 ETH"),
+        config={"configurable": {"thread_id": "usd-value-exact-output"}},
+    )
+
+    assert result["response"]["kind"] == "swap_quote"
+    assert Decimal(result["swap_draft"]["output_amount"]) == Decimal("0.005")
+    assert result["swap_draft"]["target_value_amount"] == "10"
+    assert result["swap_draft"]["target_value_currency"] == "USD"
+    assert result["swap_request"]["amount_mode"] == "exact_out"
+    assert Decimal(result["response"]["quotes"][0]["input_amount"]) == Decimal("0.01")
+    assert Decimal(result["response"]["quotes"][0]["expected_output"]) == Decimal("0.005")
+    assert provider.quote_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_swap_corrects_wrong_model_chain_for_unique_native_source():
+    class NativeOnlyProvider(Provider):
+        async def list_assets(self, _query):
+            raise AssertionError("native BNB and ETH must not use token discovery")
+
+    model = UnderstandingModel(
+        ["swap_quote"],
+        swap=[
+            SwapSlotPatch(
+                source_chain="ETH",
+                destination_chain="ETH",
+                source_symbol="BNB",
+                destination_symbol="ETH",
+            )
+        ],
+    )
+    provider = NativeOnlyProvider()
+    graph = build_graph(model=model, providers=[provider], price_provider=FixedPrices())
+
+    result = await graph.ainvoke(
+        turn("用bnb 兑换价值 10u 的 以太坊 ETH"),
+        config={"configurable": {"thread_id": "wrong-model-native-source-chain"}},
+    )
+
+    assert result["response"]["kind"] == "swap_quote"
+    assert result["active_task"]["slots"]["source_chain"] == "BSC"
+    assert result["swap_request"]["source_asset"]["chain"] == "BSC"
+    assert result["swap_request"]["source_asset"]["address"] is None
+    assert result["swap_request"]["destination_asset"]["chain"] == "ETH"
+    assert provider.quote_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_active_swap_recovers_usd_target_from_history_on_calculation_followup():
+    model = UnderstandingModel(["swap_quote"], swap=[SwapSlotPatch()])
+    provider = Provider()
+    graph = build_graph(model=model, providers=[provider], price_provider=FixedPrices())
+    active_task = {
+        "task_id": "legacy-usd-value",
+        "kind": "swap",
+        "status": "collecting",
+        "stage": "collecting_parameters",
+        "revision": 1,
+        "slots": {
+            "source_chain": "BSC",
+            "destination_chain": "ETH",
+            "source_symbol": "BNB",
+            "destination_symbol": "ETH",
+            "source_decimals": 18,
+            "destination_decimals": 18,
+        },
+        "slot_sources": {},
+        "missing_fields": ["input_amount"],
+        "updated_by": "system",
+    }
+
+    result = await graph.ainvoke(
+        {
+            **turn("你能计算一下吗"),
+            "active_task": active_task,
+            "swap_draft": active_task["slots"],
+            "conversation_history": [
+                {"role": "user", "content": "用 BNB 兑换价值 10u 的以太坊 ETH"},
+                {"role": "assistant", "content": "请提供 BNB 数量"},
+                {"role": "user", "content": "你能计算一下吗"},
+            ],
+        },
+        config={"configurable": {"thread_id": "legacy-usd-value-recovery"}},
+    )
+
+    assert result["response"]["kind"] == "swap_quote"
+    assert result["swap_draft"]["target_value_amount"] == "10"
+    assert Decimal(result["response"]["quotes"][0]["input_amount"]) == Decimal("0.01")
+
+
+@pytest.mark.asyncio
+async def test_usd_value_target_reports_missing_price_provider_without_guessing():
+    model = UnderstandingModel(
+        ["swap_quote"],
+        swap=[
+            SwapSlotPatch(
+                source_chain="BSC",
+                destination_chain="ETH",
+                source_symbol="BNB",
+                destination_symbol="ETH",
+            )
+        ],
+    )
+    graph = build_graph(model=model, providers=[Provider()])
+
+    result = await graph.ainvoke(
+        turn("用 BNB 兑换价值 10u 的以太坊 ETH"),
+        config={"configurable": {"thread_id": "usd-value-no-price"}},
+    )
+
+    assert result["response"]["kind"] == "error"
+    assert result["response"]["errors"][0]["code"] == "PRICE_PROVIDER_UNAVAILABLE"
+    assert result.get("quote_candidates") == []
+
+
+@pytest.mark.asyncio
 async def test_ethereum_swap_resolves_provider_metadata_then_quotes_amount_with_unit():
     model = UnderstandingModel(
         ["swap_quote", "clarification", "clarification", "clarification"],
@@ -894,6 +1069,23 @@ async def test_cancel_marks_active_task_cancelled_and_is_idempotent():
     assert second["response"]["kind"] == "cancelled"
     assert second["active_task"]["status"] == "cancelled"
     assert second["active_task"]["revision"] == first["active_task"]["revision"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_understands_natural_abandon_message():
+    model = UnderstandingModel(
+        ["swap_quote"],
+        swap=[SwapSlotPatch(source_symbol="USDC", destination_symbol="USDT", input_amount="1")],
+    )
+    graph = build_graph(model=model, providers=[Provider()])
+    config = {"configurable": {"thread_id": "task-natural-cancel"}}
+    await graph.ainvoke(turn("用 1 USDC 换 USDT"), config=config)
+
+    result = await graph.ainvoke(turn("算了，放弃吧"), config=config)
+
+    assert result["response"] == {"kind": "cancelled", "message": "已取消当前swap任务。"}
+    assert result["active_task"]["status"] == "cancelled"
+    assert result["conversation_state"]["status"] == "cancelled"
 
 
 @pytest.mark.asyncio

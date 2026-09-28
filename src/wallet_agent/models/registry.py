@@ -60,7 +60,9 @@ def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanM
             "你是 Wallet Agent 的 swap 参数提取器。参数不完整时仍然是 swap。"
             "只返回合法 JSON，允许且必须仅使用这些 key：source_chain、destination_chain、"
             "source_symbol、destination_symbol、source_token_address、"
-            "destination_token_address、input_amount、output_amount、amount_mode、slippage_bps。只提取本轮用户明确提供或明确修改的值；"
+            "destination_token_address、input_amount、output_amount、amount_mode、"
+            "target_value_amount、target_value_currency、slippage_bps。"
+            "只提取本轮用户明确提供或明确修改的值；"
             "未提供的值返回 null，不要重复旧值。input_amount/output_amount 保留人类可读字符串。"
             "如果 request.suggestion_data 存在，它是用户点击建议明确确认的槽位输入，"
             "优先使用其中的值，仍须遵守本规则。"
@@ -69,6 +71,9 @@ def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanM
             "中文里‘换一些 USDT’、‘兑换一点 USDT’表示目标资产是 USDT，必须写入"
             "destination_symbol，不是 source_symbol。‘用 USDC 换’表示来源资产是 USDC；"
             "如果已有任务中保存了目标资产，不要覆盖或反转它。"
+            "‘价值 10u’、‘价值 10 USD’或‘worth 10 USD’表达的是目标资产美元价值，"
+            "不是来源或目标 Token 数量；此时 target_value_amount 填数字、"
+            "target_value_currency 填 USD，input_amount 和 output_amount 都返回 null。"
             "示例：‘在 Base 用 1 USDC 换 USDT’对应 source_chain=Base、"
             "destination_chain=Base、source_symbol=USDC、destination_symbol=USDT、"
             "input_amount=1。示例：‘都在 Base 链’只输出两个 chain 字段；"
@@ -124,6 +129,9 @@ class ModelRegistry:
         models: Mapping[str, Any],
         *,
         default_model_id: str,
+        classifier_model_id: str | None = None,
+        extractor_model_id: str | None = None,
+        response_model_id: str | None = None,
         extractors: Mapping[str, Mapping[str, Any]] | None = None,
         responses: Mapping[str, Any] | None = None,
     ) -> None:
@@ -135,6 +143,16 @@ class ModelRegistry:
         }
         self._responses = dict(responses or {})
         self.default_model_id = default_model_id
+        self.classifier_model_id = classifier_model_id or default_model_id
+        self.extractor_model_id = extractor_model_id or default_model_id
+        self.response_model_id = response_model_id or default_model_id
+        for role, model_id in (
+            ("classifier", self.classifier_model_id),
+            ("extractor", self.extractor_model_id),
+            ("response", self.response_model_id),
+        ):
+            if model_id not in self._models:
+                raise ValueError(f"{role} model is not configured: {model_id}")
 
     @property
     def model_ids(self) -> tuple[str, ...]:
@@ -148,7 +166,7 @@ class ModelRegistry:
             raise ValueError(f"unknown model_id: {selected}") from exc
 
     def get_extractor(self, task_kind: str, model_id: str | None = None) -> Any:
-        selected = model_id or self.default_model_id
+        selected = model_id or self.extractor_model_id
         try:
             return self._extractors[task_kind][selected]
         except KeyError as exc:
@@ -157,7 +175,7 @@ class ModelRegistry:
             ) from exc
 
     def get_response_model(self, model_id: str | None = None) -> Any:
-        selected = model_id or self.default_model_id
+        selected = model_id or self.response_model_id
         try:
             return self._responses[selected]
         except KeyError as exc:
@@ -177,7 +195,7 @@ class ModelRouter:
         self.registry = registry
 
     async def classify(self, request: Mapping[str, Any]) -> RouteDecision:
-        model = self.registry.get(request.get("model_id"))
+        model = self.registry.get(request.get("model_id") or self.registry.classifier_model_id)
         model_request = _model_input(request) if isinstance(request, Mapping) else request
         if hasattr(model, "ainvoke"):
             result = await model.ainvoke(model_request)

@@ -77,6 +77,14 @@ def build_default_registry(
             "OPTIMISM": 10,
             "POLYGON": 137,
         }
+        native_symbols = {
+            "ETH": "ETH",
+            "BSC": "BNB",
+            "BASE": "ETH",
+            "ARBITRUM": "ETH",
+            "OPTIMISM": "ETH",
+            "POLYGON": "MATIC",
+        }
         for chain, chain_id in chain_ids.items():
             if chain not in adapters and urls(chain):
                 adapters[chain] = EVMChainAdapter(
@@ -87,6 +95,7 @@ def build_default_registry(
                     ),
                     chain=chain,
                     chain_id=chain_id,
+                    native_symbol=native_symbols[chain],
                 )
         if "TRON" not in adapters and urls("TRON"):
             adapters["TRON"] = TronChainAdapter(

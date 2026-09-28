@@ -45,13 +45,22 @@ def build_application(settings: Settings | None = None) -> Any:
     api_key = settings.deepseek_api_key or settings.openai_api_key
     if not api_key:
         raise ValueError("DEEPSEEK_API_KEY or OPENAI_API_KEY is required")
+    configured_model_ids = dict.fromkeys(
+        [
+            settings.openai_model,
+            settings.intent_model,
+            settings.slot_extraction_model,
+            settings.response_model,
+            *settings.allowed_model_ids,
+        ]
+    )
     base_clients = {
         model_id: ChatOpenAI(
             model=model_id,
             api_key=api_key,
             base_url=settings.openai_base_url,
         )
-        for model_id in dict.fromkeys([settings.openai_model, *settings.allowed_model_ids])
+        for model_id in configured_model_ids
     }
     model_clients = {
         model_id: client.with_structured_output(RouteDecision, method="json_mode")
@@ -78,6 +87,9 @@ def build_application(settings: Settings | None = None) -> Any:
     model_registry = ModelRegistry(
         model_clients,
         default_model_id=settings.openai_model,
+        classifier_model_id=settings.intent_model,
+        extractor_model_id=settings.slot_extraction_model,
+        response_model_id=settings.response_model,
         extractors=extractors,
         responses=response_models,
     )
@@ -161,6 +173,7 @@ def build_application(settings: Settings | None = None) -> Any:
         checkpointer=checkpoint_handle.checkpointer,
         max_poll_attempts=settings.poll_max_attempts,
         confirmation_ttl_seconds=settings.confirmation_ttl_seconds,
+        provider_timeout_seconds=settings.provider_timeout_seconds,
     )
     session_store = SqliteSessionStore(settings.persistence_url)
     application = create_app(

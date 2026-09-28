@@ -107,3 +107,50 @@ async def test_model_router_responds_with_facts_and_structured_contract():
     assert "balances" in prompt
     assert "prices" in prompt
     assert "不执行查询" in prompt
+
+
+@pytest.mark.asyncio
+async def test_model_router_uses_role_defaults_and_honors_explicit_override():
+    calls = []
+
+    class RoleModel:
+        def __init__(self, name, result):
+            self.name = name
+            self.result = result
+
+        async def ainvoke(self, _value):
+            calls.append(self.name)
+            return self.result
+
+    registry = ModelRegistry(
+        {
+            "deepseek-v4-pro": RoleModel("pro", {"intent": "clarification"}),
+            "deepseek-chat": RoleModel("fast-classifier", {"intent": "swap_quote"}),
+        },
+        default_model_id="deepseek-v4-pro",
+        classifier_model_id="deepseek-chat",
+        extractor_model_id="deepseek-chat",
+        response_model_id="deepseek-chat",
+        extractors={
+            "swap": {
+                "deepseek-chat": RoleModel("fast-extractor", {"source_symbol": "BNB"}),
+                "deepseek-v4-pro": RoleModel("pro-extractor", {"source_symbol": "ETH"}),
+            }
+        },
+        responses={
+            "deepseek-chat": RoleModel(
+                "fast-response", {"language": "zh", "message": "请补充数量", "suggestions": []}
+            ),
+            "deepseek-v4-pro": RoleModel(
+                "pro-response", {"language": "zh", "message": "复杂回复", "suggestions": []}
+            ),
+        },
+    )
+    router = ModelRouter(registry)
+
+    await router.classify({"message": "兑换"})
+    await router.extract("swap", {"message": "用 BNB 换"})
+    await router.respond({"message": "你好"}, {})
+    await router.classify({"model_id": "deepseek-v4-pro", "message": "复杂请求"})
+
+    assert calls == ["fast-classifier", "fast-extractor", "fast-response", "pro"]

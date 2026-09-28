@@ -181,3 +181,48 @@ def test_projection_keeps_legacy_transfer_field_names():
         "transfer_amount": "4",
         "transfer_recipient": "0x" + "2" * 40,
     }
+
+
+def test_explicit_input_amount_replaces_prior_usd_value_target():
+    task = merge_task_patch(
+        new_active_task("swap"),
+        {
+            "target_value_amount": "10",
+            "target_value_currency": "USD",
+        },
+    ).task
+    task["slots"].update(
+        output_amount="0.005",
+        amount_mode="exact_out",
+        target_value_price_usd="2000",
+    )
+
+    result = merge_task_patch(task, {"input_amount": "0.02"})
+
+    assert result.task["slots"]["input_amount"] == "0.02"
+    assert "output_amount" not in result.task["slots"]
+    assert "target_value_amount" not in result.task["slots"]
+    assert "target_value_price_usd" not in result.task["slots"]
+
+
+def test_destination_change_keeps_usd_target_but_clears_derived_output():
+    task = merge_task_patch(
+        new_active_task("swap"),
+        {
+            "destination_chain": "ETH",
+            "destination_symbol": "ETH",
+            "target_value_amount": "10",
+            "target_value_currency": "USD",
+        },
+    ).task
+    task["slots"].update(
+        output_amount="0.005",
+        amount_mode="exact_out",
+        target_value_price_usd="2000",
+    )
+
+    result = merge_task_patch(task, {"destination_symbol": "USDT"})
+
+    assert result.task["slots"]["target_value_amount"] == "10"
+    assert "output_amount" not in result.task["slots"]
+    assert "target_value_price_usd" not in result.task["slots"]

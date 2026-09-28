@@ -9,13 +9,18 @@ export function formatProcessingDuration(milliseconds: number): string {
   return `${(milliseconds / 1000).toFixed(1)} s`;
 }
 
+export function latestProgressText(entries: Array<{ text?: string }>, fallback: string): string {
+  return entries.at(-1)?.text || fallback;
+}
+
 export function responseMessage(response: any): string {
   if (!response || typeof response !== "object") return "";
-  if (response.kind === "error" && Array.isArray(response.errors)) {
+  if (Array.isArray(response.errors)) {
     const errorText = response.errors.map((item: any) => item?.message || item?.code).filter(Boolean).join("\n");
     if (errorText) return errorText;
   }
   if (response.message) return String(response.message);
+  if (response.kind === "unsupported") return "抱歉，我目前只能处理钱包余额、资产、价格、转账和兑换相关请求。";
   const messages: Record<string, string> = {
     pending: "交易已经提交，正在等待链上确认。",
     confirmed: "交易已确认，资产状态应该很快同步到钱包。",
@@ -26,9 +31,78 @@ export function responseMessage(response: any): string {
     not_propagated: "交易哈希暂时还没有在源链上出现，Provider 轮询尚未开始。",
     dropped_or_replaced: "交易可能已被丢弃或被同 nonce 的新交易替换。",
     unknown: "暂时无法确定交易状态，建议稍后重试查询。",
+    quote_selection_required: "请选择一个兑换报价后继续。",
+    confirmation_required: "请确认是否继续这笔兑换。",
+    approval_required: "这笔兑换需要先授权 Token 额度，请在钱包中确认 Approve。",
+    swap_ready: "兑换交易已准备好，请在钱包中确认并广播。",
   };
-  const status = response.provider_status || response.confirmation_status || (typeof response.status === "object" ? response.status?.status || response.status?.state : response.status);
-  return messages[status] || (status ? `交易状态：${status}` : "");
+  const status = response.provider_status || response.confirmation_status || response.stage || (typeof response.status === "object" ? response.status?.status || response.status?.state : response.status);
+  return messages[status] || messages[response.kind] || (status ? `交易状态：${status}` : "");
+}
+
+export type ConversationArtifacts = {
+  response: any;
+  quotes?: any[];
+  confirmation?: any;
+  preflight?: any;
+  approval?: any;
+  pending_transaction?: any;
+  pending_kind?: "swap" | "transfer";
+  token_candidates?: any[];
+  wallet?: any;
+  portfolio?: any;
+  price?: any;
+  gas?: any;
+  assets?: any;
+  status?: any;
+  broadcast_hash?: string;
+};
+
+export function extractConversationArtifacts(state: any): ConversationArtifacts | null {
+  if (!state || typeof state !== "object") return null;
+  const response = state.response?.response || state.response || (state.kind ? state : null);
+  if (!response || typeof response !== "object") return null;
+  const kind = response.kind;
+  const stage = response.stage || (!kind ? state.authorization_stage : undefined);
+  const artifacts: ConversationArtifacts = { response };
+
+  if (kind === "swap_quote") artifacts.quotes = response.quotes || state.quote_candidates || [];
+  if (kind === "confirmation_required") artifacts.confirmation = response.confirmation || state.confirmation_state;
+  if (kind === "approval_required" || stage === "approval_required") artifacts.approval = response.approval_transaction || state.approval_transaction;
+  if (["transfer_prepare", "swap_prepare"].includes(kind) || stage === "swap_ready") {
+    artifacts.preflight = response.preflight || state.preflight;
+    artifacts.pending_transaction = response.pending_transaction || response.transaction || state.pending_transaction;
+    artifacts.pending_kind = kind === "transfer_prepare" ? "transfer" : "swap";
+  }
+  if (kind === "clarification" && (response.token_candidates || state.token_candidates)?.length) {
+    artifacts.token_candidates = response.token_candidates || state.token_candidates;
+  }
+  if (kind === "wallet_query") artifacts.wallet = response.wallet || response;
+  if (kind === "portfolio_query") artifacts.portfolio = response.portfolio || response;
+  if (kind === "price_query") artifacts.price = response;
+  if (kind === "gas_check") artifacts.gas = response;
+  if (kind === "asset_discovery") artifacts.assets = response;
+  if (kind === "swap_status" || kind === "transaction_status") artifacts.status = response;
+  if (kind === "error" && (response.preflight || state.preflight)) artifacts.preflight = response.preflight || state.preflight;
+  if (state.broadcast_tx_hash || response.tx_hash) artifacts.broadcast_hash = state.broadcast_tx_hash || response.tx_hash;
+
+  return Object.keys(artifacts).length > 1 ? artifacts : null;
+}
+
+export function restoreConversationMessages(messages: any[], latestArtifacts?: ConversationArtifacts | null): any[] {
+  const restored = Array.isArray(messages) ? messages.map((item) => {
+    if (!item?.artifacts) return { ...item };
+    const artifacts = extractConversationArtifacts({ ...item.artifacts, response: item.artifacts.response });
+    return artifacts ? { ...item, artifacts } : Object.fromEntries(Object.entries(item).filter(([key]) => key !== "artifacts"));
+  }) : [];
+  if (!latestArtifacts) return restored;
+  for (let index = restored.length - 1; index >= 0; index -= 1) {
+    if (restored[index]?.role === "assistant") {
+      if (!restored[index].artifacts) restored[index].artifacts = latestArtifacts;
+      break;
+    }
+  }
+  return restored;
 }
 
 const chainIds: Record<string, number> = {
@@ -69,6 +143,13 @@ export function providerPriority(entry: any): number {
 
 export function formatResponseSummary(response: any): string {
   if (!response || typeof response !== "object") return "";
+  if (response.kind === "swap_quote") {
+    const count = response.quotes?.length || 0;
+    let message = count ? `我找到了 ${count} 个兑换报价，请比较后选择一个 Provider。` : "暂时没有找到可用的兑换报价。";
+    const failed = (response.provider_errors || []).map((item: any) => item?.details?.provider || "未知 Provider");
+    if (failed.length) message += `另有 ${[...new Set(failed)].join(", ")} 报价失败，已跳过。`;
+    return message;
+  }
   if (response.kind === "wallet_query") {
     const wallet = response.wallet || response;
     const native = wallet.native_balance;

@@ -29,6 +29,7 @@ def build_graph(
     checkpointer: Any | None = None,
     max_poll_attempts: int = 3,
     confirmation_ttl_seconds: int = 900,
+    provider_timeout_seconds: float = 15,
 ) -> Any:
     """Compile a graph with injectable model, providers, chain adapters, and checkpointer."""
     if isinstance(providers, dict):
@@ -59,6 +60,7 @@ def build_graph(
         price_provider=price_provider,
         max_poll_attempts=max(1, max_poll_attempts),
         confirmation_ttl_seconds=max(1, confirmation_ttl_seconds),
+        provider_timeout_seconds=max(0.001, provider_timeout_seconds),
     )
     n = make_nodes(runtime)
     builder = StateGraph(AgentState)

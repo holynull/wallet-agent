@@ -9,7 +9,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from time import perf_counter
 from typing import Any
 
@@ -37,6 +37,7 @@ from wallet_agent.domain.normalization import (
     canonical_symbol,
     chain_id_for,
     mentioned_amount_with_unit,
+    mentioned_fiat_value,
     swap_direction_hints,
     transaction_query_hints,
     unambiguous_amount_with_unit,
@@ -62,6 +63,8 @@ _RESPONSE_DATA_KEYS = {
         "input_amount",
         "output_amount",
         "amount_mode",
+        "target_value_amount",
+        "target_value_currency",
         "slippage_bps",
     },
     "transfer": {"intent", "chain", "symbol", "token_address", "decimals", "amount", "recipient"},
@@ -83,6 +86,8 @@ def _response_language(message: str) -> str:
 
 def _response_fallback(intent: str, missing: list[str], language: str) -> str:
     if language == "zh":
+        if intent == "unsupported":
+            return "抱歉，我目前只能处理钱包余额、资产、价格、转账和兑换相关请求。"
         if intent == "clarification" and not missing:
             return "你好！我可以帮你查询余额、比较兑换报价、发起转账或兑换。请告诉我具体需求。"
         if intent == "transfer":
@@ -101,6 +106,11 @@ def _response_fallback(intent: str, missing: list[str], language: str) -> str:
                 return "你要使用的 USDC 数量是多少？"
             return "请告诉我想换出的资产、目标资产和数量。"
         return "请再告诉我一些具体信息。"
+    if intent == "unsupported":
+        return (
+            "Sorry, I can currently only help with wallet balances, assets, prices, "
+            "transfers, and swaps."
+        )
     if intent == "transfer":
         phrases = {
             "transfer_recipient": "the recipient address",
@@ -120,6 +130,99 @@ def _response_fallback(intent: str, missing: list[str], language: str) -> str:
     if intent == "swap_quote":
         return "What asset would you like to swap, and what would you like to receive?"
     return "Please provide a little more detail about what you need."
+
+
+def _display_decimal(value: str, *, places: int) -> str:
+    try:
+        decimal_value = Decimal(value)
+        quantum = Decimal(1).scaleb(-places)
+        rendered = format(decimal_value.quantize(quantum, rounding=ROUND_DOWN), "f")
+        return rendered.rstrip("0").rstrip(".") or "0"
+    except (ArithmeticError, ValueError):
+        return value
+
+
+def _swap_clarification_message(
+    state: Mapping[str, Any], missing: list[str], language: str
+) -> str:
+    """Ask only for unresolved swap slots, using already confirmed task facts."""
+    draft = state.get("swap_draft") or {}
+    if not isinstance(draft, Mapping):
+        draft = {}
+    source = str(draft.get("source_symbol") or "").strip()
+    destination = str(draft.get("destination_symbol") or "").strip()
+    request = state.get("request") or {}
+    message = str(request.get("message") or "") if isinstance(request, Mapping) else ""
+    fiat_hint = mentioned_fiat_value(message)
+    fiat_value = str(draft.get("target_value_amount") or (fiat_hint or (None, None))[0] or "")
+    output_amount = str(draft.get("output_amount") or "")
+    price_usd = str(draft.get("target_value_price_usd") or "")
+    output_label = _display_decimal(output_amount, places=8) if output_amount else ""
+    price_label = _display_decimal(price_usd, places=2) if price_usd else ""
+
+    if language == "zh":
+        known = f"我已识别出用 {source} 兑换 {destination}。" if source and destination else ""
+        if fiat_value and output_amount and destination:
+            known += (
+                f"按当前 {destination} 价格{f'（约 {price_label} USD）' if price_label else ''}，"
+                f"价值 {fiat_value}u 约为 {output_label} {destination}。"
+            )
+        questions: list[str] = []
+        if "source_chain" in missing:
+            questions.append(f"{source or '来源资产'} 使用哪个网络")
+        if "destination_chain" in missing:
+            questions.append(f"{destination or '目标资产'} 使用哪个网络")
+        if "source_symbol" in missing:
+            questions.append("想换出哪种资产")
+        if "destination_symbol" in missing:
+            questions.append("想换成哪种资产")
+        if "input_amount" in missing:
+            if fiat_value:
+                questions.append(
+                    f"你提到的“价值 {fiat_value}u”是美元价值；当前报价还需要准备投入的 "
+                    f"{source or '来源资产'} 数量"
+                )
+            else:
+                questions.append(f"准备投入多少 {source or '来源资产'}")
+        if "output_amount" in missing:
+            questions.append(f"希望收到多少 {destination or '目标资产'}")
+        if "sender_address" in missing or "recipient_address" in missing:
+            questions.append("请先连接钱包，以便填写发送和接收地址")
+        return f"{known}还需要确认：{'；'.join(questions) or '兑换参数'}。"
+
+    known = (
+        f"I understood that you want to swap {source} for {destination}. "
+        if source and destination
+        else ""
+    )
+    if fiat_value and output_amount and destination:
+        known += (
+            f"At the current {destination} price"
+            f"{f' (about {price_label} USD)' if price_label else ''}, "
+            f"{fiat_value} USD is about {output_label} {destination}. "
+        )
+    questions = []
+    if "source_chain" in missing:
+        questions.append(f"the network for {source or 'the source asset'}")
+    if "destination_chain" in missing:
+        questions.append(f"the network for {destination or 'the destination asset'}")
+    if "source_symbol" in missing:
+        questions.append("the asset to spend")
+    if "destination_symbol" in missing:
+        questions.append("the asset to receive")
+    if "input_amount" in missing:
+        if fiat_value:
+            questions.append(
+                f"the {source or 'source asset'} amount to spend; "
+                f"{fiat_value} USD is a fiat-value target"
+            )
+        else:
+            questions.append(f"the {source or 'source asset'} amount to spend")
+    if "output_amount" in missing:
+        questions.append(f"the desired {destination or 'destination asset'} amount")
+    if "sender_address" in missing or "recipient_address" in missing:
+        questions.append("connect the wallet for sender and recipient addresses")
+    return f"{known}Please confirm {', '.join(questions) or 'the missing swap details'}."
 
 
 def _sanitize_response_suggestions(
@@ -225,6 +328,7 @@ class GraphRuntime:
     price_provider: Any | None = None
     max_poll_attempts: int = 3
     confirmation_ttl_seconds: int = 900
+    provider_timeout_seconds: float = 15
 
 
 _VALID_INTENTS = {
@@ -481,6 +585,16 @@ def _mapping(value: Any) -> dict[str, Any]:
     return dumped if isinstance(dumped, dict) else {}
 
 
+def _transaction_native_amount(value: Any) -> str:
+    """Normalize an unsigned transaction value for OKX preflight APIs."""
+    text = str(value if value not in (None, "") else "0").strip()
+    if text.lower().startswith("0x"):
+        return str(int(text, 16))
+    if not text.isdigit():
+        raise ValueError("transaction value must be a decimal or 0x-prefixed integer")
+    return text
+
+
 def _error(
     code: str, message: str, *, retryable: bool = False, details: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -603,6 +717,51 @@ def _looks_like_swap_message(message: str) -> bool:
     return any(token in text for token in ("swap", "exchange", "兑换", "换成", "换"))
 
 
+def _active_task_followup_intent(
+    active_task: Any, message: str, suggestion_data: Any
+) -> str | None:
+    """Reuse an unfinished task only for explicit, task-shaped follow-up input."""
+    if not isinstance(active_task, Mapping) or active_task.get("status") not in {
+        "collecting",
+        "ready",
+    }:
+        return None
+    kind = active_task.get("kind")
+    if isinstance(suggestion_data, Mapping):
+        suggested_intent = suggestion_data.get("intent")
+        if kind == "swap" and suggested_intent == "swap_quote":
+            return "swap_quote"
+        if kind == "transfer" and suggested_intent == "transfer":
+            return "transfer"
+    if kind == "swap" and (
+        _looks_like_swap_message(message)
+        or bool(swap_direction_hints(message))
+        or mentioned_amount_with_unit(message) is not None
+        or unambiguous_amount_with_unit(message) is not None
+    ):
+        return "swap_quote"
+    if kind == "transfer" and (
+        any(token in message.lower() for token in ("transfer", "send", "转账", "转给"))
+        or mentioned_amount_with_unit(message) is not None
+        or unambiguous_amount_with_unit(message) is not None
+        or bool(re.search(r"0x[0-9a-fA-F]{40}", message))
+    ):
+        return "transfer"
+    return None
+
+
+def _recent_fiat_value(history: Any) -> tuple[str, str] | None:
+    if not isinstance(history, list):
+        return None
+    for item in reversed(history):
+        if not isinstance(item, Mapping) or item.get("role") != "user":
+            continue
+        hint = mentioned_fiat_value(str(item.get("content") or ""))
+        if hint is not None:
+            return hint
+    return None
+
+
 def _parse_slippage_bps(message: str) -> int | None:
     """Parse an explicitly stated percentage or basis-point slippage value."""
     match = re.search(
@@ -628,7 +787,23 @@ def _looks_like_cancel_message(message: str) -> bool:
     text = "".join(str(message).lower().split())
     return any(
         token in text
-        for token in ("取消兑换", "取消交易", "停止兑换", "停止交易", "cancelswap", "cancel")
+        for token in (
+            "取消兑换",
+            "取消交易",
+            "停止兑换",
+            "停止交易",
+            "算了",
+            "放弃",
+            "不用了",
+            "不换了",
+            "别换了",
+            "撤销",
+            "cancelswap",
+            "cancel",
+            "never mind",
+            "nevermind",
+            "abort",
+        )
     )
 
 
@@ -865,6 +1040,11 @@ _SWAP_DRAFT_KEYS = (
     "input_amount",
     "output_amount",
     "amount_mode",
+    "target_value_amount",
+    "target_value_currency",
+    "target_value_price_usd",
+    "target_value_observed_at",
+    "target_value_provider",
     "input_amount_raw",
     "sender_address",
     "recipient_address",
@@ -934,6 +1114,25 @@ def _unique_native_chain(symbol: str, explicit_address: Any = None) -> str | Non
         if _native_symbol(chain, None) == canonical_symbol_name
     ]
     return matches[0] if len(matches) == 1 else None
+
+
+def _reconcile_unique_native_chains(slots: dict[str, Any]) -> dict[str, Any]:
+    """Correct chain guesses for uniquely identifiable native assets."""
+    reconciled = dict(slots)
+    for side in ("source", "destination"):
+        symbol = reconciled.get(f"{side}_symbol")
+        if not symbol:
+            continue
+        inferred_chain = _unique_native_chain(
+            str(symbol), reconciled.get(f"{side}_token_address")
+        )
+        if inferred_chain is None:
+            continue
+        chain_key = f"{side}_chain"
+        if canonical_chain(str(reconciled.get(chain_key) or "")) == inferred_chain:
+            continue
+        reconciled = _merge_swap_slots(reconciled, {chain_key: inferred_chain})
+    return reconciled
 
 
 def _native_swap_asset(chain: str, symbol: str) -> Asset | None:
@@ -1232,7 +1431,7 @@ async def _transaction_preflight(
             chain=chain,
             from_address=sender,
             to_address=recipient,
-            native_amount=str(getattr(transaction, "value", "0")).removeprefix("0x") or "0",
+            native_amount=_transaction_native_amount(getattr(transaction, "value", "0")),
             calldata=str(getattr(transaction, "data", "0x")),
         )
         if hasattr(wallet_provider, "estimate_gas_limit"):
@@ -1539,14 +1738,7 @@ async def _resolve_swap_assets(
     asset_providers = {
         name: provider for name, provider in providers.items() if hasattr(provider, "list_assets")
     }
-    for side in ("source", "destination"):
-        chain_key = f"{side}_chain"
-        symbol = resolved.get(f"{side}_symbol")
-        if resolved.get(chain_key) or not symbol:
-            continue
-        inferred_chain = _unique_native_chain(str(symbol), resolved.get(f"{side}_token_address"))
-        if inferred_chain is not None:
-            resolved[chain_key] = inferred_chain
+    resolved = _reconcile_unique_native_chains(resolved)
     for side in ("source", "destination"):
         chain = resolved.get(f"{side}_chain")
         symbol = resolved.get(f"{side}_symbol")
@@ -1693,6 +1885,113 @@ async def _resolve_swap_assets(
         error_count=len(errors),
     )
     return resolved, candidates, errors
+
+
+async def _resolve_swap_target_value(
+    draft: dict[str, Any], price_provider: Any | None
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Convert a USD target into an exact destination-asset amount."""
+    raw_value = draft.get("target_value_amount")
+    if raw_value in (None, ""):
+        return draft, []
+    required = ("destination_chain", "destination_symbol", "destination_decimals")
+    if any(draft.get(field) in (None, "") for field in required):
+        return draft, []
+
+    started = perf_counter()
+    _emit_progress(
+        "fiat_conversion",
+        "started",
+        message="正在按美元价值计算目标资产数量。",
+    )
+    if str(draft.get("target_value_currency") or "USD").upper() != "USD":
+        errors = [_error("FIAT_CURRENCY_UNSUPPORTED", "目前只支持按 USD 价值换算。")]
+    elif price_provider is None:
+        errors = [
+            _error(
+                "PRICE_PROVIDER_UNAVAILABLE",
+                "当前没有可用的价格服务，无法按美元价值计算目标数量。",
+                retryable=True,
+            )
+        ]
+    else:
+        errors = []
+    if errors:
+        _emit_progress(
+            "fiat_conversion",
+            "failed",
+            started=started,
+            message="美元价值换算失败。",
+            error_code=errors[0]["code"],
+        )
+        return draft, errors
+
+    try:
+        target_value = Decimal(str(raw_value))
+        if target_value <= 0:
+            raise ValueError("target value must be positive")
+        asset = Asset(
+            chain=str(draft["destination_chain"]),
+            chain_id=draft.get("destination_chain_id"),
+            symbol=str(draft["destination_symbol"]),
+            decimals=int(draft["destination_decimals"]),
+            address=_explicit_token_address(draft.get("destination_token_address")),
+        )
+        prices = await price_provider.get_prices([asset])
+        price = next((item for item in prices if Decimal(str(item.usd_price)) > 0), None)
+        if price is None:
+            raise ValueError("price is unavailable")
+        observed_at = price.observed_at
+        if observed_at is not None:
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - observed_at > timedelta(minutes=5):
+                raise ValueError("price is stale")
+        precision = Decimal(1).scaleb(-asset.decimals)
+        output_amount = (target_value / Decimal(str(price.usd_price))).quantize(
+            precision, rounding=ROUND_DOWN
+        )
+        if output_amount <= 0:
+            raise ValueError("converted amount is below asset precision")
+    except Exception:
+        error = _error(
+            "FIAT_VALUE_CONVERSION_FAILED",
+            "暂时无法取得有效的目标资产价格，请稍后重试或直接提供目标数量。",
+            retryable=True,
+        )
+        _emit_progress(
+            "fiat_conversion",
+            "failed",
+            started=started,
+            message="美元价值换算失败。",
+            error_code=error["code"],
+        )
+        return draft, [error]
+
+    resolved = dict(draft)
+    resolved.pop("input_amount", None)
+    resolved.pop("input_amount_raw", None)
+    resolved.update(
+        output_amount=format(output_amount, "f"),
+        amount_mode="exact_out",
+        target_value_amount=format(target_value, "f"),
+        target_value_currency="USD",
+        target_value_price_usd=format(Decimal(str(price.usd_price)), "f"),
+        target_value_observed_at=(
+            observed_at.isoformat()
+            if observed_at is not None
+            else datetime.now(timezone.utc).isoformat()
+        ),
+        target_value_provider=str(price.provider or "unknown"),
+    )
+    _emit_progress(
+        "fiat_conversion",
+        "completed",
+        started=started,
+        message="美元价值换算完成。",
+        destination_symbol=asset.symbol,
+    )
+    return resolved, []
 
 
 def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
@@ -1899,16 +2198,36 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         missing: list[str],
         include_portfolio: bool = False,
     ) -> dict[str, Any]:
+        response_started = perf_counter()
+        _emit_progress(
+            "response_generation",
+            "started",
+            message="正在生成回复。",
+        )
         request = dict(state.get("request") or {})
         if not request.get("message") and state.get("message"):
             request["message"] = state.get("message")
+        # Once at least one swap slot is known, the graph can ask precisely for
+        # the remaining fields without another model round trip. Open-ended
+        # swap prompts still use portfolio facts and the response model, while
+        # transfer wording keeps its existing model-generated contract.
+        deterministic = bool(missing) and intent == "swap_quote" and not include_portfolio
         facts = await response_facts(
-            state, intent=intent, missing=missing, include_portfolio=include_portfolio
+            state,
+            intent=intent,
+            missing=missing,
+            include_portfolio=include_portfolio and not deterministic,
         )
-        message = _response_fallback(intent, missing, str(facts["language_hint"]))
+        language = str(facts["language_hint"])
+        message = (
+            _swap_clarification_message(state, missing, language)
+            if deterministic and intent == "swap_quote"
+            else _response_fallback(intent, missing, language)
+        )
         suggestions: list[dict[str, Any]] = []
         responder = getattr(runtime.model, "respond", None)
-        if callable(responder):
+        response_strategy = "deterministic" if deterministic else "fallback"
+        if callable(responder) and not deterministic:
             try:
                 draft = await responder(request, facts)
                 draft = _dump(draft) or {}
@@ -1919,8 +2238,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     suggestions = _sanitize_response_suggestions(
                         draft.get("suggestions"), intent=intent, facts=facts
                     )
+                    response_strategy = "model"
             except Exception:
-                pass
+                response_strategy = "fallback"
         if not suggestions and intent == "swap_quote":
             suggestions = _swap_suggestions(
                 state.get("swap_draft") or {},
@@ -1945,6 +2265,20 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             suggestions = _sanitize_response_suggestions(suggestions, intent=intent, facts=facts)
         if not suggestions and intent == "transfer":
             suggestions = await transfer_suggestions(state, missing)
+        duration_ms = (perf_counter() - response_started) * 1000
+        wallet_event(
+            "response_generation",
+            "success",
+            duration_ms=duration_ms,
+            state=state,
+        )
+        _emit_progress(
+            "response_generation",
+            "completed",
+            started=response_started,
+            message="回复生成完成。",
+            strategy=response_strategy,
+        )
         return {
             "kind": "clarification",
             "message": message,
@@ -2246,6 +2580,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         )
         request = _mapping(state.get("request"))
         forced = state.get("forced_intent")
+        metadata = request.get("metadata")
+        suggestion_data = _suggestion_data_for_model(
+            metadata.get("suggestion_data") if isinstance(metadata, Mapping) else None
+        )
+        followup_intent = (
+            _active_task_followup_intent(
+                state.get("active_task"), str(request.get("message", "")), suggestion_data
+            )
+            if hasattr(runtime.model, "extract")
+            else None
+        )
         if _looks_like_cancel_message(str(request.get("message", ""))) and (
             state.get("active_task")
             or state.get("conversation_state")
@@ -2255,6 +2600,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             decision = {"intent": "clarification", "source": "command_guard"}
         elif forced in _VALID_INTENTS:
             decision = {"intent": forced, "source": "api"}
+        elif followup_intent in _VALID_INTENTS:
+            decision = {"intent": followup_intent, "source": "active_task"}
         elif state.get("intent") in _VALID_INTENTS and not request.get("message"):
             decision = {"intent": state["intent"], "source": "graph_resume"}
         else:
@@ -2272,10 +2619,6 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             model_request["swap_draft"] = state.get("swap_draft")
             model_request["transfer_draft"] = state.get("transfer_draft")
             model_request["conversation_history"] = state.get("conversation_history") or []
-            metadata = request.get("metadata")
-            suggestion_data = _suggestion_data_for_model(
-                metadata.get("suggestion_data") if isinstance(metadata, Mapping) else None
-            )
             if suggestion_data is not None:
                 model_request["suggestion_data"] = suggestion_data
             model_request["available_capabilities"] = {
@@ -2816,9 +3159,33 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             message=f"正在向 {name} 请求兑换报价。",
             provider=str(name),
         )
-        result = await quote_tool_node.ainvoke(
-            {"messages": [AIMessage(content="", tool_calls=[call])]}
-        )
+        try:
+            result = await asyncio.wait_for(
+                quote_tool_node.ainvoke(
+                    {"messages": [AIMessage(content="", tool_calls=[call])]}
+                ),
+                timeout=runtime.provider_timeout_seconds,
+            )
+        except TimeoutError:
+            _emit_progress(
+                "quote_provider",
+                "failed",
+                started=quote_started,
+                message=f"{name} 报价请求超时。",
+                provider=str(name),
+                error_code="PROVIDER_QUOTE_TIMEOUT",
+            )
+            return {
+                "quote_candidates": [],
+                "errors": [
+                    _error(
+                        "PROVIDER_QUOTE_TIMEOUT",
+                        f"{name} 报价超过 {runtime.provider_timeout_seconds:g} 秒，已跳过。",
+                        retryable=True,
+                        details={"provider": name},
+                    )
+                ],
+            }
         try:
             payload = json.loads(result["messages"][-1].content)
         except (TypeError, ValueError):
@@ -3038,7 +3405,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     task_kind=task_kind,
                 )
             task_patch = _task_patch(task_kind, patch_source)
+            prior_slots = (active_task or {}).get("slots", {})
             if task_kind == "swap":
+                fiat_hint = mentioned_fiat_value(message)
+                if (
+                    fiat_hint is None
+                    and not (active_task.get("slots") or {}).get("target_value_amount")
+                    and any(token in message.lower() for token in ("计算", "换算", "calculate"))
+                ):
+                    fiat_hint = _recent_fiat_value(state.get("conversation_history"))
+                if fiat_hint is not None and not {
+                    "input_amount",
+                    "output_amount",
+                }.intersection(task_patch):
+                    task_patch["target_value_amount"] = fiat_hint[0]
+                    task_patch["target_value_currency"] = fiat_hint[1]
                 explicit_slippage = _parse_slippage_bps(message)
                 if explicit_slippage is not None:
                     task_patch["slippage_bps"] = explicit_slippage
@@ -3062,10 +3443,15 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     )
                     if inferred_destination_chain is not None:
                         task_patch["destination_chain"] = inferred_destination_chain
+                effective_slots = _merge_swap_slots(prior_slots, task_patch)
+                reconciled_slots = _reconcile_unique_native_chains(effective_slots)
+                for side in ("source", "destination"):
+                    chain_key = f"{side}_chain"
+                    if reconciled_slots.get(chain_key) != effective_slots.get(chain_key):
+                        task_patch[chain_key] = reconciled_slots[chain_key]
             amount_key = "amount" if task_kind == "transfer" else "input_amount"
             explicit_amount = mentioned_amount_with_unit(message)
             parsed_amount = unambiguous_amount_with_unit(message)
-            prior_slots = active_task.get("slots", {})
             if task_kind == "swap" and explicit_amount is not None:
                 explicit_value, explicit_unit = explicit_amount
                 known_source = canonical_symbol(
@@ -3191,6 +3577,70 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             if active_task:
                 active_task = _resolved_task(active_task, draft)
                 task_update["active_task"] = active_task
+            if resolution_errors:
+                active_task = _task_progress(
+                    active_task,
+                    slots=draft,
+                    status="collecting",
+                    stage="resolving_assets",
+                    missing_fields=[],
+                )
+                return {
+                    "intent": "clarification",
+                    "route": "response",
+                    "swap_draft": draft,
+                    **task_update,
+                    "active_task": active_task,
+                    "missing_fields": [],
+                    **_task_update(
+                        state.get("conversation_state"),
+                        goal="swap",
+                        stage="resolving_assets",
+                        slots=draft,
+                        missing_fields=[],
+                    ),
+                    "max_poll_attempts": runtime.max_poll_attempts,
+                    "response": {
+                        "kind": "error",
+                        "message": "无法确认兑换资产，请检查 Token 和网络是否受支持。",
+                        "errors": resolution_errors,
+                    },
+                }
+            draft, value_errors = await _resolve_swap_target_value(
+                draft, runtime.price_provider
+            )
+            if active_task:
+                active_task = _resolved_task(active_task, draft)
+                task_update["active_task"] = active_task
+            if value_errors:
+                active_task = _task_progress(
+                    active_task,
+                    slots=draft,
+                    status="collecting",
+                    stage="resolving_value",
+                    missing_fields=[],
+                )
+                return {
+                    "intent": "clarification",
+                    "route": "response",
+                    "swap_draft": draft,
+                    **task_update,
+                    "active_task": active_task,
+                    "missing_fields": [],
+                    **_task_update(
+                        state.get("conversation_state"),
+                        goal="swap",
+                        stage="resolving_value",
+                        slots=draft,
+                        missing_fields=[],
+                    ),
+                    "max_poll_attempts": runtime.max_poll_attempts,
+                    "response": {
+                        "kind": "error",
+                        "message": "无法按美元价值计算目标资产数量。",
+                        "errors": value_errors,
+                    },
+                }
             if token_candidates:
                 descriptions = [
                     (
@@ -3257,6 +3707,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         },
                     }
                 user_missing = [field for field in missing if field in _USER_SWAP_FIELDS]
+                if draft.get("target_value_amount"):
+                    user_missing = [field for field in user_missing if field != "input_amount"]
                 if "input_amount_raw" in missing and "input_amount" not in user_missing:
                     user_missing.append("input_amount")
                 stage = "collecting_parameters" if user_missing else "resolving_assets"
@@ -3686,6 +4138,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "available_providers": list(runtime.providers),
             "selected_quote": selected,
             "response": None,
+            "errors": [{"__clear__": True}],
         }
 
     async def quote_provider(state: dict[str, Any]) -> dict[str, Any]:
@@ -3751,8 +4204,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     or [_error("NO_VALID_QUOTES", "暂时没有可用的有效兑换报价。", retryable=True)],
                 },
             }
-        # Never silently choose a provider when multiple candidates exist.
-        selected = quotes[0] if len(quotes) == 1 else _dump(state.get("selected_quote"))
+        previous_selected = _dump(state.get("selected_quote"))
+        previous_reference = (
+            previous_selected.get("provider_reference")
+            if isinstance(previous_selected, dict)
+            else None
+        )
         if runtime.price_provider and quotes:
             assets = []
             for item in quotes:
@@ -3792,6 +4249,27 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 quotes = enriched
             except Exception:
                 pass
+        # Select only after enrichment so confirmation/session projection keep
+        # USD values and price snapshots. Multiple candidates still require an
+        # explicit user choice.
+        if len(quotes) == 1:
+            selected = quotes[0]
+        elif previous_reference:
+            selected = next(
+                (
+                    item
+                    for item in quotes
+                    if item.get("provider_reference") == previous_reference
+                ),
+                previous_selected,
+            )
+        else:
+            selected = None
+        provider_errors = [
+            item
+            for item in state.get("errors", [])
+            if item.get("code") in {"PROVIDER_QUOTE_FAILED", "PROVIDER_QUOTE_TIMEOUT"}
+        ]
         snapshot_map: dict[str, Any] = {}
         for item in quotes:
             raw_snapshots = item.get("price_snapshots") or []
@@ -3822,6 +4300,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "kind": "swap_quote",
                 "quotes": quotes,
                 "price_snapshots": snapshot_map,
+                "provider_errors": provider_errors,
             },
         }
 
@@ -4859,6 +5338,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             return {"response": response}
         if state.get("errors"):
             return {"response": {"kind": "error", "errors": state["errors"]}}
+        if state.get("intent") == "unsupported":
+            message = str(
+                (state.get("request") or {}).get("message") or state.get("message") or ""
+            )
+            return {
+                "response": {
+                    "kind": "unsupported",
+                    "message": _response_fallback(
+                        "unsupported", [], _response_language(message)
+                    ),
+                }
+            }
         return {"response": {"kind": state.get("intent", "clarification")}}
 
     return locals()

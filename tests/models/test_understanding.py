@@ -158,3 +158,12 @@ async def test_ainvoke_remains_a_classification_compatibility_alias():
 
     assert result == {"intent": "wallet_query"}
     assert isinstance(client.inputs[0][0], HumanMessage)
+
+
+def test_swap_slot_patch_accepts_numeric_usd_target_from_json_models():
+    patch = SwapSlotPatch.model_validate(
+        {"target_value_amount": 10, "target_value_currency": "USD"}
+    )
+
+    assert patch.target_value_amount == "10"
+    assert patch.target_value_currency == "USD"

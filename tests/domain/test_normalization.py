@@ -4,6 +4,7 @@ from wallet_agent.domain.normalization import (
     canonical_symbol,
     chain_id_for,
     mentioned_amount_with_unit,
+    mentioned_fiat_value,
     swap_direction_hints,
     transaction_query_hints,
     unambiguous_amount,
@@ -47,6 +48,9 @@ def test_unambiguous_amount_with_unit_preserves_token_semantics():
     assert unambiguous_amount_with_unit("大约 1 USDC") is None
     assert mentioned_amount_with_unit("我想换 5USDT") == ("5", "USDT")
     assert mentioned_amount_with_unit("在 Base 用 1 USDC 换 USDT") == ("1", "USDC")
+    assert mentioned_fiat_value("兑换价值 10u 的 ETH") == ("10", "USD")
+    assert mentioned_fiat_value("worth 12.5 USD of ETH") == ("12.5", "USD")
+    assert mentioned_fiat_value("用 10 USDT 换 ETH") is None
 
 
 def test_swap_direction_hints_understand_explicit_chinese_swap_grammar():
@@ -75,6 +79,11 @@ def test_swap_direction_hints_understand_explicit_chinese_swap_grammar():
         "source_chain": "ETH",
         "source_symbol": "USDC",
         "destination_symbol": "BNB",
+    }
+    assert swap_direction_hints("用bnb 兑换价值 10u 的 以太坊 ETH") == {
+        "destination_chain": "ETH",
+        "destination_symbol": "ETH",
+        "source_symbol": "BNB",
     }
 
 

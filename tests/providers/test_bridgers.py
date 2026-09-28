@@ -347,7 +347,26 @@ async def test_bridgers_reverse_quote_binary_searches_source_amount():
 
     assert quote.input_amount == Decimal("5")
     assert quote.expected_output == Decimal("4")
-    assert len(transport.calls) < 40
+    assert len(transport.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_bridgers_reverse_quote_corrects_rate_movement_with_bounded_calls():
+    class MovingRateTransport(DynamicQuoteTransport):
+        async def post(self, path, payload, *, idempotency_key=None):
+            result = await super().post(path, payload, idempotency_key=idempotency_key)
+            if len(self.calls) == 2:
+                result["data"]["txData"]["toTokenAmount"] = "3.99"
+                result["data"]["txData"]["amountOutMin"] = "3990000"
+            return result
+
+    transport = MovingRateTransport()
+    provider = BridgersProvider.from_transport(transport)
+
+    quote = await provider.reverse_quote(valid_quote_request(), Decimal("4"))
+
+    assert quote.expected_output >= Decimal("4")
+    assert len(transport.calls) == 3
 
 
 @pytest.mark.asyncio

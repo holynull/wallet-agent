@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 
 import pytest
@@ -186,6 +187,60 @@ async def test_quote_path_fans_out_and_reduces_candidates():
 
 
 @pytest.mark.asyncio
+async def test_quote_path_keeps_success_and_reports_failed_provider():
+    class FailingProvider(FakeProvider):
+        async def quote(self, request):
+            self.calls.append(("quote", request))
+            raise RuntimeError("provider unavailable")
+
+    graph = build_graph(
+        model=FakeModel(),
+        providers=[FakeProvider("omnibridge"), FailingProvider("bridgers")],
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "c-partial-quotes",
+            "user_id": "u1",
+            "intent": "swap_quote",
+            "swap_request": quote_request(),
+        },
+        config={"configurable": {"thread_id": "t-partial-quotes"}},
+    )
+
+    assert result["response"]["kind"] == "swap_quote"
+    assert [quote["provider"] for quote in result["response"]["quotes"]] == ["omnibridge"]
+    assert result["response"]["provider_errors"][0]["details"]["provider"] == "bridgers"
+    assert "message" not in result["response"]
+
+
+@pytest.mark.asyncio
+async def test_quote_provider_timeout_is_bounded_and_explicit():
+    class SlowProvider(FakeProvider):
+        async def quote(self, request):
+            await asyncio.sleep(1)
+            return await super().quote(request)
+
+    graph = build_graph(
+        model=FakeModel(),
+        providers=[SlowProvider("slow")],
+        provider_timeout_seconds=0.01,
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "c-timeout-quote",
+            "user_id": "u1",
+            "intent": "swap_quote",
+            "swap_request": quote_request(),
+        },
+        config={"configurable": {"thread_id": "t-timeout-quote"}},
+    )
+
+    assert result["response"]["kind"] == "error"
+    assert result["response"]["errors"][0]["code"] == "PROVIDER_QUOTE_TIMEOUT"
+    assert result["response"]["errors"][0]["retryable"] is True
+
+
+@pytest.mark.asyncio
 async def test_quote_provider_streams_progress_with_duration():
     graph = build_graph(
         model=FakeModel(),
@@ -242,6 +297,25 @@ async def test_forced_intent_does_not_emit_an_unfinished_progress_stage():
         if item["status"] in {"completed", "completed_with_errors", "failed"}
     }
     assert {item["stage"] for item in progress if item["status"] == "started"} <= terminal_stages
+
+
+@pytest.mark.asyncio
+async def test_unsupported_response_has_user_facing_message():
+    graph = build_graph(model=FakeModel(), providers=[])
+
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "c-unsupported-message",
+            "user_id": "u1",
+            "request": {"message": "帮我订一张机票"},
+            "intent": "unsupported",
+            "forced_intent": "unsupported",
+        },
+        config={"configurable": {"thread_id": "t-unsupported-message"}},
+    )
+
+    assert result["response"]["kind"] == "unsupported"
+    assert "钱包" in result["response"]["message"]
 
 
 @pytest.mark.asyncio
@@ -435,6 +509,31 @@ async def test_swap_asset_resolution_accepts_native_source_without_contract_addr
     assert request is not None
     assert request.input_amount_raw == "100000000000000000"
     assert request.source_asset.address is None
+
+
+@pytest.mark.asyncio
+async def test_swap_asset_resolution_corrects_wrong_chain_for_unique_native_source():
+    provider = AssetDiscoveryProvider("catalog", [])
+
+    resolved, candidates, errors = await _resolve_swap_assets(
+        {
+            "source_chain": "ETH",
+            "source_symbol": "BNB",
+            "destination_chain": "ETH",
+            "destination_symbol": "ETH",
+            "target_value_amount": "10",
+            "target_value_currency": "USD",
+        },
+        {"catalog": provider},
+    )
+
+    assert candidates == []
+    assert errors == []
+    assert resolved["source_chain"] == "BSC"
+    assert resolved["source_chain_id"] == 56
+    assert resolved["source_decimals"] == 18
+    assert resolved.get("source_token_address") is None
+    assert provider.calls == []
 
 
 @pytest.mark.asyncio
@@ -699,6 +798,66 @@ async def test_conversational_swap_reports_missing_asset_catalog_without_calling
     assert result["response"]["errors"][0]["code"] == "ASSET_PROVIDER_UNAVAILABLE"
     assert result["missing_fields"] == []
     assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_asset_resolution_failure_stops_before_fiat_conversion():
+    class CountingPrices:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_prices(self, _assets):
+            self.calls += 1
+            return []
+
+    prices = CountingPrices()
+    graph = build_graph(
+        model=SwapExtractionModel(
+            {
+                "intent": "swap_quote",
+                "source_chain": "ETH",
+                "source_symbol": "NOT_A_TOKEN",
+                "destination_chain": "BSC",
+                "destination_symbol": "BNB",
+                "target_value_amount": "10",
+                "target_value_currency": "USD",
+            }
+        ),
+        providers=[EmptyAssetDiscoveryProvider("catalog")],
+        price_provider=prices,
+    )
+    request = {
+        "conversation_id": "asset-failure-before-fiat",
+        "user_id": "u1",
+        "request": {"message": "用未知资产兑换价值 10u 的 BNB"},
+        "wallet_context": {"address": "0x" + "1" * 40, "chain": "ETH", "chain_id": 1},
+    }
+
+    result = await graph.ainvoke(
+        request,
+        config={"configurable": {"thread_id": "asset-failure-result"}},
+    )
+    progress = []
+    async for chunk in graph.astream(
+        request,
+        config={"configurable": {"thread_id": "asset-failure-progress"}},
+        stream_mode="custom",
+    ):
+        progress.append(chunk)
+
+    assert result["response"]["kind"] == "error"
+    assert result["response"]["errors"][0]["code"] == "ASSET_NOT_FOUND"
+    assert result["task_stage"] == "resolving_assets"
+    assert result["active_task"]["stage"] == "resolving_assets"
+    assert prices.calls == 0
+    assert not any(item["stage"] == "fiat_conversion" for item in progress)
+    terminal = [
+        item
+        for item in progress
+        if item["status"] in {"completed", "completed_with_errors", "failed"}
+    ]
+    assert terminal[-1]["stage"] == "asset_resolution"
+    assert terminal[-1]["status"] == "completed_with_errors"
 
 
 @pytest.mark.asyncio

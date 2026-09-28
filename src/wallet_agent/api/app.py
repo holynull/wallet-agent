@@ -179,6 +179,137 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _conversation_artifacts(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Project one response into the card snapshot persisted beside its chat message."""
+    raw_response = state.get("response") or {}
+    if isinstance(raw_response, Mapping) and isinstance(raw_response.get("response"), Mapping):
+        raw_response = raw_response["response"]
+    if not isinstance(raw_response, Mapping) or not raw_response:
+        return None
+    response = _jsonable(raw_response)
+    kind = response.get("kind")
+    stage = response.get("stage") or (state.get("authorization_stage") if not kind else None)
+    artifacts: dict[str, Any] = {"response": response}
+
+    if kind == "swap_quote":
+        artifacts["quotes"] = response.get("quotes") or _jsonable(
+            state.get("quote_candidates") or []
+        )
+    if kind == "confirmation_required":
+        artifacts["confirmation"] = response.get("confirmation") or _jsonable(
+            state.get("confirmation_state")
+        )
+    if kind == "approval_required" or stage == "approval_required":
+        artifacts["approval"] = response.get("approval_transaction") or _jsonable(
+            state.get("approval_transaction")
+        )
+    if kind in {"transfer_prepare", "swap_prepare"} or stage == "swap_ready":
+        artifacts["preflight"] = response.get("preflight") or _jsonable(
+            state.get("preflight")
+        )
+        artifacts["pending_transaction"] = (
+            response.get("pending_transaction")
+            or response.get("transaction")
+            or _jsonable(state.get("pending_transaction"))
+        )
+        artifacts["pending_kind"] = "transfer" if kind == "transfer_prepare" else "swap"
+    if kind == "clarification":
+        candidates = response.get("token_candidates") or state.get("token_candidates") or []
+        if candidates:
+            artifacts["token_candidates"] = _jsonable(candidates)
+    if kind == "wallet_query":
+        artifacts["wallet"] = response.get("wallet") or response
+    if kind == "portfolio_query":
+        artifacts["portfolio"] = response.get("portfolio") or response
+    if kind == "price_query":
+        artifacts["price"] = response
+    if kind == "gas_check":
+        artifacts["gas"] = response
+    if kind == "asset_discovery":
+        artifacts["assets"] = response
+    if kind in {"swap_status", "transaction_status"}:
+        artifacts["status"] = response
+    if kind == "error" and (response.get("preflight") or state.get("preflight")):
+        artifacts["preflight"] = response.get("preflight") or _jsonable(state.get("preflight"))
+    if state.get("broadcast_tx_hash") or response.get("tx_hash"):
+        artifacts["broadcast_hash"] = state.get("broadcast_tx_hash") or response.get("tx_hash")
+
+    return artifacts if len(artifacts) > 1 else None
+
+
+def _assistant_response_content(response: Mapping[str, Any]) -> str:
+    if response.get("message"):
+        return str(response["message"])
+    errors = response.get("errors") or []
+    if errors and isinstance(errors[0], Mapping):
+        return str(errors[0].get("message") or errors[0].get("code") or "请求处理失败。")
+    kind = response.get("kind")
+    stage = response.get("stage")
+    if kind == "swap_quote":
+        count = len(response.get("quotes") or [])
+        message = f"我找到了 {count} 个兑换报价，请比较后选择一个 Provider。"
+        failed = [
+            str((item.get("details") or {}).get("provider") or "未知 Provider")
+            for item in response.get("provider_errors") or []
+            if isinstance(item, Mapping)
+        ]
+        if failed:
+            message += f"另有 {', '.join(dict.fromkeys(failed))} 报价失败，已跳过。"
+        return message
+    messages = {
+        "unsupported": "抱歉，我目前只能处理钱包余额、资产、价格、转账和兑换相关请求。",
+        "confirmation_required": "请确认是否继续这笔兑换。",
+        "approval_required": "这笔兑换需要先授权 Token 额度，请在钱包中确认 Approve。",
+        "transfer_prepare": "转账交易已准备好，请在钱包中确认并广播。",
+        "swap_prepare": "兑换交易已准备好，请在钱包中确认并广播。",
+        "wallet_query": "钱包余额查询完成。",
+        "portfolio_query": "资产组合查询完成。",
+        "price_query": "价格查询完成。",
+        "gas_check": "Gas 检查完成。",
+        "asset_discovery": "Token 资产查询完成。",
+        "transaction_status": "交易状态查询完成。",
+        "swap_status": "兑换状态查询完成。",
+        "error": "请求处理失败。",
+    }
+    stage_messages = {
+        "approval_required": "这笔兑换需要先授权 Token 额度，请在钱包中确认 Approve。",
+        "swap_ready": "兑换交易已准备好，请在钱包中确认并广播。",
+        "quote_selection_required": "请选择一个兑换报价后继续。",
+    }
+    return messages.get(str(kind)) or stage_messages.get(str(stage)) or "请求已处理完成。"
+
+
+def _assistant_history_entry(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    response = state.get("response") or {}
+    if not isinstance(response, Mapping) or not response:
+        return None
+    entry: dict[str, Any] = {
+        "role": "assistant",
+        "content": _assistant_response_content(response),
+    }
+    artifacts = _conversation_artifacts(state)
+    if artifacts:
+        entry["artifacts"] = artifacts
+    suggestions = response.get("suggestions")
+    if suggestions:
+        entry["suggestions"] = _jsonable(suggestions)
+    return entry
+
+
+def _stream_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep persisted card snapshots out of SSE state duplication."""
+    public_state = _jsonable(state)
+    history = public_state.get("conversation_history")
+    if isinstance(history, list):
+        public_state["conversation_history"] = [
+            {key: value for key, value in item.items() if key != "artifacts"}
+            if isinstance(item, dict)
+            else item
+            for item in history
+        ]
+    return public_state
+
+
 def _broadcast_response(
     record: SwapSessionRecord,
     broadcast_status: BroadcastStatus | str | None = None,
@@ -553,6 +684,7 @@ def create_app(
             "session_id": session.session_id,
             "session": _jsonable(session),
             "messages": _jsonable(state.get("conversation_history") or []),
+            "latest_artifacts": _conversation_artifacts(state),
         }
 
     @app.delete("/v1/agent/conversations/{conversation_id}")
@@ -572,6 +704,31 @@ def create_app(
         if checkpointer is not None and hasattr(checkpointer, "adelete_thread"):
             await checkpointer.adelete_thread(conversation_id)
         return {"conversation_id": conversation_id, "deleted": deleted}
+
+    async def persist_assistant_history(
+        conversation_id: str, state: Mapping[str, Any]
+    ) -> None:
+        """Persist response text and its immutable UI-card snapshot as one chat item."""
+        graph = app.state.graph
+        history_entry = _assistant_history_entry(state)
+        if history_entry is None or graph is None or not hasattr(graph, "aupdate_state"):
+            return
+        config = {"configurable": {"thread_id": conversation_id}}
+        history = state.get("conversation_history") or []
+        if hasattr(graph, "aget_state"):
+            snapshot = await graph.aget_state(config)
+            values = getattr(snapshot, "values", None) or {}
+            history = values.get("conversation_history") or history
+        duplicate = any(
+            isinstance(item, Mapping)
+            and item.get("role") == "assistant"
+            and item.get("content") == history_entry["content"]
+            and item.get("artifacts") == history_entry.get("artifacts")
+            for item in history
+        )
+        if duplicate:
+            return
+        await graph.aupdate_state(config, {"conversation_history": [history_entry]})
 
     async def project_session(
         session_id: str | None,
@@ -607,11 +764,18 @@ def create_app(
         )
         selected = state.get("selected_quote")
         if selected:
+            selected_reference = (
+                selected.get("provider_reference")
+                if isinstance(selected, Mapping)
+                else getattr(selected, "provider_reference", None)
+            )
             changes["quote"] = (
                 selected
                 if isinstance(selected, NormalizedQuote)
                 else NormalizedQuote.model_validate(selected)
             )
+            if selected_reference:
+                changes["selected_provider_reference"] = str(selected_reference)
         candidates = state.get("quote_candidates") or []
         if candidates:
             changes["quote_candidates"] = [
@@ -677,6 +841,17 @@ def create_app(
                 # longer actionable and must not make clients render signing cards.
                 changes["approval_transaction"] = None
                 changes["pending_transaction"] = None
+        if response.get("kind") == "cancelled" and not broadcast_lifecycle_active:
+            changes.update(
+                status="cancelled",
+                stage="cancelled",
+                pending_transaction=None,
+                approval_transaction=None,
+                approval_tx_hash=None,
+                allowance_requirement=None,
+                confirmation_state=None,
+                gas_estimate=None,
+            )
         for field in ("approval_transaction", "approval_tx_hash", "allowance_requirement"):
             if state.get(field) is not None:
                 changes[field] = state[field]
@@ -775,7 +950,9 @@ def create_app(
         try:
             if app.state.graph is None:
                 result = input_state
-                app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
+                app.state.runs[run_id]["events"].append(
+                    {"event": "complete", "state": _stream_state(result)}
+                )
             else:
 
                 async def get_snapshot() -> Any:
@@ -784,6 +961,7 @@ def create_app(
                     return app.state.graph.get_state(config)
 
                 async def execute(graph_input: dict[str, Any]) -> dict[str, Any]:
+                    response_updates: list[dict[str, Any]] = []
                     snapshot = await get_snapshot()
                     request = (
                         graph_input.get("request")
@@ -848,17 +1026,33 @@ def create_app(
                         # are progress, while graph state responses are user-facing
                         # only when they contain a typed response object.
                         if mode == "updates" and isinstance(event, Mapping):
+                            node_updates = [
+                                value for value in event.values() if isinstance(value, Mapping)
+                            ]
+                            for node_update in node_updates:
+                                nested_response = node_update.get("response")
+                                if isinstance(nested_response, Mapping):
+                                    response_updates.append(
+                                        {"response": _jsonable(nested_response)}
+                                    )
                             response_value = event.get("response")
                             if isinstance(response_value, Mapping):
                                 event = {"response": _jsonable(response_value)}
+                                response_updates.append(event)
                         event_name = "progress" if mode == "custom" else (
-                            "response" if isinstance(event, Mapping) and isinstance(event.get("response"), Mapping) else "update"
+                            "response"
+                            if isinstance(event, Mapping)
+                            and isinstance(event.get("response"), Mapping)
+                            else "update"
                         )
                         app.state.runs[run_id]["events"].append(
                             {"event": event_name, "data": event}
                         )
                     snapshot = await get_snapshot()
-                    return dict(snapshot.values)
+                    final_state = dict(snapshot.values)
+                    for update in response_updates:
+                        await persist_assistant_history(thread_id, update)
+                    return final_state
 
                 result = await execute(input_state)
                 # A swap turn owns a business session. Once quotes are available,
@@ -887,45 +1081,24 @@ def create_app(
                     )
                 snapshot = await get_snapshot()
                 result = snapshot.values
-                response_for_history = result.get("response") or {}
-                if response_for_history and hasattr(app.state.graph, "aupdate_state"):
-                    assistant_content = response_for_history.get("message") or (
-                        response_for_history.get("kind")
-                    )
-                    history = result.get("conversation_history") or []
-                    duplicate_assistant = any(
-                        isinstance(item, Mapping)
-                        and item.get("role") == "assistant"
-                        and item.get("content") == str(assistant_content)
-                        for item in history
-                    )
-                    if assistant_content and not duplicate_assistant:
-                        await app.state.graph.aupdate_state(
-                            config,
-                            {
-                                "conversation_history": [
-                                    {
-                                        "role": "assistant",
-                                        "content": str(assistant_content),
-                                    }
-                                ]
-                            },
-                        )
-                        snapshot = await get_snapshot()
-                        result = snapshot.values
+                await persist_assistant_history(thread_id, result)
+                snapshot = await get_snapshot()
+                result = snapshot.values
                 interrupted = bool(getattr(snapshot, "tasks", ())) and bool(
                     getattr(snapshot, "next", ())
                 )
                 if interrupted or "__interrupt__" in result:
                     app.state.runs[run_id]["status"] = "awaiting_confirmation"
                     app.state.runs[run_id]["events"].append(
-                        {"event": "action_required", "state": result}
+                        {"event": "action_required", "state": _stream_state(result)}
                     )
                     await project_session(
                         session_id, result, status="awaiting_confirmation", run_id=run_id
                     )
                 else:
-                    app.state.runs[run_id]["events"].append({"event": "complete", "state": result})
+                    app.state.runs[run_id]["events"].append(
+                        {"event": "complete", "state": _stream_state(result)}
+                    )
                     app.state.runs[run_id]["status"] = "complete"
                     response_kind = (result.get("response") or {}).get("kind")
                     session_status = None
@@ -1262,6 +1435,7 @@ def create_app(
                             Command(resume={"approved": False}),
                             config={"configurable": {"thread_id": session.thread_id}},
                         )
+                        await persist_assistant_history(session.thread_id, result)
                     updated = await project_session(session_id, result, status="cancelled")
                     if updated is not None:
                         return _jsonable(updated)
@@ -1286,6 +1460,7 @@ def create_app(
                 Command(resume={"approved": True}),
                 config=config,
             )
+            await persist_assistant_history(session.thread_id, result)
             if hasattr(graph, "aget_state"):
                 snapshot = await graph.aget_state(config)
             else:
@@ -1530,6 +1705,7 @@ def create_app(
                 },
                 config={"configurable": {"thread_id": session.thread_id}},
             )
+            await persist_assistant_history(session.thread_id, result)
         updated = await project_session(session_id, result, status="awaiting_confirmation")
         if updated is not None:
             updated = await session_store.update(
@@ -1620,6 +1796,7 @@ def create_app(
                     },
                     config=config,
                 )
+            await persist_assistant_history(session.thread_id, result)
         response = result.get("response") or {}
         stage = result.get("authorization_stage") or response.get("stage") or "swap_ready"
         return _jsonable(
