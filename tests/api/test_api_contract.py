@@ -4,7 +4,7 @@ from langgraph.types import Command, Interrupt
 
 from wallet_agent.api import create_app
 from wallet_agent.api.app import _assistant_history_entry, _conversation_artifacts, _stream_state
-from wallet_agent.domain.models import UnsignedTransaction
+from wallet_agent.domain.models import ProviderOrder, UnsignedTransaction
 from wallet_agent.persistence import InMemorySessionStore, SwapSessionRecord
 
 
@@ -117,6 +117,95 @@ async def test_sse_completion_and_missing_run_contract():
     assert "event: complete" in stream.text
     assert "RUN_NOT_FOUND" in missing.text
     assert "run not found" in missing.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_new_transfer_projection_clears_stale_swap_session_lifecycle():
+    session_store = InMemorySessionStore()
+    await session_store.save(
+        SwapSessionRecord(
+            session_id="session-transfer-reset",
+            user_id="alice",
+            thread_id="conversation-transfer-reset",
+            status="completed",
+            stage="completed",
+            provider_order=ProviderOrder(
+                provider="bridgers",
+                provider_order_id="old-order",
+                provider_reference="old-reference",
+                tx_hash="0x" + "a" * 64,
+            ),
+            broadcast_tx_hash="0x" + "a" * 64,
+            broadcast_status="confirmed",
+        )
+    )
+
+    class Graph:
+        def __init__(self):
+            self.state = None
+
+        async def astream(self, value, *, config, stream_mode):
+            del config, stream_mode
+            self.state = {
+                **value,
+                "intent": "clarification",
+                "operation_reset": True,
+                "active_task": {
+                    "task_id": "transfer-task",
+                    "kind": "transfer",
+                    "status": "collecting",
+                    "stage": "collecting_parameters",
+                    "revision": 1,
+                    "slots": {"chain": "BSC", "symbol": "USDC"},
+                    "slot_sources": {},
+                    "missing_fields": ["transfer_recipient"],
+                },
+                "task_stage": "collecting_parameters",
+                "provider_orders": {},
+                "provider_order_ids": {},
+                "selected_quote": None,
+                "broadcast_tx_hash": None,
+                "broadcast_status": None,
+                "response": {
+                    "kind": "clarification",
+                    "message": "请补充收款地址。",
+                    "missing_fields": ["transfer_recipient"],
+                },
+            }
+            yield ("updates", {"response": self.state["response"]})
+
+        async def aget_state(self, _config):
+            class Snapshot:
+                tasks = ()
+                next = ()
+
+            snapshot = Snapshot()
+            snapshot.values = self.state or {}
+            return snapshot
+
+    graph = Graph()
+    app = create_app(graph=graph, store=session_store)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "conversation_id": "conversation-transfer-reset",
+                "session_id": "session-transfer-reset",
+                "message": "给自己转 1 USDC",
+            },
+        )
+        await app.state.runs[response.json()["run_id"]]["task"]
+
+    assert response.status_code == 200
+    projected = await session_store.get("session-transfer-reset")
+    assert projected is not None
+    assert projected.status == "collecting_parameters"
+    assert projected.stage == "collecting_parameters"
+    assert projected.provider_order is None
+    assert projected.broadcast_tx_hash is None
 
 
 @pytest.mark.asyncio

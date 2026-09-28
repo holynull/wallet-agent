@@ -806,17 +806,39 @@ def create_app(
             return None
         state = {str(key): _jsonable(value) for key, value in state.items()}
         changes: dict[str, Any] = {}
+        operation_reset = bool(state.get("operation_reset"))
+        if operation_reset:
+            # A session is the projection of the current wallet operation.
+            # Conversation history retains completed cards; stale swap
+            # lifecycle fields must not contaminate a new transfer/swap.
+            changes.update(
+                quote=None,
+                quote_candidates=[],
+                selected_provider_reference=None,
+                pending_transaction=None,
+                provider_order=None,
+                order_status=None,
+                broadcast_tx_hash=None,
+                broadcast_status=None,
+                approval_transaction=None,
+                approval_tx_hash=None,
+                allowance_requirement=None,
+                preflight=None,
+                confirmation_state=None,
+                gas_estimate=None,
+                last_error=None,
+            )
         effective_broadcast_tx_hash = (
             state["broadcast_tx_hash"]
             if "broadcast_tx_hash" in state
-            else current.broadcast_tx_hash
+            else (None if operation_reset else current.broadcast_tx_hash)
         )
         effective_broadcast_status = (
             state["broadcast_status"]
             if "broadcast_status" in state
-            else current.broadcast_status
+            else (None if operation_reset else current.broadcast_status)
         )
-        broadcast_lifecycle_active = bool(
+        broadcast_lifecycle_active = not operation_reset and bool(
             effective_broadcast_tx_hash
             or current.provider_order
             or current.order_status
@@ -1343,6 +1365,9 @@ def create_app(
             # API-forced intents are turn-scoped. Explicitly overwrite any
             # value left in the LangGraph checkpoint by select/continue APIs.
             "forced_intent": None,
+            # Turn-scoped signal. A graph node sets it when this message starts
+            # a new business operation in the same conversation.
+            "operation_reset": False,
         }
         if existing_session is not None:
             if existing_session.quote is not None:
@@ -1397,13 +1422,6 @@ def create_app(
                     "approval_transaction": None,
                     "pending_transaction": None,
                     "authorization_stage": None,
-                    # The old task may still be marked as an active swap in
-                    # the checkpoint.  Keep the quote/order for explicit
-                    # status queries, but do not let an unrelated new message
-                    # inherit that task and get coerced into swap_quote.
-                    "active_task": None,
-                    "conversation_state": None,
-                    "swap_draft": None,
                 }
             )
         if wallet_context:

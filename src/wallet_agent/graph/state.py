@@ -115,6 +115,7 @@ class AgentState(TypedDict, total=False):
     supervisor_output: NotRequired[dict[str, Any] | None]
     conversation_state: NotRequired[ConversationState | None]
     task_stage: NotRequired[str | None]
+    operation_reset: NotRequired[bool]
     wallet_context: NotRequired[dict[str, Any] | None]
     capabilities: NotRequired[dict[str, Any] | None]
     swap_request: NotRequired[dict[str, Any] | None]

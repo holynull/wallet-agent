@@ -745,9 +745,39 @@ def _active_task_followup_intent(
         or mentioned_amount_with_unit(message) is not None
         or unambiguous_amount_with_unit(message) is not None
         or bool(re.search(r"0x[0-9a-fA-F]{40}", message))
+        or any(
+            token in message.lower()
+            for token in (
+                "自己",
+                "当前钱包",
+                "钱包地址",
+                "收款地址",
+                "bsc",
+                "bnb chain",
+                "usdc",
+                "usdt",
+                "eth",
+            )
+        )
     ):
         return "transfer"
     return None
+
+
+def _self_recipient_hint(message: str) -> bool:
+    text = "".join(str(message).lower().split())
+    return any(
+        phrase in text
+        for phrase in (
+            "给自己",
+            "转给自己",
+            "转到自己的地址",
+            "当前钱包地址",
+            "我的钱包地址",
+            "myself",
+            "mywallet",
+        )
+    )
 
 
 def _recent_fiat_value(history: Any) -> tuple[str, str] | None:
@@ -1197,6 +1227,31 @@ async def _resolve_transfer_asset(
         return resolved
 
     asset = _COMMON_TRANSFER_ASSETS.get((canonical_chain_name, canonical_symbol_name))
+    # A wallet balance is a trusted, chain-specific source of token metadata.
+    # Prefer it before provider discovery so a connected wallet can complete a
+    # transfer without asking the user to paste a contract and decimals.
+    if asset is None:
+        raw_balances = context.get("token_balances") or context.get("assets") or []
+        wallet_matches: list[Asset] = []
+        for raw_balance in raw_balances:
+            item = raw_balance.get("asset") if isinstance(raw_balance, Mapping) else None
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                candidate = Asset.model_validate(item)
+            except Exception:
+                continue
+            if (
+                candidate.address
+                and canonical_chain(str(candidate.chain)) == canonical_chain_name
+                and canonical_symbol(str(candidate.symbol)) == canonical_symbol_name
+            ):
+                wallet_matches.append(candidate)
+        unique_wallet = {
+            (str(item.address).lower(), int(item.decimals)): item for item in wallet_matches
+        }
+        if len(unique_wallet) == 1:
+            asset = next(iter(unique_wallet.values()))
     if asset is None:
         matches: list[Asset] = []
         for provider in providers.values():
@@ -2293,27 +2348,125 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         facts = await response_facts(
             state, intent="transfer", missing=missing, include_portfolio=False
         )
-        suggestion = {
-            "label": "填写收款地址" if facts["language_hint"] == "zh" else "Provide recipient",
-            "message": (
-                "收款地址是 0x..." if facts["language_hint"] == "zh" else "Send it to 0x..."
-            ),
-            "data": {
-                key: value
-                for key, value in {
-                    "intent": "transfer",
-                    "chain": (
-                        draft.get("transfer_chain")
-                        or draft.get("chain")
-                        or (state.get("wallet_context") or {}).get("chain")
-                    ),
-                    "symbol": draft.get("transfer_symbol") or draft.get("symbol"),
-                    "amount": draft.get("transfer_amount") or draft.get("amount"),
-                }.items()
-                if value is not None
-            },
+        if not missing:
+            return []
+
+        context = state.get("wallet_context") or {}
+        chain = (
+            draft.get("transfer_chain")
+            or draft.get("chain")
+            or context.get("chain")
+        )
+        symbol = draft.get("transfer_symbol") or draft.get("symbol")
+        amount = draft.get("transfer_amount") or draft.get("amount")
+        base_data = {
+            key: value
+            for key, value in {
+                "intent": "transfer",
+                "chain": chain,
+                "symbol": symbol,
+                "amount": amount,
+            }.items()
+            if value is not None
         }
-        return _sanitize_response_suggestions([suggestion], intent="transfer", facts=facts)
+        suggestions: list[dict[str, Any]] = []
+        language = facts["language_hint"]
+
+        if "transfer_recipient" in missing:
+            wallet_address = context.get("address")
+            if wallet_address:
+                suggestions.append(
+                    {
+                        "label": "使用当前钱包地址" if language == "zh" else "Use current wallet",
+                        "message": (
+                            "使用当前连接钱包地址作为收款地址。"
+                            if language == "zh"
+                            else "Use the connected wallet address as the recipient."
+                        ),
+                        "data": {**base_data, "recipient": str(wallet_address)},
+                    }
+                )
+            else:
+                suggestions.append(
+                    {
+                        "label": "填写收款地址" if language == "zh" else "Provide recipient",
+                        "message": (
+                            "请提供收款钱包地址。"
+                            if language == "zh"
+                            else "Provide the recipient wallet address."
+                        ),
+                        "data": base_data,
+                    }
+                )
+
+        if "transfer_token_address" in missing or "transfer_decimals" in missing:
+            wallet_assets: list[Mapping[str, Any]] = []
+            for raw_balance in context.get("token_balances") or context.get("assets") or []:
+                item = raw_balance.get("asset") if isinstance(raw_balance, Mapping) else None
+                if isinstance(item, Mapping):
+                    wallet_assets.append(item)
+            matching_assets = [
+                item
+                for item in wallet_assets
+                if item.get("address")
+                and chain
+                and symbol
+                and canonical_chain(str(item.get("chain"))) == canonical_chain(str(chain))
+                and canonical_symbol(str(item.get("symbol"))) == canonical_symbol(str(symbol))
+            ]
+            unique_assets = {
+                (str(item.get("address")).lower(), item.get("decimals")): item
+                for item in matching_assets
+            }
+            if len(unique_assets) == 1:
+                asset = next(iter(unique_assets.values()))
+                asset_chain = asset.get("chain") or chain
+                asset_symbol = asset.get("symbol") or symbol
+                suggestions.append(
+                    {
+                        "label": (
+                            f"使用钱包中的 {asset_chain} {asset_symbol}"
+                            if language == "zh"
+                            else f"Use wallet {asset_chain} {asset_symbol}"
+                        ),
+                        "message": (
+                            "使用钱包余额中的 Token 合约和精度。"
+                            if language == "zh"
+                            else "Use the token contract and precision from the wallet balance."
+                        ),
+                        "data": {
+                            **base_data,
+                            "chain": asset_chain,
+                            "symbol": asset_symbol,
+                            "token_address": asset.get("address"),
+                            "decimals": asset.get("decimals"),
+                        },
+                    }
+                )
+
+        if "transfer_chain" in missing:
+            for supported_chain in facts.get("supported_chains", []):
+                if len(suggestions) >= 3:
+                    break
+                suggestions.append(
+                    {
+                        "label": (
+                            f"使用 {supported_chain} 网络"
+                            if language == "zh"
+                            else f"Use {supported_chain}"
+                        ),
+                        "message": (
+                            f"在 {supported_chain} 网络上继续这笔转账。"
+                            if language == "zh"
+                            else f"Continue this transfer on {supported_chain}."
+                        ),
+                        "data": {**base_data, "chain": supported_chain},
+                    }
+                )
+
+        return _sanitize_response_suggestions(
+            suggestions, intent="transfer", facts=facts
+        )
 
     async def wallet_balance_tool(
         chain: str,
@@ -3359,6 +3512,43 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             task_kind = active_task.get("kind")
         task_update: dict[str, Any] = {}
         if task_kind in {"transfer", "swap"}:
+            lifecycle_active = bool(
+                state.get("provider_orders")
+                or state.get("broadcast_tx_hash")
+                or state.get("selected_quote")
+                or state.get("confirmation_state")
+                or state.get("pending_transaction")
+            )
+            previous_kind = str((active_task or {}).get("kind") or "")
+            previous_status = str((active_task or {}).get("status") or "")
+            operation_reset = lifecycle_active and (
+                previous_kind != task_kind
+                or previous_status in {"completed", "cancelled"}
+                or intent_value in {"transfer", "swap_quote"}
+            )
+            if operation_reset:
+                # Preserve conversation history, but remove the previous
+                # operation's irreversible lifecycle and authorization state.
+                task_update.update(
+                    operation_reset=True,
+                    selected_quote=None,
+                    quote_candidates=[{"__clear__": True}],
+                    provider_orders={},
+                    provider_order_ids={},
+                    status_snapshot=None,
+                    transaction_query=None,
+                    transaction_status_snapshot=None,
+                    broadcast_tx_hash=None,
+                    broadcast_status=None,
+                    confirmation_state=None,
+                    pending_transaction=None,
+                    approval_transaction=None,
+                    approval_tx_hash=None,
+                    allowance_requirement=None,
+                    preflight=None,
+                    swap_gas_estimate=None,
+                    errors=[{"__clear__": True}],
+                )
             if (
                 not active_task
                 or active_task.get("kind") != task_kind
@@ -3420,6 +3610,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 )
             task_patch = _task_patch(task_kind, patch_source)
             prior_slots = (active_task or {}).get("slots", {})
+            if task_kind == "transfer" and _self_recipient_hint(message):
+                wallet_address = (state.get("wallet_context") or {}).get("address")
+                if wallet_address:
+                    task_patch["recipient"] = str(wallet_address)
             if task_kind == "swap":
                 fiat_hint = mentioned_fiat_value(message)
                 if (
@@ -3514,7 +3708,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     task_patch["amount_raw"] = None
             merged = merge_task_patch(active_task, task_patch)
             active_task = merged.task
-            task_update = {"active_task": active_task, **merged.invalidation}
+            task_update = {
+                **task_update,
+                "active_task": active_task,
+                **merged.invalidation,
+            }
             if task_kind == "transfer" and any(
                 state.get(field) is not None
                 for field in (
@@ -3823,6 +4021,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             request_model, missing = _transfer_draft_request(draft, state.get("wallet_context"))
             if request_model is None:
                 canonical_slots = dict((active_task or {}).get("slots") or {})
+                canonical_slots.update(
+                    {
+                        _TRANSFER_CANONICAL_KEYS.get(key, key): value
+                        for key, value in draft.items()
+                        if value is not None
+                    }
+                )
                 active_task = _task_progress(
                     active_task,
                     slots=canonical_slots,
@@ -3863,7 +4068,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             active_task = _task_progress(
                 active_task,
-                slots=dict((active_task or {}).get("slots") or {}),
+                slots={
+                    **dict((active_task or {}).get("slots") or {}),
+                    **{
+                        _TRANSFER_CANONICAL_KEYS.get(key, key): value
+                        for key, value in draft.items()
+                        if value is not None
+                    },
+                },
                 status="ready",
                 stage="ready_for_prepare",
                 missing_fields=[],

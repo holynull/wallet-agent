@@ -7,6 +7,7 @@ from wallet_agent.domain.models import (
     AssetQuery,
     FeeEstimate,
     NormalizedQuote,
+    ProviderOrder,
     TokenBalance,
     TokenPrice,
     UnsignedTransaction,
@@ -162,6 +163,45 @@ class Chain:
         )
 
 
+class BscTokenChain:
+    async def validate_address(self, address):
+        return address.startswith("0x") and len(address) == 42
+
+    async def get_native_balance(self, _address):
+        return TokenBalance(
+            asset=Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18),
+            amount=Decimal("1"),
+            amount_raw="1000000000000000000",
+        )
+
+    async def get_token_balance(self, token, _address):
+        return TokenBalance(
+            asset=token,
+            amount=Decimal("10"),
+            amount_raw="10000000000000000000",
+        )
+
+    async def estimate_fee(self, *, to=None, data=None):
+        del to, data
+        return FeeEstimate(
+            chain="BSC",
+            chain_id=56,
+            asset=Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18),
+            amount=Decimal("0.0001"),
+            amount_raw="100000000000000",
+        )
+
+    def build_erc20_transfer(self, *, token, from_address, to_address, amount_raw):
+        del from_address, to_address
+        return UnsignedTransaction(
+            chain="BSC",
+            chain_id=56,
+            to=token.address,
+            data="0xa9059cbb",
+            value="0",
+        )
+
+
 class OkxWalletProvider:
     chain_index_by_name = {"BASE": "8453"}
 
@@ -225,6 +265,135 @@ async def test_transfer_clarification_retains_known_slots_in_active_task():
         "amount": "0.01",
     }
     assert result["transfer_draft"]["transfer_amount"] == "0.01"
+
+
+@pytest.mark.asyncio
+async def test_transfer_suggestions_match_missing_recipient_and_use_wallet_address():
+    model = UnderstandingModel(
+        ["transfer"],
+        transfer=[TransferSlotPatch(chain="BASE", symbol="ETH", amount="0.01")],
+    )
+    graph = build_graph(model=model, chains={"BASE": Chain()})
+
+    result = await graph.ainvoke(
+        turn("从当前 Base 钱包转 0.01 ETH"),
+        config={"configurable": {"thread_id": "transfer-suggestions"}},
+    )
+
+    suggestion = result["response"]["suggestions"][0]
+    assert suggestion["label"] == "使用当前钱包地址"
+    assert suggestion["data"]["recipient"] == WALLET
+    assert "transfer_recipient" in result["response"]["missing_fields"]
+
+
+@pytest.mark.asyncio
+async def test_transfer_followup_current_wallet_address_continues_active_task():
+    model = UnderstandingModel(
+        ["transfer"],
+        transfer=[
+            TransferSlotPatch(chain="BASE", symbol="ETH", amount="0.01"),
+            TransferSlotPatch(),
+        ],
+    )
+    graph = build_graph(model=model, chains={"BASE": Chain()})
+    config = {"configurable": {"thread_id": "transfer-wallet-followup"}}
+
+    first = await graph.ainvoke(turn("转 0.01 ETH"), config=config)
+    assert first["response"]["missing_fields"] == ["transfer_recipient"]
+
+    second = await graph.ainvoke(turn("使用当前钱包地址"), config=config)
+    assert second["response"]["kind"] == "transfer_prepare"
+    assert second["transfer_request"]["recipient"] == WALLET
+
+
+@pytest.mark.asyncio
+async def test_transfer_followup_bsc_usdc_resolves_wallet_token_metadata():
+    wallet_usdc = "0x" + "8" * 40
+    model = UnderstandingModel(
+        ["transfer"],
+        transfer=[
+            TransferSlotPatch(amount="1", recipient=RECIPIENT),
+            TransferSlotPatch(chain="BSC", symbol="USDC"),
+        ],
+    )
+    graph = build_graph(model=model, chains={"BSC": BscTokenChain()})
+    config = {"configurable": {"thread_id": "transfer-bsc-usdc-followup"}}
+    context = {
+        "address": WALLET,
+        "chain": "BSC",
+        "chain_id": 56,
+        "token_balances": [
+            {
+                "asset": {
+                    "chain": "BSC",
+                    "chain_id": 56,
+                    "symbol": "USDC",
+                    "decimals": 18,
+                    "address": wallet_usdc,
+                }
+            }
+        ],
+    }
+
+    first = await graph.ainvoke(
+        {**turn("转 1 到这个地址"), "wallet_context": {"address": WALLET}}, config=config
+    )
+    assert first["response"]["missing_fields"] == ["transfer_chain"]
+
+    second = await graph.ainvoke(
+        {**turn("BSC 上的 USDC"), "wallet_context": context}, config=config
+    )
+    assert second["response"]["kind"] == "transfer_prepare"
+    assert second["transfer_request"]["token"]["address"] == wallet_usdc
+    assert second["transfer_request"]["token"]["decimals"] == 18
+    assert second["active_task"]["slots"]["token_address"] == wallet_usdc
+
+
+@pytest.mark.asyncio
+async def test_new_transfer_resets_completed_swap_lifecycle_state():
+    old_order = ProviderOrder(
+        provider="bridgers",
+        provider_order_id="old-order",
+        provider_reference="old-reference",
+        tx_hash="0x" + "a" * 64,
+    )
+    model = UnderstandingModel(
+        ["transfer"],
+        transfer=[
+            TransferSlotPatch(
+                chain="BASE",
+                symbol="ETH",
+                amount="0.01",
+                recipient=RECIPIENT,
+            )
+        ],
+    )
+    graph = build_graph(model=model, chains={"BASE": Chain()})
+    result = await graph.ainvoke(
+        {
+            **turn(f"转 0.01 ETH 给 {RECIPIENT}"),
+            "active_task": {
+                "task_id": "old-swap",
+                "kind": "swap",
+                "status": "completed",
+                "stage": "completed",
+                "revision": 2,
+                "slots": {},
+                "slot_sources": {},
+            },
+            "provider_orders": {"bridgers": old_order.model_dump(mode="json")},
+            "broadcast_tx_hash": old_order.tx_hash,
+            "broadcast_status": "confirmed",
+            "selected_quote": {"provider_reference": "old-reference"},
+        },
+        config={"configurable": {"thread_id": "transfer-after-swap"}},
+    )
+
+    assert result["response"]["kind"] == "transfer_prepare"
+    assert result["operation_reset"] is True
+    assert result["provider_orders"] == {}
+    assert result.get("selected_quote") is None
+    assert result.get("broadcast_tx_hash") is None
 
 
 @pytest.mark.asyncio
