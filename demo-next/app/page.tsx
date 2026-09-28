@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { classifyAgentTest, ConversationArtifacts, extractConversationArtifacts, formatProcessingDuration, formatResponseSummary, latestProgressText, parseSseFrames, providerPriority as getProviderPriority, responseMessage, restoreConversationMessages, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
+import { classifyAgentTest, ConversationArtifacts, extractConversationArtifacts, formatProcessingDuration, formatResponseSummary, latestProgressText, parseSseFrame, parseSseFrames, providerPriority as getProviderPriority, responseMessage, restoreConversationMessages, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
 
 type Message = { id?: string; role: "user" | "assistant" | "system"; content: string; fullContent?: string; typing?: boolean; suggestions?: any[]; artifacts?: ConversationArtifacts; responseKey?: string };
 type ProgressEntry = { text: string; elapsed?: number };
@@ -322,16 +322,16 @@ export default function Home() {
     if (display) setMessages((current) => [...current, { role: "system", content: "联调检查完成。" }]);
   }
   async function readStream(runId: string, render = true, requestStartedAt = performance.now()) {
-    const response = await fetch(`${API_BASE}/v1/agent/stream/${runId}`, { headers, signal: abortRef.current?.signal });
-    if (!response.ok) { const raw = await response.text(); throw new Error(`SSE ${response.status}: ${raw || response.statusText}`); }
-    if (!response.body) throw new Error("SSE stream unavailable");
-    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let assistant = ""; let finalResponse: any = null; const events: any[] = [];
+    let lastEventId = ""; let reconnects = 0; let terminalReceived = false; let assistant = ""; let finalResponse: any = null; const events: any[] = [];
     const processFrame = (frame: string) => {
-      const eventName = frame.match(/^event:\s*(.+)$/m)?.[1] || "message";
-      const data = frame.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+      const parsedFrame = parseSseFrame(frame);
+      const eventName = parsedFrame.event;
+      const data = parsedFrame.data;
       if (!data) return;
       try {
         const payload = JSON.parse(data);
+        if (parsedFrame.id) lastEventId = parsedFrame.id;
+        if (["complete", "error", "action_required"].includes(eventName)) terminalReceived = true;
         log(`SSE ${eventName}`, payload);
         const current = payload?.state || payload?.data?.state || payload?.data || payload;
         events.push({ event: eventName, payload, state: current });
@@ -348,14 +348,32 @@ export default function Home() {
         if (content && eventName !== "progress") assistant = content;
       } catch { /* ignore malformed keepalive */ }
     };
+
     while (true) {
-      const item = await reader.read(); if (item.done) break;
-      buffer += decoder.decode(item.value, { stream: true });
-      const parsed = parseSseFrames(buffer); buffer = parsed.remainder;
-      parsed.frames.forEach(processFrame);
+      let buffer = "";
+      try {
+        const suffix = lastEventId ? `?last_event_id=${encodeURIComponent(lastEventId)}` : "";
+        const response = await fetch(`${API_BASE}/v1/agent/stream/${runId}${suffix}`, { headers, signal: abortRef.current?.signal });
+        if (!response.ok) { const raw = await response.text(); throw new Error(`SSE ${response.status}: ${raw || response.statusText}`); }
+        if (!response.body) throw new Error("SSE stream unavailable");
+        const reader = response.body.getReader(); const decoder = new TextDecoder();
+        while (true) {
+          const item = await reader.read(); if (item.done) break;
+          buffer += decoder.decode(item.value, { stream: true });
+          const parsed = parseSseFrames(buffer); buffer = parsed.remainder;
+          parsed.frames.forEach(processFrame);
+        }
+        buffer += decoder.decode();
+        if (buffer.trim()) processFrame(buffer);
+        if (!terminalReceived) throw new Error("SSE stream ended before a terminal event");
+        break;
+      } catch (error) {
+        if ((error as Error)?.name === "AbortError" || reconnects >= 3) throw error;
+        reconnects += 1;
+        log(`SSE RECONNECT ${runId}`, { last_event_id: lastEventId, attempt: reconnects });
+        await new Promise((resolve) => setTimeout(resolve, 250 * reconnects));
+      }
     }
-    buffer += decoder.decode();
-    if (buffer.trim()) processFrame(buffer);
     if (render) setBackendDuration(Math.max(0, performance.now() - requestStartedAt));
     if (render && assistant && !finalResponse && !responseKeysRef.current.has(`fallback:${assistant}`)) { responseKeysRef.current.add(`fallback:${assistant}`); setMessages((current) => [...current, { role: "assistant", content: assistant }]); }
     return events;
@@ -420,7 +438,7 @@ export default function Home() {
       if (!response && current.confirmation_state?.status === "requested") response = { kind: "confirmation_required", confirmation: current.confirmation_state };
       else if (!response && stage === "approval_required") response = { kind: "approval_required", stage, approval_transaction: current.approval_transaction };
       else if (!response && current.pending_transaction) response = { kind: current.intent === "transfer" ? "transfer_prepare" : "swap_prepare", stage, transaction: current.pending_transaction, preflight: current.preflight };
-      else if (!response && current.broadcast_status) response = { kind: "swap_status", status: current.broadcast_status, tx_hash: current.broadcast_tx_hash };
+      else if (!response && current.broadcast_status) response = { kind: "swap_status", status: current.broadcast_status, tx_hash: current.broadcast_tx_hash, message: current.message };
     }
     if (eventName === "error") setMessages((previous) => [...previous, { role: "assistant", content: current?.error?.message || responseMessage(current?.error) || "Agent 执行失败。" }]);
     if (response?.kind === "clarification") {

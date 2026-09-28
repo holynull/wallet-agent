@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     asset_cache_ttl_seconds: int = Field(default=600, ge=0)
 
     persistence_url: str = "sqlite+aiosqlite:///./wallet_agent.db"
+    redis_url: str | None = None
+    redis_key_prefix: str = "wallet-agent"
+    run_event_ttl_seconds: int = Field(default=86_400, ge=60)
+    run_event_max_entries: int = Field(default=2_000, ge=100, le=100_000)
+    conversation_lock_lease_seconds: float = Field(default=120, gt=1)
+    conversation_lock_wait_seconds: float = Field(default=30, gt=0)
     auth_required: bool = False
     auth_tokens: dict[str, str] = Field(default_factory=dict)
     poll_interval_seconds: float = Field(default=5, gt=0)

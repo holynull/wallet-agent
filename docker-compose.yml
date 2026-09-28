@@ -6,9 +6,14 @@ services:
     env_file:
       - .env
     environment:
-      PERSISTENCE_URL: sqlite+aiosqlite:////app/data/wallet_agent.db
-    volumes:
-      - wallet-agent-data:/app/data
+      PERSISTENCE_URL: postgresql://wallet_agent:wallet_agent@postgres:5432/wallet_agent
+      REDIS_URL: redis://redis:6379/0
+      LANGGRAPH_STRICT_MSGPACK: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 10s
@@ -16,5 +21,50 @@ services:
       retries: 5
     restart: unless-stopped
 
+  demo-next:
+    build:
+      context: ./demo-next
+      args:
+        NEXT_PUBLIC_AGENT_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      wallet-agent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: wallet_agent
+      POSTGRES_USER: wallet_agent
+      POSTGRES_PASSWORD: wallet_agent
+    volumes:
+      - wallet-agent-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallet_agent -d wallet_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - wallet-agent-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
 volumes:
-  wallet-agent-data:
+  wallet-agent-postgres:
+  wallet-agent-redis:

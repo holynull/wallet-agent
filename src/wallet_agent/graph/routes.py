@@ -30,6 +30,8 @@ def route_after_intent(state: dict[str, Any]) -> str:
         # this selected quote. Only a fresh quote selection/new swap may clear
         # it and create another confirmation cycle.
         return "response"
+    if intent == "swap_status" and state.get("provider_orders"):
+        return "status_poll"
     if state.get("broadcast_tx_hash") and intent in {"swap_status", "swap_prepare"}:
         return "register_broadcast"
     if (

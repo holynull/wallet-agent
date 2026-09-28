@@ -17,6 +17,9 @@ dependencies = [
   "sqlalchemy>=2.0,<3",
   "aiosqlite>=0.20,<1",
   "langgraph-checkpoint-sqlite>=2,<4",
+  "redis>=5,<7",
+  "langgraph-checkpoint-postgres>=2,<4",
+  "psycopg[binary]>=3.2,<4",
 ]
 
 [dependency-groups]

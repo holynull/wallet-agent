@@ -18,6 +18,12 @@ def test_settings_load_non_secret_defaults(monkeypatch):
     assert settings.response_model == "deepseek-chat"
     assert settings.allowed_model_ids == ["deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]
     assert settings.openai_base_url == "https://api.deepseek.com"
+    assert settings.redis_url is None
+    assert settings.redis_key_prefix == "wallet-agent"
+    assert settings.run_event_ttl_seconds == 86_400
+    assert settings.run_event_max_entries == 2_000
+    assert settings.conversation_lock_lease_seconds == 120
+    assert settings.conversation_lock_wait_seconds == 30
 
 
 @pytest.mark.parametrize(
@@ -28,6 +34,10 @@ def test_settings_load_non_secret_defaults(monkeypatch):
         ("poll_interval_seconds", 0),
         ("poll_max_attempts", 0),
         ("poll_max_attempts", 1001),
+        ("run_event_ttl_seconds", 59),
+        ("run_event_max_entries", 99),
+        ("conversation_lock_lease_seconds", 1),
+        ("conversation_lock_wait_seconds", 0),
     ],
 )
 def test_settings_rejects_invalid_polling_and_timeout_values(monkeypatch, field, value):

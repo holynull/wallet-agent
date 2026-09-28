@@ -184,6 +184,47 @@ async def test_omnibridge_800_quote_normalizes_amounts_and_preserves_source_flag
 
 
 @pytest.mark.asyncio
+async def test_omnibridge_quote_truncates_deposit_amount_to_eight_places():
+    transport = FakeTransport(
+        quote_response(depositMin="0.001"),
+        {
+            "resCode": 800,
+            "resMsg": "Success",
+            "data": {"orderId": "precision-order", "platformAddr": "0xplatform"},
+        },
+    )
+    provider = OmniBridgeProvider.from_transport(transport, source_flag="wallet-agent")
+
+    quote = await provider.quote(valid_quote_request("0.013677590544728694"))
+    order = await provider.prepare(quote)
+
+    assert quote.input_amount == Decimal("0.01367759")
+    assert quote.input_amount_raw == "13677590000000000"
+    assert order.input_amount == Decimal("0.01367759")
+    assert transport.calls[0]["payload"]["depositCoinAmt"] == "0.01367759"
+    assert transport.calls[1]["payload"]["depositCoinAmt"] == "0.01367759"
+
+
+@pytest.mark.asyncio
+async def test_omnibridge_prepare_rejects_stale_high_precision_quote_before_api_call():
+    transport = FakeTransport(quote_response())
+    provider = OmniBridgeProvider.from_transport(transport)
+    quote = await provider.quote(valid_quote_request("0.013677590544728694"))
+    stale_quote = quote.model_copy(
+        update={
+            "input_amount": Decimal("0.013677590544728694"),
+            "input_amount_raw": "13677590544728694",
+        }
+    )
+
+    with pytest.raises(ProviderResponseError) as exc_info:
+        await provider.prepare(stale_quote)
+
+    assert exc_info.value.code == "919"
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_omnibridge_rejects_non_800_response():
     provider = OmniBridgeProvider.from_transport(
         FakeTransport({"resCode": 801, "resMsg": "Unsupported", "data": {}}),
@@ -226,6 +267,27 @@ async def test_omnibridge_reverse_quote_accepts_decimal_noise_within_raw_unit():
     quote = await provider.reverse_quote(erc20_quote_request(), Decimal("5"))
 
     assert quote.expected_output > Decimal("4.999999")
+
+
+@pytest.mark.asyncio
+async def test_omnibridge_reverse_quote_rounds_up_to_provider_precision():
+    transport = FakeTransport(
+        quote_response(
+            instantRate="1", depositCoinFeeRate="0", chainFee="0", depositMin="0"
+        ),
+        quote_response(
+            instantRate="1", depositCoinFeeRate="0", chainFee="0", depositMin="0"
+        ),
+    )
+    provider = OmniBridgeProvider.from_transport(transport)
+
+    target = Decimal("0.013677590544728694")
+    quote = await provider.reverse_quote(valid_quote_request(), target)
+
+    assert quote.input_amount == Decimal("0.0136776")
+    assert quote.input_amount_raw == "13677600000000000"
+    assert quote.expected_output >= target
+    assert transport.calls[1]["payload"]["depositCoinAmt"] == "0.0136776"
 
 
 @pytest.mark.asyncio
@@ -325,6 +387,10 @@ async def test_omnibridge_register_broadcast_calls_modify_tx_id_idempotently():
 
     assert order.provider_order_id == "omni-order-42"
     assert order.tx_hash == "0xdeposit"
+    assert order.provider_payload == {
+        "equipment_no": "0x1234567890abcdef1234567890abcd",
+        "source_type": "H5",
+    }
     assert transport.calls[2]["path"] == "/api/v2/modifyTxId"
     assert transport.calls[2]["payload"] == {
         "orderId": "omni-order-42",

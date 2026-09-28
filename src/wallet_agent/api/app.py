@@ -37,7 +37,12 @@ from wallet_agent.okx import (
     OkxWalletError,
 )
 from wallet_agent.persistence import (
+    TERMINAL_RUN_STATUSES,
+    InMemoryLockManager,
+    InMemoryRunStore,
     InMemorySessionStore,
+    LockManager,
+    RunStore,
     SessionRevisionConflict,
     SessionStore,
     SwapSessionRecord,
@@ -317,10 +322,42 @@ def _broadcast_response(
     message: str | None = None,
 ) -> dict[str, Any]:
     payload = _jsonable(record)
-    payload["broadcast_status"] = broadcast_status or record.stage or record.status
+    effective_status = broadcast_status or record.broadcast_status or record.stage or record.status
+    payload["broadcast_status"] = effective_status
+    if message is None and record.provider_order is not None:
+        message = {
+            "confirmed": "源链交易已确认，兑换服务正在处理，目标链资产尚未确认到账。",
+            "broadcast_pending": "源链交易已广播，兑换服务正在处理，目标链资产尚未确认到账。",
+            "broadcast_seen": "源链已发现这笔交易，兑换服务正在处理，目标链资产尚未确认到账。",
+        }.get(str(effective_status), "兑换服务正在处理，目标链资产尚未确认到账。")
     if message is not None:
         payload["message"] = message
     return payload
+
+
+def _provider_order_with_persisted_metadata(
+    order: ProviderOrder,
+    pending_transaction: UnsignedTransaction | DepositOrder | None,
+    quote: NormalizedQuote | None = None,
+) -> ProviderOrder:
+    """Carry restart-safe provider lookup metadata into the persisted order."""
+    quote_payload = getattr(quote, "provider_payload", None)
+    pending_payload = getattr(pending_transaction, "provider_payload", None)
+    if not isinstance(quote_payload, Mapping):
+        quote_payload = {}
+    if not isinstance(pending_payload, Mapping):
+        pending_payload = {}
+    if not quote_payload and not pending_payload:
+        return order
+    merged = {**quote_payload, **pending_payload}
+    merged.update(
+        {
+            str(key): value
+            for key, value in order.provider_payload.items()
+            if value not in (None, "")
+        }
+    )
+    return order.model_copy(update={"provider_payload": merged})
 
 
 def _display_text(record: SwapSessionRecord, *keys: str) -> str | None:
@@ -524,6 +561,8 @@ def create_app(
     execution_observer: Any | None = None,
     price_provider: Any | None = None,
     store: SessionStore | None = None,
+    run_store: RunStore | None = None,
+    lock_manager: LockManager | None = None,
     token_verifier: TokenVerifier | None = None,
     require_auth: bool = False,
     model_registry: Any = None,
@@ -539,6 +578,14 @@ def create_app(
                 close = getattr(transport, "aclose", None)
                 if close is not None:
                     await close()
+            for resource in (application.state.run_store, application.state.session_store):
+                close = getattr(resource, "aclose", None)
+                if close is not None:
+                    await close()
+            checkpoint_handle = getattr(application.state, "checkpointer_handle", None)
+            close = getattr(checkpoint_handle, "aclose", None)
+            if close is not None:
+                await close()
 
     app = FastAPI(title="Wallet Agent", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
@@ -552,6 +599,9 @@ def create_app(
         allow_headers=["*"],
     )
     session_store = store or InMemorySessionStore()
+    local_runs: dict[str, dict[str, Any]] = {}
+    event_store = run_store or InMemoryRunStore(local_runs)
+    conversation_locks = lock_manager or InMemoryLockManager()
     provider_map = dict(providers or {})
     app.state.graph = graph
     app.state.chain_registry = chain_registry
@@ -561,19 +611,19 @@ def create_app(
     app.state.execution_observer = execution_observer
     app.state.price_provider = price_provider
     app.state.session_store = session_store
-    app.state.runs: dict[str, dict[str, Any]] = {}
-    app.state.graph_locks: dict[str, asyncio.Lock] = {}
+    app.state.runs = local_runs
+    app.state.run_store = event_store
+    app.state.lock_manager = conversation_locks
     app.state.token_verifier = token_verifier
     app.state.require_auth = require_auth
     app.state.model_registry = model_registry
     app.state.transports: list[Any] = []
 
-    def graph_lock(thread_id: str) -> asyncio.Lock:
-        lock = app.state.graph_locks.get(thread_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            app.state.graph_locks[thread_id] = lock
-        return lock
+    def graph_lock(thread_id: str) -> Any:
+        return conversation_locks.lock(thread_id)
+
+    async def append_run_event(run_id: str, event: Mapping[str, Any]) -> str:
+        return await event_store.append(run_id, _jsonable(event))
 
     def execution_adapter(chain: str) -> Any:
         observer = app.state.execution_observer
@@ -632,6 +682,17 @@ def create_app(
     async def ready() -> dict[str, str]:
         if app.state.graph is None:
             raise HTTPException(status_code=503, detail="agent graph is not configured")
+        try:
+            if not await event_store.ready() or not await session_store.ready():
+                raise RuntimeError("persistence dependency is unavailable")
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "PERSISTENCE_UNAVAILABLE",
+                    "message": "Runtime persistence is unavailable.",
+                },
+            ) from exc
         return {"status": "ready"}
 
     @app.get("/v1/agent/conversations")
@@ -719,12 +780,12 @@ def create_app(
             snapshot = await graph.aget_state(config)
             values = getattr(snapshot, "values", None) or {}
             history = values.get("conversation_history") or history
-        duplicate = any(
-            isinstance(item, Mapping)
-            and item.get("role") == "assistant"
-            and item.get("content") == history_entry["content"]
-            and item.get("artifacts") == history_entry.get("artifacts")
-            for item in history
+        last_item = history[-1] if history else None
+        duplicate = (
+            isinstance(last_item, Mapping)
+            and last_item.get("role") == "assistant"
+            and last_item.get("content") == history_entry["content"]
+            and last_item.get("artifacts") == history_entry.get("artifacts")
         )
         if duplicate:
             return
@@ -875,6 +936,9 @@ def create_app(
                 gas_estimate=None,
                 stage="failed",
             )
+            errors = response.get("errors") or []
+            if errors and isinstance(errors[0], Mapping):
+                changes["last_error"] = _jsonable(errors[0])
         if status:
             changes["status"] = status
         if run_id:
@@ -941,16 +1005,17 @@ def create_app(
         *,
         session_id: str | None = None,
     ) -> None:
-        run = app.state.runs.setdefault(run_id, {"events": []})
-        run["status"] = "running"
-        run.setdefault("events", [])
+        await event_store.set_status(run_id, "running")
         thread_id = str(config.get("configurable", {}).get("thread_id", ""))
         lock = graph_lock(thread_id)
-        await lock.acquire()
+        acquired = False
         try:
+            await lock.__aenter__()
+            acquired = True
             if app.state.graph is None:
                 result = input_state
-                app.state.runs[run_id]["events"].append(
+                await append_run_event(
+                    run_id,
                     {"event": "complete", "state": _stream_state(result)}
                 )
             else:
@@ -961,7 +1026,6 @@ def create_app(
                     return app.state.graph.get_state(config)
 
                 async def execute(graph_input: dict[str, Any]) -> dict[str, Any]:
-                    response_updates: list[dict[str, Any]] = []
                     snapshot = await get_snapshot()
                     request = (
                         graph_input.get("request")
@@ -1026,32 +1090,21 @@ def create_app(
                         # are progress, while graph state responses are user-facing
                         # only when they contain a typed response object.
                         if mode == "updates" and isinstance(event, Mapping):
-                            node_updates = [
-                                value for value in event.values() if isinstance(value, Mapping)
-                            ]
-                            for node_update in node_updates:
-                                nested_response = node_update.get("response")
-                                if isinstance(nested_response, Mapping):
-                                    response_updates.append(
-                                        {"response": _jsonable(nested_response)}
-                                    )
                             response_value = event.get("response")
                             if isinstance(response_value, Mapping):
                                 event = {"response": _jsonable(response_value)}
-                                response_updates.append(event)
                         event_name = "progress" if mode == "custom" else (
                             "response"
                             if isinstance(event, Mapping)
                             and isinstance(event.get("response"), Mapping)
                             else "update"
                         )
-                        app.state.runs[run_id]["events"].append(
+                        await append_run_event(
+                            run_id,
                             {"event": event_name, "data": event}
                         )
                     snapshot = await get_snapshot()
                     final_state = dict(snapshot.values)
-                    for update in response_updates:
-                        await persist_assistant_history(thread_id, update)
                     return final_state
 
                 result = await execute(input_state)
@@ -1065,6 +1118,10 @@ def create_app(
                     and not result.get("pending_transaction")
                 ):
                     await project_session(session_id, result, status="quoted", run_id=run_id)
+                    # The quote and its cards are a completed user-facing step.
+                    # Preserve it before the automatic confirmation execution
+                    # replaces ``response`` in the same checkpoint.
+                    await persist_assistant_history(thread_id, result)
                     result = await execute(
                         {
                             "request": result.get("request"),
@@ -1088,18 +1145,20 @@ def create_app(
                     getattr(snapshot, "next", ())
                 )
                 if interrupted or "__interrupt__" in result:
-                    app.state.runs[run_id]["status"] = "awaiting_confirmation"
-                    app.state.runs[run_id]["events"].append(
+                    await append_run_event(
+                        run_id,
                         {"event": "action_required", "state": _stream_state(result)}
                     )
+                    await event_store.set_status(run_id, "awaiting_confirmation")
                     await project_session(
                         session_id, result, status="awaiting_confirmation", run_id=run_id
                     )
                 else:
-                    app.state.runs[run_id]["events"].append(
+                    await append_run_event(
+                        run_id,
                         {"event": "complete", "state": _stream_state(result)}
                     )
-                    app.state.runs[run_id]["status"] = "complete"
+                    await event_store.set_status(run_id, "complete")
                     response_kind = (result.get("response") or {}).get("kind")
                     session_status = None
                     if response_kind == "transfer_prepare":
@@ -1125,10 +1184,9 @@ def create_app(
                         if task_stage == "collecting_parameters":
                             session_status = "collecting_parameters"
                     await project_session(session_id, result, status=session_status, run_id=run_id)
-            if app.state.runs[run_id]["status"] == "running":
-                app.state.runs[run_id]["status"] = "complete"
+            if await event_store.get_status(run_id) == "running":
+                await event_store.set_status(run_id, "complete")
         except _GraphInterruptConflict as exc:
-            app.state.runs[run_id]["status"] = "failed"
             error = AgentError(
                 code=exc.code,
                 message=str(exc),
@@ -1136,23 +1194,26 @@ def create_app(
                     "interrupt_kinds": sorted(kind or "unknown" for kind in exc.kinds)
                 },
             ).model_dump(mode="json")
-            app.state.runs[run_id]["events"].append(
+            await append_run_event(
+                run_id,
                 {
                     "event": "error",
                     "error": error,
                 }
             )
+            await event_store.set_status(run_id, "failed")
         except Exception as exc:  # errors are returned without exception internals
-            app.state.runs[run_id]["status"] = "failed"
             error = AgentError(code="AGENT_EXECUTION_ERROR", message=str(exc)).model_dump(
                 mode="json"
             )
-            app.state.runs[run_id]["events"].append(
+            await append_run_event(
+                run_id,
                 {
                     "event": "error",
                     "error": error,
                 }
             )
+            await event_store.set_status(run_id, "failed")
             if session_id:
                 current = await session_store.get(session_id)
                 if current is not None:
@@ -1170,7 +1231,8 @@ def create_app(
                         # never let cleanup hide the original graph error.
                         pass
         finally:
-            lock.release()
+            if acquired:
+                await lock.__aexit__(None, None, None)
 
     @app.post("/v1/agent/turn")
     async def turn(request: Request, payload: TurnRequest) -> dict[str, Any]:
@@ -1312,7 +1374,13 @@ def create_app(
                 }:
                     input_state["broadcast_status"] = broadcast_status
         if existing_session is not None and existing_session.provider_order is not None:
-            order = existing_session.provider_order
+            # Backfill orders created before provider metadata was persisted,
+            # so an existing conversation also survives a process restart.
+            order = _provider_order_with_persisted_metadata(
+                existing_session.provider_order,
+                existing_session.pending_transaction,
+                existing_session.quote,
+            )
             input_state.update(
                 {
                     "provider_orders": {
@@ -1370,7 +1438,8 @@ def create_app(
             input_state["forced_intent"] = raw_agent_test_intent
             input_state["intent"] = raw_agent_test_intent
         config = {"configurable": {"thread_id": conversation_id}}
-        app.state.runs[run_id] = {"status": "queued", "events": []}
+        await event_store.create(run_id, owner_id=user_id)
+        app.state.runs.setdefault(run_id, {})
         task = asyncio.create_task(run_graph(run_id, input_state, config, session_id=session_id))
         app.state.runs[run_id]["task"] = task
         response = {
@@ -1385,30 +1454,42 @@ def create_app(
     @app.get("/v1/agent/stream/{run_id}")
     async def stream(run_id: str, request: Request) -> StreamingResponse:
         async def events() -> AsyncIterator[str]:
-            seen = 0
+            cursor = (
+                request.headers.get("last-event-id")
+                or request.query_params.get("last_event_id")
+                or "0"
+            )
             while True:
                 if await request.is_disconnected():
                     return
-                run = app.state.runs.get(run_id)
-                if run is None:
+                event_list = await event_store.read(
+                    run_id,
+                    after_id=cursor,
+                    block_ms=1_000,
+                )
+                if event_list is None:
                     yield (
                         "event: error\ndata: "
                         '{"code":"RUN_NOT_FOUND","message":"Run not found."}\n\n'
                     )
                     return
-                event_list = run["events"]
-                while seen < len(event_list):
-                    event = event_list[seen]
-                    seen += 1
+                for stored_event in event_list:
+                    event = stored_event.payload
+                    cursor = stored_event.event_id
                     kind = event.get("event", "update")
                     data = json.dumps(_jsonable(event), ensure_ascii=True)
-                    yield f"event: {kind}\ndata: {data}\n\n"
-                if run.get("status") in {"complete", "failed", "awaiting_confirmation"}:
+                    yield f"id: {cursor}\nevent: {kind}\ndata: {data}\n\n"
+                status = await event_store.get_status(run_id)
+                if status in TERMINAL_RUN_STATUSES:
                     return
-                await asyncio.sleep(0.05)
 
         return StreamingResponse(
-            events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
+            events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     async def owned_session(session_id: str, user_id: str) -> SwapSessionRecord:
@@ -1488,7 +1569,10 @@ def create_app(
                 status=authorization_stage,
                 stage=authorization_stage,
             )
-        return _jsonable(updated or result)
+        payload = _jsonable(updated or result)
+        if response.get("kind") == "error":
+            payload["response"] = _jsonable(response)
+        return payload
 
     @app.post("/v1/swap/{session_id}/cancel")
     async def cancel(request: Request, session_id: str, payload: ConfirmRequest) -> dict[str, Any]:
@@ -1615,6 +1699,11 @@ def create_app(
                     reference = str(transaction_reference)
             try:
                 order = await provider.register_broadcast(reference, payload.tx_hash)
+                order = _provider_order_with_persisted_metadata(
+                    order,
+                    session.pending_transaction,
+                    session.quote,
+                )
             except Exception as exc:
                 raise HTTPException(
                     status_code=503,
@@ -1631,8 +1720,8 @@ def create_app(
             updated = await session_store.update(
                 session_id,
                 expected_revision=session.revision,
-                status=broadcast_status,
-                stage=broadcast_status,
+                status="processing",
+                stage="processing",
                 broadcast_status=broadcast_status,
                 broadcast_tx_hash=payload.tx_hash,
                 provider_order=order,
@@ -1720,6 +1809,7 @@ def create_app(
                 approval_transaction=None,
                 approval_tx_hash=None,
                 allowance_requirement=None,
+                last_error=None,
             )
         return _jsonable(updated or result)
 

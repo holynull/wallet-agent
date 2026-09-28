@@ -59,6 +59,19 @@ is accepted only when its task ID, revision, and payload hash still match.
    Direct conversational swap turns also expose an expiring `confirmation_state`
    (`status`, `summary`, `requested_at`, `expires_at`) in the session projection;
    render it as an explicit approval step before signing.
+
+   Store the last fully parsed SSE `id`. If the connection closes before a
+   terminal `complete`, `error`, or `action_required` event, reconnect to the
+   same run without creating another turn:
+
+   ```http
+   GET /v1/agent/stream/{run_id}?last_event_id=1736298045123-0
+   ```
+
+   Native clients may send the same cursor in `Last-Event-ID`. The query form
+   is useful for browser `fetch`. Apply the cursor only after the complete
+   frame has been parsed; the server then replays only newer Redis Stream
+   entries, even when the reconnect reaches a different API instance.
 3. After the user chooses one card, submit its exact `provider_reference` to
    `POST /v1/swap/{session_id}/select-quote`:
 
@@ -126,10 +139,13 @@ message while preserving the returned identifiers:
 }
 ```
 
-Reconnects reuse the same `conversation_id` and `session_id`; never create a
-new provider order, re-broadcast an approve, or re-run a provider write merely
-because an SSE connection dropped. Repeating an identical broadcast hash is
-idempotent; a different hash for the same session is rejected.
+Reconnects reuse the same `run_id`, `conversation_id`, and `session_id`; never
+create a new provider order, re-broadcast an approve, or re-run a provider
+write merely because an SSE connection dropped. Repeating an identical
+broadcast hash is idempotent; a different hash for the same session is
+rejected. A reconnect is available only while the server's configured run
+event TTL retains that stream, so clients should persist the final session
+projection as their durable UI state.
 
 ## Transfer and price requests
 
@@ -173,7 +189,8 @@ chain, symbol, and contract address while preserving provider errors.
 
 ## Release hardening
 
-- Configure durable checkpoint/session persistence in production.
+- Configure PostgreSQL checkpoint/session persistence and Redis run
+  events/conversation locks in every multi-instance production deployment.
 - Configure `ALLOWED_MODEL_IDS` server-side. The app may send `model_id`, but
   never an API key, base URL, signer, wallet client, seed phrase, or private key.
 - Require Bearer authentication and enforce session ownership at the API edge.

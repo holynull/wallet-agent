@@ -5,7 +5,7 @@ from langgraph.types import Command
 
 from wallet_agent.domain.models import Asset, NormalizedQuote, UnsignedTransaction
 from wallet_agent.graph.build import build_graph
-from wallet_agent.persistence import create_checkpointer
+from wallet_agent.persistence import LazyAsyncPostgresSaver, create_checkpointer
 
 
 class PrepareProvider:
@@ -80,3 +80,14 @@ async def test_sqlite_checkpoint_survives_graph_rebuild_without_duplicate_prepar
         assert provider.prepare_calls == 1
     finally:
         await second_handle.aclose()
+
+
+def test_postgres_checkpointer_is_selected_without_eager_connection():
+    handle = create_checkpointer(
+        "postgresql+psycopg://wallet_agent:secret@postgres:5432/wallet_agent"
+    )
+
+    assert isinstance(handle.checkpointer, LazyAsyncPostgresSaver)
+    assert handle.checkpointer.dsn == (
+        "postgresql://wallet_agent:secret@postgres:5432/wallet_agent"
+    )

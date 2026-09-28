@@ -12,6 +12,7 @@ from wallet_agent.chains.registry import ChainAdapterRegistry
 from wallet_agent.domain.models import (
     AllowanceRequirement,
     Asset,
+    DepositOrder,
     FeeEstimate,
     NormalizedOrderStatus,
     NormalizedQuote,
@@ -20,6 +21,7 @@ from wallet_agent.domain.models import (
 )
 from wallet_agent.graph.build import build_graph
 from wallet_agent.persistence import InMemorySessionStore, SwapSessionRecord
+from wallet_agent.providers.http import ProviderResponseError
 
 
 class Model:
@@ -171,6 +173,65 @@ async def test_select_quote_requires_confirmation_before_allowance_and_prepare()
     assert confirmed.json()["approval_transaction"]["data"].startswith("0x095ea7b3")
     assert adapter.allowance_calls == 1
     assert provider.prepare_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_confirm_returns_structured_error_when_provider_prepare_fails():
+    quote = NormalizedQuote(
+        provider="omnibridge",
+        source_asset=Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18),
+        destination_asset=Asset(chain="ETH", chain_id=1, symbol="ETH", decimals=18),
+        input_amount=Decimal("0.013677590544728694"),
+        input_amount_raw="13677590544728694",
+        expected_output=Decimal("0.003781301214772780"),
+        expected_output_raw="3781301214772780",
+        provider_reference="stale-precision-quote",
+    )
+
+    class FailingPrepareProvider(Provider):
+        provider_name = "omnibridge"
+
+        async def prepare(self, quote):
+            self.prepare_calls += 1
+            raise ProviderResponseError("919", "存币金额不合法,最长8位小数")
+
+    provider = FailingPrepareProvider()
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-prepare-error",
+            user_id="alice",
+            thread_id="t-prepare-error",
+            quote_candidates=[quote],
+        )
+    )
+    graph = build_graph(model=Model(), providers=[provider])
+    app = create_app(graph=graph, providers={"omnibridge": provider}, store=store)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        selected = await client.post(
+            "/v1/swap/s-prepare-error/select-quote",
+            json={"user_id": "alice", "provider_reference": quote.provider_reference},
+        )
+        confirmed = await client.post(
+            "/v1/swap/s-prepare-error/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+
+    assert selected.status_code == 200
+    assert confirmed.status_code == 200
+    body = confirmed.json()
+    assert body["status"] == "failed"
+    assert body["stage"] == "failed"
+    assert body["response"]["kind"] == "error"
+    assert "最多 8 位小数" in body["response"]["message"]
+    assert body["last_error"]["code"] == "PROVIDER_PREPARE_FAILED"
+    assert body["last_error"]["details"] == {
+        "provider": "omnibridge",
+        "provider_code": "919",
+    }
 
 
 @pytest.mark.asyncio
@@ -607,8 +668,9 @@ async def test_status_turn_after_broadcast_polls_order_without_reopening_approva
     session = await store.get("s-status")
 
     assert broadcast.status_code == 200
-    assert broadcast.json()["stage"] == "confirmed"
+    assert broadcast.json()["stage"] == "processing"
     assert broadcast.json()["broadcast_status"] == "confirmed"
+    assert "目标链资产尚未确认到账" in broadcast.json()["message"]
     assert provider.status_calls == 1
     assert final_state["response"]["kind"] == "swap_status"
     assert final_state["response"]["status"]["status"] == "processing"
@@ -624,6 +686,161 @@ async def test_status_turn_after_broadcast_polls_order_without_reopening_approva
     assert session.broadcast_status == "confirmed"
     assert session.order_status is not None
     assert session.order_status.status == "processing"
+
+
+@pytest.mark.asyncio
+async def test_broadcast_persists_deposit_metadata_after_provider_restart():
+    quote = NormalizedQuote(
+        provider="omnibridge",
+        source_asset=Asset(chain="BASE", chain_id=8453, symbol="ETH", decimals=18),
+        destination_asset=Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18),
+        input_amount=Decimal("1"),
+        input_amount_raw="1000000000000000000",
+        expected_output=Decimal("1"),
+        expected_output_raw="1000000000000000000",
+        provider_reference="quote-before-restart",
+    )
+    pending = DepositOrder(
+        provider="omnibridge",
+        provider_order_id="omni-order-after-restart",
+        deposit_address="0x" + "8" * 40,
+        source_asset=quote.source_asset,
+        destination_asset=quote.destination_asset,
+        input_amount=quote.input_amount,
+        input_amount_raw=quote.input_amount_raw,
+        provider_reference="omni-order-after-restart",
+        provider_payload={"equipment_no": "persisted-equipment", "source_type": "IOS"},
+    )
+
+    class RestartedProvider:
+        provider_name = "omnibridge"
+
+        async def register_broadcast(self, provider_reference, tx_hash):
+            assert provider_reference == pending.provider_reference
+            return ProviderOrder(
+                provider="omnibridge",
+                provider_order_id=provider_reference,
+                provider_reference=provider_reference,
+                tx_hash=tx_hash,
+            )
+
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-restarted-provider",
+            user_id="alice",
+            thread_id="t-restarted-provider",
+            status="swap_ready",
+            stage="swap_ready",
+            quote=quote,
+            pending_transaction=pending,
+        )
+    )
+    provider = RestartedProvider()
+    app = create_app(
+        graph=None,
+        providers={"omnibridge": provider},
+        chain_registry=ChainAdapterRegistry({"BASE": Adapter()}),
+        store=store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/swap/s-restarted-provider/broadcast",
+            json={
+                "user_id": "alice",
+                "chain": "BASE",
+                "tx_hash": "0x" + "c" * 64,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["provider_order"]["provider_payload"] == {
+        "equipment_no": "persisted-equipment",
+        "source_type": "IOS",
+    }
+    assert response.json()["stage"] == "processing"
+
+
+@pytest.mark.asyncio
+async def test_status_turn_backfills_metadata_for_existing_provider_order():
+    quote = NormalizedQuote(
+        provider="omnibridge",
+        source_asset=Asset(chain="BASE", chain_id=8453, symbol="ETH", decimals=18),
+        destination_asset=Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18),
+        input_amount=Decimal("1"),
+        input_amount_raw="1000000000000000000",
+        expected_output=Decimal("1"),
+        expected_output_raw="1000000000000000000",
+        provider_reference="legacy-quote",
+        provider_payload={"equipment_no": "legacy-equipment", "source_type": "IOS"},
+    )
+
+    class RestartedStatusProvider:
+        provider_name = "omnibridge"
+
+        def __init__(self):
+            self.status_calls = 0
+
+        async def get_status(self, order):
+            self.status_calls += 1
+            assert order.provider_payload == quote.provider_payload
+            return NormalizedOrderStatus(
+                provider="omnibridge",
+                provider_order_id=order.provider_order_id,
+                provider_reference=order.provider_reference,
+                status="processing",
+                tx_hash=order.tx_hash,
+            )
+
+    provider = RestartedStatusProvider()
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-legacy-provider-order",
+            user_id="alice",
+            thread_id="t-legacy-provider-order",
+            status="processing",
+            stage="processing",
+            quote=quote,
+            provider_order=ProviderOrder(
+                provider="omnibridge",
+                provider_order_id="legacy-order",
+                provider_reference="legacy-order",
+                tx_hash="0x" + "d" * 64,
+            ),
+            broadcast_tx_hash="0x" + "d" * 64,
+            broadcast_status="confirmed",
+        )
+    )
+    graph = build_graph(model=StatusModel(), providers=[provider])
+    app = create_app(
+        graph=graph,
+        providers={"omnibridge": provider},
+        store=store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        turn = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "conversation_id": "t-legacy-provider-order",
+                "session_id": "s-legacy-provider-order",
+                "message": "怎么样了？",
+            },
+        )
+        await app.state.runs[turn.json()["run_id"]]["task"]
+
+    restored = await store.get("s-legacy-provider-order")
+    assert provider.status_calls == 1
+    assert restored is not None
+    assert restored.provider_order is not None
+    assert restored.provider_order.provider_payload == quote.provider_payload
 
 
 @pytest.mark.asyncio

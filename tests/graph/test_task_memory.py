@@ -289,6 +289,40 @@ async def test_transaction_status_uses_registered_transfer_broadcast():
 
 
 @pytest.mark.asyncio
+async def test_transaction_status_infers_chain_from_selected_swap_quote():
+    tx_hash = "0x" + "9" * 64
+    source = Asset(chain="ETH", chain_id=1, symbol="USDC", decimals=6, address=USDC)
+    destination = Asset(chain="BSC", chain_id=56, symbol="USDT", decimals=6, address=USDT)
+    quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=source,
+        destination_asset=destination,
+        input_amount=Decimal("1"),
+        input_amount_raw="1000000",
+        expected_output=Decimal("1"),
+        expected_output_raw="1000000",
+        provider_reference="selected-chain",
+    )
+    graph = build_graph(
+        model=TransactionStatusModel([{}]),
+        explorer_provider=TransactionExplorer(),
+    )
+
+    result = await graph.ainvoke(
+        {
+            **turn("源链交易确认了吗？"),
+            "broadcast_tx_hash": tx_hash,
+            "selected_quote": quote.model_dump(mode="json"),
+            "pending_transaction": None,
+        },
+        config={"configurable": {"thread_id": "selected-quote-transaction-chain"}},
+    )
+
+    assert result["response"]["kind"] == "transaction_status"
+    assert result["transaction_query"] == {"chain": "ETH", "tx_hash": tx_hash}
+
+
+@pytest.mark.asyncio
 async def test_transaction_status_uses_local_not_propagated_broadcast_before_explorer():
     tx_hash = "0x" + "f" * 64
 
@@ -508,6 +542,51 @@ async def test_swap_follow_up_classified_as_clarification_still_merges_chain_pat
     assert second["active_task"]["slots"]["source_symbol"] == "USDC"
     assert provider.quote_calls == 1
     assert model.extracted_kinds == ["swap", "swap"]
+
+
+@pytest.mark.asyncio
+async def test_wallet_connected_followup_rebuilds_active_swap_request():
+    model = UnderstandingModel(
+        ["swap_prepare"],
+        swap=[SwapSlotPatch()],
+    )
+    provider = Provider()
+    graph = build_graph(model=model, providers=[provider])
+
+    result = await graph.ainvoke(
+        {
+            **turn("已经连接"),
+            "active_task": {
+                "task_id": "wallet-followup-swap",
+                "kind": "swap",
+                "status": "collecting",
+                "stage": "collecting_parameters",
+                "revision": 1,
+                "slots": {
+                    "source_chain": "BASE",
+                    "destination_chain": "BASE",
+                    "source_symbol": "USDC",
+                    "destination_symbol": "USDT",
+                    "source_token_address": USDC,
+                    "destination_token_address": USDT,
+                    "source_decimals": 6,
+                    "destination_decimals": 6,
+                    "input_amount": "1",
+                },
+                "slot_sources": {},
+                "missing_fields": ["sender_address", "recipient_address"],
+            },
+        },
+        config={"configurable": {"thread_id": "wallet-connected-swap-followup"}},
+    )
+
+    assert result["response"]["kind"] == "swap_quote"
+    assert result["swap_request"]["sender_address"] == WALLET
+    assert result["swap_request"]["recipient_address"] == WALLET
+    assert provider.quote_calls == 1
+    assert "MISSING_SWAP_PARAMETERS" not in {
+        error["code"] for error in result.get("errors", [])
+    }
 
 
 @pytest.mark.asyncio

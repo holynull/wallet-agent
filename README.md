@@ -61,6 +61,35 @@ machine-readable preflight checks before signing. The app must choose the return
 `provider_reference`; the service never picks a quote silently.
 Use a stable `conversation_id` as the LangGraph `thread_id` when reconnecting.
 
+## Multi-instance persistence and SSE recovery
+
+Local development keeps the zero-service defaults: SQLite stores LangGraph
+checkpoints/session projections and run events/locks remain in process. For two
+or more API instances, configure both shared backends:
+
+```dotenv
+PERSISTENCE_URL=postgresql://wallet_agent:change-me@postgres:5432/wallet_agent
+REDIS_URL=redis://redis:6379/0
+REDIS_KEY_PREFIX=wallet-agent
+RUN_EVENT_TTL_SECONDS=86400
+RUN_EVENT_MAX_ENTRIES=2000
+CONVERSATION_LOCK_LEASE_SECONDS=120
+CONVERSATION_LOCK_WAIT_SECONDS=30
+```
+
+PostgreSQL owns LangGraph checkpoints and the app-facing session projection.
+Redis Streams owns the cross-instance run-event log, while a renewable Redis
+lease serializes turns for the same `conversation_id`. Every SSE frame includes
+an `id`. Reconnect to the same `run_id` with `Last-Event-ID` or
+`?last_event_id=...`; only later events are replayed. Resume is bounded by
+`RUN_EVENT_TTL_SECONDS` and stream trimming.
+
+`docker compose up --build` starts the API with PostgreSQL and Redis. The
+Compose credentials are local-development defaults; replace them in a real
+deployment. An interrupted process is not silently re-executed by another API
+replica: persisted checkpoints make an explicit retry/resume safe, while Redis
+preserves events already emitted to the client.
+
 能力扩展路线见 [docs/wallet-agent-capability-roadmap.md](docs/wallet-agent-capability-roadmap.md)。
 资产组合和 Gas 助手还提供
 `/wallet/{address}/portfolio`、`/wallet/{address}/gas`，也可通过对话

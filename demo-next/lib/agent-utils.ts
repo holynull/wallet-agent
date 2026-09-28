@@ -3,6 +3,18 @@ export function parseSseFrames(buffer: string): { frames: string[]; remainder: s
   return { frames: frames.slice(0, -1), remainder: frames.at(-1) || "" };
 }
 
+export function parseSseFrame(frame: string): { id: string; event: string; data: string } {
+  const lines = frame.split("\n");
+  return {
+    id: lines.find((line) => line.startsWith("id:"))?.slice(3).trim() || "",
+    event: lines.find((line) => line.startsWith("event:"))?.slice(6).trim() || "message",
+    data: lines
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n"),
+  };
+}
+
 export function formatProcessingDuration(milliseconds: number): string {
   if (!Number.isFinite(milliseconds) || milliseconds < 0) return "0 ms";
   if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`;

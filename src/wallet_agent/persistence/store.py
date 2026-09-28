@@ -75,6 +75,8 @@ class SessionStore(Protocol):
         expected_revision: int | None = None,
         **changes: object,
     ) -> SwapSessionRecord: ...
+    async def ready(self) -> bool: ...
+    async def aclose(self) -> None: ...
 
 
 class InMemorySessionStore:
@@ -127,9 +129,25 @@ class InMemorySessionStore:
             self._sessions[session_id] = updated
             return updated.model_copy(deep=True)
 
+    async def ready(self) -> bool:
+        return True
 
-class SqliteSessionStore:
-    """Async SQLite session index for a single service instance or test.
+    async def aclose(self) -> None:
+        return None
+
+
+def _async_database_url(url: str) -> str:
+    if url.startswith("postgres://"):
+        return f"postgresql+psycopg://{url[len('postgres://') :]}"
+    if url.startswith("postgresql://"):
+        return f"postgresql+psycopg://{url[len('postgresql://') :]}"
+    if url.startswith("sqlite://") and not url.startswith("sqlite+aiosqlite://"):
+        return f"sqlite+aiosqlite://{url[len('sqlite://') :]}"
+    return url
+
+
+class SqlSessionStore:
+    """Async SQL session projection store for SQLite or PostgreSQL.
 
     LangGraph checkpoints remain owned by its configured checkpointer; this
     table stores only the app-facing swap session projection.
@@ -140,7 +158,7 @@ class SqliteSessionStore:
 
         from .tables import SwapSessionRow
 
-        self.engine = create_async_engine(url)
+        self.engine = create_async_engine(_async_database_url(url))
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
         self.row_model = SwapSessionRow
         self._initialized = False
@@ -155,9 +173,11 @@ class SqliteSessionStore:
             # ``create_all`` does not add columns to an existing deployment.
             # Keep the tiny projection migration local and idempotent.
             try:
-                await connection.execute(
-                    text("ALTER TABLE swap_sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
-                )
+                suffix = " IF NOT EXISTS" if connection.dialect.name == "postgresql" else ""
+                await connection.execute(text(
+                    f"ALTER TABLE swap_sessions ADD COLUMN{suffix} "
+                    "revision INTEGER NOT NULL DEFAULT 0"
+                ))
             except Exception:
                 pass
         self._initialized = True
@@ -257,3 +277,17 @@ class SqliteSessionStore:
                 raise SessionRevisionConflict(session_id, current.revision, actual)
             await db.commit()
             return updated
+
+    async def ready(self) -> bool:
+        from sqlalchemy import text
+
+        await self._ensure_init()
+        async with self.session_factory() as db:
+            return (await db.execute(text("SELECT 1"))).scalar_one() == 1
+
+    async def aclose(self) -> None:
+        await self.engine.dispose()
+
+
+class SqliteSessionStore(SqlSessionStore):
+    """Backward-compatible name for existing imports."""

@@ -240,7 +240,7 @@ SCENARIOS = {
             provider_register=(FaultOutcome("success", "order-idempotent"),),
         ),
         wallet_hashes=("0x" + "d" * 64,),
-        expected_final_stage="confirmed",
+        expected_final_stage="processing",
         expected_wallet_sends=1,
         expected_register_attempts=1,
         driver_actions=("broadcast", "broadcast_same", "broadcast_conflict"),
@@ -373,7 +373,7 @@ SCENARIOS = {
             provider_status=(FaultOutcome("completed"),),
         ),
         wallet_hashes=("0x" + "5" * 64,),
-        expected_final_stage="confirmed",
+        expected_final_stage="processing",
         expected_wallet_sends=1,
         expected_register_attempts=1,
         driver_actions=("broadcast",),
@@ -2129,13 +2129,10 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
         if any(excluded in message for excluded in definition.excluded_response_messages):
             failures.append("status response regressed to an excluded message")
     for previous, current in zip(status_steps, status_steps[1:]):
-        if (
-            previous.evidence.get("assistant_message")
-            == current.evidence.get("assistant_message")
-            and previous.evidence.get("assistant_history_count")
-            != current.evidence.get("assistant_history_count")
+        if current.evidence.get("assistant_history_count") != (
+            previous.evidence.get("assistant_history_count", 0) + 1
         ):
-            failures.append("duplicate assistant status message appended to history")
+            failures.append("status turn did not append exactly one assistant reply")
     status = "passed" if not failures and all(item.passed for item in invariants) else "failed"
     return LifecycleReport(
         id=definition.id,

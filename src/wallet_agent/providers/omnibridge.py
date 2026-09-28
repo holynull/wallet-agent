@@ -23,6 +23,8 @@ from wallet_agent.domain.normalization import canonical_chain, canonical_symbol
 from .cache import AsyncTTLCache
 from .http import ProviderResponseError
 
+_DEPOSIT_DECIMAL_PLACES = 8
+
 
 def _equipment(address: str) -> str:
     return address[:32]
@@ -43,6 +45,25 @@ def _raw(amount: Decimal, decimals: int) -> str:
 
 def _raw_up(amount: Decimal, decimals: int) -> str:
     return str(int((amount * (Decimal(10) ** decimals)).to_integral_value(rounding=ROUND_CEILING)))
+
+
+def _deposit_amount(
+    amount: Decimal, token_decimals: int, *, rounding: str = ROUND_DOWN
+) -> Decimal:
+    """Normalize an amount to the precision accepted by Omni order creation."""
+    precision = min(token_decimals, _DEPOSIT_DECIMAL_PLACES)
+    quantum = Decimal(1).scaleb(-precision)
+    normalized = amount.quantize(quantum, rounding=rounding)
+    if normalized <= 0:
+        raise ValueError("deposit amount is below OmniBridge precision")
+    return Decimal(_decimal_text(normalized))
+
+
+def _decimal_text(amount: Decimal) -> str:
+    text = format(amount, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
 
 
 def _output_meets_target(actual: Decimal, target: Decimal, decimals: int) -> bool:
@@ -158,12 +179,19 @@ class OmniBridgeProvider:
         return list(assets)
 
     async def quote(self, request: SwapQuoteRequest) -> NormalizedQuote:
+        input_amount = _deposit_amount(request.input_amount, request.source_asset.decimals)
+        request = request.model_copy(
+            update={
+                "input_amount": input_amount,
+                "input_amount_raw": _raw(input_amount, request.source_asset.decimals),
+            }
+        )
         deposit_code = _coin_code(request.source_asset)
         receive_code = _coin_code(request.destination_asset)
         payload = {
             "depositCoinCode": deposit_code,
             "receiveCoinCode": receive_code,
-            "depositCoinAmt": str(request.input_amount),
+            "depositCoinAmt": _decimal_text(request.input_amount),
             "sourceFlag": self.source_flag,
         }
         data = _success(await self.transport.post("/api/v1/getBaseInfo", payload))
@@ -253,10 +281,11 @@ class OmniBridgeProvider:
         """Invert Omni's quote formula, then verify with a forward quote."""
         if output_amount <= 0:
             raise ValueError("target output amount must be greater than zero")
+        probe_amount = _deposit_amount(request.input_amount, request.source_asset.decimals)
         probe_payload = {
             "depositCoinCode": _coin_code(request.source_asset),
             "receiveCoinCode": _coin_code(request.destination_asset),
-            "depositCoinAmt": str(request.input_amount),
+            "depositCoinAmt": _decimal_text(probe_amount),
             "sourceFlag": self.source_flag,
         }
         data = _success(await self.transport.post("/api/v1/getBaseInfo", probe_payload))
@@ -273,8 +302,12 @@ class OmniBridgeProvider:
             raise ValueError(
                 f"required source amount {input_amount} is outside Omni bounds {minimum}..{maximum}"
             )
+        input_amount = _deposit_amount(
+            input_amount,
+            request.source_asset.decimals,
+            rounding=ROUND_CEILING,
+        )
         raw = _raw_up(input_amount, request.source_asset.decimals)
-        input_amount = Decimal(raw) / (Decimal(10) ** request.source_asset.decimals)
         if input_amount > maximum:
             raise ValueError(
                 f"required source amount {input_amount} is outside Omni bounds {minimum}..{maximum}"
@@ -300,6 +333,13 @@ class OmniBridgeProvider:
                 "depositMax": meta.get("deposit_max", "Infinity"),
             }
         amount = quote.input_amount
+        normalized_amount = _deposit_amount(amount, quote.source_asset.decimals)
+        if normalized_amount != amount:
+            raise ProviderResponseError(
+                "919",
+                "存币金额最多支持 8 位小数，请重新获取报价。",
+                category="client",
+            )
         minimum, maximum = (
             Decimal(str(qdata.get("depositMin", "0"))),
             Decimal(str(qdata.get("depositMax", "Infinity"))),
@@ -312,7 +352,7 @@ class OmniBridgeProvider:
             request = {
                 "depositCoinCode": deposit_code,
                 "receiveCoinCode": (_coin_code(quote.destination_asset)),
-                "depositCoinAmt": str(quote.input_amount),
+                "depositCoinAmt": _decimal_text(quote.input_amount),
                 "sourceFlag": meta.get("source_flag", self.source_flag),
             }
         request.update(
@@ -362,11 +402,16 @@ class OmniBridgeProvider:
                 idempotency_key=provider_reference,
             )
         )
+        meta = self._orders.get(provider_reference, {})
         return ProviderOrder(
             provider="omnibridge",
             provider_order_id=provider_reference,
             provider_reference=provider_reference,
             tx_hash=tx_hash,
+            provider_payload={
+                "equipment_no": meta.get("equipment_no", ""),
+                "source_type": meta.get("source_type", self.source_type),
+            },
         )
 
     async def get_status(self, order: ProviderOrder) -> NormalizedOrderStatus:

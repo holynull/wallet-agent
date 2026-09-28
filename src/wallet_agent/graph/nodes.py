@@ -2655,6 +2655,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             else:
                 decision = {**decision, "source": "model"}
+        if (
+            decision.get("intent") == "transaction_status"
+            and state.get("provider_orders")
+            and state.get("broadcast_tx_hash")
+            and not transaction_query_hints(str(request.get("message", ""))).get(
+                "transaction_hash"
+            )
+        ):
+            # A status follow-up inside an active swap asks about the provider
+            # order unless the user explicitly supplied a different hash.
+            decision = {"intent": "swap_status", "source": "swap_context"}
         update: dict[str, Any] = {
             "intent": decision["intent"],
             "predicted_intent": decision["intent"],
@@ -3339,6 +3350,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         explicit_task_kind = {
             "transfer": "transfer",
             "swap_quote": "swap",
+            # Rebuild a quote request after wallet connection completes the
+            # missing sender/recipient context.
+            "swap_prepare": "swap",
         }.get(intent_value)
         task_kind = explicit_task_kind
         if task_kind is None and intent_value == "clarification" and active_task:
@@ -3946,8 +3960,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 draft["tx_hash"] = str(registered_hash)
             if registered_hash and explicit_chain is None:
                 pending = _mapping(state.get("pending_transaction"))
-                if pending.get("chain"):
-                    draft["chain"] = str(pending["chain"])
+                selected = _mapping(state.get("selected_quote"))
+                source_asset = _mapping(selected.get("source_asset"))
+                inferred_chain = (
+                    pending.get("chain")
+                    or source_asset.get("chain")
+                    or request.get("chain")
+                    or (state.get("wallet_context") or {}).get("chain")
+                )
+                if inferred_chain:
+                    draft["chain"] = str(inferred_chain)
             if draft.get("chain"):
                 draft["chain"] = canonical_chain(str(draft["chain"]))
             pending = _mapping(state.get("pending_transaction"))
@@ -4085,7 +4107,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         if raw is None:
             return {
                 "intent": "clarification",
-                "errors": [_error("MISSING_SWAP_PARAMETERS", "Swap parameters are required.")],
+                "errors": [
+                    _error(
+                        "MISSING_SWAP_PARAMETERS",
+                        "兑换参数尚未准备完整，请补充缺失信息。",
+                    )
+                ],
             }
         try:
             request = _request(raw)
@@ -4405,6 +4432,34 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 )
             return response
 
+        def prepare_failure(provider_name: str, exc: Exception) -> dict[str, Any]:
+            provider_code = str(getattr(exc, "code", "") or "")
+            if provider_name == "omnibridge" and provider_code == "919":
+                message = (
+                    "OmniBridge 不接受当前报价的金额精度（最多 8 位小数）。"
+                    "请重新获取报价后再选择 Provider。"
+                )
+            else:
+                message = "兑换服务暂时无法准备交易，请重新获取报价后再试。"
+            details = {"provider": provider_name}
+            if provider_code:
+                details["provider_code"] = provider_code
+            error = _error(
+                "PROVIDER_PREPARE_FAILED",
+                message,
+                retryable=True,
+                details=details,
+            )
+            return {
+                "authorization_stage": "failed",
+                "response": {
+                    "kind": "error",
+                    "stage": "failed",
+                    "message": message,
+                    "errors": [error],
+                },
+            }
+
         selected = state.get("selected_quote")
         if not selected:
             return {
@@ -4425,7 +4480,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         "errors": [_error("PROVIDER_UNAVAILABLE", "Provider unavailable")],
                     }
                 }
-            prepared = await provider.prepare(quote)
+            try:
+                prepared = await provider.prepare(quote)
+            except Exception as exc:
+                return prepare_failure(str(selected.get("provider")), exc)
             preflight = None
             request = state.get("swap_request") or {}
             source_asset = request.get("source_asset") or selected.get("source_asset") or {}
@@ -4578,7 +4636,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "errors": [_error("PROVIDER_UNAVAILABLE", "Provider unavailable")],
                 }
             }
-        prepared = await provider.prepare(quote)
+        try:
+            prepared = await provider.prepare(quote)
+        except Exception as exc:
+            return prepare_failure(str(selected.get("provider")), exc)
         preflight = None
         request = state.get("swap_request") or {}
         source_asset = request.get("source_asset") or selected.get("source_asset") or {}
@@ -5199,6 +5260,19 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             ) or selected.get("provider_reference", "")
             order = await provider.register_broadcast(str(provider_reference), tx_hash)
             value = _dump(order)
+            pending_payload = (
+                _mapping(pending).get("provider_payload") if pending is not None else {}
+            )
+            if isinstance(pending_payload, Mapping) and pending_payload:
+                order_payload = _mapping(value.get("provider_payload"))
+                value["provider_payload"] = {
+                    **pending_payload,
+                    **{
+                        str(key): item
+                        for key, item in order_payload.items()
+                        if item not in (None, "")
+                    },
+                }
             return {
                 "provider_order_ids": {provider_name: order.provider_order_id},
                 "provider_orders": {provider_name: value},

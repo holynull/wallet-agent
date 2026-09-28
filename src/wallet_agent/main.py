@@ -28,7 +28,12 @@ from wallet_agent.okx import (
     OkxSignedClient,
     OkxWalletAdapter,
 )
-from wallet_agent.persistence import SqliteSessionStore, initialize_checkpointer
+from wallet_agent.persistence import (
+    RedisLockManager,
+    RedisRunStore,
+    SqlSessionStore,
+    initialize_checkpointer,
+)
 from wallet_agent.prices import OkxPriceProvider
 from wallet_agent.providers import BridgersProvider, HttpJsonTransport, OmniBridgeProvider
 
@@ -175,7 +180,26 @@ def build_application(settings: Settings | None = None) -> Any:
         confirmation_ttl_seconds=settings.confirmation_ttl_seconds,
         provider_timeout_seconds=settings.provider_timeout_seconds,
     )
-    session_store = SqliteSessionStore(settings.persistence_url)
+    session_store = SqlSessionStore(settings.persistence_url)
+    redis_client = None
+    run_store = None
+    lock_manager = None
+    if settings.redis_url:
+        from redis.asyncio import from_url as redis_from_url
+
+        redis_client = redis_from_url(settings.redis_url, decode_responses=True)
+        run_store = RedisRunStore(
+            redis_client,
+            key_prefix=settings.redis_key_prefix,
+            ttl_seconds=settings.run_event_ttl_seconds,
+            max_events=settings.run_event_max_entries,
+        )
+        lock_manager = RedisLockManager(
+            redis_client,
+            key_prefix=settings.redis_key_prefix,
+            lease_seconds=settings.conversation_lock_lease_seconds,
+            wait_seconds=settings.conversation_lock_wait_seconds,
+        )
     application = create_app(
         graph=graph,
         providers=providers,
@@ -184,6 +208,8 @@ def build_application(settings: Settings | None = None) -> Any:
         execution_observer=execution_observer,
         price_provider=price_provider,
         store=session_store,
+        run_store=run_store,
+        lock_manager=lock_manager,
         model_registry=model_registry,
         token_verifier=StaticTokenVerifier(settings.auth_tokens) if settings.auth_tokens else None,
         require_auth=settings.auth_required,

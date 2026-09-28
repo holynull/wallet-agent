@@ -60,6 +60,11 @@ class BroadcastProvider:
         )
 
 
+class MisclassifiedSwapStatusModel:
+    async def classify(self, _request):
+        return {"intent": "transaction_status"}
+
+
 class ReparseModel:
     def __init__(self):
         self.classify_calls = 0
@@ -275,3 +280,36 @@ async def test_broadcast_status_not_propagated_skips_provider_registration_and_p
     assert result["response"]["status"] == "not_propagated"
     assert provider.broadcast_calls == 0
     assert provider.status_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_active_swap_status_followup_polls_existing_provider_order():
+    provider = BroadcastProvider()
+    graph = build_graph(model=MisclassifiedSwapStatusModel(), providers=[provider])
+    quote = selected_quote()
+    tx_hash = "0x" + "7" * 64
+    order = ProviderOrder(
+        provider="bridgers",
+        provider_order_id="order-1",
+        provider_reference=quote["provider_reference"],
+        tx_hash=tx_hash,
+    )
+
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "misclassified-swap-status",
+            "request": {"message": "到账了没有？"},
+            "selected_quote": quote,
+            "broadcast_tx_hash": tx_hash,
+            "broadcast_status": "confirmed",
+            "provider_orders": {"bridgers": order.model_dump(mode="json")},
+        },
+        config={"configurable": {"thread_id": "misclassified-swap-status"}},
+    )
+
+    assert result["intent"] == "swap_status"
+    assert result["supervisor_decision"]["source"] == "swap_context"
+    assert result["response"]["kind"] == "swap_status"
+    assert result["response"]["provider_status"] == "processing"
+    assert provider.status_calls == 1
+    assert provider.broadcast_calls == 0

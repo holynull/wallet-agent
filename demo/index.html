@@ -485,27 +485,44 @@
 
   async function readSse(runId, options = {}) {
     const signal = options.signal || state.streamAbort?.signal;
-    const response = await fetch(`/v1/agent/stream/${runId}`, { headers: authHeaders(), signal });
-    if (!response.ok) {
-      const raw = await response.text();
-      recordDebug(`SSE CONNECT ${runId} · ${response.status}`, { raw });
-      throw new Error(raw);
-    }
-    recordDebug(`SSE CONNECT ${runId} · ${response.status}`, { headers: Object.fromEntries(response.headers.entries()) });
-    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
-    const events = [];
+    let lastEventId = ''; let reconnects = 0; let terminalReceived = false; const events = [];
     while (true) {
-      const chunk = await reader.read(); if (chunk.done) break; buffer += decoder.decode(chunk.value, { stream: true });
-      const frames = buffer.split('\n\n'); buffer = frames.pop() || '';
-      for (const frame of frames) {
-        const event = (frame.match(/^event: (.+)$/m) || [])[1] || 'message'; const data = (frame.match(/^data: (.+)$/m) || [])[1] || '{}';
-        let parsed; try { parsed = JSON.parse(data); } catch { parsed = { data }; }
-        recordDebug(`SSE ${event}`, parsed);
-        const current = applyEvent(event, parsed, options.apply !== false, runId);
-        events.push({ event, payload: parsed, state: current });
+      let buffer = '';
+      try {
+        const suffix = lastEventId ? `?last_event_id=${encodeURIComponent(lastEventId)}` : '';
+        const response = await fetch(`/v1/agent/stream/${runId}${suffix}`, { headers: authHeaders(), signal });
+        if (!response.ok) {
+          const raw = await response.text();
+          recordDebug(`SSE CONNECT ${runId} · ${response.status}`, { raw });
+          throw new Error(raw);
+        }
+        recordDebug(`SSE CONNECT ${runId} · ${response.status}`, { lastEventId, headers: Object.fromEntries(response.headers.entries()) });
+        const reader = response.body.getReader(); const decoder = new TextDecoder();
+        while (true) {
+          const chunk = await reader.read(); if (chunk.done) break; buffer += decoder.decode(chunk.value, { stream: true });
+          const frames = buffer.split('\n\n'); buffer = frames.pop() || '';
+          for (const frame of frames) {
+            const id = (frame.match(/^id:\s*(.+)$/m) || [])[1] || '';
+            const event = (frame.match(/^event:\s*(.+)$/m) || [])[1] || 'message';
+            const data = frame.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trimStart()).join('\n') || '{}';
+            let parsed; try { parsed = JSON.parse(data); } catch { parsed = { data }; }
+            if (id) lastEventId = id;
+            if (['complete', 'error', 'action_required'].includes(event)) terminalReceived = true;
+            recordDebug(`SSE ${event}`, parsed);
+            const current = applyEvent(event, parsed, options.apply !== false, runId);
+            events.push({ id, event, payload: parsed, state: current });
+          }
+        }
+        if (buffer.trim()) recordDebug('SSE trailing data', buffer);
+        if (!terminalReceived) throw new Error('SSE stream ended before a terminal event');
+        break;
+      } catch (error) {
+        if (error?.name === 'AbortError' || reconnects >= 3) throw error;
+        reconnects += 1;
+        recordDebug(`SSE RECONNECT ${runId}`, { lastEventId, attempt: reconnects });
+        await new Promise((resolve) => setTimeout(resolve, reconnects * 250));
       }
     }
-    if (buffer.trim()) recordDebug('SSE trailing data', buffer);
     return events;
   }
   function responseState(data) {

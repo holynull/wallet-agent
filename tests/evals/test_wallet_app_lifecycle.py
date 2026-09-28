@@ -151,7 +151,7 @@ async def test_partial_provider_quote_failure_preserves_successful_candidate():
 
 
 @pytest.mark.asyncio
-async def test_repeated_status_does_not_duplicate_assistant_history():
+async def test_repeated_status_adds_one_assistant_reply_per_user_turn():
     report = await run_scenario("repeated_status_response")
 
     assert report.status == "passed"
@@ -160,9 +160,9 @@ async def test_repeated_status_does_not_duplicate_assistant_history():
     assert status_steps[0].evidence["assistant_message"] == status_steps[1].evidence[
         "assistant_message"
     ]
-    assert status_steps[1].evidence["assistant_history_count"] == status_steps[0].evidence[
-        "assistant_history_count"
-    ]
+    assert status_steps[1].evidence["assistant_history_count"] == (
+        status_steps[0].evidence["assistant_history_count"] + 1
+    )
 
 
 @pytest.mark.asyncio

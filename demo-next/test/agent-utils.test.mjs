@@ -6,6 +6,7 @@ import {
   formatResponseSummary,
   formatProcessingDuration,
   latestProgressText,
+  parseSseFrame,
   parseSseFrames,
   providerPriority,
   responseMessage,
@@ -32,6 +33,14 @@ test("parses complete SSE frames and preserves partial remainder", () => {
   assert.deepEqual(parseSseFrames("event: update\ndata: {}\n\nevent: complete\ndata:"), {
     frames: ["event: update\ndata: {}"],
     remainder: "event: complete\ndata:",
+  });
+});
+
+test("parses SSE event IDs for resumable streams", () => {
+  assert.deepEqual(parseSseFrame("id: 173-0\nevent: complete\ndata: {\"ok\":true}"), {
+    id: "173-0",
+    event: "complete",
+    data: '{"ok":true}',
   });
 });
 
