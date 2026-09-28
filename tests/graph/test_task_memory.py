@@ -202,6 +202,26 @@ class BscTokenChain:
         )
 
 
+class BscWalletProvider:
+    chain_index_by_name = {"BSC": "56"}
+
+    async def get_token_balances(self, _address, chain_indexes):
+        assert chain_indexes == ["56"]
+        return [
+            TokenBalance(
+                asset=Asset(
+                    chain="BSC",
+                    chain_id=56,
+                    symbol="USDC",
+                    decimals=18,
+                    address="0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+                ),
+                amount=Decimal("8"),
+                amount_raw="8000000000000000000",
+            )
+        ]
+
+
 class OkxWalletProvider:
     chain_index_by_name = {"BASE": "8453"}
 
@@ -347,6 +367,40 @@ async def test_transfer_followup_bsc_usdc_resolves_wallet_token_metadata():
     assert second["transfer_request"]["token"]["address"] == wallet_usdc
     assert second["transfer_request"]["token"]["decimals"] == 18
     assert second["active_task"]["slots"]["token_address"] == wallet_usdc
+
+
+@pytest.mark.asyncio
+async def test_transfer_uses_wallet_provider_for_token_metadata_when_context_has_no_balances():
+    model = UnderstandingModel(
+        ["transfer"],
+        transfer=[
+            TransferSlotPatch(
+                chain="BSC",
+                symbol="USDC",
+                amount="1",
+                recipient=RECIPIENT,
+            )
+        ],
+    )
+    graph = build_graph(
+        model=model,
+        chains={"BSC": BscTokenChain()},
+        wallet_provider=BscWalletProvider(),
+    )
+
+    result = await graph.ainvoke(
+        {
+            **turn(f"给 {RECIPIENT} 转 1 USDC"),
+            "wallet_context": {"address": WALLET, "chain": "BSC", "chain_id": 56},
+        },
+        config={"configurable": {"thread_id": "transfer-wallet-provider-metadata"}},
+    )
+
+    assert result["response"]["kind"] == "transfer_prepare"
+    assert result["transfer_request"]["token"]["address"] == (
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"
+    )
+    assert result["transfer_request"]["token"]["decimals"] == 18
 
 
 @pytest.mark.asyncio

@@ -1211,6 +1211,7 @@ async def _resolve_transfer_asset(
     draft: dict[str, Any],
     providers: Mapping[str, Any],
     wallet_context: Mapping[str, Any] | None = None,
+    wallet_provider: Any | None = None,
 ) -> dict[str, Any]:
     """Fill transfer token metadata from trusted common assets or providers."""
     resolved = dict(draft)
@@ -1232,9 +1233,31 @@ async def _resolve_transfer_asset(
     # transfer without asking the user to paste a contract and decimals.
     if asset is None:
         raw_balances = context.get("token_balances") or context.get("assets") or []
+        if (
+            not raw_balances
+            and wallet_provider is not None
+            and hasattr(wallet_provider, "get_token_balances")
+            and context.get("address")
+        ):
+            chain_indexes = getattr(wallet_provider, "chain_index_by_name", {}) or {}
+            chain_index = chain_indexes.get(canonical_chain_name)
+            if chain_index is not None:
+                try:
+                    raw_balances = await wallet_provider.get_token_balances(
+                        str(context["address"]), [str(chain_index)]
+                    )
+                except Exception:
+                    # Wallet balance reads are an optional metadata source;
+                    # provider asset discovery remains the fallback.
+                    raw_balances = []
         wallet_matches: list[Asset] = []
         for raw_balance in raw_balances:
-            item = raw_balance.get("asset") if isinstance(raw_balance, Mapping) else None
+            if isinstance(raw_balance, Mapping):
+                item = raw_balance.get("asset")
+            else:
+                item = getattr(raw_balance, "asset", None)
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(mode="json")
             if not isinstance(item, Mapping):
                 continue
             try:
@@ -4016,7 +4039,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 else dict(state.get("transfer_draft") or {})
             )
             draft = await _resolve_transfer_asset(
-                draft, runtime.providers, state.get("wallet_context")
+                draft,
+                runtime.providers,
+                state.get("wallet_context"),
+                runtime.wallet_provider,
             )
             request_model, missing = _transfer_draft_request(draft, state.get("wallet_context"))
             if request_model is None:
