@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -593,6 +594,11 @@ def create_app(
         allow_origins=[
             "http://localhost:3000",
             "http://127.0.0.1:3000",
+            *(
+                origin.strip().rstrip("/")
+                for origin in str(os.getenv("CORS_ALLOW_ORIGINS", "")).split(",")
+                if origin.strip()
+            ),
         ],
         allow_credentials=True,
         allow_methods=["*"],

@@ -26,6 +26,21 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+远程服务器部署时，Demo 在用户浏览器中运行，因此 `NEXT_PUBLIC_AGENT_API_URL`
+必须填写浏览器可访问的 API 地址，不能填写 Compose 内部的 `wallet-agent:8000`：
+
+```dotenv
+NEXT_PUBLIC_AGENT_API_URL=http://<server-ip>:8000
+CORS_ALLOW_ORIGINS=http://<server-ip>:3000
+```
+
+修改这两个值后需要重新构建 Demo；它们不是运行时热更新配置：
+
+```bash
+docker compose build --no-cache demo-next
+docker compose up -d --force-recreate demo-next wallet-agent
+```
+
 如果修改了 Python 源码、依赖或 Dockerfile，强制重新构建并重建 API：
 
 ```bash

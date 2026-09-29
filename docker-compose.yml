@@ -25,7 +25,9 @@ services:
     build:
       context: ./demo-next
       args:
-        NEXT_PUBLIC_AGENT_API_URL: http://localhost:8000
+        # The browser calls the API, so this must be reachable from the user's
+        # browser rather than from inside the Compose network.
+        NEXT_PUBLIC_AGENT_API_URL: ${NEXT_PUBLIC_AGENT_API_URL:-http://localhost:8000}
     ports:
       - "3000:3000"
     depends_on:
