@@ -103,7 +103,17 @@ export default function Home() {
   }
   const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
   async function loadHistory() {
-    try { const body = await requestApi("/v1/agent/conversations?user_id=browser-demo", { headers }); setConversations(body.conversations ?? []); log("CONVERSATIONS", body); }
+    try {
+      const body = await requestApi("/v1/agent/conversations?user_id=browser-demo", { headers });
+      const history = Array.isArray(body.conversations) ? body.conversations : [];
+      history.sort((left: Conversation, right: Conversation) => {
+        const rightTime = Date.parse(right.updated_at);
+        const leftTime = Date.parse(left.updated_at);
+        return (Number.isFinite(rightTime) ? rightTime : 0) - (Number.isFinite(leftTime) ? leftTime : 0);
+      });
+      setConversations(history);
+      log("CONVERSATIONS", { ...body, conversations: history });
+    }
     catch (error) { setMessages((current) => [...current, { role: "assistant", content: `读取历史失败：${error instanceof Error ? error.message : String(error)}` }]); }
   }
   async function loadConversation(id: string) {

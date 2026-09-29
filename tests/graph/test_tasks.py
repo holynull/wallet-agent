@@ -141,6 +141,25 @@ def test_swap_chain_correction_clears_resolved_asset_metadata():
     assert result.invalidation["quote_candidates"] == [{"__clear__": True}]
 
 
+def test_transfer_asset_change_clears_resolved_token_metadata():
+    task = merge_task_patch(
+        new_active_task("transfer", task_id="transfer-asset-change"),
+        {
+            "chain": "BSC",
+            "chain_id": 56,
+            "symbol": "USDC",
+            "token_address": "0x" + "8" * 40,
+            "decimals": 18,
+            "amount": "1",
+        },
+    ).task
+
+    result = merge_task_patch(task, {"chain": "ETH", "symbol": "ETH"})
+
+    assert result.task["slots"] == {"chain": "ETH", "symbol": "ETH", "amount": "1"}
+
+
+
 def test_swap_amount_correction_invalidates_transaction_artifacts():
     task = new_active_task("swap", task_id="swap-1")
     task["revision"] = 1

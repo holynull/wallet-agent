@@ -13,6 +13,7 @@ from .state import ActiveTask, SlotSource, TaskKind
 
 _TRANSFER_TO_LEGACY = {
     "chain": "transfer_chain",
+    "chain_id": "transfer_chain_id",
     "symbol": "transfer_symbol",
     "token_address": "transfer_token_address",
     "decimals": "transfer_decimals",
@@ -196,8 +197,17 @@ def _clear_derived_slots(
     patch: Mapping[str, Any],
 ) -> None:
     if kind == "transfer":
-        if changed & {"chain", "symbol", "token_address"} and "decimals" not in patch:
+        if changed & {"chain", "symbol"}:
+            if "token_address" not in patch:
+                slots.pop("token_address", None)
+            if "decimals" not in patch:
+                slots.pop("decimals", None)
+            if "chain_id" not in patch:
+                slots.pop("chain_id", None)
+        elif "token_address" in changed and "decimals" not in patch:
             slots.pop("decimals", None)
+        if "chain" in changed and "chain_id" not in patch:
+            slots.pop("chain_id", None)
         if "amount" in changed and "amount_raw" not in patch:
             slots.pop("amount_raw", None)
         return

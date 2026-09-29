@@ -80,8 +80,25 @@ def _suggestion_data_for_model(value: Any) -> dict[str, Any] | None:
     return clean or None
 
 
-def _response_language(message: str) -> str:
-    return "zh" if re.search(r"[\u3400-\u9fff]", message) else "en"
+def _message_language(message: str) -> str | None:
+    if re.search(r"[\u3400-\u9fff]", message):
+        return "zh"
+    # Numeric amounts and bare wallet addresses do not carry a language signal.
+    text = re.sub(r"0x[0-9a-fA-F]+", "", message)
+    return "en" if re.search(r"[A-Za-z]{2,}", text) else None
+
+
+def _response_language(message: str, history: Any = None) -> str:
+    current = _message_language(message)
+    if current:
+        return current
+    for item in reversed(history or []):
+        if not isinstance(item, Mapping):
+            continue
+        language = _message_language(str(item.get("content") or ""))
+        if language:
+            return language
+    return "en"
 
 
 def _response_fallback(intent: str, missing: list[str], language: str) -> str:
@@ -350,6 +367,7 @@ _VALID_INTENTS = {
 
 _TRANSFER_CANONICAL_KEYS = {
     "transfer_chain": "chain",
+    "transfer_chain_id": "chain_id",
     "transfer_symbol": "symbol",
     "transfer_token_address": "token_address",
     "transfer_decimals": "decimals",
@@ -1187,6 +1205,70 @@ def _explicit_token_address(value: Any) -> str | None:
     return address or None
 
 
+def _sanitize_native_transfer_draft(
+    draft: Mapping[str, Any], wallet_context: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Remove stale ERC-20 metadata when a persisted transfer is native."""
+    resolved = dict(draft)
+    context = wallet_context or {}
+    chain = resolved.get("transfer_chain") or resolved.get("chain") or context.get("chain")
+    symbol = resolved.get("transfer_symbol") or resolved.get("symbol")
+    if not chain or not symbol:
+        return resolved
+    canonical_chain_name = canonical_chain(str(chain))
+    canonical_symbol_name = canonical_symbol(str(symbol))
+    if _native_symbol(canonical_chain_name, None) != canonical_symbol_name:
+        return resolved
+    for key in (
+        "token_address",
+        "transfer_token_address",
+        "decimals",
+        "transfer_decimals",
+        "chain_id",
+        "transfer_chain_id",
+        "amount_raw",
+        "transfer_amount_raw",
+    ):
+        resolved.pop(key, None)
+    resolved["transfer_chain"] = canonical_chain_name
+    resolved["transfer_symbol"] = canonical_symbol_name
+    return resolved
+
+
+def _sanitize_native_transfer_task(
+    task: dict[str, Any] | None, wallet_context: Mapping[str, Any] | None = None
+) -> dict[str, Any] | None:
+    if not task or task.get("kind") != "transfer":
+        return task
+    slots = dict(task.get("slots") or {})
+    chain = slots.get("chain") or slots.get("transfer_chain") or (wallet_context or {}).get("chain")
+    symbol = slots.get("symbol") or slots.get("transfer_symbol")
+    if not chain or not symbol:
+        return task
+    if _native_symbol(canonical_chain(str(chain)), None) != canonical_symbol(str(symbol)):
+        return task
+    sanitized = dict(slots)
+    for key in (
+        "token_address",
+        "transfer_token_address",
+        "decimals",
+        "transfer_decimals",
+        "chain_id",
+        "transfer_chain_id",
+        "amount_raw",
+        "transfer_amount_raw",
+    ):
+        sanitized.pop(key, None)
+    if sanitized == slots:
+        return task
+    sources = {
+        key: value
+        for key, value in dict(task.get("slot_sources") or {}).items()
+        if key in sanitized
+    }
+    return {**task, "slots": sanitized, "slot_sources": sources, "updated_by": "system"}
+
+
 _COMMON_TRANSFER_ASSETS: dict[tuple[str, str], Asset] = {
     ("ETH", "USDC"): Asset(
         chain="ETH",
@@ -1223,7 +1305,7 @@ async def _resolve_transfer_asset(
     canonical_chain_name = canonical_chain(str(chain))
     canonical_symbol_name = canonical_symbol(str(symbol))
     if _native_symbol(canonical_chain_name, None) == canonical_symbol_name:
-        return resolved
+        return _sanitize_native_transfer_draft(resolved, context)
     if resolved.get("transfer_token_address") and resolved.get("transfer_decimals") is not None:
         return resolved
 
@@ -2108,7 +2190,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "intent": intent,
             "missing_fields": list(missing),
             "user_message": message,
-            "language_hint": _response_language(message),
+            "language_hint": _response_language(message, state.get("conversation_history")),
             "wallet": {
                 "address": context.get("address") or request.get("address"),
                 "chain": context.get("chain") or request.get("chain"),
@@ -3729,6 +3811,24 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     # explicit amount instead.
                     task_patch["amount"] = None
                     task_patch["amount_raw"] = None
+            if task_kind == "transfer":
+                prior_symbol = canonical_symbol(str(prior_slots.get("symbol") or ""))
+                next_symbol = canonical_symbol(
+                    str(task_patch.get("symbol") or prior_symbol or "")
+                )
+                if prior_symbol and next_symbol != prior_symbol and "chain" not in task_patch:
+                    # A changed asset must not inherit the previous asset's
+                    # network. Prefer the connected wallet network for its
+                    # native asset; otherwise force the resolver to use the
+                    # current wallet context instead of stale task state.
+                    wallet_context = state.get("wallet_context") or {}
+                    wallet_chain = wallet_context.get("chain")
+                    if wallet_chain and _native_symbol(
+                        str(wallet_chain), wallet_context
+                    ) == next_symbol:
+                        task_patch["chain"] = str(wallet_chain)
+                    else:
+                        task_patch["chain"] = None
             merged = merge_task_patch(active_task, task_patch)
             active_task = merged.task
             task_update = {
@@ -4033,6 +4133,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "max_poll_attempts": runtime.max_poll_attempts,
             }
         if intent_value == "transfer":
+            active_task = _sanitize_native_transfer_task(active_task, state.get("wallet_context"))
             draft = (
                 project_legacy_draft(active_task)
                 if active_task and active_task.get("kind") == "transfer"

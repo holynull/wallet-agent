@@ -214,10 +214,12 @@ class SqlSessionStore:
             rows = await db.execute(
                 select(self.row_model)
                 .where(self.row_model.user_id == user_id)
-                .order_by(self.row_model.revision.desc())
-                .limit(limit)
             )
-            return [SwapSessionRecord.model_validate_json(row.payload) for row in rows.scalars()]
+            sessions = [
+                SwapSessionRecord.model_validate_json(row.payload) for row in rows.scalars()
+            ]
+            sessions.sort(key=lambda session: session.updated_at, reverse=True)
+            return sessions[:limit]
 
     async def delete(self, session_id: str, *, user_id: str) -> bool:
         from sqlalchemy import delete

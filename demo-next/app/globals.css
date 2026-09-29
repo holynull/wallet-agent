@@ -44,7 +44,7 @@ main { width: min(1180px, 100%); min-height: 100dvh; margin: 0 auto; background:
 .assistant .bubble { background: #202a37; border: 1px solid #304055; border-bottom-left-radius: 4px; }
 .card { margin: 10px 0; padding: 13px; border: 1px solid #344256; border-radius: 10px; background: #18212d; }
 .card h3 { margin: 0 0 9px; font-size: 14px; }
-.progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }.progress-heading h3 { margin: 0; }.progress-heading > span { color: #8fa7c1; font-size: 11px; }
+.progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }.progress-heading h3 { margin: 0; font-size: 12px; font-weight: 600; line-height: 1.35; }.progress-heading > span { color: #8fa7c1; font-size: 11px; }
 .progress-list { display: grid; gap: 7px; margin: 12px 0 0; padding: 0; list-style: none; }.progress-list li { display: flex; align-items: baseline; gap: 8px; color: #aab8c9; font-size: 12px; }.progress-list li i { flex: 0 0 auto; width: 6px; height: 6px; margin-left: 2px; border-radius: 50%; background: #4d78c9; }.progress-list li:last-child { color: #dce7f3; }.progress-list li:last-child i { background: #57c58c; box-shadow: 0 0 0 3px rgba(87,197,140,.12); }
 .card p { margin: 6px 0; color: #bdc8d7; font-size: 12px; white-space: pre-line; }
 .card pre { max-height: 220px; margin: 8px 0; padding: 10px; overflow: auto; border-radius: 8px; background: #0a0f15; color: #c9d5e5; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }

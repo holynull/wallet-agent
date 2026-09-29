@@ -4,7 +4,7 @@ import pytest
 
 from wallet_agent.domain.models import Asset, TokenBalance, TokenPrice
 from wallet_agent.graph import build_graph
-from wallet_agent.models import RouteDecision
+from wallet_agent.models import RouteDecision, TransferSlotPatch
 from wallet_agent.models.contracts import AgentResponseDraft
 
 WALLET = "0x" + "1" * 40
@@ -28,6 +28,24 @@ class ResponseModel:
         if self.error:
             raise self.error
         return self.response
+
+
+class ChineseTransferFollowupModel(ResponseModel):
+    def __init__(self):
+        super().__init__(error=RuntimeError("response model unavailable"))
+        self.classifications = iter(["transfer", "clarification"])
+        self.patches = iter(
+            [
+                TransferSlotPatch(chain="ETH", symbol="USDC", amount="1"),
+                TransferSlotPatch(amount="0.1"),
+            ]
+        )
+
+    async def classify(self, _request):
+        return RouteDecision(intent=next(self.classifications))
+
+    async def extract(self, _kind, _request):
+        return next(self.patches)
 
 
 class SuggestionAwareSwapModel(ResponseModel):
@@ -116,6 +134,28 @@ async def test_transfer_clarification_uses_model_message_and_never_exposes_inter
         "chain": "ETH",
         "symbol": "USDC",
     }
+
+
+@pytest.mark.asyncio
+async def test_numeric_transfer_followup_inherits_chinese_response_language():
+    graph = build_graph(model=ChineseTransferFollowupModel(), wallet_provider=Wallet())
+    config = {"configurable": {"thread_id": "chinese-transfer-followup"}}
+
+    first = await graph.ainvoke(turn("转 1 USDC"), config=config)
+    assert first["response"]["kind"] == "clarification"
+
+    second = await graph.ainvoke(
+        {
+            **turn("0.1"),
+            "conversation_history": [
+                {"role": "user", "content": "转 1 USDC"},
+                {"role": "assistant", "content": "请补充收款地址。"},
+            ],
+        },
+        config=config,
+    )
+
+    assert second["response"]["message"] == "请补充收款地址。"
 
 
 @pytest.mark.asyncio

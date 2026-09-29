@@ -743,6 +743,88 @@ async def test_transfer_asset_change_without_explicit_amount_does_not_reuse_prev
 
 
 @pytest.mark.asyncio
+async def test_transfer_native_followup_does_not_inherit_previous_bsc_token_metadata():
+    model = UnderstandingModel(
+        ["transfer", "transfer", "clarification"],
+        transfer=[
+            TransferSlotPatch(
+                chain="BSC",
+                symbol="USDC",
+                token_address="0x" + "8" * 40,
+                decimals=18,
+                amount="1",
+                recipient=WALLET,
+            ),
+            TransferSlotPatch(symbol="ETH", recipient=WALLET),
+            TransferSlotPatch(amount="0.00001"),
+        ],
+    )
+    graph = build_graph(model=model, chains={"BSC": BscTokenChain(), "ETH": Chain()})
+    config = {"configurable": {"thread_id": "transfer-native-after-bsc-token"}}
+    context = {"address": WALLET, "chain": "ETH", "chain_id": 1, "native_symbol": "ETH"}
+
+    first = await graph.ainvoke(
+        {**turn("转 BSC 上的 USDC"), "wallet_context": context}, config=config
+    )
+    assert first["response"]["kind"] == "transfer_prepare"
+
+    second = await graph.ainvoke(
+        {**turn("给自己转一点 ETH"), "wallet_context": context}, config=config
+    )
+    assert second["response"]["missing_fields"] == ["transfer_amount"]
+    assert second["active_task"]["slots"] == {
+        "chain": "ETH",
+        "symbol": "ETH",
+        "recipient": WALLET,
+    }
+
+    third = await graph.ainvoke(
+        {**turn("0.00001"), "wallet_context": context}, config=config
+    )
+    assert third["response"]["kind"] == "transfer_prepare"
+    assert third["transfer_request"]["chain"] == "ETH"
+    assert third["transfer_request"]["token"] is None
+
+
+@pytest.mark.asyncio
+async def test_transfer_native_resume_cleans_stale_persisted_token_metadata():
+    model = UnderstandingModel(
+        ["clarification"],
+        transfer=[TransferSlotPatch()],
+    )
+    graph = build_graph(model=model, chains={"ETH": Chain()})
+    stale_task = {
+        "task_id": "stale-native-transfer",
+        "kind": "transfer",
+        "status": "collecting",
+        "stage": "collecting_parameters",
+        "revision": 4,
+        "slots": {
+            "chain": "ETH",
+            "symbol": "ETH",
+            "token_address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "transfer_chain_id": 1,
+            "recipient": WALLET,
+        },
+        "slot_sources": {},
+        "missing_fields": ["transfer_amount"],
+    }
+
+    result = await graph.ainvoke(
+        {
+            **turn("0.0001"),
+            "active_task": stale_task,
+        },
+        config={"configurable": {"thread_id": "stale-native-transfer"}},
+    )
+
+    assert result["response"]["kind"] == "transfer_prepare"
+    assert result["transfer_request"]["token"] is None
+    assert result["active_task"]["slots"]["symbol"] == "ETH"
+    assert "token_address" not in result["active_task"]["slots"]
+
+
+@pytest.mark.asyncio
 async def test_swap_follow_up_classified_as_clarification_still_merges_chain_patch():
     model = UnderstandingModel(
         ["swap_quote", "clarification"],
