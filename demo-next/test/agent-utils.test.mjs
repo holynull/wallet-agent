@@ -51,6 +51,7 @@ test("maps status responses to user-facing text", () => {
   assert.equal(responseMessage({ kind: "clarification", errors: [{ code: "MISSING_PRICE_PARAMETERS", message: "请补充价格查询参数" }] }), "请补充价格查询参数");
   assert.equal(responseMessage({ kind: "swap_status", provider_status: "not_propagated" }), "交易哈希暂时还没有在源链上出现，Provider 轮询尚未开始。");
   assert.equal(responseMessage({ kind: "confirmation_required" }), "请确认是否继续这笔兑换。");
+  assert.equal(responseMessage({ kind: "transfer_prepare" }), "转账交易已准备好，请在钱包中确认并广播。");
   assert.match(responseMessage({ kind: "unsupported" }), /钱包/);
 });
 

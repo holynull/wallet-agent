@@ -46,6 +46,7 @@ export function responseMessage(response: any): string {
     quote_selection_required: "请选择一个兑换报价后继续。",
     confirmation_required: "请确认是否继续这笔兑换。",
     approval_required: "这笔兑换需要先授权 Token 额度，请在钱包中确认 Approve。",
+    transfer_prepare: "转账交易已准备好，请在钱包中确认并广播。",
     swap_ready: "兑换交易已准备好，请在钱包中确认并广播。",
   };
   const status = response.provider_status || response.confirmation_status || response.stage || (typeof response.status === "object" ? response.status?.status || response.status?.state : response.status);

@@ -375,6 +375,17 @@ export default function Home() {
       }
     }
     if (render) setBackendDuration(Math.max(0, performance.now() - requestStartedAt));
+    if (render) {
+      log("SSE STREAM SUMMARY", {
+        run_id: runId,
+        event_count: events.length,
+        last_event_id: lastEventId || null,
+        terminal_received: terminalReceived,
+        response_kind: finalResponse?.kind || null,
+        assistant_text_seen: Boolean(assistant),
+        duration_ms: Math.round(performance.now() - requestStartedAt),
+      });
+    }
     if (render && assistant && !finalResponse && !responseKeysRef.current.has(`fallback:${assistant}`)) { responseKeysRef.current.add(`fallback:${assistant}`); setMessages((current) => [...current, { role: "assistant", content: assistant }]); }
     return events;
   }
@@ -449,6 +460,15 @@ export default function Home() {
     if (response) applyActiveArtifacts(artifacts);
     const summary = formatResponseSummary(response);
     const finalMessage = response?.message || summary;
+    log("SSE RESPONSE RESOLUTION", {
+      event: eventName || "snapshot",
+      response_kind: response?.kind || null,
+      response_message_present: Boolean(response?.message),
+      summary_present: Boolean(summary),
+      final_message_present: Boolean(finalMessage),
+      artifact_types: artifacts ? Object.keys(artifacts).filter((key) => key !== "response") : [],
+      current_keys: current && typeof current === "object" ? Object.keys(current).slice(0, 30) : [],
+    });
     if (finalMessage) {
       const key = eventName ? `${value?.runId || "stream"}:${response.kind || "response"}:${finalMessage}` : undefined;
       appendAssistantMessage(finalMessage, response?.kind === "clarification" ? response.suggestions || [] : [], artifacts, key);
