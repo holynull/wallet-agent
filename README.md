@@ -84,6 +84,8 @@ only the returned chain-qualified transaction hash to the service.
 本地调试的完整步骤（包括浏览器 Network/Console、SSE、报价选择和
 approve/兑换交易流程）见 [docs/local-demo-debugging.md](docs/local-demo-debugging.md)。
 
+Demo/API 调用示例见 [docs/demo-api-guide.md](docs/demo-api-guide.md)。
+
 Demo 现在支持对话式兑换和 EIP-1193 浏览器钱包连接；钱包插件只提供公开地址和链信息，签名仍在浏览器钱包本地完成。详见 [docs/mobile-integration.md](docs/mobile-integration.md)。
 
 For a command-line check after startup:
