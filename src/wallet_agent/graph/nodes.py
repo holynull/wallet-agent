@@ -4352,6 +4352,47 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "transaction_query": draft,
                 "max_poll_attempts": runtime.max_poll_attempts,
             }
+        if intent_value == "price_query":
+            raw_price = state.get("price_request") or {}
+            current = dict(_mapping(raw_price))
+            if hasattr(runtime.model, "extract"):
+                extraction_request = dict(request)
+                extraction_request["conversation_history"] = state.get("conversation_history") or []
+                try:
+                    patch = runtime.model.extract("price", extraction_request)
+                    patch = await patch if hasattr(patch, "__await__") else patch
+                    extracted = _mapping(patch)
+                    current.update({key: value for key, value in extracted.items() if value not in (None, "")})
+                except Exception as exc:
+                    return {
+                        "response": {
+                            "kind": "clarification",
+                            "message": "请提供要查询价格的资产，例如 BTC 或 ETH。",
+                            "errors": [_error("PRICE_PARAMETERS_INVALID", str(exc), retryable=True)],
+                        },
+                        "route": "response",
+                    }
+            if not current.get("symbol"):
+                return {
+                    "response": {
+                        "kind": "clarification",
+                        "message": "请提供要查询价格的资产，例如 BTC 或 ETH。",
+                        "missing_fields": ["symbol"],
+                    },
+                    "route": "response",
+                }
+            chain = current.get("chain") or "ETH"
+            symbol = str(current["symbol"]).upper()
+            decimals = int(current.get("decimals") or 18)
+            return {
+                "price_request": {
+                    "chain": chain,
+                    "symbol": symbol,
+                    "decimals": decimals,
+                    "address": current.get("token_address"),
+                },
+                "route": "price_query",
+            }
         if intent_value == "portfolio_query":
             draft = dict(state.get("portfolio_request") or {})
             draft.update(

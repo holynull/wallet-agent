@@ -15,6 +15,7 @@ from wallet_agent.config import Settings
 from wallet_agent.graph import build_graph
 from wallet_agent.models import (
     AgentResponseDraft,
+    PriceSlotPatch,
     ModelRegistry,
     ModelRouter,
     RouteDecision,
@@ -72,6 +73,10 @@ def build_application(settings: Settings | None = None) -> Any:
         for model_id, client in base_clients.items()
     }
     extractors = {
+        "price": {
+            model_id: client.with_structured_output(PriceSlotPatch, method="json_mode")
+            for model_id, client in base_clients.items()
+        },
         "transfer": {
             model_id: client.with_structured_output(TransferSlotPatch, method="json_mode")
             for model_id, client in base_clients.items()

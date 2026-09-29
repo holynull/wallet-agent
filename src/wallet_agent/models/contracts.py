@@ -74,6 +74,15 @@ class TransactionStatusSlotPatch(UnderstandingModel):
     transaction_hash: str | None = Field(default=None, description="用户提供的交易哈希")
 
 
+class PriceSlotPatch(UnderstandingModel):
+    """Price query asset fields explicitly stated in the current user message."""
+
+    chain: str | None = Field(default=None, description="用户明确指定的资产网络")
+    symbol: str | None = Field(default=None, description="用户要查询价格的资产符号")
+    token_address: str | None = Field(default=None, description="用户明确提供的 Token 合约地址")
+    decimals: int | None = Field(default=None, ge=0, le=255, description="用户明确提供的 Token 精度")
+
+
 class SwapSlotPatch(UnderstandingModel):
     """Swap fields explicitly stated in the current user message."""
 

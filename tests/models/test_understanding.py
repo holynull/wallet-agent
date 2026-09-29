@@ -4,6 +4,7 @@ from langchain_core.messages import HumanMessage
 from wallet_agent.models import (
     ModelRegistry,
     ModelRouter,
+    PriceSlotPatch,
     RouteDecision,
     SwapSlotPatch,
     TransferSlotPatch,
@@ -20,7 +21,7 @@ class CapturingClient:
         return self.output
 
 
-def router_with_clients(*, classifier=None, transfer=None, swap=None, transaction_status=None):
+def router_with_clients(*, classifier=None, transfer=None, swap=None, transaction_status=None, price=None):
     classifier = classifier or CapturingClient(RouteDecision(intent="clarification"))
     return ModelRouter(
         ModelRegistry(
@@ -30,6 +31,7 @@ def router_with_clients(*, classifier=None, transfer=None, swap=None, transactio
                 "transfer": {"deepseek-chat": transfer or CapturingClient(TransferSlotPatch())},
                 "swap": {"deepseek-chat": swap or CapturingClient(SwapSlotPatch())},
                 "transaction_status": {"deepseek-chat": transaction_status or CapturingClient({})},
+                "price": {"deepseek-chat": price or CapturingClient(PriceSlotPatch())},
             },
         )
     )
@@ -147,6 +149,18 @@ async def test_transaction_status_extractor_preserves_chain_and_hash():
     prompt = client.inputs[0][0].content
     assert "transaction_chain" in prompt
     assert "transaction_hash" in prompt
+
+
+@pytest.mark.asyncio
+async def test_price_extractor_recognizes_asset_from_natural_language():
+    client = CapturingClient(PriceSlotPatch(symbol="BTC"))
+    router = router_with_clients(price=client)
+
+    patch = await router.extract("price", {"message": "今天 BTC 的价格是多少"})
+
+    assert patch.symbol == "BTC"
+    assert patch.chain is None
+    assert "symbol" in client.inputs[0][0].content
 
 
 @pytest.mark.asyncio

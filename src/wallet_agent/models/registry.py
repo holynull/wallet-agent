@@ -10,6 +10,7 @@ from langchain_core.messages import HumanMessage
 
 from .contracts import (
     AgentResponseDraft,
+    PriceSlotPatch,
     RouteDecision,
     SwapSlotPatch,
     TransactionStatusSlotPatch,
@@ -41,7 +42,14 @@ def _model_input(request: Mapping[str, Any]) -> list[HumanMessage]:
 
 def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanMessage]:
     payload = json.dumps(dict(request), ensure_ascii=False, default=str)
-    if task_kind == "transfer":
+    if task_kind == "price":
+        instructions = (
+            "你是 Wallet Agent 的 price 参数提取器。只返回合法 JSON，允许且必须仅使用这些 key："
+            "chain、symbol、token_address、decimals。只提取本轮用户明确提供的资产信息；"
+            "未提供的值返回 null，不要猜测网络、Token 地址或精度。中文‘比特币’写 symbol=BTC，"
+            "‘以太坊’写 symbol=ETH；‘BTC 的价格’和‘ETH price’都必须提取 symbol。"
+        )
+    elif task_kind == "transfer":
         instructions = (
             "你是 Wallet Agent 的 transfer 参数提取器。参数不完整时仍然是 transfer。"
             "只返回合法 JSON，允许且必须仅使用这些 key：chain、symbol、token_address、"
@@ -213,6 +221,7 @@ class ModelRouter:
         else:
             result = model.invoke(model_request)
         contracts = {
+            "price": PriceSlotPatch,
             "transfer": TransferSlotPatch,
             "swap": SwapSlotPatch,
             "transaction_status": TransactionStatusSlotPatch,

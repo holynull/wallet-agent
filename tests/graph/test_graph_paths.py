@@ -27,6 +27,20 @@ class FakeModel:
         return {"intent": value.get("intent", "clarification")}
 
 
+class NaturalLanguagePriceModel:
+    async def classify(self, _request):
+        return {"intent": "price_query"}
+
+    async def extract(self, task_kind, _request):
+        assert task_kind == "price"
+        return {"symbol": "BTC", "chain": "ETH", "decimals": 18}
+
+
+class FixedPriceProvider:
+    async def get_prices(self, assets):
+        return [TokenPrice(asset=asset, usd_price=Decimal("60000"), provider="okx") for asset in assets]
+
+
 class SwapExtractionModel:
     def __init__(self, output):
         self.output = output
@@ -108,6 +122,23 @@ def quote_request():
         sender_address="0xsender",
         recipient_address="0xrecipient",
     )
+
+
+@pytest.mark.asyncio
+async def test_natural_language_price_query_extracts_asset_before_price_node():
+    graph = build_graph(model=NaturalLanguagePriceModel(), providers=[], price_provider=FixedPriceProvider())
+
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "price-natural-language",
+            "user_id": "u1",
+            "request": {"message": "今天 BTC 的价格是多少"},
+        },
+        config={"configurable": {"thread_id": "price-natural-language"}},
+    )
+
+    assert result["response"]["kind"] == "price_query"
+    assert result["response"]["prices"][0]["asset"]["symbol"] == "BTC"
 
 
 @pytest.mark.asyncio

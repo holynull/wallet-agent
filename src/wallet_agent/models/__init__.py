@@ -1,5 +1,6 @@
 from .contracts import (
     AgentResponseDraft,
+    PriceSlotPatch,
     ResponseSuggestion,
     RouteDecision,
     SwapSlotPatch,
@@ -12,6 +13,7 @@ __all__ = [
     "ModelRegistry",
     "ModelRouter",
     "AgentResponseDraft",
+    "PriceSlotPatch",
     "RouteDecision",
     "ResponseSuggestion",
     "SwapSlotPatch",

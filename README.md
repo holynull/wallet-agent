@@ -15,18 +15,64 @@ uv sync
 
 开发过程中需要热重载时，可以运行 `./scripts/start_local.sh --reload`。
 
-## Docker + real mobile-call demo
+## Docker 部署
 
-The Docker service uses the real configuration from `.env`; it does not use a
-fake model or fake provider. Set `DEEPSEEK_API_KEY`, configure the RPC URLs, and
-enable Bridgers/OmniBridge only when their source flags and sandbox/production
-access are ready.
+Docker Compose 会启动 API、Next.js Demo、PostgreSQL 和 Redis。API 使用 `.env`
+中的真实模型和 Provider 配置，不会自动使用 fake model/provider。首次部署：
 
 ```bash
 cp .env.example .env
-# edit .env and set the real key and provider settings
-docker compose up --build
+# 编辑 .env，至少设置 DEEPSEEK_API_KEY；按需配置 RPC、Bridgers、OmniBridge 和 OKX
+docker compose up -d --build
 ```
+
+如果修改了 Python 源码、依赖或 Dockerfile，强制重新构建并重建 API：
+
+```bash
+docker compose build --no-cache wallet-agent
+docker compose up -d --force-recreate wallet-agent
+```
+
+如果当前环境需要 HTTP/HTTPS 代理，代理变量会被 Docker Compose 传递给构建命令：
+
+```bash
+HTTP_PROXY=http://127.0.0.1:7890 \
+HTTPS_PROXY=http://127.0.0.1:7890 \
+NO_PROXY=localhost,127.0.0.1,postgres,redis \
+docker compose build wallet-agent demo-next
+docker compose up -d
+```
+
+检查服务状态和日志：
+
+```bash
+docker compose ps
+curl http://localhost:8000/health
+curl http://localhost:8000/ready
+docker compose logs -f wallet-agent
+```
+
+成功启动后：
+
+- API: [http://localhost:8000](http://localhost:8000)
+- Demo: [http://localhost:3000](http://localhost:3000)
+
+停止服务但保留 PostgreSQL/Redis 数据卷：
+
+```bash
+docker compose down
+```
+
+仅在确认要删除本地会话、checkpoint、SSE 事件和 Redis 数据时，才删除数据卷：
+
+```bash
+docker compose down -v
+```
+
+Docker 部署的 SSE 恢复和多实例配置见下面的
+[Multi-instance persistence and SSE recovery](#multi-instance-persistence-and-sse-recovery)。
+
+## Docker + real mobile-call demo
 
 Open [http://localhost:8000/demo/](http://localhost:8000/demo/) in a browser.
 The page calls the same REST/SSE endpoints that a mobile app uses: turn,
