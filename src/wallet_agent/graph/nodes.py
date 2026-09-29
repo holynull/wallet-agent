@@ -44,6 +44,7 @@ from wallet_agent.domain.normalization import (
 )
 from wallet_agent.observability import wallet_event
 
+from .state import DialogueState
 from .tasks import (
     hydrate_active_task,
     merge_task_patch,
@@ -634,6 +635,178 @@ def _parse_model_output(value: Any) -> dict[str, Any] | None:
             return None
         return result if isinstance(result, dict) else None
     return None
+
+
+def latest_public_result(history: Any) -> dict[str, Any] | None:
+    """Return the latest immutable user-visible response card from history."""
+    for item in reversed(history or []):
+        if not isinstance(item, Mapping) or item.get("role") != "assistant":
+            continue
+        artifacts = item.get("artifacts")
+        if not isinstance(artifacts, Mapping):
+            continue
+        response = artifacts.get("response")
+        if not isinstance(response, Mapping):
+            continue
+        return dict(response)
+    return None
+
+
+def _model_conversation_history(history: Any, *, limit: int = 12) -> list[dict[str, Any]]:
+    """Keep model context bounded while the full history remains checkpointed for the UI."""
+    items = [item for item in (history or []) if isinstance(item, Mapping)]
+    return [dict(item) for item in items[-limit:]]
+
+
+def _latest_read_response(history: Any) -> dict[str, Any] | None:
+    """Return the latest persisted wallet or portfolio result."""
+    response = latest_public_result(history)
+    if response and str(response.get("kind") or "") in {"wallet_query", "portfolio_query"}:
+        return response
+    return None
+
+
+def dialogue_snapshot(state: Mapping[str, Any]) -> DialogueState:
+    """Project one compact, JSON-safe dialogue context from graph state."""
+    request = state.get("request") or {}
+    message = str(request.get("message") or state.get("message") or "")
+    result = latest_public_result(state.get("conversation_history"))
+    kind = str(result.get("kind") or "") if result else ""
+    topic_by_kind = {
+        "wallet_query": "wallet",
+        "portfolio_query": "portfolio",
+        "price_query": "price",
+        "gas_check": "gas",
+        "transaction_status": "transaction",
+        "swap_status": "swap_status",
+        "swap_quote": "swap",
+        "transfer_prepare": "transfer",
+        "swap_prepare": "swap",
+    }
+    active_topic = topic_by_kind.get(kind, "")
+    goal = (
+        "read"
+        if active_topic in {"wallet", "portfolio", "price", "gas", "transaction"}
+        else "unknown"
+    )
+    if active_topic in {"transfer", "swap"}:
+        goal = active_topic
+    elif active_topic == "swap_status":
+        goal = "status"
+    if not active_topic:
+        lowered = message.lower()
+        if any(token in lowered for token in ("转账", "transfer", "send")):
+            goal, active_topic = "transfer", "transfer"
+        elif any(token in lowered for token in ("兑换", "换", "swap")):
+            goal, active_topic = "swap", "swap"
+    return DialogueState(
+        goal=goal,
+        active_topic=active_topic or "unknown",
+        referent=result,
+        language=_response_language(message, state.get("conversation_history")),
+        last_result_kind=kind or None,
+    )
+
+
+def _history_followup_intent(message: str, history: Any) -> str | None:
+    """Recognize short follow-ups that refer to the last balance/portfolio result."""
+    previous = _latest_read_response(history)
+    if previous is None:
+        return None
+    text = str(message or "").strip().lower()
+    if not text:
+        return None
+    list_followup = re.search(
+        r"(哪\s*(?:\d+|一|几)\s*项|哪些资产|哪些币|"
+        r"分别(是什么|有多少)?|列(出来|一下|出)|list|which assets|what assets)",
+        text,
+    )
+    asset_followup = re.search(
+        r"(有多少|余额|多少|哪个.*(多|高|值)|价值|worth|how much|which.*(largest|highest))",
+        text,
+    )
+    if not (list_followup or asset_followup):
+        return None
+    return str(previous.get("kind"))
+
+
+def _wallet_balance_items(wallet: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    items: list[Mapping[str, Any]] = []
+    native = wallet.get("native_balance")
+    if isinstance(native, Mapping) and native.get("asset"):
+        items.append(native)
+    for item in wallet.get("token_balances") or []:
+        if isinstance(item, Mapping) and item.get("asset"):
+            items.append(item)
+    return items
+
+
+def _wallet_summary_message(wallet: Mapping[str, Any], language: str) -> str:
+    items = _wallet_balance_items(wallet)
+    if not items:
+        return (
+            "当前钱包没有查到可用余额。"
+            if language == "zh"
+            else "I couldn't find any available balance in this wallet."
+        )
+    lines = []
+    for item in items:
+        asset = item.get("asset") or {}
+        symbol = str(asset.get("symbol") or "未知资产")
+        amount = str(item.get("amount") or "0")
+        lines.append(f"- {symbol}：{amount}" if language == "zh" else f"- {symbol}: {amount}")
+    chain = str(wallet.get("chain") or "当前网络")
+    if language == "zh":
+        return f"{chain} 钱包目前有 {len(items)} 项资产：\n" + "\n".join(lines)
+    return f"This wallet has {len(items)} assets on {chain}:\n" + "\n".join(lines)
+
+
+def _read_response_fallback(response: Mapping[str, Any], language: str) -> str:
+    """Provide a useful deterministic summary when response generation is unavailable."""
+    kind = str(response.get("kind") or "")
+    if kind == "wallet_query":
+        return _wallet_summary_message(response.get("wallet") or {}, language)
+    if kind == "portfolio_query":
+        portfolio = response.get("portfolio") or {}
+        assets = portfolio.get("assets") or []
+        total = portfolio.get("total_usd_value")
+        if language == "zh":
+            suffix = f"，总价值约 ${total}" if total is not None else ""
+            return f"当前资产组合包含 {len(assets)} 项资产{suffix}。"
+        suffix = f", worth about ${total} in total" if total is not None else ""
+        return f"Your portfolio contains {len(assets)} assets{suffix}."
+    if kind == "price_query":
+        prices = response.get("prices") or []
+        if prices:
+            first = prices[0]
+            asset = first.get("asset") or {}
+            return (
+                f"{asset.get('symbol', '该资产')} 当前价格约为 ${first.get('usd_price')}。"
+                if language == "zh"
+                else (
+                    f"{asset.get('symbol', 'The asset')} is currently about "
+                    f"${first.get('usd_price')}."
+                )
+            )
+    if kind == "gas_check":
+        return str(response.get("message") or "暂时无法完成 Gas 检查。")
+    if kind == "asset_discovery":
+        count = len(response.get("assets") or [])
+        return (
+            f"我找到 {count} 个匹配的资产。"
+            if language == "zh"
+            else f"I found {count} matching assets."
+        )
+    if kind in {"transaction_status", "swap_status"}:
+        return str(response.get("message") or "暂时无法确定交易状态。")
+    if kind == "swap_quote":
+        count = len(response.get("quotes") or [])
+        return (
+            f"我找到 {count} 个兑换报价，请选择一个继续。"
+            if language == "zh"
+            else f"I found {count} swap quotes. Choose one to continue."
+        )
+    return "请求已处理完成。" if language == "zh" else "The request is complete."
 
 
 def _confirmation_snapshot(
@@ -2573,6 +2746,64 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             suggestions, intent="transfer", facts=facts
         )
 
+    async def naturalize_read_response(
+        state: Mapping[str, Any], response: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Turn verified read facts into user-facing language at one boundary."""
+        result = _dump(response)
+        if not isinstance(result, dict):
+            return dict(response)
+        kind = str(result.get("kind") or "")
+        if kind not in {
+            "wallet_query",
+            "portfolio_query",
+            "price_query",
+            "gas_check",
+            "asset_discovery",
+            "transaction_status",
+            "swap_status",
+            "swap_quote",
+        }:
+            return dict(response)
+        request = dict(state.get("request") or {})
+        message = str(request.get("message") or state.get("message") or "")
+        facts: dict[str, Any] = {
+            "intent": kind,
+            "missing_fields": [],
+            "user_message": message,
+            "language_hint": _response_language(message, state.get("conversation_history")),
+            "dialogue": _dump(state.get("dialogue") or {}),
+            "result": result,
+        }
+        if kind == "wallet_query":
+            wallet = result.get("wallet") or {}
+            facts["wallet_result"] = wallet
+            facts["balances"] = [
+                {
+                    "chain": (item.get("asset") or {}).get("chain"),
+                    "symbol": (item.get("asset") or {}).get("symbol"),
+                    "amount": item.get("amount"),
+                    "usd_value": item.get("usd_value"),
+                }
+                for item in _wallet_balance_items(wallet)
+            ]
+        responder = getattr(runtime.model, "respond", None)
+        if callable(responder):
+            try:
+                draft = _dump(await responder(request, facts)) or {}
+                if isinstance(draft, Mapping) and str(draft.get("message") or "").strip():
+                    language = str(draft.get("language") or facts["language_hint"])
+                    if language.split("-")[0].lower() == facts["language_hint"]:
+                        result["message"] = str(draft["message"]).strip()
+                        result["suggestions"] = _sanitize_response_suggestions(
+                            draft.get("suggestions"), intent=kind, facts=facts
+                        )
+            except Exception:
+                pass
+        if not str(result.get("message") or "").strip():
+            result["message"] = _read_response_fallback(result, facts["language_hint"])
+        return result
+
     async def wallet_balance_tool(
         chain: str,
         address: str,
@@ -2828,6 +3059,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
     asset_tool_node = ToolNode([asset_discovery_tool], name="asset_tools")
     quote_tool_node = ToolNode([quote_lookup_tool], name="quote_tools")
 
+    async def dialogue_manager(state: dict[str, Any]) -> dict[str, Any]:
+        """Project conversational context before capability routing."""
+        return {"dialogue": dialogue_snapshot(state)}
+
     async def supervisor(state: dict[str, Any]) -> dict[str, Any]:
         """Plan one turn; execution remains in the existing graph nodes."""
         started = perf_counter()
@@ -2849,6 +3084,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             if hasattr(runtime.model, "extract")
             else None
         )
+        history_followup_intent = _history_followup_intent(
+            str(request.get("message", "")), state.get("conversation_history")
+        )
         if _looks_like_cancel_message(str(request.get("message", ""))) and (
             state.get("active_task")
             or state.get("conversation_state")
@@ -2860,6 +3098,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             decision = {"intent": forced, "source": "api"}
         elif followup_intent in _VALID_INTENTS:
             decision = {"intent": followup_intent, "source": "active_task"}
+        elif history_followup_intent in _VALID_INTENTS:
+            decision = {"intent": history_followup_intent, "source": "history_followup"}
         elif state.get("intent") in _VALID_INTENTS and not request.get("message"):
             decision = {"intent": state["intent"], "source": "graph_resume"}
         else:
@@ -2876,7 +3116,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             model_request["active_task"] = state.get("active_task")
             model_request["swap_draft"] = state.get("swap_draft")
             model_request["transfer_draft"] = state.get("transfer_draft")
-            model_request["conversation_history"] = state.get("conversation_history") or []
+            model_request["conversation_history"] = _model_conversation_history(
+                state.get("conversation_history")
+            )
+            model_request["dialogue"] = state.get("dialogue") or dialogue_snapshot(state)
+            previous_response = _latest_read_response(state.get("conversation_history"))
+            if previous_response is not None:
+                model_request["previous_read_response"] = previous_response
             if suggestion_data is not None:
                 model_request["suggestion_data"] = suggestion_data
             model_request["available_capabilities"] = {
@@ -3025,9 +3271,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             }
         wallet = result.get("wallet") or {}
+        response = await naturalize_read_response(
+            state,
+            {"kind": "wallet_query", "wallet": wallet},
+        )
         return {
             "wallet_context": wallet,
-            "response": {"kind": "wallet_query", "wallet": wallet},
+            "response": response,
         }
 
     async def transaction_tool_call(state: dict[str, Any]) -> dict[str, Any]:
@@ -3099,7 +3349,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         transaction = result.get("transaction") or {}
         return {
             "transaction_status_snapshot": transaction,
-            "response": {"kind": "transaction_status", **transaction},
+            "response": await naturalize_read_response(
+                state, {"kind": "transaction_status", **transaction}
+            ),
         }
 
     async def gas_tool_call(state: dict[str, Any]) -> dict[str, Any]:
@@ -3165,7 +3417,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             }
         gas = result.get("gas") or {}
-        return {"gas_snapshot": gas, "response": {"kind": "gas_check", **gas}}
+        return {
+            "gas_snapshot": gas,
+            "response": await naturalize_read_response(state, {"kind": "gas_check", **gas}),
+        }
 
     async def baseline_swap_gas_estimate(selected: Mapping[str, Any]) -> dict[str, Any] | None:
         """Estimate a read-only source-chain baseline without preparing a provider order."""
@@ -3395,7 +3650,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         }
         return {
             "asset_snapshot": snapshot,
-            "response": {"kind": "asset_discovery", **snapshot},
+            "response": await naturalize_read_response(
+                state, {"kind": "asset_discovery", **snapshot}
+            ),
         }
 
     async def quote_tool_call(state: dict[str, Any]) -> dict[str, Any]:
@@ -3666,7 +3923,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 extraction_request["wallet_context"] = state.get("wallet_context")
                 extraction_request["active_task"] = active_task
                 extraction_request["conversation_state"] = state.get("conversation_state")
-                extraction_request["conversation_history"] = state.get("conversation_history") or []
+                extraction_request["conversation_history"] = _model_conversation_history(
+                    state.get("conversation_history")
+                )
                 metadata = request.get("metadata")
                 suggestion_data = _suggestion_data_for_model(
                     metadata.get("suggestion_data") if isinstance(metadata, Mapping) else None
@@ -4238,7 +4497,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             patch_source: Any = parsed
             if hasattr(runtime.model, "extract"):
                 extraction_request = dict(request)
-                extraction_request["conversation_history"] = state.get("conversation_history") or []
+                extraction_request["conversation_history"] = _model_conversation_history(
+                    state.get("conversation_history")
+                )
                 extraction_started = perf_counter()
                 _emit_progress(
                     "slot_extraction",
@@ -4357,18 +4618,28 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             current = dict(_mapping(raw_price))
             if hasattr(runtime.model, "extract"):
                 extraction_request = dict(request)
-                extraction_request["conversation_history"] = state.get("conversation_history") or []
+                extraction_request["conversation_history"] = _model_conversation_history(
+                    state.get("conversation_history")
+                )
                 try:
                     patch = runtime.model.extract("price", extraction_request)
                     patch = await patch if hasattr(patch, "__await__") else patch
                     extracted = _mapping(patch)
-                    current.update({key: value for key, value in extracted.items() if value not in (None, "")})
+                    current.update(
+                        {
+                            key: value
+                            for key, value in extracted.items()
+                            if value not in (None, "")
+                        }
+                    )
                 except Exception as exc:
                     return {
                         "response": {
                             "kind": "clarification",
                             "message": "请提供要查询价格的资产，例如 BTC 或 ETH。",
-                            "errors": [_error("PRICE_PARAMETERS_INVALID", str(exc), retryable=True)],
+                            "errors": [
+                                _error("PRICE_PARAMETERS_INVALID", str(exc), retryable=True)
+                            ],
                         },
                         "route": "response",
                     }
@@ -4699,7 +4970,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             slots=state.get("swap_draft") or {},
             missing_fields=[],
         )
-        return {
+        quote_response = {
             "selected_quote": selected,
             "quote_candidates": [{"__clear__": True}, *quotes],
             **task_update,
@@ -4710,6 +4981,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "provider_errors": provider_errors,
             },
         }
+        quote_response["response"] = await naturalize_read_response(
+            state, quote_response["response"]
+        )
+        return quote_response
 
     async def transfer(state: dict[str, Any]) -> dict[str, Any]:
         raw = (
@@ -5240,7 +5515,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 snapshot["price_error"] = "价格服务暂时不可用。"
             return {
                 "portfolio_snapshot": snapshot,
-                "response": {"kind": "portfolio_query", "portfolio": snapshot},
+                "response": await naturalize_read_response(
+                    state, {"kind": "portfolio_query", "portfolio": snapshot}
+                ),
             }
         except Exception as exc:
             return {
@@ -5306,7 +5583,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             }
             return {
                 "gas_snapshot": snapshot,
-                "response": {"kind": "gas_check", **snapshot},
+                "response": await naturalize_read_response(
+                    state, {"kind": "gas_check", **snapshot}
+                ),
             }
         except Exception as exc:
             return {
@@ -5369,12 +5648,15 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         }
         return {
             "asset_snapshot": snapshot,
-            "response": {
-                "kind": "asset_discovery",
-                "assets": result_assets,
-                "query": snapshot["query"],
-                "provider_errors": provider_errors,
-            },
+            "response": await naturalize_read_response(
+                state,
+                {
+                    "kind": "asset_discovery",
+                    "assets": result_assets,
+                    "query": snapshot["query"],
+                    "provider_errors": provider_errors,
+                },
+            ),
         }
 
     async def price_query(state: dict[str, Any]) -> dict[str, Any]:
@@ -5401,7 +5683,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
 
             asset = Asset.model_validate(raw)
             prices = await runtime.price_provider.get_prices([asset])
-            return {"response": {"kind": "price_query", "prices": [_dump(item) for item in prices]}}
+            return {
+                "response": await naturalize_read_response(
+                    state,
+                    {"kind": "price_query", "prices": [_dump(item) for item in prices]},
+                )
+            }
         except Exception as exc:
             return {
                 "response": {
@@ -5442,7 +5729,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
                 return {
                     "transaction_status_snapshot": snapshot,
-                    "response": {"kind": "transaction_status", **snapshot},
+                    "response": await naturalize_read_response(
+                        state, {"kind": "transaction_status", **snapshot}
+                    ),
                 }
             except Exception as exc:
                 return {
@@ -5607,17 +5896,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         broadcast_status = state.get("broadcast_status")
         provider_visible = {"broadcast_seen", "broadcast_pending", "confirmed"}
         if broadcast_status and broadcast_status not in provider_visible:
+            response_payload = {
+                "kind": "swap_status",
+                "status": broadcast_status,
+                "broadcast_status": broadcast_status,
+                "tx_hash": tx_hash,
+                "message": (
+                    "Source-chain transaction propagation is not confirmed yet; "
+                    "provider order polling has not started."
+                ),
+            }
             return {
-                "response": {
-                    "kind": "swap_status",
-                    "status": broadcast_status,
-                    "broadcast_status": broadcast_status,
-                    "tx_hash": tx_hash,
-                    "message": (
-                        "Source-chain transaction propagation is not confirmed yet; "
-                        "provider order polling has not started."
-                    ),
-                }
+                "response": await naturalize_read_response(state, response_payload)
             }
         orders = state.get("provider_orders", {})
         if provider_name in orders:
@@ -5678,36 +5968,39 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         broadcast_status = state.get("broadcast_status")
         provider_visible = {"broadcast_seen", "broadcast_pending", "confirmed", None}
         if state.get("broadcast_tx_hash") and broadcast_status not in provider_visible:
+            response_payload = {
+                "kind": "swap_status",
+                "status": broadcast_status,
+                "broadcast_status": broadcast_status,
+                "tx_hash": state.get("broadcast_tx_hash"),
+                "message": (
+                    "Source-chain transaction propagation is not confirmed yet; "
+                    "provider order polling has not started."
+                ),
+            }
             return {
-                "response": {
-                    "kind": "swap_status",
-                    "status": broadcast_status,
-                    "broadcast_status": broadcast_status,
-                    "tx_hash": state.get("broadcast_tx_hash"),
-                    "message": (
-                        "Source-chain transaction propagation is not confirmed yet; "
-                        "provider order polling has not started."
-                    ),
-                },
+                "response": await naturalize_read_response(state, response_payload),
                 "poll_attempts": state.get("poll_attempts", 0),
             }
         orders = state.get("provider_orders", {})
         if not orders:
             if state.get("pending_transaction"):
-                return {
-                    "response": {
-                        "kind": "swap_status",
-                        "status": "swap_ready",
-                        "message": "兑换交易已准备好，正在等待钱包签名并广播。",
-                        "pending_transaction": state["pending_transaction"],
-                    }
-                }
-            return {
-                "response": {
+                response_payload = {
                     "kind": "swap_status",
-                    "status": "unknown",
-                    "message": status_messages["unknown"],
-                },
+                    "status": "swap_ready",
+                    "message": "兑换交易已准备好，正在等待钱包签名并广播。",
+                    "pending_transaction": state["pending_transaction"],
+                }
+                return {
+                    "response": await naturalize_read_response(state, response_payload)
+                }
+            response_payload = {
+                "kind": "swap_status",
+                "status": "unknown",
+                "message": status_messages["unknown"],
+            }
+            return {
+                "response": await naturalize_read_response(state, response_payload),
                 "poll_attempts": state.get("poll_attempts", 0) + 1,
             }
         provider_name, raw_order = next(iter(orders.items()))
@@ -5748,18 +6041,19 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 if broadcast_message
                 else provider_message
             )
+            response_payload = {
+                "kind": "swap_status",
+                "status": dumped,
+                "provider_status": provider_status,
+                "broadcast_status": broadcast_status,
+                "confirmation_status": broadcast_status,
+                "tx_hash": state.get("broadcast_tx_hash"),
+                "message": message,
+            }
             return {
                 "status_snapshot": dumped,
                 "poll_attempts": attempts,
-                "response": {
-                    "kind": "swap_status",
-                    "status": dumped,
-                    "provider_status": provider_status,
-                    "broadcast_status": broadcast_status,
-                    "confirmation_status": broadcast_status,
-                    "tx_hash": state.get("broadcast_tx_hash"),
-                    "message": message,
-                },
+                "response": await naturalize_read_response(state, response_payload),
             }
         except Exception as exc:
             return {
@@ -5772,6 +6066,25 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
     async def response(state: dict[str, Any]) -> dict[str, Any]:
         if state.get("response"):
             return {}
+        intent = str(state.get("intent") or "")
+        if state.get("errors"):
+            return {"response": {"kind": "error", "errors": state["errors"]}}
+        if intent in {
+            "wallet_query",
+            "portfolio_query",
+            "price_query",
+            "gas_check",
+            "asset_discovery",
+            "transaction_status",
+            "swap_status",
+            "swap_quote",
+        }:
+            return {
+                "response": await naturalize_read_response(
+                    state,
+                    {"kind": intent, "errors": state.get("errors", [])},
+                )
+            }
         if state.get("intent") == "clarification":
             response: dict[str, Any] = {
                 "kind": "clarification",
@@ -5790,8 +6103,6 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     ),
                 )
             return {"response": response}
-        if state.get("errors"):
-            return {"response": {"kind": "error", "errors": state["errors"]}}
         if state.get("intent") == "unsupported":
             message = str(
                 (state.get("request") or {}).get("message") or state.get("message") or ""

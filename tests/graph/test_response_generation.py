@@ -89,6 +89,60 @@ class Prices:
         return [TokenPrice(asset=asset, usd_price=Decimal("1"), provider="okx") for asset in assets]
 
 
+class WalletQueryModel(ResponseModel):
+    def __init__(self, intents):
+        super().__init__()
+        self.intents = iter(intents)
+
+    async def classify(self, _request):
+        return RouteDecision(intent=next(self.intents))
+
+
+class ReadResponseModel(WalletQueryModel):
+    def __init__(self, response):
+        super().__init__(["wallet_query"])
+        self.response = response
+
+
+@pytest.mark.asyncio
+async def test_read_results_use_the_unified_response_boundary():
+    model = ReadResponseModel(
+        AgentResponseDraft(
+            language="zh",
+            message="你现在有 2 项资产：ETH 和 USDC。",
+            suggestions=[],
+        )
+    )
+    graph = build_graph(model=model, wallet_provider=WalletBalanceProvider())
+
+    result = await graph.ainvoke(
+        turn("我的余额"),
+        config={"configurable": {"thread_id": "unified-read-response"}},
+    )
+
+    assert result["response"]["message"] == "你现在有 2 项资产：ETH 和 USDC。"
+    assert model.calls
+
+
+class WalletBalanceProvider:
+    chain_index_by_name = {"ETH": "1"}
+
+    async def get_token_balances(self, _address, chain_indexes):
+        assert chain_indexes == ["1"]
+        return [
+            TokenBalance(
+                asset=Asset(chain="ETH", chain_id=1, symbol="ETH", decimals=18),
+                amount=Decimal("0.5"),
+                amount_raw="500000000000000000",
+            ),
+            TokenBalance(
+                asset=Asset(chain="ETH", chain_id=1, symbol="USDC", decimals=6, address=USDC),
+                amount=Decimal("12.5"),
+                amount_raw="12500000",
+            ),
+        ]
+
+
 def turn(message):
     return {
         "conversation_id": "response-test",
@@ -101,6 +155,54 @@ def turn(message):
             "native_symbol": "ETH",
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_wallet_query_replies_with_balance_summary_instead_of_completion_status():
+    graph = build_graph(
+        model=WalletQueryModel(["wallet_query"]),
+        wallet_provider=WalletBalanceProvider(),
+    )
+
+    result = await graph.ainvoke(
+        turn("我的余额"),
+        config={"configurable": {"thread_id": "wallet-summary"}},
+    )
+
+    assert result["response"]["kind"] == "wallet_query"
+    assert "2 项资产" in result["response"]["message"]
+    assert "ETH：0.5" in result["response"]["message"]
+    assert "USDC：12.5" in result["response"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_wallet_followup_uses_previous_wallet_result_when_classifier_says_clarification():
+    model = WalletQueryModel(["wallet_query", "clarification"])
+    graph = build_graph(model=model, wallet_provider=WalletBalanceProvider())
+    config = {"configurable": {"thread_id": "wallet-followup"}}
+
+    first = await graph.ainvoke(turn("我的余额"), config=config)
+    second = await graph.ainvoke(
+        {
+            **turn("哪 2 项？"),
+            "conversation_history": [
+                {"role": "user", "content": "我的余额"},
+                {
+                    "role": "assistant",
+                    "content": first["response"]["message"],
+                    "artifacts": {
+                        "response": first["response"],
+                        "wallet": first["response"]["wallet"],
+                    },
+                },
+                {"role": "user", "content": "哪 2 项？"},
+            ],
+        },
+        config=config,
+    )
+
+    assert second["response"]["kind"] == "wallet_query"
+    assert "2 项资产" in second["response"]["message"]
 
 
 @pytest.mark.asyncio
@@ -133,6 +235,7 @@ async def test_transfer_clarification_uses_model_message_and_never_exposes_inter
         "amount": "1",
         "chain": "ETH",
         "symbol": "USDC",
+        "recipient": WALLET,
     }
 
 

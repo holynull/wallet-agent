@@ -33,6 +33,16 @@ class ConversationState(TypedDict, total=False):
     updated_by: str
 
 
+class DialogueState(TypedDict, total=False):
+    """Compact durable context used for natural-language follow-ups."""
+
+    goal: Literal["read", "transfer", "swap", "status", "unknown"]
+    active_topic: str
+    referent: dict[str, Any] | None
+    language: Literal["zh", "en"]
+    last_result_kind: str | None
+
+
 class ConfirmationState(TypedDict, total=False):
     """A resumable, expiring approval request owned by the wallet client."""
 
@@ -114,6 +124,7 @@ class AgentState(TypedDict, total=False):
     supervisor_decision: NotRequired[dict[str, Any] | None]
     supervisor_output: NotRequired[dict[str, Any] | None]
     conversation_state: NotRequired[ConversationState | None]
+    dialogue: NotRequired[DialogueState | None]
     task_stage: NotRequired[str | None]
     operation_reset: NotRequired[bool]
     wallet_context: NotRequired[dict[str, Any] | None]

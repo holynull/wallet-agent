@@ -173,7 +173,8 @@ async def test_sse_final_response_is_retained_in_history():
     turn = next(step for step in report.steps if step.operation == "turn")
     assert turn.evidence["stream_event_count"] > 1
     assert turn.evidence["response_kind"] == "swap_quote"
-    assert turn.evidence["assistant_message"] == "swap_quote"
+    assert turn.evidence["assistant_message"]
+    assert turn.evidence["assistant_message"] != "swap_quote"
     assert turn.evidence["assistant_history_count"] == 1
 
 

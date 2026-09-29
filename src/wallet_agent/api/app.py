@@ -325,6 +325,10 @@ def _broadcast_response(
     payload = _jsonable(record)
     effective_status = broadcast_status or record.broadcast_status or record.stage or record.status
     payload["broadcast_status"] = effective_status
+    if str(effective_status) == "broadcast_pending":
+        # Expose immediate chain visibility without changing the persisted
+        # business stage, which remains processing until provider completion.
+        payload["status"] = effective_status
     if message is None and record.provider_order is not None:
         message = {
             "confirmed": "源链交易已确认，兑换服务正在处理，目标链资产尚未确认到账。",
@@ -925,6 +929,8 @@ def create_app(
             )
             if order_state:
                 changes["stage"] = str(order_state)
+            if response.get("broadcast_status") == "broadcast_pending":
+                changes["stage"] = "broadcast_pending"
             if state.get("provider_orders") or state.get("broadcast_tx_hash"):
                 # Once a swap has been broadcast, old checkpoint values are no
                 # longer actionable and must not make clients render signing cards.
@@ -1198,6 +1204,11 @@ def create_app(
                             if isinstance(raw_status, Mapping)
                             else raw_status
                         )
+                        if (
+                            session_status == "processing"
+                            and result.get("broadcast_status") == "broadcast_pending"
+                        ):
+                            session_status = "broadcast_pending"
                     if response_kind == "error":
                         active_kind = (result.get("active_task") or {}).get("kind")
                         if result.get("intent") == "swap_quote" or active_kind == "swap":

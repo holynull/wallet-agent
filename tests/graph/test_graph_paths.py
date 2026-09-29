@@ -38,7 +38,10 @@ class NaturalLanguagePriceModel:
 
 class FixedPriceProvider:
     async def get_prices(self, assets):
-        return [TokenPrice(asset=asset, usd_price=Decimal("60000"), provider="okx") for asset in assets]
+        return [
+            TokenPrice(asset=asset, usd_price=Decimal("60000"), provider="okx")
+            for asset in assets
+        ]
 
 
 class SwapExtractionModel:
@@ -126,7 +129,11 @@ def quote_request():
 
 @pytest.mark.asyncio
 async def test_natural_language_price_query_extracts_asset_before_price_node():
-    graph = build_graph(model=NaturalLanguagePriceModel(), providers=[], price_provider=FixedPriceProvider())
+    graph = build_graph(
+        model=NaturalLanguagePriceModel(),
+        providers=[],
+        price_provider=FixedPriceProvider(),
+    )
 
     result = await graph.ainvoke(
         {
@@ -241,7 +248,7 @@ async def test_quote_path_keeps_success_and_reports_failed_provider():
     assert result["response"]["kind"] == "swap_quote"
     assert [quote["provider"] for quote in result["response"]["quotes"]] == ["omnibridge"]
     assert result["response"]["provider_errors"][0]["details"]["provider"] == "bridgers"
-    assert "message" not in result["response"]
+    assert result["response"]["message"]
 
 
 @pytest.mark.asyncio

@@ -64,6 +64,7 @@ def build_graph(
     )
     n = make_nodes(runtime)
     builder = StateGraph(AgentState)
+    builder.add_node("dialogue_manager", n["dialogue_manager"])
     builder.add_node("supervisor", n["supervisor"])
     builder.add_node("intent", n["intent"])
     builder.add_node("resolve_swap", n["resolve_swap"])
@@ -93,7 +94,8 @@ def build_graph(
     builder.add_node("register_broadcast", n["register_broadcast"])
     builder.add_node("status_poll", n["status_poll"])
     builder.add_node("response", n["response"])
-    builder.add_edge(START, "supervisor")
+    builder.add_edge(START, "dialogue_manager")
+    builder.add_edge("dialogue_manager", "supervisor")
     builder.add_edge("supervisor", "intent")
     builder.add_conditional_edges(
         "intent",
