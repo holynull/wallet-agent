@@ -110,6 +110,7 @@ def build_application(settings: Settings | None = None) -> Any:
         extractors=extractors,
         responses=response_models,
         readers=read_models if settings.read_agent_enabled else {},
+        raw_models=base_clients,
     )
     model = ModelRouter(model_registry)
     providers: dict[str, Any] = {}

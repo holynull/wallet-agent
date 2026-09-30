@@ -117,8 +117,14 @@ Classification, slot extraction, response generation, and read-only planning use
 fallback for complex reasoning. Read-only planning is bounded to four tool
 rounds. Configure `READ_AGENT_ENABLED=false` to
 keep the legacy deterministic read routes. The planner can only call balance, price, gas,
-asset-discovery, and transaction-status tools; it cannot reach signing,
+asset-discovery, market-detail, price-history, portfolio, and transaction-status tools; it cannot reach signing,
 authorization, transfer, swap, or broadcast nodes.
+
+The enabled read-only path uses DeepSeek native tool calls: Flash returns a
+tool call, the graph executes the allowlisted read tool through `ToolNode`, and
+the resulting `ToolMessage` is returned to Flash for the next decision. Write
+capabilities remain deterministic graph nodes behind wallet confirmation and
+are never exposed as model tools.
 
 The HTTP API is rooted at `/v1`: agent turns and SSE streaming, explicit swap
 quote selection (`/swap/{session_id}/select-quote`), expiring confirmation state,

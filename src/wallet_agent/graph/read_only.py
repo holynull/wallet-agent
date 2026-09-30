@@ -20,6 +20,144 @@ READ_ONLY_TOOL_NAMES = frozenset(
 )
 READ_ONLY_MAX_ROUNDS = 4
 
+# These are deliberately read-only. Write capabilities never cross the model
+# boundary; transfer, approval, swap preparation, signing, and broadcast stay
+# in deterministic graph nodes with an explicit confirmation gate.
+READ_ONLY_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "wallet_balance",
+            "description": "Read native and token balances for a wallet on one network.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chain": {"type": "string", "description": "Network name."},
+                    "address": {"type": "string", "description": "Wallet address."},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "price_lookup",
+            "description": "Read the current USD price of a specified asset.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chain": {"type": "string"},
+                    "symbol": {"type": "string"},
+                    "token_address": {"type": "string"},
+                    "decimals": {"type": "integer"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gas_estimate",
+            "description": "Estimate network fees without signing or broadcasting.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chain": {"type": "string"},
+                    "address": {"type": "string"},
+                    "to": {"type": "string"},
+                    "data": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "asset_discovery",
+            "description": "Find supported token metadata by network and symbol.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chain": {"type": "string"},
+                    "search": {"type": "string"},
+                    "provider_name": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transaction_status",
+            "description": "Read the status of a transaction hash on a network.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chain": {"type": "string"},
+                    "tx_hash": {"type": "string"},
+                },
+                "required": ["tx_hash"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "market_details",
+            "description": "Read market metadata such as liquidity or volume for an asset.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chain": {"type": "string"},
+                    "symbol": {"type": "string"},
+                    "token_address": {"type": "string"},
+                    "decimals": {"type": "integer"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "price_history",
+            "description": "Read historical price candles for an asset.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chain": {"type": "string"},
+                    "symbol": {"type": "string"},
+                    "token_address": {"type": "string"},
+                    "decimals": {"type": "integer"},
+                    "period": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "portfolio_snapshot",
+            "description": "Read a wallet portfolio snapshot and total value.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chain": {"type": "string"},
+                    "address": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
 
 @dataclass(frozen=True)
 class ReadOnlyToolCall:

@@ -26,6 +26,10 @@ OPENAI_BASE_URL=https://api.deepseek.com
 
 意图识别、参数提取、自然语言回复和只读工具规划默认使用支持工具调用及结构化输出的 `deepseek-flash`；`deepseek-v4-pro` 可作为显式复杂推理模型。客户端不能切换到未纳入服务端允许列表的模型。
 
+只读查询使用原生 tool-calling 链路：模型返回工具调用，服务端通过
+LangGraph `ToolNode` 执行白名单内的查询工具，再把 `ToolMessage` 回传给模型。
+转账、授权、兑换、签名和广播不会暴露给模型工具列表，仍由确定性 graph 和钱包确认流程控制。
+
 ### 配置 EVM RPC
 
 如果要查询真实余额、Allowance、交易回执和生成交易，需要配置 RPC。建议每条链配置多个 RPC URL：

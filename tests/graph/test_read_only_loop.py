@@ -1,4 +1,5 @@
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
 
 from wallet_agent.graph.read_only import (
     READ_ONLY_TOOL_NAMES,
@@ -6,6 +7,7 @@ from wallet_agent.graph.read_only import (
     route_read_only,
     run_read_only_round,
 )
+from wallet_agent.graph.routes import route_after_intent
 
 
 def test_registry_contains_only_read_capabilities():
@@ -31,6 +33,69 @@ def test_route_stops_after_two_rounds():
     assert route_read_only(
         {"read_loop_count": 4, "read_tool_call": {"name": "price_lookup"}}
     ) == "response"
+
+
+@pytest.mark.parametrize("intent", ["market_details", "price_history", "portfolio_query"])
+def test_extended_read_intents_use_the_native_read_only_route(intent):
+    assert route_after_intent({"intent": intent, "read_only_enabled": True}) == "read_only"
+
+
+@pytest.mark.asyncio
+async def test_native_read_tool_call_round_executes_tool_and_returns_to_model():
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import TokenPrice
+    from wallet_agent.graph.build import build_graph
+
+    class PriceProvider:
+        async def get_prices(self, assets):
+            return [
+                TokenPrice(
+                    asset=assets[0],
+                    usd_price=Decimal("1800"),
+                    provider="okx",
+                )
+            ]
+
+    class NativeReadModel:
+        read_agent_enabled = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def classify(self, _request):
+            return {"intent": "price_query"}
+
+        async def extract(self, _task_kind, _request):
+            return {"symbol": "ETH", "chain": "ETH", "decimals": 18}
+
+        async def invoke_read_tools(self, messages, _tools):
+            self.calls.append(messages)
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-price-1",
+                            "name": "price_lookup",
+                            "args": {"symbol": "ETH", "chain": "ETH", "decimals": 18},
+                        }
+                    ],
+                )
+            return AIMessage(content="无需继续查询")
+
+    model = NativeReadModel()
+    result = await build_graph(model=model, price_provider=PriceProvider()).ainvoke(
+        {"request": {"message": "ETH 现在多少钱"}},
+        config={"configurable": {"thread_id": "native-read-only"}},
+    )
+
+    assert result["response"]["kind"] == "price_query"
+    assert result["response"]["prices"][0]["usd_price"] == "1800"
+    assert result["read_tool_calls"][0]["call_id"] == "call-price-1"
+    assert result["read_tool_calls"][0]["status"] == "completed"
+    assert len(model.calls) == 2
+    assert any(isinstance(item, ToolMessage) for item in model.calls[1])
     assert route_read_only(
         {"read_loop_count": 1, "read_tool_call": None, "read_only_complete": True}
     ) == "response"

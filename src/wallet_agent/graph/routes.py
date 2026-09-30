@@ -53,8 +53,10 @@ def route_after_intent(state: dict[str, Any]) -> str:
         return "read_only" if state.get("read_only_enabled") else "price_query"
     if intent == "transaction_status":
         return "read_only" if state.get("read_only_enabled") else "transaction_status"
-    if intent == "portfolio_query":
-        return "portfolio_query"
+    if intent in {"portfolio_query", "market_details", "price_history"}:
+        if state.get("read_only_enabled"):
+            return "read_only"
+        return "portfolio_query" if intent == "portfolio_query" else "response"
     if intent == "gas_check":
         return "read_only" if state.get("read_only_enabled") else "gas_check"
     if intent == "asset_discovery":

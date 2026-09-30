@@ -131,6 +131,8 @@ class AgentState(TypedDict, total=False):
     read_reference: NotRequired[dict[str, Any] | None]
     read_loop_count: NotRequired[int]
     read_tool_calls: NotRequired[list[dict[str, Any]]]
+    read_messages: NotRequired[list[Any]]
+    read_native: NotRequired[bool]
     read_facts: NotRequired[dict[str, Any] | None]
     read_tool_call: NotRequired[dict[str, Any] | None]
     read_only_enabled: NotRequired[bool]

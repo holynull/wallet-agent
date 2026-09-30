@@ -545,6 +545,12 @@
       return progress;
     }
     const current = responseState(data);
+    if (shouldRender && Array.isArray(current?.model_trace) && current.model_trace.length) {
+      const modelCalls = current.model_trace.map(({ call_id, elapsed_ms, ...call }) => (
+        { ...call, call_id, elapsed_ms }
+      ));
+      recordDebug('模型调用', modelCalls);
+    }
     if (shouldRender && current?.session_id) state.sessionId = current.session_id;
     if (shouldRender && Array.isArray(current?.quote_candidates)) { state.quotes = current.quote_candidates; renderQuotes(); }
     if (shouldRender && current?.selected_provider_reference) state.selectedProviderReference = current.selected_provider_reference;

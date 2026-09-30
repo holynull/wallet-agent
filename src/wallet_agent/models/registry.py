@@ -32,7 +32,8 @@ def _model_input(request: Mapping[str, Any]) -> list[HumanMessage]:
                 "不要输出 Markdown、解释文字或代码块。可选 intent 包括："
                 "wallet_query、swap_quote、swap_prepare、swap_status、"
                 "transfer、price_query、transaction_status、portfolio_query、"
-                "gas_check、asset_discovery、clarification、unsupported。"
+                "gas_check、asset_discovery、market_details、price_history、"
+                "clarification、unsupported。"
                 "如果用户只是问候、与钱包无关，或完全无法识别任务，才使用 clarification。"
                 "参数不完整的转账仍然是 transfer，参数不完整的兑换仍然是 swap_quote。"
                 "兑换请求即使只写了类似“帮我兑换 1USDT”的紧凑格式，也要识别为 swap_quote。"
@@ -164,6 +165,7 @@ class ModelRegistry:
         extractors: Mapping[str, Mapping[str, Any]] | None = None,
         responses: Mapping[str, Any] | None = None,
         readers: Mapping[str, Any] | None = None,
+        raw_models: Mapping[str, Any] | None = None,
     ) -> None:
         if default_model_id not in models:
             raise ValueError(f"default model is not configured: {default_model_id}")
@@ -173,6 +175,7 @@ class ModelRegistry:
         }
         self._responses = dict(responses or {})
         self._readers = dict(readers or {})
+        self._raw_models = dict(raw_models or models)
         self.default_model_id = default_model_id
         self.classifier_model_id = classifier_model_id or default_model_id
         self.extractor_model_id = extractor_model_id or default_model_id
@@ -221,6 +224,13 @@ class ModelRegistry:
             return self._models[selected]
         except KeyError as exc:
             raise ValueError(f"unknown model_id: {selected}") from exc
+
+    def get_raw(self, model_id: str | None = None) -> Any:
+        selected = model_id or self.read_agent_model_id
+        try:
+            return self._raw_models[selected]
+        except KeyError as exc:
+            raise ValueError(f"raw model is not configured: {selected}") from exc
 
     def get_extractor(self, task_kind: str, model_id: str | None = None) -> Any:
         selected = model_id or self.extractor_model_id
@@ -313,6 +323,35 @@ class ModelRouter:
             model=model, request=model_request,
         )
         return result if isinstance(result, ReadToolPlan) else ReadToolPlan.model_validate(result)
+
+    async def invoke_read_tools(
+        self,
+        messages: list[Any],
+        tools: list[dict[str, Any]],
+        model_id: str | None = None,
+    ) -> Any:
+        """Run the native tool-calling read model and preserve its call IDs."""
+        selected = str(model_id or self.registry.read_agent_model_id)
+        raw_model = self.registry.get_raw(selected)
+        binder = getattr(raw_model, "bind_tools", None)
+        if not callable(binder):
+            raise ValueError(f"read model does not support tool calls: {selected}")
+        model = binder(tools)
+        result = await self._invoke(
+            role="read_agent",
+            model_id=selected,
+            stage="只读工具调用",
+            model=model,
+            request=messages,
+        )
+        calls = getattr(result, "tool_calls", None) or []
+        if self._model_trace:
+            self._model_trace[-1]["tool_call_ids"] = [
+                str(item.get("id"))
+                for item in calls
+                if isinstance(item, Mapping) and item.get("id")
+            ]
+        return result
 
     async def classify(self, request: Mapping[str, Any]) -> RouteDecision:
         model_id = str(request.get("model_id") or self.registry.classifier_model_id)

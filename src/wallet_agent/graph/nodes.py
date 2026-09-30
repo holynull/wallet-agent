@@ -13,7 +13,7 @@ from decimal import ROUND_DOWN, Decimal
 from time import perf_counter
 from typing import Any
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.config import get_stream_writer
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
@@ -48,6 +48,8 @@ from .dialogue import resolve_quote_reference, resolve_read_reference
 from .facts import validate_response_draft
 from .read_only import (
     READ_ONLY_MAX_ROUNDS,
+    READ_ONLY_TOOL_NAMES,
+    READ_ONLY_TOOL_SCHEMAS,
     ReadOnlyToolCall,
     read_only_decision,
     read_only_tool_name_for_intent,
@@ -918,6 +920,22 @@ def _read_response_fallback(response: Mapping[str, Any], language: str) -> str:
                     f"${first.get('usd_price')}."
                 )
             )
+    if kind == "market_details":
+        count = len(response.get("details") or [])
+        return (
+            f"我找到 {count} 条行情详情。"
+            if language == "zh"
+            else f"I found {count} market detail records."
+        )
+    if kind == "price_history":
+        history = response.get("history") or {}
+        candles = history.get("candles") if isinstance(history, Mapping) else None
+        count = len(candles or []) if isinstance(candles, list) else 0
+        return (
+            f"已找到 {count} 条历史价格数据。"
+            if language == "zh"
+            else f"I found {count} historical price records."
+        )
     if kind == "gas_check":
         return str(response.get("message") or "暂时无法完成 Gas 检查。")
     if kind == "asset_discovery":
@@ -2982,9 +3000,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "price_query",
             "gas_check",
             "asset_discovery",
+            "market_details",
+            "price_history",
             "transaction_status",
             "swap_status",
             "swap_quote",
+            "market_details",
+            "price_history",
         }:
             return dict(response)
         request = dict(state.get("request") or {})
@@ -3340,6 +3362,89 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "read_only_complete": True,
                 "read_only_pending": False,
             }
+        native_invoker = getattr(runtime.model, "invoke_read_tools", None)
+        if callable(native_invoker):
+            messages = list(state.get("read_messages") or [])
+            if not messages:
+                context = {
+                    "message": request.get("message"),
+                    "intent": intent,
+                    "wallet_context": state.get("wallet_context"),
+                    "read_facts": state.get("read_facts") or {},
+                    "task_plan": request.get("task_plan"),
+                }
+                messages = [
+                    SystemMessage(
+                        content=(
+                            "你是钱包只读查询 Agent。只能调用提供的只读工具，"
+                            "不能转账、兑换、授权、签名或广播。"
+                            "每轮根据已验证的 ToolMessage 决定是否需要下一次查询；"
+                            "缺少用户必须确认的网络、地址或资产时不要猜测，"
+                            "直接结束并让上层提问。工具参数必须来自用户请求、钱包上下文或已验证事实。"
+                        )
+                    ),
+                    HumanMessage(
+                        content=json.dumps(context, ensure_ascii=False, default=str)
+                    ),
+                ]
+            try:
+                native_output = await native_invoker(messages, READ_ONLY_TOOL_SCHEMAS)
+            except ValueError:
+                # Injected legacy/fake models may expose the facade without a
+                # tool-capable backend. Fall back to the structured planner.
+                native_output = None
+            if native_output is not None:
+                tool_calls = list(getattr(native_output, "tool_calls", None) or [])
+                invalid_calls = [
+                    item
+                    for item in tool_calls
+                    if not isinstance(item, Mapping)
+                    or str(item.get("name") or "") not in READ_ONLY_TOOL_NAMES
+                    or not isinstance(item.get("args", item.get("arguments", {})), Mapping)
+                ]
+                if invalid_calls:
+                    return {
+                        "response": {
+                            "kind": "error",
+                            "errors": [
+                                _error(
+                                    "READ_TOOL_NOT_ALLOWED",
+                                    "模型请求了不允许的只读工具或参数。",
+                                )
+                            ],
+                        },
+                        "read_messages": [*messages, native_output],
+                        "read_tool_call": None,
+                        "read_only_complete": True,
+                        "read_only_pending": False,
+                        "read_native": True,
+                    }
+                if tool_calls:
+                    existing_calls = [dict(item) for item in state.get("read_tool_calls") or []]
+                    records = [
+                        {
+                            "call_id": str(item.get("id") or ""),
+                            "name": str(item.get("name")),
+                            "args": dict(item.get("args", item.get("arguments", {}))),
+                            "status": "started",
+                        }
+                        for item in tool_calls
+                    ]
+                    return {
+                        "read_messages": [*messages, native_output],
+                        "read_tool_call": {"native": True},
+                        "read_tool_calls": [*existing_calls, *records],
+                        "read_only_complete": False,
+                        "read_only_pending": True,
+                        "read_native": True,
+                    }
+                return {
+                    "read_messages": [*messages, native_output],
+                    "read_tool_call": None,
+                    "read_only_complete": True,
+                    "read_only_pending": False,
+                    "read_native": True,
+                }
         call = await read_only_decision(runtime.model, request)
         if call is None:
             if state.get("read_loop_count", 0) == 0:
@@ -3400,6 +3505,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         arguments = raw_call.get("arguments") or {}
 
         async def price_lookup(args: dict[str, Any]) -> dict[str, Any]:
+            """Read the current price for an asset."""
             raw = state.get("price_request") or {}
             merged = {**raw, **args}
             asset, error = _normalize_price_asset(
@@ -3434,29 +3540,53 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             return {"ok": True, "prices": [_dump(item) for item in prices]}
 
         async def wallet_balance(args: dict[str, Any]) -> dict[str, Any]:
-            return await wallet_balance_tool(str(args.get("chain")), str(args.get("address")))
+            """Read wallet balances."""
+            context = state.get("wallet_context") or {}
+            chain = args.get("chain") or context.get("chain")
+            address = args.get("address") or context.get("address")
+            if not chain or not address:
+                return {
+                    "ok": False,
+                    "code": "WALLET_CONTEXT_REQUIRED",
+                    "error": "请先连接钱包并明确查询网络。",
+                }
+            return await wallet_balance_tool(str(chain), str(address))
 
         async def transaction_status(args: dict[str, Any]) -> dict[str, Any]:
+            """Read a transaction status."""
+            context = state.get("wallet_context") or {}
             return await transaction_status_tool(
-                str(args.get("chain")),
-                str(args.get("tx_hash")),
+                str(args.get("chain") or context.get("chain") or ""),
+                str(args.get("tx_hash") or ""),
                 state.get("broadcast_status"),
             )
 
         async def gas_estimate(args: dict[str, Any]) -> dict[str, Any]:
+            """Estimate a network fee."""
+            context = state.get("wallet_context") or {}
+            chain = args.get("chain") or context.get("chain")
+            address = args.get("address") or context.get("address")
+            if not chain or not address:
+                return {
+                    "ok": False,
+                    "code": "WALLET_CONTEXT_REQUIRED",
+                    "error": "请先连接钱包并明确查询网络。",
+                }
             return await gas_estimate_tool(
-                str(args.get("chain")),
-                str(args.get("address")),
+                str(chain),
+                str(address),
                 args.get("to"),
                 args.get("data"),
             )
 
         async def asset_discovery(args: dict[str, Any]) -> dict[str, Any]:
+            """Discover token metadata."""
             return await asset_discovery_tool(
                 args.get("chain"), args.get("search"), args.get("provider_name")
             )
 
         async def market_details(args: dict[str, Any]) -> dict[str, Any]:
+            """Read market details for an asset."""
             raw = {**(state.get("price_request") or {}), **args}
             asset, error = _normalize_price_asset(raw, {}, state.get("wallet_context"))
             if error:
@@ -3476,6 +3606,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 return {"ok": False, "code": "MARKET_DETAILS_FAILED", "error": "行情详情暂不可用。"}
 
         async def price_history(args: dict[str, Any]) -> dict[str, Any]:
+            """Read historical prices for an asset."""
             raw = {**(state.get("price_request") or {}), **args}
             asset, error = _normalize_price_asset(raw, {}, state.get("wallet_context"))
             if error:
@@ -3499,6 +3630,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 return {"ok": False, "code": "PRICE_HISTORY_FAILED", "error": "历史价格暂不可用。"}
 
         async def portfolio_snapshot(args: dict[str, Any]) -> dict[str, Any]:
+            """Read a wallet portfolio snapshot."""
             context = state.get("wallet_context") or {}
             address = str(args.get("address") or context.get("address") or "")
             chain = str(args.get("chain") or context.get("chain") or "")
@@ -3544,6 +3676,134 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "price_history": price_history,
             "portfolio_snapshot": portfolio_snapshot,
         }
+        async def native_price_lookup(**kwargs: Any) -> dict[str, Any]:
+            """Read the current price for an asset."""
+            return await price_lookup(dict(kwargs))
+
+        async def native_wallet_balance(**kwargs: Any) -> dict[str, Any]:
+            """Read wallet balances."""
+            return await wallet_balance(dict(kwargs))
+
+        async def native_transaction_status(**kwargs: Any) -> dict[str, Any]:
+            """Read a transaction status."""
+            return await transaction_status(dict(kwargs))
+
+        async def native_gas_estimate(**kwargs: Any) -> dict[str, Any]:
+            """Estimate a network fee."""
+            return await gas_estimate(dict(kwargs))
+
+        async def native_asset_discovery(**kwargs: Any) -> dict[str, Any]:
+            """Discover token metadata."""
+            return await asset_discovery(dict(kwargs))
+
+        async def native_market_details(**kwargs: Any) -> dict[str, Any]:
+            """Read market details for an asset."""
+            return await market_details(dict(kwargs))
+
+        async def native_price_history(**kwargs: Any) -> dict[str, Any]:
+            """Read historical prices for an asset."""
+            return await price_history(dict(kwargs))
+
+        async def native_portfolio_snapshot(**kwargs: Any) -> dict[str, Any]:
+            """Read a wallet portfolio snapshot."""
+            return await portfolio_snapshot(dict(kwargs))
+
+        native_tools = [
+            native_wallet_balance,
+            native_price_lookup,
+            native_gas_estimate,
+            native_asset_discovery,
+            native_transaction_status,
+            native_market_details,
+            native_price_history,
+            native_portfolio_snapshot,
+        ]
+        for native_tool, tool_name in zip(
+            native_tools, tools, strict=True
+        ):
+            native_tool.__name__ = tool_name
+        if state.get("read_native"):
+            count = int(state.get("read_loop_count") or 0) + 1
+            messages = list(state.get("read_messages") or [])
+            calls = [dict(item) for item in state.get("read_tool_calls") or []]
+            facts = dict(state.get("read_facts") or {})
+            try:
+                tool_result = await ToolNode(native_tools, name="read_only_tools").ainvoke(
+                    {"messages": [messages[-1]]}
+                )
+                tool_messages = list(tool_result.get("messages") or [])
+            except Exception as exc:
+                for record in calls:
+                    if record.get("status") == "started":
+                        record.update(
+                            status="failed",
+                            error={"code": "READ_TOOL_FAILED", "message": str(exc)},
+                        )
+                facts["error"] = {
+                    "code": "READ_TOOL_FAILED",
+                    "message": str(exc),
+                }
+                return {
+                    "read_loop_count": count,
+                    "read_messages": messages,
+                    "read_tool_calls": calls,
+                    "read_facts": facts,
+                    "read_tool_call": None,
+                    "read_only_pending": False,
+                    "read_only_complete": True,
+                }
+            for message in tool_messages:
+                call_id = str(getattr(message, "tool_call_id", "") or "")
+                name = str(getattr(message, "name", "") or "")
+                record = next(
+                    (item for item in calls if str(item.get("call_id")) == call_id),
+                    None,
+                )
+                if record is not None:
+                    name = name or str(record.get("name") or "")
+                content = getattr(message, "content", message)
+                try:
+                    payload = content if isinstance(content, dict) else json.loads(str(content))
+                except (TypeError, ValueError):
+                    payload = {
+                        "ok": False,
+                        "code": "TOOL_OUTPUT_INVALID",
+                        "error": str(content),
+                    }
+                if not isinstance(payload, dict):
+                    payload = {
+                        "ok": False,
+                        "code": "TOOL_OUTPUT_INVALID",
+                        "error": "只读工具返回了非 JSON 对象。",
+                    }
+                facts[name] = payload
+                if record is not None:
+                    record.update(
+                        status="completed" if payload.get("ok", True) else "failed",
+                        elapsed_ms=round((perf_counter() - started) * 1000, 2),
+                    )
+                    if not payload.get("ok", True):
+                        record["error"] = {
+                            "code": payload.get("code", "READ_TOOL_FAILED"),
+                            "message": payload.get("error", "只读工具调用失败。"),
+                        }
+            wallet_event(
+                "read_only_tool",
+                "success" if all(item.get("status") == "completed" for item in calls) else "error",
+                duration_ms=(perf_counter() - started) * 1000,
+                state={**state, "read_facts": facts, "read_tool_calls": calls},
+                tool_name="native",
+                tool_status="completed",
+            )
+            return {
+                "read_loop_count": count,
+                "read_messages": [*messages, *tool_messages],
+                "read_tool_calls": calls,
+                "read_facts": facts,
+                "read_tool_call": None,
+                "read_only_pending": True,
+                "read_only_complete": False,
+            }
         update = await run_read_only_round(
             state,
             ReadOnlyToolCall(name=name, arguments=dict(arguments)),
@@ -3810,7 +4070,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "transaction_status",
                     "gas_estimate",
                     "asset_discovery",
-                    "quote_lookup",
+                    "market_details",
+                    "price_history",
+                    "portfolio_snapshot",
                 ],
                 "business_nodes": ["transfer", "swap_allowance", "prepare", "status_poll"],
             }
@@ -3860,16 +4122,33 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "request": request,
             "read_loop_count": 0,
             "read_tool_calls": [],
+            "read_messages": [],
+            "read_native": False,
             "read_facts": {},
             "read_tool_call": None,
             "read_only_complete": False,
             "read_only_pending": False,
         }
+        has_native_read_tools = hasattr(runtime.model, "invoke_read_tools")
+        has_structured_read_planner = hasattr(runtime.model, "plan_read")
         update["read_only_enabled"] = bool(
-            getattr(runtime.model, "read_agent_enabled", hasattr(runtime.model, "plan_read"))
-            and hasattr(runtime.model, "plan_read")
+            getattr(
+                runtime.model,
+                "read_agent_enabled",
+                has_native_read_tools or has_structured_read_planner,
+            )
+            and (has_native_read_tools or has_structured_read_planner)
             and decision.get("intent")
-            in {"wallet_query", "price_query", "transaction_status", "gas_check", "asset_discovery"}
+            in {
+                "wallet_query",
+                "price_query",
+                "transaction_status",
+                "gas_check",
+                "asset_discovery",
+                "market_details",
+                "price_history",
+                "portfolio_query",
+            }
         )
         if decision.get("source") == "operation_history" and historical_swap is not None:
             update.update(
@@ -4476,6 +4755,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "portfolio_query",
             "gas_check",
             "asset_discovery",
+            "market_details",
+            "price_history",
         }
         if _looks_like_cancel_message(message) and (
             active_task
@@ -6855,6 +7136,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "transaction_status",
             "swap_status",
             "swap_quote",
+            "market_details",
+            "price_history",
         }:
             return {
                 "response": await naturalize_read_response(

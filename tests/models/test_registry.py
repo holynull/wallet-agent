@@ -1,6 +1,7 @@
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
+from wallet_agent.graph.read_only import READ_ONLY_TOOL_SCHEMAS
 from wallet_agent.models import ModelRegistry, ModelRouter
 from wallet_agent.models.contracts import AgentResponseDraft
 
@@ -174,6 +175,47 @@ async def test_model_router_plans_only_whitelisted_read_tools():
 
     assert result.name == "price_lookup"
     assert result.arguments == {"symbol": "ETH"}
+
+
+@pytest.mark.asyncio
+async def test_model_router_invokes_native_read_tool_model_and_records_tool_call_stage():
+    calls = []
+
+    class BoundModel:
+        async def ainvoke(self, messages):
+            calls.append(messages)
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-price-1",
+                        "name": "price_lookup",
+                        "args": {"symbol": "ETH"},
+                    }
+                ],
+            )
+
+    class RawModel:
+        def bind_tools(self, tools):
+            calls.append(tools)
+            return BoundModel()
+
+    router = ModelRouter(
+        ModelRegistry(
+            {"deepseek-flash": FakeModel()},
+            default_model_id="deepseek-flash",
+            raw_models={"deepseek-flash": RawModel()},
+        )
+    )
+    result = await router.invoke_read_tools(
+        [HumanMessage(content="ETH price")], READ_ONLY_TOOL_SCHEMAS
+    )
+
+    assert result.tool_calls[0]["id"] == "call-price-1"
+    assert calls[0] == READ_ONLY_TOOL_SCHEMAS
+    trace = router.consume_model_trace()
+    assert trace[0]["stage"] == "只读工具调用"
+    assert trace[0]["tool_call_ids"] == ["call-price-1"]
 
 
 @pytest.mark.asyncio
