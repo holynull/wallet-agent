@@ -19,6 +19,8 @@ Intent = Literal[
     "portfolio_query",
     "gas_check",
     "asset_discovery",
+    "market_details",
+    "price_history",
 ]
 
 
@@ -153,6 +155,8 @@ class AgentState(TypedDict, total=False):
     transaction_status_snapshot: NotRequired[dict[str, Any] | None]
     portfolio_request: NotRequired[dict[str, Any] | None]
     portfolio_snapshot: NotRequired[dict[str, Any] | None]
+    market_query: NotRequired[dict[str, Any] | None]
+    price_history_request: NotRequired[dict[str, Any] | None]
     gas_request: NotRequired[dict[str, Any] | None]
     gas_snapshot: NotRequired[dict[str, Any] | None]
     asset_query: NotRequired[dict[str, Any] | None]

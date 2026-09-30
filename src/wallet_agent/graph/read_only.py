@@ -13,9 +13,12 @@ READ_ONLY_TOOL_NAMES = frozenset(
         "gas_estimate",
         "asset_discovery",
         "transaction_status",
+        "market_details",
+        "price_history",
+        "portfolio_snapshot",
     }
 )
-READ_ONLY_MAX_ROUNDS = 2
+READ_ONLY_MAX_ROUNDS = 4
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,9 @@ def read_only_tool_name_for_intent(intent: str) -> str | None:
         "gas_check": "gas_estimate",
         "asset_discovery": "asset_discovery",
         "transaction_status": "transaction_status",
+        "market_details": "market_details",
+        "price_history": "price_history",
+        "portfolio_query": "portfolio_snapshot",
     }.get(intent)
 
 

@@ -17,6 +17,9 @@ IntentName = Literal[
     "swap_allowance",
     "price_query",
     "transaction_status",
+    "market_details",
+    "price_history",
+    "portfolio_snapshot",
     "portfolio_query",
     "gas_check",
     "asset_discovery",
@@ -28,6 +31,9 @@ ReadToolName = Literal[
     "gas_estimate",
     "asset_discovery",
     "transaction_status",
+    "market_details",
+    "price_history",
+    "portfolio_snapshot",
 ]
 
 

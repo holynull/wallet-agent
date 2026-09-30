@@ -429,6 +429,8 @@ _VALID_INTENTS = {
     "portfolio_query",
     "gas_check",
     "asset_discovery",
+    "market_details",
+    "price_history",
 }
 
 _TRANSFER_CANONICAL_KEYS = {
@@ -3295,6 +3297,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         request["dialogue"] = state.get("dialogue")
         request["read_facts"] = state.get("read_facts") or {}
         request["read_loop_count"] = state.get("read_loop_count", 0)
+        request["task_plan"] = {
+            "goal": intent,
+            "completed_tools": [
+                item.get("name")
+                for item in state.get("read_tool_calls") or []
+                if item.get("status") == "completed"
+            ],
+            "available_facts": sorted((state.get("read_facts") or {}).keys()),
+            "max_steps": 4,
+        }
         if intent == "wallet_query" and _looks_like_other_chain_balance_request(
             str(request.get("message") or "")
         ):
@@ -3444,12 +3456,93 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 args.get("chain"), args.get("search"), args.get("provider_name")
             )
 
+        async def market_details(args: dict[str, Any]) -> dict[str, Any]:
+            raw = {**(state.get("price_request") or {}), **args}
+            asset, error = _normalize_price_asset(raw, {}, state.get("wallet_context"))
+            if error:
+                return {"ok": False, **error}
+            provider = runtime.price_provider
+            method = getattr(provider, "get_market_details", None) if provider else None
+            if method is None:
+                return {
+                    "ok": False,
+                    "code": "MARKET_DETAILS_UNAVAILABLE",
+                    "error": "行情详情暂不可用。",
+                }
+            try:
+                details = await method([asset])
+                return {"ok": True, "details": [_dump(item) for item in details]}
+            except Exception:
+                return {"ok": False, "code": "MARKET_DETAILS_FAILED", "error": "行情详情暂不可用。"}
+
+        async def price_history(args: dict[str, Any]) -> dict[str, Any]:
+            raw = {**(state.get("price_request") or {}), **args}
+            asset, error = _normalize_price_asset(raw, {}, state.get("wallet_context"))
+            if error:
+                return {"ok": False, **error}
+            provider = runtime.price_provider
+            method = getattr(provider, "get_historical_prices", None) if provider else None
+            if method is None:
+                return {
+                    "ok": False,
+                    "code": "PRICE_HISTORY_UNAVAILABLE",
+                    "error": "历史价格暂不可用。",
+                }
+            try:
+                page = await method(
+                    asset,
+                    period=str(args.get("period") or "1h"),
+                    limit=int(args.get("limit") or 24),
+                )
+                return {"ok": True, "history": _dump(page)}
+            except Exception:
+                return {"ok": False, "code": "PRICE_HISTORY_FAILED", "error": "历史价格暂不可用。"}
+
+        async def portfolio_snapshot(args: dict[str, Any]) -> dict[str, Any]:
+            context = state.get("wallet_context") or {}
+            address = str(args.get("address") or context.get("address") or "")
+            chain = str(args.get("chain") or context.get("chain") or "")
+            if not address:
+                return {"ok": False, "code": "WALLET_ADDRESS_REQUIRED", "error": "请先连接钱包。"}
+            try:
+                balances = await wallet_balance_tool(chain, address)
+                if not balances.get("ok"):
+                    return balances
+                total = None
+                provider = runtime.wallet_provider
+                if provider and hasattr(provider, "get_total_value"):
+                    indexes = (
+                        [okx_chain_index(chain)]
+                        if chain
+                        else list(getattr(provider, "chain_name_by_index", {}))
+                    )
+                    value = await provider.get_total_value(
+                        address, [item for item in indexes if item]
+                    )
+                    total = _dump(value)
+                return {
+                    "ok": True,
+                    "portfolio": {
+                        "wallet": balances.get("wallet"),
+                        "total_value": total,
+                    },
+                }
+            except Exception:
+                return {
+                    "ok": False,
+                    "code": "PORTFOLIO_QUERY_FAILED",
+                    "error": "资产组合暂不可用。",
+                }
+
         tools = {
             "wallet_balance": wallet_balance,
             "price_lookup": price_lookup,
             "gas_estimate": gas_estimate,
             "asset_discovery": asset_discovery,
             "transaction_status": transaction_status,
+            "market_details": market_details,
+            "price_history": price_history,
+            "portfolio_snapshot": portfolio_snapshot,
         }
         update = await run_read_only_round(
             state,
@@ -3484,6 +3577,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             result = {"kind": "gas_check", **(latest.get("gas") or {})}
         elif call_name == "asset_discovery" and isinstance(latest, dict) and latest.get("ok"):
             result = {"kind": "asset_discovery", **latest}
+        elif call_name == "market_details" and isinstance(latest, dict) and latest.get("ok"):
+            result = {"kind": "market_details", **latest}
+        elif call_name == "price_history" and isinstance(latest, dict) and latest.get("ok"):
+            result = {"kind": "price_history", **latest}
+        elif call_name == "portfolio_snapshot" and isinstance(latest, dict) and latest.get("ok"):
+            result = {"kind": "portfolio_query", **(latest.get("portfolio") or {})}
         if not result:
             error = facts.get("error") or {}
             latest_error = latest if isinstance(latest, Mapping) else {}

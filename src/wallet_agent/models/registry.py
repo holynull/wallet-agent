@@ -139,8 +139,12 @@ def _read_model_input(request: Mapping[str, Any]) -> list[HumanMessage]:
     instructions = (
         "你是 Wallet Agent 的快速只读查询规划器。只能选择一个只读工具，或者返回 name=null。"
         "允许的工具只有 wallet_balance、price_lookup、gas_estimate、asset_discovery、"
-        "transaction_status。不要执行转账、兑换、授权、签名或广播。"
+        "transaction_status、market_details、price_history、portfolio_snapshot。"
+        "不要执行转账、兑换、授权、签名或广播。"
         "已有 read_facts 足以回答用户时返回 name=null；需要补充事实时才选择工具。"
+        "这是一个有状态的多步计划：先查看 task_plan 和 read_facts，"
+        "只选择下一步尚未完成且能减少不确定性的工具；"
+        "如果缺少用户必须确认的网络、钱包地址或资产选择，返回 name=null，让上层向用户提问。"
         "arguments 只能填写用户请求、对话引用或已验证事实中明确可用的参数。"
         "只返回结构化 JSON。不要输出 reasoning、Markdown 或额外字段。"
     )
