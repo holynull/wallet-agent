@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { classifyAgentTest, ConversationArtifacts, extractConversationArtifacts, formatProcessingDuration, formatResponseSummary, latestProgressText, parseSseFrame, parseSseFrames, providerPriority as getProviderPriority, responseMessage, restoreConversationMessages, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
+import { classifyAgentTest, ConversationArtifacts, extractConversationArtifacts, extractReadOnlyTrace, formatProcessingDuration, formatResponseSummary, latestProgressText, parseSseFrame, parseSseFrames, providerPriority as getProviderPriority, ReadOnlyTrace, responseMessage, restoreConversationMessages, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
 
 type Message = { id?: string; role: "user" | "assistant" | "system"; content: string; fullContent?: string; typing?: boolean; suggestions?: any[]; artifacts?: ConversationArtifacts; responseKey?: string };
 type ProgressEntry = { text: string; elapsed?: number };
@@ -91,6 +91,7 @@ export default function Home() {
   const [suggestions, setSuggestions] = useState<any[]>([]);
   const [tokenCandidates, setTokenCandidates] = useState<any[]>([]);
   const [progress, setProgress] = useState<ProgressEntry[]>([]);
+  const [readOnlyTrace, setReadOnlyTrace] = useState<ReadOnlyTrace | null>(null);
   const [backendDuration, setBackendDuration] = useState<number | null>(null);
   const [backendStage, setBackendStage] = useState("等待请求");
   const [agentTests, setAgentTests] = useState<Record<string, string>>({});
@@ -144,7 +145,7 @@ export default function Home() {
     try { return await action(); }
     finally { setActionLoading(null); endProcessing(); }
   }
-  function clearConversationState() { abortRef.current?.abort(); abortRef.current = null; setBusy(false); setActionLoading(null); endProcessing(); setConversationId(null); setSessionId(null); setQuotes([]); setSelectedQuote(null); setPendingTransaction(null); setPendingKind("swap"); setBroadcastHash(null); setConfirmation(null); setApproval(null); setPreflight(null); setStatus(null); setWalletData(null); setPortfolioData(null); setPriceData(null); setGasData(null); setAssetsData(null); setSuggestions([]); setTokenCandidates([]); setProgress([]); setBackendDuration(null); setBackendStage("等待请求"); responseKeysRef.current.clear(); }
+  function clearConversationState() { abortRef.current?.abort(); abortRef.current = null; setBusy(false); setActionLoading(null); endProcessing(); setConversationId(null); setSessionId(null); setQuotes([]); setSelectedQuote(null); setPendingTransaction(null); setPendingKind("swap"); setBroadcastHash(null); setConfirmation(null); setApproval(null); setPreflight(null); setStatus(null); setWalletData(null); setPortfolioData(null); setPriceData(null); setGasData(null); setAssetsData(null); setSuggestions([]); setTokenCandidates([]); setProgress([]); setReadOnlyTrace(null); setBackendDuration(null); setBackendStage("等待请求"); responseKeysRef.current.clear(); }
   function applyActiveArtifacts(artifacts?: ConversationArtifacts | null) {
     setQuotes(artifacts?.quotes || []);
     setConfirmation(artifacts?.confirmation || null);
@@ -324,6 +325,7 @@ export default function Home() {
   async function sendText(text: string, display = false, extraMetadata: Record<string, unknown> = {}) {
     // Each request owns its own progress timeline; do not mix it with the prior turn.
     setProgress([]);
+    setReadOnlyTrace(null);
     setBackendDuration(null);
     setBackendStage("正在处理请求");
     const requestStartedAt = performance.now();
@@ -437,6 +439,8 @@ export default function Home() {
   function applyState(value: any) {
     const eventName = value?.event;
     const current = value?.state || value?.data?.state || value?.data || value;
+    const trace = extractReadOnlyTrace(current);
+    if (trace) setReadOnlyTrace(trace);
     if (eventName === "progress" || current?.progress) {
       const progressValue = current?.progress || current?.data || current;
       const progressText = progressValue?.message || progressValue?.stage;
@@ -588,7 +592,7 @@ export default function Home() {
         </div>
         <form className="composer" onSubmit={send}><div className="composer-row"><textarea onKeyDown={handleComposerKeyDown} value={message} onChange={(event) => setMessage(event.target.value)} placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled={busy || Boolean(actionLoading)} /><button disabled={busy || Boolean(actionLoading)}>{busy ? <><i className="loading-spinner" />处理中…</> : "发送"}</button></div><div className="toolbar"><span className="muted">{processing ? `${processing.label} · ${formatProcessingDuration(processingElapsed)}` : "就绪"}</span>{busy && <button type="button" className="secondary" onClick={cancelRequest}>取消请求</button>}{!busy && !actionLoading && lastMessage && <button type="button" className="secondary" onClick={() => void retryLastMessage()}>重试</button>}</div><div className="meta"><span>conversation: {conversationId ?? "新会话"}</span><span>session: {sessionId ?? "未创建"}</span></div></form>
       </section>
-      <aside className="side-column"><div className="side-card"><div className="side-title"><span>运行状态</span><b className={processing ? "busy" : "ready"}>{processing ? "处理中" : "就绪"}</b></div><div className="stat"><span>网络</span><strong>{wallet?.chain || "未连接"}</strong></div><div className="stat"><span>会话</span><strong>{sessionId ? "已建立" : "新会话"}</strong></div><div className="stat"><span>请求耗时</span><strong>{processing ? formatProcessingDuration(processingElapsed) : "--"}</strong></div><div className="stat"><span>后端耗时</span><strong>{backendDuration == null ? "--" : `${backendDuration} ms`}</strong></div><div className="stat"><span>当前阶段</span><strong className="stage-value">{processing?.label || latestProgressText(progress, backendStage)}</strong></div></div>{progress.length > 0 && <section className="side-card progress-card"><div className="progress-heading"><h3>处理过程</h3><span>{backendDuration == null ? "进行中" : `${backendDuration} ms`}</span></div><ol className="progress-list">{progress.map((item, index) => <li key={`${item.text}-${index}`}><i /> <span>{item.text}{item.elapsed != null ? ` · ${item.elapsed} ms` : ""}</span></li>)}</ol></section>}<details className="panel debug-panel"><summary>后端调试数据（{debug.length} 条）</summary><div className="toolbar"><button className="secondary" onClick={() => navigator.clipboard?.writeText(debug.join("\n\n"))}>复制</button><button className="secondary" onClick={() => setDebug([])}>清空</button></div><pre className="debug">{debug.join("\n\n") || "等待后端响应…"}</pre></details>{Object.keys(agentTests).length > 0 && <div className="side-card test-card"><div className="side-title"><span>Agent 测试</span><b>{Object.values(agentTests).filter((value) => value.startsWith("通过")).length}/{AGENT_TESTS.length}</b></div><div className="test-list">{AGENT_TESTS.map((item) => <div key={item.id}><span>{item.name}</span><em>{agentTests[item.id] || "未运行"}</em></div>)}</div></div>}</aside>
+      <aside className="side-column"><div className="side-card"><div className="side-title"><span>运行状态</span><b className={processing ? "busy" : "ready"}>{processing ? "处理中" : "就绪"}</b></div><div className="stat"><span>网络</span><strong>{wallet?.chain || "未连接"}</strong></div><div className="stat"><span>会话</span><strong>{sessionId ? "已建立" : "新会话"}</strong></div><div className="stat"><span>请求耗时</span><strong>{processing ? formatProcessingDuration(processingElapsed) : "--"}</strong></div><div className="stat"><span>后端耗时</span><strong>{backendDuration == null ? "--" : `${backendDuration} ms`}</strong></div><div className="stat"><span>当前阶段</span><strong className="stage-value">{processing?.label || latestProgressText(progress, backendStage)}</strong></div></div>{progress.length > 0 && <section className="side-card progress-card"><div className="progress-heading"><h3>处理过程</h3><span>{backendDuration == null ? "进行中" : `${backendDuration} ms`}</span></div><ol className="progress-list">{progress.map((item, index) => <li key={`${item.text}-${index}`}><i /> <span>{item.text}{item.elapsed != null ? ` · ${item.elapsed} ms` : ""}</span></li>)}</ol></section>}{readOnlyTrace && <section className="side-card read-only-card" data-testid="read-only-trace"><div className="progress-heading"><h3>只读查询</h3><span>{readOnlyTrace.loopCount}/2 轮</span></div>{readOnlyTrace.reference && <p className="trace-reference">引用：{readOnlyTrace.reference.id || readOnlyTrace.reference.kind || "已解析"}</p>}<ol className="progress-list">{readOnlyTrace.toolCalls.map((call, index) => <li key={`${call.name || "tool"}-${index}`}><i className={call.status === "failed" || call.status === "rejected" ? "failed" : ""} /><span>{call.name || "只读工具"} · {call.status || "处理中"}{call.elapsed_ms != null ? ` · ${call.elapsed_ms} ms` : ""}</span></li>)}</ol>{Object.keys(readOnlyTrace.facts).length > 0 && <details><summary>验证事实</summary><pre className="debug">{JSON.stringify(sanitizeDebug(readOnlyTrace.facts), null, 2)}</pre></details>}</section>}<details className="panel debug-panel"><summary>后端调试数据（{debug.length} 条）</summary><div className="toolbar"><button className="secondary" onClick={() => navigator.clipboard?.writeText(debug.join("\n\n"))}>复制</button><button className="secondary" onClick={() => setDebug([])}>清空</button></div><pre className="debug">{debug.join("\n\n") || "等待后端响应…"}</pre></details>{Object.keys(agentTests).length > 0 && <div className="side-card test-card"><div className="side-title"><span>Agent 测试</span><b>{Object.values(agentTests).filter((value) => value.startsWith("通过")).length}/{AGENT_TESTS.length}</b></div><div className="test-list">{AGENT_TESTS.map((item) => <div key={item.id}><span>{item.name}</span><em>{agentTests[item.id] || "未运行"}</em></div>)}</div></div>}</aside>
     </div>
   </main>;
 }

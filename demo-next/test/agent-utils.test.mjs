@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   classifyAgentTest,
   extractConversationArtifacts,
+  extractReadOnlyTrace,
   formatResponseSummary,
   formatProcessingDuration,
   latestProgressText,
@@ -27,6 +28,27 @@ test("uses the last visible progress entry as the current stage", () => {
     latestProgressText([{ text: "请求类型识别完成。" }, { text: "Bridgers 报价请求失败。" }], "等待请求"),
     "Bridgers 报价请求失败。",
   );
+});
+
+test("reads the last progress entry without requiring Array.prototype.at", () => {
+  const legacyArrayLike = { 0: { text: "旧运行时" }, length: 1 };
+  assert.equal(latestProgressText(legacyArrayLike, "等待请求"), "旧运行时");
+});
+
+test("extracts read-only tool trace from a streamed graph state", () => {
+  assert.deepEqual(extractReadOnlyTrace({
+    read_only_enabled: true,
+    read_loop_count: 1,
+    read_tool_calls: [{ name: "price_lookup", status: "completed", elapsed_ms: 12.4 }],
+    read_facts: { price_lookup: { ok: true, prices: [{ usd_price: "1800" }] } },
+    read_reference: { kind: "asset", id: "ETH:ETH", facts: { symbol: "ETH" } },
+  }), {
+    enabled: true,
+    loopCount: 1,
+    toolCalls: [{ name: "price_lookup", status: "completed", elapsed_ms: 12.4 }],
+    facts: { price_lookup: { ok: true, prices: [{ usd_price: "1800" }] } },
+    reference: { kind: "asset", id: "ETH:ETH", facts: { symbol: "ETH" } },
+  });
 });
 
 test("parses complete SSE frames and preserves partial remainder", () => {

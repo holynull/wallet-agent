@@ -1,6 +1,6 @@
 export function parseSseFrames(buffer: string): { frames: string[]; remainder: string } {
   const frames = buffer.split("\n\n");
-  return { frames: frames.slice(0, -1), remainder: frames.at(-1) || "" };
+  return { frames: frames.slice(0, -1), remainder: frames[frames.length - 1] || "" };
 }
 
 export function parseSseFrame(frame: string): { id: string; event: string; data: string } {
@@ -22,7 +22,31 @@ export function formatProcessingDuration(milliseconds: number): string {
 }
 
 export function latestProgressText(entries: Array<{ text?: string }>, fallback: string): string {
-  return entries.at(-1)?.text || fallback;
+  return (entries.length ? entries[entries.length - 1]?.text : undefined) || fallback;
+}
+
+export type ReadOnlyTrace = {
+  enabled: boolean;
+  loopCount: number;
+  toolCalls: Array<Record<string, any>>;
+  facts: Record<string, any>;
+  reference: Record<string, any> | null;
+};
+
+export function extractReadOnlyTrace(state: any): ReadOnlyTrace | null {
+  if (!state || typeof state !== "object") return null;
+  const toolCalls = Array.isArray(state.read_tool_calls)
+    ? state.read_tool_calls.filter((item: any) => item && typeof item === "object").map((item: any) => ({ ...item }))
+    : [];
+  const loopCount = Number.isFinite(Number(state.read_loop_count))
+    ? Number(state.read_loop_count)
+    : 0;
+  const facts = state.read_facts && typeof state.read_facts === "object" ? { ...state.read_facts } : {};
+  const reference = state.read_reference && typeof state.read_reference === "object"
+    ? { ...state.read_reference }
+    : null;
+  const enabled = state.read_only_enabled === true || loopCount > 0 || toolCalls.length > 0 || reference !== null;
+  return enabled ? { enabled, loopCount, toolCalls, facts, reference } : null;
 }
 
 export function responseMessage(response: any): string {
