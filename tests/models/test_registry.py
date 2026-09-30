@@ -55,12 +55,39 @@ async def test_model_router_records_models_used_by_each_call():
     await router.respond({"message": "你好"}, {})
     await router.plan_read({"message": "余额", "read_facts": {}})
 
-    assert router.consume_model_trace() == [
-        {"role": "classifier", "model_id": "deepseek-chat"},
-        {"role": "extractor", "model_id": "deepseek-chat", "task_kind": "transfer"},
-        {"role": "response", "model_id": "deepseek-chat"},
-        {"role": "read_agent", "model_id": "deepseek-chat"},
+    trace = router.consume_model_trace()
+    assert [(item["role"], item["model_id"], item.get("task_kind")) for item in trace] == [
+        ("classifier", "deepseek-chat", None),
+        ("extractor", "deepseek-chat", "transfer"),
+        ("response", "deepseek-chat", None),
+        ("read_agent", "deepseek-chat", None),
     ]
+
+
+@pytest.mark.asyncio
+async def test_model_router_trace_includes_call_timing_and_stage():
+    class TimedModel:
+        async def ainvoke(self, _value):
+            return {"intent": "clarification"}
+
+    router = ModelRouter(
+        ModelRegistry(
+            {"deepseek-chat": TimedModel()}, default_model_id="deepseek-chat"
+        )
+    )
+
+    await router.classify({"message": "你好"})
+
+    trace = router.consume_model_trace()
+    assert len(trace) == 1
+    item = trace[0]
+    assert item["role"] == "classifier"
+    assert item["model_id"] == "deepseek-chat"
+    assert item["stage"] == "请求识别"
+    assert item["call_id"].startswith("classifier-")
+    assert item["timestamp"].endswith("Z")
+    assert isinstance(item["elapsed_ms"], int)
+    assert item["elapsed_ms"] >= 0
 
 
 def test_registry_has_default_and_allows_whitelisted_temporary_selection():

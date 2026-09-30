@@ -109,7 +109,14 @@ async def test_graph_interrupt_is_serialized_before_run_store_append():
 async def test_model_trace_is_emitted_in_sse_and_final_state():
     class TraceRouter:
         def consume_model_trace(self):
-            return [{"role": "classifier", "model_id": "deepseek-chat"}]
+            return [{
+                "call_id": "classifier-1",
+                "role": "classifier",
+                "model_id": "deepseek-chat",
+                "stage": "请求识别",
+                "timestamp": "2026-09-30T00:00:00Z",
+                "elapsed_ms": 12,
+            }]
 
     class TraceGraph:
         _model = TraceRouter()
@@ -135,6 +142,8 @@ async def test_model_trace_is_emitted_in_sse_and_final_state():
 
     assert '"event": "model"' in stream.text
     assert '"model_id": "deepseek-chat"' in stream.text
+    assert '"stage": "\\u8bf7\\u6c42\\u8bc6\\u522b"' in stream.text
+    assert '"elapsed_ms": 12' in stream.text
 
 
 class UnavailableRunStore(InMemoryRunStore):

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any
 
 from langchain_core.messages import HumanMessage
@@ -245,13 +247,55 @@ class ModelRouter:
     def __init__(self, registry: ModelRegistry) -> None:
         self.registry = registry
         self.read_agent_enabled = registry.read_agent_enabled
-        self._model_trace: list[dict[str, str]] = []
+        self._model_trace: list[dict[str, Any]] = []
+        self._model_call_index = 0
 
-    def _record_model(self, role: str, model_id: str, **details: str) -> None:
-        entry = {"role": role, "model_id": model_id, **details}
+    def _record_model(
+        self,
+        role: str,
+        model_id: str,
+        *,
+        elapsed_ms: int,
+        stage: str,
+        **details: str,
+    ) -> None:
+        self._model_call_index += 1
+        entry = {
+            "call_id": f"{role}-{self._model_call_index}",
+            "role": role,
+            "model_id": model_id,
+            "stage": stage,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "elapsed_ms": elapsed_ms,
+            **details,
+        }
         self._model_trace.append(entry)
 
-    def consume_model_trace(self) -> list[dict[str, str]]:
+    async def _invoke(
+        self,
+        *,
+        role: str,
+        model_id: str,
+        stage: str,
+        model: Any,
+        request: Any,
+        **details: str,
+    ) -> Any:
+        started = perf_counter()
+        try:
+            if hasattr(model, "ainvoke"):
+                return await model.ainvoke(request)
+            return model.invoke(request)
+        finally:
+            self._record_model(
+                role,
+                model_id,
+                elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
+                stage=stage,
+                **details,
+            )
+
+    def consume_model_trace(self) -> list[dict[str, Any]]:
         trace = list(self._model_trace)
         self._model_trace.clear()
         return trace
@@ -259,23 +303,21 @@ class ModelRouter:
     async def plan_read(self, request: Mapping[str, Any]) -> ReadToolPlan:
         model_id = str(request.get("read_agent_model_id") or self.registry.read_agent_model_id)
         model = self.registry.get_read_model(model_id)
-        self._record_model("read_agent", model_id)
         model_request = _read_model_input(request)
-        if hasattr(model, "ainvoke"):
-            result = await model.ainvoke(model_request)
-        else:
-            result = model.invoke(model_request)
+        result = await self._invoke(
+            role="read_agent", model_id=model_id, stage="查询规划",
+            model=model, request=model_request,
+        )
         return result if isinstance(result, ReadToolPlan) else ReadToolPlan.model_validate(result)
 
     async def classify(self, request: Mapping[str, Any]) -> RouteDecision:
         model_id = str(request.get("model_id") or self.registry.classifier_model_id)
         model = self.registry.get(model_id)
-        self._record_model("classifier", model_id)
         model_request = _model_input(request) if isinstance(request, Mapping) else request
-        if hasattr(model, "ainvoke"):
-            result = await model.ainvoke(model_request)
-        else:
-            result = model.invoke(model_request)
+        result = await self._invoke(
+            role="classifier", model_id=model_id, stage="请求识别",
+            model=model, request=model_request,
+        )
         return result if isinstance(result, RouteDecision) else RouteDecision.model_validate(result)
 
     async def extract(
@@ -283,12 +325,18 @@ class ModelRouter:
     ) -> TransferSlotPatch | SwapSlotPatch | TransactionStatusSlotPatch:
         model_id = str(request.get("model_id") or self.registry.extractor_model_id)
         model = self.registry.get_extractor(task_kind, model_id)
-        self._record_model("extractor", model_id, task_kind=task_kind)
         model_request = _slot_model_input(task_kind, request)
-        if hasattr(model, "ainvoke"):
-            result = await model.ainvoke(model_request)
-        else:
-            result = model.invoke(model_request)
+        stage_names = {
+            "price": "价格参数提取",
+            "transfer": "转账参数提取",
+            "swap": "兑换参数提取",
+            "transaction_status": "交易状态参数提取",
+        }
+        result = await self._invoke(
+            role="extractor", model_id=model_id,
+            stage=stage_names.get(task_kind, "请求参数提取"),
+            model=model, request=model_request, task_kind=task_kind,
+        )
         contracts = {
             "price": PriceSlotPatch,
             "transfer": TransferSlotPatch,
@@ -306,12 +354,11 @@ class ModelRouter:
     ) -> AgentResponseDraft:
         model_id = str(request.get("model_id") or self.registry.response_model_id)
         model = self.registry.get_response_model(model_id)
-        self._record_model("response", model_id)
         model_request = _response_model_input(request, facts)
-        if hasattr(model, "ainvoke"):
-            result = await model.ainvoke(model_request)
-        else:
-            result = model.invoke(model_request)
+        result = await self._invoke(
+            role="response", model_id=model_id, stage="生成回复",
+            model=model, request=model_request,
+        )
         return (
             result
             if isinstance(result, AgentResponseDraft)

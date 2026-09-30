@@ -72,9 +72,9 @@ async def test_mobile_demo_page_is_served_by_api_app():
     assert "observed_at" in response.text
     assert "history" in response.text
     assert "candles" in response.text
-    assert "当前模型" in response.text
-    assert "model-trace-panel" in response.text
-    assert "本轮模型" in response.text
+    assert "call_id" in response.text
+    assert "elapsed_ms" in response.text
+    assert "模型调用" in response.text
 
 
 @pytest.mark.asyncio

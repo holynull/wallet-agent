@@ -84,7 +84,7 @@ export function responseMessage(response: any): string {
 
 export type ConversationArtifacts = {
   response: any;
-  model_trace?: Array<{ role?: string; model_id?: string; task_kind?: string }>;
+  model_trace?: Array<{ call_id?: string; role?: string; model_id?: string; task_kind?: string; stage?: string; timestamp?: string; elapsed_ms?: number }>;
   quotes?: any[];
   confirmation?: any;
   preflight?: any;
@@ -135,6 +135,23 @@ export function extractConversationArtifacts(state: any): ConversationArtifacts 
   if (readOnly) artifacts.readOnly = readOnly;
 
   return Object.keys(artifacts).length > 1 ? artifacts : null;
+}
+
+export function mergeModelTrace(
+  ...sources: Array<Array<Record<string, any>> | undefined | null>
+): Array<Record<string, any>> {
+  const merged: Array<Record<string, any>> = [];
+  const seen = new Set<string>();
+  for (const source of sources) {
+    for (const item of source || []) {
+      if (!item || typeof item !== "object") continue;
+      const key = String(item.call_id || `${item.timestamp || ""}:${item.role || ""}:${item.task_kind || ""}:${item.model_id || ""}`);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push({ ...item });
+    }
+  }
+  return merged.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
 }
 
 export function restoreConversationMessages(messages: any[], latestArtifacts?: ConversationArtifacts | null): any[] {
