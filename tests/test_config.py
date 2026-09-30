@@ -12,13 +12,13 @@ def test_settings_load_non_secret_defaults(monkeypatch):
     assert settings.provider_timeout_seconds == 15
     assert settings.poll_max_attempts == 20
     assert settings.allowed_chains == ["EVM", "TRON", "SOLANA"]
-    assert settings.openai_model == "deepseek-v4-pro"
+    assert settings.openai_model == "deepseek-chat"
     assert settings.intent_model == "deepseek-chat"
     assert settings.slot_extraction_model == "deepseek-chat"
-    assert settings.response_model == "deepseek-v4-pro"
+    assert settings.response_model == "deepseek-chat"
     assert settings.read_agent_enabled is True
     assert settings.read_agent_model == "deepseek-chat"
-    assert settings.allowed_model_ids == ["deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]
+    assert settings.allowed_model_ids == ["deepseek-chat"]
     assert settings.openai_base_url == "https://api.deepseek.com"
     assert settings.redis_url is None
     assert settings.redis_key_prefix == "wallet-agent"
