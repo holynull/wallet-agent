@@ -75,6 +75,27 @@ def test_agent_response_draft_supports_structured_suggestions():
 
 
 @pytest.mark.asyncio
+async def test_model_router_plans_only_whitelisted_read_tools():
+    class ReadModel:
+        async def ainvoke(self, value):
+            assert "read_facts" in value[0].content
+            return {"name": "price_lookup", "arguments": {"symbol": "ETH"}}
+
+    router = ModelRouter(
+        ModelRegistry(
+            {"deepseek-chat": FakeModel()},
+            default_model_id="deepseek-chat",
+            read_agent_model_id="deepseek-chat",
+            readers={"deepseek-chat": ReadModel()},
+        )
+    )
+    result = await router.plan_read({"message": "ETH price", "read_facts": {}})
+
+    assert result.name == "price_lookup"
+    assert result.arguments == {"symbol": "ETH"}
+
+
+@pytest.mark.asyncio
 async def test_model_router_responds_with_facts_and_structured_contract():
     captured = {}
 

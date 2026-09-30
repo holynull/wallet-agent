@@ -51,6 +51,24 @@ test("extracts read-only tool trace from a streamed graph state", () => {
   });
 });
 
+test("restores read-only trace from persisted conversation artifacts", () => {
+  assert.deepEqual(extractReadOnlyTrace({
+    read_only: {
+      enabled: true,
+      loop_count: 1,
+      tool_calls: [{ name: "price_lookup", status: "completed" }],
+      facts: { price_lookup: { ok: true } },
+      reference: { kind: "asset", id: "ETH:ETH" },
+    },
+  }), {
+    enabled: true,
+    loopCount: 1,
+    toolCalls: [{ name: "price_lookup", status: "completed" }],
+    facts: { price_lookup: { ok: true } },
+    reference: { kind: "asset", id: "ETH:ETH" },
+  });
+});
+
 test("parses complete SSE frames and preserves partial remainder", () => {
   assert.deepEqual(parseSseFrames("event: update\ndata: {}\n\nevent: complete\ndata:"), {
     frames: ["event: update\ndata: {}"],

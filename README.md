@@ -112,6 +112,12 @@ python scripts/smoke_test.py --base-url http://localhost:8000
 The default model backend is DeepSeek's official OpenAI-compatible API:
 `https://api.deepseek.com` with `deepseek-v4-pro`. To use another compatible
 backend, set `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_BASE_URL` instead.
+Read-only queries use the faster `deepseek-chat` planner by default and are
+bounded to two tool rounds. Configure `READ_AGENT_ENABLED=false` to keep the
+legacy deterministic read routes, or set `READ_AGENT_MODEL` to another model
+listed in `ALLOWED_MODEL_IDS`. The planner can only call balance, price, gas,
+asset-discovery, and transaction-status tools; it cannot reach signing,
+authorization, transfer, swap, or broadcast nodes.
 
 The HTTP API is rooted at `/v1`: agent turns and SSE streaming, explicit swap
 quote selection (`/swap/{session_id}/select-quote`), expiring confirmation state,

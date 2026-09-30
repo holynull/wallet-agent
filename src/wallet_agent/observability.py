@@ -26,6 +26,8 @@ def wallet_event(
     duration_ms: float,
     state: Mapping[str, Any],
     error_code: str | None = None,
+    tool_name: str | None = None,
+    tool_status: str | None = None,
 ) -> None:
     """Log only an allowlisted operational projection of graph state."""
     task = state.get("active_task") or {}
@@ -41,5 +43,9 @@ def wallet_event(
         "route": state.get("route"),
         "wallet_address": _masked_address(context.get("address")),
         "error_code": error_code,
+        "conversation_id": state.get("conversation_id"),
+        "read_loop_count": state.get("read_loop_count"),
+        "read_tool_name": tool_name,
+        "read_tool_status": tool_status,
     }
     logger.info(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))

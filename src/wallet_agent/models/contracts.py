@@ -22,6 +22,14 @@ IntentName = Literal[
     "asset_discovery",
 ]
 
+ReadToolName = Literal[
+    "wallet_balance",
+    "price_lookup",
+    "gas_estimate",
+    "asset_discovery",
+    "transaction_status",
+]
+
 
 class UnderstandingModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -37,6 +45,13 @@ class AgentResponseDraft(UnderstandingModel):
     language: str = Field(min_length=2, max_length=16)
     message: str = Field(min_length=1, max_length=2000)
     suggestions: list[ResponseSuggestion] = Field(default_factory=list, max_length=3)
+
+
+class ReadToolPlan(UnderstandingModel):
+    """A bounded, read-only tool request selected by the fast planner."""
+
+    name: ReadToolName | None = None
+    arguments: dict[str, Any] = Field(default_factory=dict)
 
 
 class RouteDecision(UnderstandingModel):
@@ -80,7 +95,9 @@ class PriceSlotPatch(UnderstandingModel):
     chain: str | None = Field(default=None, description="用户明确指定的资产网络")
     symbol: str | None = Field(default=None, description="用户要查询价格的资产符号")
     token_address: str | None = Field(default=None, description="用户明确提供的 Token 合约地址")
-    decimals: int | None = Field(default=None, ge=0, le=255, description="用户明确提供的 Token 精度")
+    decimals: int | None = Field(
+        default=None, ge=0, le=255, description="用户明确提供的 Token 精度"
+    )
 
 
 class SwapSlotPatch(UnderstandingModel):

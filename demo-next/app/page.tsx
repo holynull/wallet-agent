@@ -161,6 +161,7 @@ export default function Home() {
     setAssetsData(artifacts?.assets || null);
     setStatus(artifacts?.status || null);
     setBroadcastHash(artifacts?.broadcast_hash || null);
+    setReadOnlyTrace(artifacts?.readOnly || null);
   }
   function appendAssistantMessage(content: string, suggestions: any[] = [], artifacts?: ConversationArtifacts | null, responseKey?: string) {
     if (responseKey && responseKeysRef.current.has(responseKey)) {

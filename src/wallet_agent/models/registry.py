@@ -11,6 +11,7 @@ from langchain_core.messages import HumanMessage
 from .contracts import (
     AgentResponseDraft,
     PriceSlotPatch,
+    ReadToolPlan,
     RouteDecision,
     SwapSlotPatch,
     TransactionStatusSlotPatch,
@@ -131,6 +132,19 @@ def _response_model_input(
     return [HumanMessage(content=f"{instructions}\n\nrequest 和 facts JSON：\n{payload}")]
 
 
+def _read_model_input(request: Mapping[str, Any]) -> list[HumanMessage]:
+    payload = json.dumps(dict(request), ensure_ascii=False, default=str)
+    instructions = (
+        "你是 Wallet Agent 的快速只读查询规划器。只能选择一个只读工具，或者返回 name=null。"
+        "允许的工具只有 wallet_balance、price_lookup、gas_estimate、asset_discovery、"
+        "transaction_status。不要执行转账、兑换、授权、签名或广播。"
+        "已有 read_facts 足以回答用户时返回 name=null；需要补充事实时才选择工具。"
+        "arguments 只能填写用户请求、对话引用或已验证事实中明确可用的参数。"
+        "只返回结构化 JSON。"
+    )
+    return [HumanMessage(content=f"{instructions}\n\nrequest JSON：\n{payload}")]
+
+
 class ModelRegistry:
     def __init__(
         self,
@@ -140,8 +154,10 @@ class ModelRegistry:
         classifier_model_id: str | None = None,
         extractor_model_id: str | None = None,
         response_model_id: str | None = None,
+        read_agent_model_id: str | None = None,
         extractors: Mapping[str, Mapping[str, Any]] | None = None,
         responses: Mapping[str, Any] | None = None,
+        readers: Mapping[str, Any] | None = None,
     ) -> None:
         if default_model_id not in models:
             raise ValueError(f"default model is not configured: {default_model_id}")
@@ -150,17 +166,35 @@ class ModelRegistry:
             str(kind): dict(kind_models) for kind, kind_models in (extractors or {}).items()
         }
         self._responses = dict(responses or {})
+        self._readers = dict(readers or {})
         self.default_model_id = default_model_id
         self.classifier_model_id = classifier_model_id or default_model_id
         self.extractor_model_id = extractor_model_id or default_model_id
         self.response_model_id = response_model_id or default_model_id
+        self.read_agent_model_id = read_agent_model_id or default_model_id
         for role, model_id in (
             ("classifier", self.classifier_model_id),
             ("extractor", self.extractor_model_id),
             ("response", self.response_model_id),
+            ("read agent", self.read_agent_model_id),
         ):
             if model_id not in self._models:
                 raise ValueError(f"{role} model is not configured: {model_id}")
+        if self._readers and self.read_agent_model_id not in self._readers:
+            raise ValueError(
+                f"read agent model is not configured: {self.read_agent_model_id}"
+            )
+
+    @property
+    def read_agent_enabled(self) -> bool:
+        return self.read_agent_model_id in self._readers
+
+    def get_read_model(self, model_id: str | None = None) -> Any:
+        selected = model_id or self.read_agent_model_id
+        try:
+            return self._readers[selected]
+        except KeyError as exc:
+            raise ValueError(f"read agent is not configured: model={selected}") from exc
 
     @property
     def model_ids(self) -> tuple[str, ...]:
@@ -201,6 +235,16 @@ class ModelRouter:
 
     def __init__(self, registry: ModelRegistry) -> None:
         self.registry = registry
+        self.read_agent_enabled = registry.read_agent_enabled
+
+    async def plan_read(self, request: Mapping[str, Any]) -> ReadToolPlan:
+        model = self.registry.get_read_model()
+        model_request = _read_model_input(request)
+        if hasattr(model, "ainvoke"):
+            result = await model.ainvoke(model_request)
+        else:
+            result = model.invoke(model_request)
+        return result if isinstance(result, ReadToolPlan) else ReadToolPlan.model_validate(result)
 
     async def classify(self, request: Mapping[str, Any]) -> RouteDecision:
         model = self.registry.get(request.get("model_id") or self.registry.classifier_model_id)

@@ -26,7 +26,7 @@ class ReadOnlyToolCall:
 
 def route_read_only(state: dict[str, Any]) -> Literal["agent", "tool", "response"]:
     count = int(state.get("read_loop_count") or 0)
-    if count >= READ_ONLY_MAX_ROUNDS:
+    if count >= READ_ONLY_MAX_ROUNDS or state.get("read_only_complete"):
         return "response"
     if state.get("read_tool_call"):
         return "tool"
@@ -89,6 +89,8 @@ async def read_only_decision(model: Any, request: dict[str, Any]) -> ReadOnlyToo
     output = planner(request)
     if hasattr(output, "__await__"):
         output = await output
+    if hasattr(output, "model_dump"):
+        output = output.model_dump(mode="json")
     if not isinstance(output, dict):
         return None
     name = output.get("name")

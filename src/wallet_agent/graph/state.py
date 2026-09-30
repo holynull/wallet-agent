@@ -131,6 +131,8 @@ class AgentState(TypedDict, total=False):
     read_facts: NotRequired[dict[str, Any] | None]
     read_tool_call: NotRequired[dict[str, Any] | None]
     read_only_enabled: NotRequired[bool]
+    read_only_complete: NotRequired[bool]
+    read_only_pending: NotRequired[bool]
     task_stage: NotRequired[str | None]
     operation_reset: NotRequired[bool]
     wallet_context: NotRequired[dict[str, Any] | None]

@@ -35,17 +35,22 @@ export type ReadOnlyTrace = {
 
 export function extractReadOnlyTrace(state: any): ReadOnlyTrace | null {
   if (!state || typeof state !== "object") return null;
-  const toolCalls = Array.isArray(state.read_tool_calls)
-    ? state.read_tool_calls.filter((item: any) => item && typeof item === "object").map((item: any) => ({ ...item }))
+  const source = state.read_only && typeof state.read_only === "object" ? state.read_only : state;
+  const toolCallsValue = source.read_tool_calls ?? source.tool_calls;
+  const toolCalls = Array.isArray(toolCallsValue)
+    ? toolCallsValue.filter((item: any) => item && typeof item === "object").map((item: any) => ({ ...item }))
     : [];
-  const loopCount = Number.isFinite(Number(state.read_loop_count))
-    ? Number(state.read_loop_count)
+  const loopValue = source.read_loop_count ?? source.loop_count;
+  const loopCount = Number.isFinite(Number(loopValue))
+    ? Number(loopValue)
     : 0;
-  const facts = state.read_facts && typeof state.read_facts === "object" ? { ...state.read_facts } : {};
-  const reference = state.read_reference && typeof state.read_reference === "object"
-    ? { ...state.read_reference }
+  const factsValue = source.read_facts ?? source.facts;
+  const facts = factsValue && typeof factsValue === "object" ? { ...factsValue } : {};
+  const referenceValue = source.read_reference ?? source.reference;
+  const reference = referenceValue && typeof referenceValue === "object"
+    ? { ...referenceValue }
     : null;
-  const enabled = state.read_only_enabled === true || loopCount > 0 || toolCalls.length > 0 || reference !== null;
+  const enabled = source.read_only_enabled === true || source.enabled === true || loopCount > 0 || toolCalls.length > 0 || reference !== null;
   return enabled ? { enabled, loopCount, toolCalls, facts, reference } : null;
 }
 
@@ -93,6 +98,7 @@ export type ConversationArtifacts = {
   assets?: any;
   status?: any;
   broadcast_hash?: string;
+  readOnly?: ReadOnlyTrace;
 };
 
 export function extractConversationArtifacts(state: any): ConversationArtifacts | null {
@@ -122,6 +128,8 @@ export function extractConversationArtifacts(state: any): ConversationArtifacts 
   if (kind === "swap_status" || kind === "transaction_status") artifacts.status = response;
   if (kind === "error" && (response.preflight || state.preflight)) artifacts.preflight = response.preflight || state.preflight;
   if (state.broadcast_tx_hash || response.tx_hash) artifacts.broadcast_hash = state.broadcast_tx_hash || response.tx_hash;
+  const readOnly = extractReadOnlyTrace(state.read_only || state);
+  if (readOnly) artifacts.readOnly = readOnly;
 
   return Object.keys(artifacts).length > 1 ? artifacts : null;
 }

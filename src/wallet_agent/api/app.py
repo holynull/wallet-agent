@@ -240,6 +240,22 @@ def _conversation_artifacts(state: Mapping[str, Any]) -> dict[str, Any] | None:
     if state.get("broadcast_tx_hash") or response.get("tx_hash"):
         artifacts["broadcast_hash"] = state.get("broadcast_tx_hash") or response.get("tx_hash")
 
+    read_only_fields = {
+        "enabled": state.get("read_only_enabled") is True,
+        "loop_count": int(state.get("read_loop_count") or 0),
+        "tool_calls": _jsonable(state.get("read_tool_calls") or []),
+        "facts": _jsonable(state.get("read_facts") or {}),
+        "reference": _jsonable(state.get("read_reference")),
+    }
+    if (
+        read_only_fields["enabled"]
+        or read_only_fields["loop_count"]
+        or read_only_fields["tool_calls"]
+        or read_only_fields["facts"]
+        or read_only_fields["reference"]
+    ):
+        artifacts["read_only"] = read_only_fields
+
     return artifacts if len(artifacts) > 1 else None
 
 

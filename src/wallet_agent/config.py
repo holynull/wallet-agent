@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     intent_model: str = "deepseek-chat"
     slot_extraction_model: str = "deepseek-chat"
     response_model: str = "deepseek-chat"
+    read_agent_enabled: bool = True
+    read_agent_model: str = "deepseek-chat"
     openai_base_url: str | None = "https://api.deepseek.com"
     allowed_model_ids: list[str] = Field(
         default_factory=lambda: ["deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]

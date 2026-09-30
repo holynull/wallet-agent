@@ -28,6 +28,9 @@ def test_route_stops_after_two_rounds():
     assert route_read_only(
         {"read_loop_count": 2, "read_tool_call": {"name": "price_lookup"}}
     ) == "response"
+    assert route_read_only(
+        {"read_loop_count": 1, "read_tool_call": None, "read_only_complete": True}
+    ) == "response"
 
 
 @pytest.mark.asyncio
@@ -113,14 +116,21 @@ async def test_graph_uses_opt_in_read_planner_without_entering_write_path():
         async def extract(self, _task_kind, _request):
             return {"symbol": "ETH", "chain": "ETH", "decimals": 18}
 
+        def __init__(self):
+            self.rounds = 0
+
         async def plan_read(self, request):
-            assert request["read_loop_count"] == 0
+            self.rounds += 1
+            assert request["read_loop_count"] == self.rounds - 1
+            if self.rounds > 2:
+                return None
             return {
                 "name": "price_lookup",
                 "arguments": {"symbol": "ETH", "chain": "ETH", "decimals": 18},
             }
 
-    graph = build_graph(model=ReadPlanner(), price_provider=PriceProvider())
+    model = ReadPlanner()
+    graph = build_graph(model=model, price_provider=PriceProvider())
     result = await graph.ainvoke(
         {
             "conversation_id": "read-only-safe",
@@ -134,7 +144,9 @@ async def test_graph_uses_opt_in_read_planner_without_entering_write_path():
     assert result["response"]["prices"][0]["usd_price"] == "1800"
     assert result["read_tool_calls"][0]["name"] == "price_lookup"
     assert result["read_tool_calls"][0]["status"] == "completed"
-    assert result["read_loop_count"] == 1
+    assert model.rounds == 2
+    assert result["read_loop_count"] == 2
     assert result["read_only_enabled"] is True
+    assert result["read_only_complete"] is True
     assert result.get("transfer_request") is None
     assert result.get("swap_request") is None

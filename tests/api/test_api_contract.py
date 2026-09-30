@@ -66,6 +66,27 @@ def test_assistant_history_entry_persists_card_snapshot():
     assert entry["artifacts"]["quotes"][0]["provider_reference"] == "quote-1"
 
 
+def test_assistant_history_entry_persists_read_only_trace():
+    entry = _assistant_history_entry(
+        {
+            "response": {"kind": "price_query", "prices": [{"usd_price": "1800"}]},
+            "read_only_enabled": True,
+            "read_loop_count": 1,
+            "read_tool_calls": [{"name": "price_lookup", "status": "completed"}],
+            "read_facts": {"price_lookup": {"ok": True}},
+            "read_reference": {"kind": "asset", "id": "ETH:ETH"},
+        }
+    )
+
+    assert entry["artifacts"]["read_only"] == {
+        "enabled": True,
+        "loop_count": 1,
+        "tool_calls": [{"name": "price_lookup", "status": "completed"}],
+        "facts": {"price_lookup": {"ok": True}},
+        "reference": {"kind": "asset", "id": "ETH:ETH"},
+    }
+
+
 def test_sse_state_does_not_duplicate_persisted_card_payloads():
     state = {
         "response": {"kind": "swap_quote", "quotes": []},

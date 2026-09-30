@@ -3129,6 +3129,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         return {"dialogue": dialogue_snapshot(state)}
 
     async def read_only_agent(state: dict[str, Any]) -> dict[str, Any]:
+        started = perf_counter()
         intent = str(state.get("intent") or "")
         request = dict(state.get("request") or {})
         request["dialogue"] = state.get("dialogue")
@@ -3157,15 +3158,38 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         },
                     )
             if call is None:
-                return {"read_tool_call": None, "read_loop_count": READ_ONLY_MAX_ROUNDS}
-        return {
+                update = {
+                    "read_tool_call": None,
+                    "read_only_complete": True,
+                    "read_only_pending": False,
+                }
+                wallet_event(
+                    "read_only_agent",
+                    "success",
+                    duration_ms=(perf_counter() - started) * 1000,
+                    state=state,
+                )
+                return update
+        update = {
             "read_tool_call": {
                 "name": call.name,
                 "arguments": call.arguments,
-            }
+            },
+            "read_only_complete": False,
+            "read_only_pending": True,
         }
+        wallet_event(
+            "read_only_agent",
+            "success",
+            duration_ms=(perf_counter() - started) * 1000,
+            state=state,
+            tool_name=call.name,
+            tool_status="planned",
+        )
+        return update
 
     async def read_only_tool(state: dict[str, Any]) -> dict[str, Any]:
+        started = perf_counter()
         raw_call = state.get("read_tool_call") or {}
         name = str(raw_call.get("name") or "")
         arguments = raw_call.get("arguments") or {}
@@ -3212,31 +3236,42 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "asset_discovery": asset_discovery,
             "transaction_status": transaction_status,
         }
-        return await run_read_only_round(
+        update = await run_read_only_round(
             state,
             ReadOnlyToolCall(name=name, arguments=dict(arguments)),
             tools,
         )
+        record = (update.get("read_tool_calls") or [{}])[-1]
+        wallet_event(
+            "read_only_tool",
+            "error" if record.get("status") in {"failed", "rejected"} else "success",
+            duration_ms=(perf_counter() - started) * 1000,
+            state={**state, **update},
+            error_code=(record.get("error") or {}).get("code"),
+            tool_name=name,
+            tool_status=record.get("status"),
+        )
+        return update
 
     async def read_only_observe(state: dict[str, Any]) -> dict[str, Any]:
+        started = perf_counter()
         facts = state.get("read_facts") or {}
         result: dict[str, Any] = {}
-        if "wallet_balance" in facts and facts["wallet_balance"].get("ok"):
-            result = {"kind": "wallet_query", "wallet": facts["wallet_balance"].get("wallet") or {}}
-        elif "price_lookup" in facts and facts["price_lookup"].get("ok"):
-            result = {"kind": "price_query", "prices": facts["price_lookup"].get("prices") or []}
-        elif "transaction_status" in facts and facts["transaction_status"].get("ok"):
-            result = {
-                "kind": "transaction_status",
-                **(facts["transaction_status"].get("transaction") or {}),
-            }
-        elif "gas_estimate" in facts and facts["gas_estimate"].get("ok"):
-            result = {"kind": "gas_check", **(facts["gas_estimate"].get("gas") or {})}
-        elif "asset_discovery" in facts and facts["asset_discovery"].get("ok"):
-            result = {"kind": "asset_discovery", **facts["asset_discovery"]}
+        call_name = str((state.get("read_tool_calls") or [{}])[-1].get("name") or "")
+        latest = facts.get(call_name) if call_name else None
+        if call_name == "wallet_balance" and isinstance(latest, dict) and latest.get("ok"):
+            result = {"kind": "wallet_query", "wallet": latest.get("wallet") or {}}
+        elif call_name == "price_lookup" and isinstance(latest, dict) and latest.get("ok"):
+            result = {"kind": "price_query", "prices": latest.get("prices") or []}
+        elif call_name == "transaction_status" and isinstance(latest, dict) and latest.get("ok"):
+            result = {"kind": "transaction_status", **(latest.get("transaction") or {})}
+        elif call_name == "gas_estimate" and isinstance(latest, dict) and latest.get("ok"):
+            result = {"kind": "gas_check", **(latest.get("gas") or {})}
+        elif call_name == "asset_discovery" and isinstance(latest, dict) and latest.get("ok"):
+            result = {"kind": "asset_discovery", **latest}
         if not result:
             error = facts.get("error") or {}
-            return {
+            update = {
                 "response": {
                     "kind": "error",
                     "errors": [
@@ -3245,14 +3280,40 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             error.get("message", "只读查询失败。"),
                         )
                     ],
-                }
+                },
+                "read_only_complete": True,
+                "read_only_pending": False,
             }
-        return {"response": await naturalize_read_response(state, result), "read_tool_call": None}
+            wallet_event(
+                "read_only_observe",
+                "error",
+                duration_ms=(perf_counter() - started) * 1000,
+                state=state,
+                error_code=error.get("code", "READ_TOOL_FAILED"),
+                tool_name=call_name,
+            )
+            return update
+        final = int(state.get("read_loop_count") or 0) >= READ_ONLY_MAX_ROUNDS
+        update = {
+            "response": await naturalize_read_response(state, result),
+            "read_tool_call": None,
+            "read_only_complete": final,
+            "read_only_pending": not final,
+        }
+        wallet_event(
+            "read_only_observe",
+            "success",
+            duration_ms=(perf_counter() - started) * 1000,
+            state=state,
+            tool_name=call_name,
+            tool_status="completed",
+        )
+        return update
 
     def route_read_only(state: dict[str, Any]) -> str:
         from .read_only import route_read_only as route
 
-        if state.get("response"):
+        if state.get("response") and not state.get("read_only_pending"):
             return "response"
         return route(state)
 
@@ -3390,9 +3451,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             # Preserve every legacy request field while making the checkpoint
             # representation serializable for subsequent resume calls.
             "request": request,
+            "read_loop_count": 0,
+            "read_tool_calls": [],
+            "read_facts": {},
+            "read_tool_call": None,
+            "read_only_complete": False,
+            "read_only_pending": False,
         }
         update["read_only_enabled"] = bool(
-            hasattr(runtime.model, "plan_read")
+            getattr(runtime.model, "read_agent_enabled", hasattr(runtime.model, "plan_read"))
+            and hasattr(runtime.model, "plan_read")
             and decision.get("intent")
             in {"wallet_query", "price_query", "transaction_status", "gas_check", "asset_discovery"}
         )

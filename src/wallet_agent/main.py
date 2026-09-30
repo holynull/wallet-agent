@@ -15,9 +15,10 @@ from wallet_agent.config import Settings
 from wallet_agent.graph import build_graph
 from wallet_agent.models import (
     AgentResponseDraft,
-    PriceSlotPatch,
     ModelRegistry,
     ModelRouter,
+    PriceSlotPatch,
+    ReadToolPlan,
     RouteDecision,
     SwapSlotPatch,
     TransactionStatusSlotPatch,
@@ -57,6 +58,7 @@ def build_application(settings: Settings | None = None) -> Any:
             settings.intent_model,
             settings.slot_extraction_model,
             settings.response_model,
+            settings.read_agent_model,
             *settings.allowed_model_ids,
         ]
     )
@@ -94,14 +96,20 @@ def build_application(settings: Settings | None = None) -> Any:
         model_id: client.with_structured_output(AgentResponseDraft, method="json_mode")
         for model_id, client in base_clients.items()
     }
+    read_models = {
+        model_id: client.with_structured_output(ReadToolPlan, method="json_mode")
+        for model_id, client in base_clients.items()
+    }
     model_registry = ModelRegistry(
         model_clients,
         default_model_id=settings.openai_model,
         classifier_model_id=settings.intent_model,
         extractor_model_id=settings.slot_extraction_model,
         response_model_id=settings.response_model,
+        read_agent_model_id=settings.read_agent_model,
         extractors=extractors,
         responses=response_models,
+        readers=read_models if settings.read_agent_enabled else {},
     )
     model = ModelRouter(model_registry)
     providers: dict[str, Any] = {}
