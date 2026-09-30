@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   classifyAgentTest,
+  buildReadOnlyTimeline,
   extractConversationArtifacts,
   extractReadOnlyTrace,
   formatResponseSummary,
@@ -49,6 +50,54 @@ test("extracts read-only tool trace from a streamed graph state", () => {
     facts: { price_lookup: { ok: true, prices: [{ usd_price: "1800" }] } },
     reference: { kind: "asset", id: "ETH:ETH", facts: { symbol: "ETH" } },
   });
+});
+
+test("builds a native tool-calling timeline with model, tool, and ToolMessage entries", () => {
+  assert.deepEqual(buildReadOnlyTimeline([
+    {
+      call_id: "read_agent-2",
+      role: "read_agent",
+      model_id: "deepseek-flash",
+      stage: "只读工具调用",
+      elapsed_ms: 23,
+      tool_call_ids: ["call-price-1"],
+    },
+  ], [
+    {
+      call_id: "call-price-1",
+      name: "price_lookup",
+      args: { symbol: "ETH", chain: "BASE" },
+      status: "completed",
+      elapsed_ms: 31,
+    },
+  ]), [
+    {
+      kind: "model",
+      key: "model:read_agent-2",
+      call_id: "read_agent-2",
+      label: "只读工具调用",
+      model_id: "deepseek-flash",
+      elapsed_ms: 23,
+      tool_call_ids: ["call-price-1"],
+    },
+    {
+      kind: "tool",
+      key: "tool:call-price-1",
+      call_id: "call-price-1",
+      name: "price_lookup",
+      args: { symbol: "ETH", chain: "BASE" },
+      status: "completed",
+      elapsed_ms: 31,
+    },
+    {
+      kind: "result",
+      key: "result:call-price-1",
+      call_id: "call-price-1",
+      name: "price_lookup",
+      status: "completed",
+      elapsed_ms: 31,
+    },
+  ]);
 });
 
 test("restores read-only trace from persisted conversation artifacts", () => {

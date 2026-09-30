@@ -33,6 +33,89 @@ export type ReadOnlyTrace = {
   reference: Record<string, any> | null;
 };
 
+export type ReadOnlyTimelineItem = {
+  kind: "model" | "tool" | "result";
+  key: string;
+  call_id?: string;
+  name?: string;
+  label?: string;
+  model_id?: string;
+  status?: string;
+  args?: Record<string, any>;
+  error?: any;
+  elapsed_ms?: number;
+  tool_call_ids?: string[];
+};
+
+function optionalField(target: Record<string, any>, key: string, value: any): void {
+  if (value !== undefined && value !== null && value !== "") target[key] = value;
+}
+
+export function buildReadOnlyTimeline(
+  modelTrace: Array<Record<string, any>> = [],
+  toolCalls: Array<Record<string, any>> = [],
+): ReadOnlyTimelineItem[] {
+  const timeline: ReadOnlyTimelineItem[] = [];
+  const calls = toolCalls.filter((item) => item && typeof item === "object");
+  const callsById = new Map(calls.map((item, index) => [
+    String(item.call_id || item.id || `anonymous-${index}`),
+    item,
+  ]));
+  const consumed = new Set<Record<string, any>>();
+
+  const appendTool = (call: Record<string, any>, index: number) => {
+    if (consumed.has(call)) return;
+    consumed.add(call);
+    const callId = String(call.call_id || call.id || `anonymous-${index}`);
+    const name = String(call.name || "只读工具");
+    const tool: ReadOnlyTimelineItem = {
+      kind: "tool",
+      key: `tool:${callId}`,
+      call_id: callId,
+      name,
+    };
+    optionalField(tool, "args", call.args || call.arguments);
+    optionalField(tool, "status", call.status || "处理中");
+    optionalField(tool, "elapsed_ms", call.elapsed_ms);
+    optionalField(tool, "error", call.error);
+    timeline.push(tool);
+
+    const result: ReadOnlyTimelineItem = {
+      kind: "result",
+      key: `result:${callId}`,
+      call_id: callId,
+      name,
+    };
+    optionalField(result, "status", call.status || "处理中");
+    optionalField(result, "elapsed_ms", call.elapsed_ms);
+    optionalField(result, "error", call.error);
+    timeline.push(result);
+  };
+
+  for (const [index, item] of modelTrace.filter((entry) => entry && typeof entry === "object").entries()) {
+    const model: ReadOnlyTimelineItem = {
+      kind: "model",
+      key: `model:${String(item.call_id || `${item.timestamp || "unknown"}-${index}`)}`,
+      label: String(item.stage || item.role || "模型调用"),
+    };
+    optionalField(model, "call_id", item.call_id);
+    optionalField(model, "model_id", item.model_id);
+    optionalField(model, "elapsed_ms", item.elapsed_ms);
+    const toolCallIds = Array.isArray(item.tool_call_ids)
+      ? item.tool_call_ids.map((value: any) => String(value)).filter(Boolean)
+      : [];
+    if (toolCallIds.length) model.tool_call_ids = toolCallIds;
+    timeline.push(model);
+    toolCallIds.forEach((callId) => {
+      const call = callsById.get(callId);
+      if (call) appendTool(call, calls.indexOf(call));
+    });
+  }
+
+  calls.forEach((call, index) => appendTool(call, index));
+  return timeline;
+}
+
 export function extractReadOnlyTrace(state: any): ReadOnlyTrace | null {
   if (!state || typeof state !== "object") return null;
   const source = state.read_only && typeof state.read_only === "object" ? state.read_only : state;
