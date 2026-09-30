@@ -7,7 +7,9 @@ import {
   extractReadOnlyTrace,
   formatResponseSummary,
   formatProcessingDuration,
+  formatModelTraceEntry,
   latestProgressText,
+  mergeModelTrace,
   parseSseFrame,
   parseSseFrames,
   providerPriority,
@@ -21,6 +23,37 @@ test("formats processing duration for an active request", () => {
   assert.equal(formatProcessingDuration(0), "0 ms");
   assert.equal(formatProcessingDuration(438), "438 ms");
   assert.equal(formatProcessingDuration(1542), "1.5 s");
+});
+
+test("formats model usage and cache metadata without showing missing fields", () => {
+  assert.equal(
+    formatModelTraceEntry({
+      stage: "只读工具调用",
+      model_id: "deepseek-flash",
+      call_id: "read_agent-1",
+      elapsed_ms: 23,
+      prompt_tokens: 120,
+      completion_tokens: 9,
+      cached_tokens: 80,
+      finish_reason: "tool_calls",
+    }),
+    "只读工具调用 · deepseek-flash · call_id read_agent-1 · 23 ms · 120 prompt · 9 completion · 80 cached · finish:tool_calls",
+  );
+  assert.equal(formatModelTraceEntry({ model_id: "deepseek-flash" }), "模型调用 · deepseek-flash");
+});
+
+test("merges later model usage metadata for an existing call", () => {
+  assert.deepEqual(mergeModelTrace(
+    [{ call_id: "read_agent-1", model_id: "deepseek-flash", elapsed_ms: 20 }],
+    [{ call_id: "read_agent-1", prompt_tokens: 100, cached_tokens: 80, finish_reason: "stop" }],
+  ), [{
+    call_id: "read_agent-1",
+    model_id: "deepseek-flash",
+    elapsed_ms: 20,
+    prompt_tokens: 100,
+    cached_tokens: 80,
+    finish_reason: "stop",
+  }]);
 });
 
 test("uses the last visible progress entry as the current stage", () => {

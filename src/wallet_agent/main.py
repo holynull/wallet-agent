@@ -62,11 +62,44 @@ def build_application(settings: Settings | None = None) -> Any:
             *settings.allowed_model_ids,
         ]
     )
+    def build_client(
+        model_id: str,
+        *,
+        thinking_enabled: bool,
+        reasoning_effort: str,
+    ) -> Any:
+        kwargs: dict[str, Any] = {
+            "model": model_id,
+            "api_key": api_key,
+            "base_url": settings.openai_base_url,
+        }
+        is_deepseek = model_id.startswith("deepseek-") or "deepseek" in str(
+            settings.openai_base_url or ""
+        ).lower()
+        if is_deepseek:
+            kwargs.update(
+                reasoning_effort=reasoning_effort,
+                extra_body={
+                    "thinking": {
+                        "type": "enabled" if thinking_enabled else "disabled"
+                    }
+                },
+            )
+        return ChatOpenAI(**kwargs)
+
     base_clients = {
-        model_id: ChatOpenAI(
-            model=model_id,
-            api_key=api_key,
-            base_url=settings.openai_base_url,
+        model_id: build_client(
+            model_id,
+            thinking_enabled=settings.deepseek_thinking_enabled,
+            reasoning_effort=settings.deepseek_reasoning_effort,
+        )
+        for model_id in configured_model_ids
+    }
+    read_clients = {
+        model_id: build_client(
+            model_id,
+            thinking_enabled=settings.read_agent_thinking_enabled,
+            reasoning_effort=settings.read_agent_reasoning_effort,
         )
         for model_id in configured_model_ids
     }
@@ -110,7 +143,7 @@ def build_application(settings: Settings | None = None) -> Any:
         extractors=extractors,
         responses=response_models,
         readers=read_models if settings.read_agent_enabled else {},
-        raw_models=base_clients,
+        raw_models=read_clients,
     )
     model = ModelRouter(model_registry)
     providers: dict[str, Any] = {}

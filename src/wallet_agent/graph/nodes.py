@@ -47,12 +47,14 @@ from wallet_agent.observability import wallet_event
 from .dialogue import resolve_quote_reference, resolve_read_reference
 from .facts import validate_response_draft
 from .read_only import (
+    READ_ONLY_MAX_PARALLEL_TOOLS,
     READ_ONLY_MAX_ROUNDS,
     READ_ONLY_TOOL_NAMES,
     READ_ONLY_TOOL_SCHEMAS,
     ReadOnlyToolCall,
     read_only_decision,
     read_only_tool_name_for_intent,
+    read_tool_signature,
     run_read_only_round,
 )
 from .state import DialogueState
@@ -3328,6 +3330,15 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             ],
             "available_facts": sorted((state.get("read_facts") or {}).keys()),
             "max_steps": 4,
+            "completed_tool_signatures": [
+                str(
+                    item.get("signature")
+                    or read_tool_signature(str(item.get("name") or ""), item.get("args"))
+                )
+                for item in state.get("read_tool_calls") or []
+                if item.get("status") in {"completed", "reused"}
+            ],
+            "max_parallel_tools": READ_ONLY_MAX_PARALLEL_TOOLS,
         }
         if intent == "wallet_query" and _looks_like_other_chain_balance_request(
             str(request.get("message") or "")
@@ -3402,6 +3413,30 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     or str(item.get("name") or "") not in READ_ONLY_TOOL_NAMES
                     or not isinstance(item.get("args", item.get("arguments", {})), Mapping)
                 ]
+                if len(tool_calls) > READ_ONLY_MAX_PARALLEL_TOOLS:
+                    return {
+                        "response": {
+                            "kind": "error",
+                            "errors": [
+                                _error(
+                                    "READ_TOOL_BATCH_TOO_LARGE",
+                                    (
+                                        f"一次最多只能并行查询 {READ_ONLY_MAX_PARALLEL_TOOLS} "
+                                        "个只读工具。"
+                                    ),
+                                    details={"max_parallel_tools": READ_ONLY_MAX_PARALLEL_TOOLS},
+                                )
+                            ],
+                        },
+                        "read_messages": [*messages, native_output],
+                        "read_tool_calls": [
+                            dict(item) for item in state.get("read_tool_calls") or []
+                        ],
+                        "read_tool_call": None,
+                        "read_only_complete": True,
+                        "read_only_pending": False,
+                        "read_native": True,
+                    }
                 if invalid_calls:
                     return {
                         "response": {
@@ -3421,14 +3456,54 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     }
                 if tool_calls:
                     existing_calls = [dict(item) for item in state.get("read_tool_calls") or []]
+                    completed_signatures = {
+                        str(
+                            item.get("signature")
+                            or read_tool_signature(
+                                str(item.get("name") or ""), item.get("args")
+                            )
+                        )
+                        for item in existing_calls
+                        if item.get("status") in {"completed", "reused"}
+                    }
+                    incoming_signatures = [
+                        read_tool_signature(
+                            str(item.get("name") or ""),
+                            dict(item.get("args", item.get("arguments", {}))),
+                        )
+                        for item in tool_calls
+                    ]
+                    if incoming_signatures and all(
+                        signature in completed_signatures for signature in incoming_signatures
+                    ):
+                        reused_records = [
+                            {
+                                "call_id": str(item.get("id") or ""),
+                                "name": str(item.get("name")),
+                                "args": dict(item.get("args", item.get("arguments", {}))),
+                                "signature": signature,
+                                "status": "reused",
+                                "elapsed_ms": 0,
+                            }
+                            for item, signature in zip(tool_calls, incoming_signatures, strict=True)
+                        ]
+                        return {
+                            "read_messages": [*messages, native_output],
+                            "read_tool_calls": [*existing_calls, *reused_records],
+                            "read_tool_call": None,
+                            "read_only_complete": True,
+                            "read_only_pending": False,
+                            "read_native": True,
+                        }
                     records = [
                         {
                             "call_id": str(item.get("id") or ""),
                             "name": str(item.get("name")),
                             "args": dict(item.get("args", item.get("arguments", {}))),
+                            "signature": signature,
                             "status": "started",
                         }
-                        for item in tool_calls
+                        for item, signature in zip(tool_calls, incoming_signatures, strict=True)
                     ]
                     return {
                         "read_messages": [*messages, native_output],

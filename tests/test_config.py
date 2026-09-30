@@ -18,6 +18,10 @@ def test_settings_load_non_secret_defaults(monkeypatch):
     assert settings.response_model == "deepseek-flash"
     assert settings.read_agent_enabled is True
     assert settings.read_agent_model == "deepseek-flash"
+    assert settings.deepseek_thinking_enabled is False
+    assert settings.deepseek_reasoning_effort == "none"
+    assert settings.read_agent_thinking_enabled is True
+    assert settings.read_agent_reasoning_effort == "low"
     assert settings.allowed_model_ids == ["deepseek-flash", "deepseek-v4-pro"]
     assert settings.openai_base_url == "https://api.deepseek.com"
     assert settings.redis_url is None

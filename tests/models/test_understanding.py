@@ -1,5 +1,5 @@
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from wallet_agent.models import (
     ModelRegistry,
@@ -21,7 +21,9 @@ class CapturingClient:
         return self.output
 
 
-def router_with_clients(*, classifier=None, transfer=None, swap=None, transaction_status=None, price=None):
+def router_with_clients(
+    *, classifier=None, transfer=None, swap=None, transaction_status=None, price=None
+):
     classifier = classifier or CapturingClient(RouteDecision(intent="clarification"))
     return ModelRouter(
         ModelRegistry(
@@ -64,8 +66,9 @@ async def test_transfer_extractor_names_every_slot_and_preserves_values():
 
     assert patch.amount == "0.01"
     assert patch.recipient == recipient
-    assert isinstance(client.inputs[0][0], HumanMessage)
-    prompt = client.inputs[0][0].content
+    assert isinstance(client.inputs[0][0], SystemMessage)
+    assert isinstance(client.inputs[0][1], HumanMessage)
+    prompt = "\n".join(item.content for item in client.inputs[0])
     assert all(
         field in prompt
         for field in ("chain", "symbol", "token_address", "decimals", "amount", "recipient")
@@ -91,7 +94,7 @@ async def test_swap_extractor_receives_existing_slots_and_explicit_schema():
     )
 
     assert patch.destination_chain == "BASE"
-    prompt = client.inputs[0][0].content
+    prompt = "\n".join(item.content for item in client.inputs[0])
     assert all(
         field in prompt
         for field in (
@@ -128,7 +131,7 @@ async def test_swap_extractor_prompt_includes_clicked_structured_suggestion():
         },
     )
 
-    prompt = client.inputs[0][0].content
+    prompt = "\n".join(item.content for item in client.inputs[0])
     assert "suggestion_data" in prompt
     assert '"output_amount": "10"' in prompt
 
@@ -146,7 +149,7 @@ async def test_transaction_status_extractor_preserves_chain_and_hash():
 
     assert patch.transaction_chain == "ETH"
     assert patch.transaction_hash == tx_hash
-    prompt = client.inputs[0][0].content
+    prompt = "\n".join(item.content for item in client.inputs[0])
     assert "transaction_chain" in prompt
     assert "transaction_hash" in prompt
 
@@ -171,7 +174,21 @@ async def test_ainvoke_remains_a_classification_compatibility_alias():
     result = await router.ainvoke({"message": "查询余额"})
 
     assert result == {"intent": "wallet_query"}
-    assert isinstance(client.inputs[0][0], HumanMessage)
+    assert isinstance(client.inputs[0][0], SystemMessage)
+    assert isinstance(client.inputs[0][1], HumanMessage)
+
+
+def test_read_only_price_schema_prefers_server_asset_resolution():
+    from wallet_agent.graph.read_only import READ_ONLY_TOOL_SCHEMAS
+
+    price_lookup = next(
+        item["function"] for item in READ_ONLY_TOOL_SCHEMAS
+        if item["function"]["name"] == "price_lookup"
+    )
+    description = price_lookup["description"].lower()
+    assert "resolve" in description
+    assert "decimals" in description
+    assert "user" in description
 
 
 def test_swap_slot_patch_accepts_numeric_usd_target_from_json_models():

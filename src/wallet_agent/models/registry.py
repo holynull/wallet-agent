@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from .contracts import (
     AgentResponseDraft,
@@ -21,27 +21,35 @@ from .contracts import (
 )
 
 
-def _model_input(request: Mapping[str, Any]) -> list[HumanMessage]:
+def _instruction_messages(instructions: str, payload_label: str, payload: str) -> list[Any]:
+    """Keep stable role instructions separate from dynamic data for prefix caching."""
+    return [
+        SystemMessage(content=instructions),
+        HumanMessage(content=f"{payload_label}\n{payload}"),
+    ]
+
+
+def _model_input(request: Mapping[str, Any]) -> list[Any]:
     """Adapt the agent's serializable request state to LangChain input."""
     payload = json.dumps(dict(request), ensure_ascii=False, default=str)
-    return [
-        HumanMessage(
-            content=(
-                "你是 Wallet Agent 的意图识别器。请根据下面的请求判断用户意图，"
-                "并只返回一个合法 JSON 对象，使用结构化输出中允许的字段。"
-                "不要输出 Markdown、解释文字或代码块。可选 intent 包括："
-                "wallet_query、swap_quote、swap_prepare、swap_status、"
-                "transfer、price_query、transaction_status、portfolio_query、"
-                "gas_check、asset_discovery、market_details、price_history、"
-                "clarification、unsupported。"
-                "如果用户只是问候、与钱包无关，或完全无法识别任务，才使用 clarification。"
-                "参数不完整的转账仍然是 transfer，参数不完整的兑换仍然是 swap_quote。"
-                "兑换请求即使只写了类似“帮我兑换 1USDT”的紧凑格式，也要识别为 swap_quote。"
-                "不要提取参数；不要因为缺少链、Token、金额、地址或钱包连接而改变任务类型。\n\n"
-                f"请求 JSON（conversation_history 包含当前 thread 的完整公开对话历史）：\n{payload}"
-            )
-        )
-    ]
+    instructions = (
+        "你是 Wallet Agent 的意图识别器。请根据下面的请求判断用户意图，"
+        "并只返回一个合法 JSON 对象，使用结构化输出中允许的字段。"
+        "不要输出 Markdown、解释文字或代码块。可选 intent 包括："
+        "wallet_query、swap_quote、swap_prepare、swap_status、"
+        "transfer、price_query、transaction_status、portfolio_query、"
+        "gas_check、asset_discovery、market_details、price_history、"
+        "clarification、unsupported。"
+        "如果用户只是问候、与钱包无关，或完全无法识别任务，才使用 clarification。"
+        "参数不完整的转账仍然是 transfer，参数不完整的兑换仍然是 swap_quote。"
+        "兑换请求即使只写了类似‘帮我兑换 1USDT’的紧凑格式，也要识别为 swap_quote。"
+        "不要提取参数；不要因为缺少链、Token、金额、地址或钱包连接而改变任务类型。"
+    )
+    return _instruction_messages(
+        instructions,
+        "请求 JSON（conversation_history 包含当前 thread 的完整公开对话历史）：",
+        payload,
+    )
 
 
 def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanMessage]:
@@ -106,9 +114,11 @@ def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanM
         )
     else:
         raise ValueError(f"unsupported task extractor: {task_kind}")
-    return [
-        HumanMessage(content=(f"{instructions}\n\n请求、完整对话历史和已有任务 JSON：\n{payload}"))
-    ]
+    return _instruction_messages(
+        instructions,
+        "请求、完整对话历史和已有任务 JSON：",
+        payload,
+    )
 
 
 def _response_model_input(
@@ -132,7 +142,7 @@ def _response_model_input(
         "绝不调用工具、不执行查询、签名、授权、广播或转账/兑换；不要生成交易数据、私钥或签名内容。"
         "仅返回符合结构化输出 schema 的 JSON。"
     )
-    return [HumanMessage(content=f"{instructions}\n\nrequest 和 facts JSON：\n{payload}")]
+    return _instruction_messages(instructions, "request 和 facts JSON：", payload)
 
 
 def _read_model_input(request: Mapping[str, Any]) -> list[HumanMessage]:
@@ -149,7 +159,7 @@ def _read_model_input(request: Mapping[str, Any]) -> list[HumanMessage]:
         "arguments 只能填写用户请求、对话引用或已验证事实中明确可用的参数。"
         "只返回结构化 JSON。不要输出 reasoning、Markdown 或额外字段。"
     )
-    return [HumanMessage(content=f"{instructions}\n\nrequest JSON：\n{payload}")]
+    return _instruction_messages(instructions, "request JSON：", payload)
 
 
 class ModelRegistry:
@@ -271,7 +281,7 @@ class ModelRouter:
         *,
         elapsed_ms: int,
         stage: str,
-        **details: str,
+        **details: Any,
     ) -> None:
         self._model_call_index += 1
         entry = {
@@ -285,6 +295,53 @@ class ModelRouter:
         }
         self._model_trace.append(entry)
 
+    @staticmethod
+    def _response_usage(value: Any) -> dict[str, Any]:
+        """Normalize OpenAI-compatible usage metadata without persisting reasoning text."""
+        response_metadata = getattr(value, "response_metadata", None) or {}
+        usage_metadata = getattr(value, "usage_metadata", None) or {}
+        token_usage = response_metadata.get("token_usage") or response_metadata.get("usage") or {}
+
+        def first(*values: Any) -> Any:
+            return next((item for item in values if item is not None), None)
+
+        prompt_tokens = first(
+            usage_metadata.get("input_tokens"),
+            token_usage.get("prompt_tokens"),
+            response_metadata.get("prompt_tokens"),
+        )
+        completion_tokens = first(
+            usage_metadata.get("output_tokens"),
+            token_usage.get("completion_tokens"),
+            response_metadata.get("completion_tokens"),
+        )
+        total_tokens = first(
+            usage_metadata.get("total_tokens"),
+            token_usage.get("total_tokens"),
+            response_metadata.get("total_tokens"),
+        )
+        prompt_details = token_usage.get("prompt_tokens_details") or {}
+        cached_tokens = first(
+            prompt_details.get("cached_tokens"),
+            token_usage.get("cached_tokens"),
+            response_metadata.get("prompt_cache_hit_tokens"),
+        )
+        finish_reason = first(
+            response_metadata.get("finish_reason"),
+            response_metadata.get("finish"),
+        )
+        details: dict[str, Any] = {}
+        for key, item in (
+            ("prompt_tokens", prompt_tokens),
+            ("completion_tokens", completion_tokens),
+            ("total_tokens", total_tokens),
+            ("cached_tokens", cached_tokens),
+            ("finish_reason", finish_reason),
+        ):
+            if item is not None:
+                details[key] = item
+        return details
+
     async def _invoke(
         self,
         *,
@@ -296,16 +353,20 @@ class ModelRouter:
         **details: str,
     ) -> Any:
         started = perf_counter()
+        result: Any = None
         try:
             if hasattr(model, "ainvoke"):
-                return await model.ainvoke(request)
-            return model.invoke(request)
+                result = await model.ainvoke(request)
+            else:
+                result = model.invoke(request)
+            return result
         finally:
             self._record_model(
                 role,
                 model_id,
                 elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
                 stage=stage,
+                **self._response_usage(result),
                 **details,
             )
 
@@ -336,7 +397,16 @@ class ModelRouter:
         binder = getattr(raw_model, "bind_tools", None)
         if not callable(binder):
             raise ValueError(f"read model does not support tool calls: {selected}")
-        model = binder(tools)
+        try:
+            model = binder(
+                tools,
+                tool_choice="auto",
+                parallel_tool_calls=True,
+            )
+        except TypeError:
+            # Keep injected legacy model doubles and older OpenAI-compatible
+            # clients usable while the production client supports both flags.
+            model = binder(tools)
         result = await self._invoke(
             role="read_agent",
             model_id=selected,

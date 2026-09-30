@@ -33,6 +33,37 @@ export type ReadOnlyTrace = {
   reference: Record<string, any> | null;
 };
 
+export type ModelTraceEntry = {
+  call_id?: string;
+  role?: string;
+  model_id?: string;
+  task_kind?: string;
+  stage?: string;
+  timestamp?: string;
+  elapsed_ms?: number;
+  tool_call_ids?: string[];
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  cached_tokens?: number;
+  finish_reason?: string;
+};
+
+export function formatModelTraceEntry(item: ModelTraceEntry | Record<string, any>): string {
+  const parts = [
+    item.stage || item.role || "模型调用",
+    item.model_id,
+    item.call_id ? `call_id ${item.call_id}` : null,
+    item.elapsed_ms != null ? `${item.elapsed_ms} ms` : null,
+    item.prompt_tokens != null ? `${item.prompt_tokens} prompt` : null,
+    item.completion_tokens != null ? `${item.completion_tokens} completion` : null,
+    item.total_tokens != null ? `${item.total_tokens} total` : null,
+    item.cached_tokens != null ? `${item.cached_tokens} cached` : null,
+    item.finish_reason ? `finish:${item.finish_reason}` : null,
+  ];
+  return parts.filter(Boolean).join(" · ");
+}
+
 export type ReadOnlyTimelineItem = {
   kind: "model" | "tool" | "result";
   key: string;
@@ -45,6 +76,11 @@ export type ReadOnlyTimelineItem = {
   error?: any;
   elapsed_ms?: number;
   tool_call_ids?: string[];
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  cached_tokens?: number;
+  finish_reason?: string;
 };
 
 function optionalField(target: Record<string, any>, key: string, value: any): void {
@@ -101,6 +137,11 @@ export function buildReadOnlyTimeline(
     optionalField(model, "call_id", item.call_id);
     optionalField(model, "model_id", item.model_id);
     optionalField(model, "elapsed_ms", item.elapsed_ms);
+    optionalField(model, "prompt_tokens", item.prompt_tokens);
+    optionalField(model, "completion_tokens", item.completion_tokens);
+    optionalField(model, "total_tokens", item.total_tokens);
+    optionalField(model, "cached_tokens", item.cached_tokens);
+    optionalField(model, "finish_reason", item.finish_reason);
     const toolCallIds = Array.isArray(item.tool_call_ids)
       ? item.tool_call_ids.map((value: any) => String(value)).filter(Boolean)
       : [];
@@ -167,7 +208,7 @@ export function responseMessage(response: any): string {
 
 export type ConversationArtifacts = {
   response: any;
-  model_trace?: Array<{ call_id?: string; role?: string; model_id?: string; task_kind?: string; stage?: string; timestamp?: string; elapsed_ms?: number }>;
+  model_trace?: ModelTraceEntry[];
   quotes?: any[];
   confirmation?: any;
   preflight?: any;
@@ -224,14 +265,18 @@ export function mergeModelTrace(
   ...sources: Array<Array<Record<string, any>> | undefined | null>
 ): Array<Record<string, any>> {
   const merged: Array<Record<string, any>> = [];
-  const seen = new Set<string>();
+  const positions = new Map<string, number>();
   for (const source of sources) {
     for (const item of source || []) {
       if (!item || typeof item !== "object") continue;
       const key = String(item.call_id || `${item.timestamp || ""}:${item.role || ""}:${item.task_kind || ""}:${item.model_id || ""}`);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      merged.push({ ...item });
+      const position = positions.get(key);
+      if (position !== undefined) {
+        merged[position] = { ...merged[position], ...item };
+      } else {
+        positions.set(key, merged.length);
+        merged.push({ ...item });
+      }
     }
   }
   return merged.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));

@@ -91,6 +91,45 @@ async def test_model_router_trace_includes_call_timing_and_stage():
     assert item["elapsed_ms"] >= 0
 
 
+@pytest.mark.asyncio
+async def test_native_model_trace_normalizes_provider_usage_and_finish_reason():
+    class BoundModel:
+        async def ainvoke(self, _messages):
+            return AIMessage(
+                content="",
+                tool_calls=[],
+                response_metadata={
+                    "finish_reason": "stop",
+                    "token_usage": {
+                        "prompt_tokens": 120,
+                        "completion_tokens": 9,
+                        "total_tokens": 129,
+                        "prompt_tokens_details": {"cached_tokens": 80},
+                    },
+                },
+            )
+
+    class RawModel:
+        def bind_tools(self, _tools):
+            return BoundModel()
+
+    router = ModelRouter(
+        ModelRegistry(
+            {"deepseek-flash": FakeModel()},
+            default_model_id="deepseek-flash",
+            raw_models={"deepseek-flash": RawModel()},
+        )
+    )
+    await router.invoke_read_tools([HumanMessage(content="ETH price")], READ_ONLY_TOOL_SCHEMAS)
+
+    item = router.consume_model_trace()[0]
+    assert item["finish_reason"] == "stop"
+    assert item["prompt_tokens"] == 120
+    assert item["completion_tokens"] == 9
+    assert item["total_tokens"] == 129
+    assert item["cached_tokens"] == 80
+
+
 def test_registry_has_default_and_allows_whitelisted_temporary_selection():
     default = FakeModel()
     reasoner = FakeModel()
@@ -125,8 +164,9 @@ async def test_model_router_converts_mapping_request_to_langchain_messages():
 
     assert result == {"intent": "clarification"}
     assert isinstance(captured["value"], list)
-    assert isinstance(captured["value"][0], HumanMessage)
-    assert "你好" in captured["value"][0].content
+    assert captured["value"][0].type == "system"
+    assert isinstance(captured["value"][1], HumanMessage)
+    assert "你好" in captured["value"][1].content
 
 
 def test_agent_response_draft_supports_structured_suggestions():
@@ -160,7 +200,7 @@ def test_agent_response_draft_supports_structured_suggestions():
 async def test_model_router_plans_only_whitelisted_read_tools():
     class ReadModel:
         async def ainvoke(self, value):
-            assert "read_facts" in value[0].content
+            assert "read_facts" in value[1].content
             return {"name": "price_lookup", "arguments": {"symbol": "ETH"}}
 
     router = ModelRouter(
@@ -196,8 +236,8 @@ async def test_model_router_invokes_native_read_tool_model_and_records_tool_call
             )
 
     class RawModel:
-        def bind_tools(self, tools):
-            calls.append(tools)
+        def bind_tools(self, tools, **kwargs):
+            calls.append((tools, kwargs))
             return BoundModel()
 
     router = ModelRouter(
@@ -212,7 +252,10 @@ async def test_model_router_invokes_native_read_tool_model_and_records_tool_call
     )
 
     assert result.tool_calls[0]["id"] == "call-price-1"
-    assert calls[0] == READ_ONLY_TOOL_SCHEMAS
+    assert calls[0] == (
+        READ_ONLY_TOOL_SCHEMAS,
+        {"tool_choice": "auto", "parallel_tool_calls": True},
+    )
     trace = router.consume_model_trace()
     assert trace[0]["stage"] == "只读工具调用"
     assert trace[0]["tool_call_ids"] == ["call-price-1"]
@@ -246,7 +289,7 @@ async def test_model_router_responds_with_facts_and_structured_contract():
     )
 
     assert isinstance(result, AgentResponseDraft)
-    prompt = captured["value"][0].content
+    prompt = "\n".join(item.content for item in captured["value"])
     assert "supported_chains" in prompt
     assert "balances" in prompt
     assert "prices" in prompt

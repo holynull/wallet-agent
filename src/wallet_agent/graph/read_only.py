@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Awaitable, Callable, Literal
@@ -19,6 +20,19 @@ READ_ONLY_TOOL_NAMES = frozenset(
     }
 )
 READ_ONLY_MAX_ROUNDS = 4
+READ_ONLY_MAX_PARALLEL_TOOLS = 4
+
+
+def read_tool_signature(name: str, arguments: dict[str, Any] | None) -> str:
+    """Return a stable, JSON-safe identity for one read-only request."""
+    encoded = json.dumps(
+        arguments or {},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return f"{name}:{encoded}"
 
 # These are deliberately read-only. Write capabilities never cross the model
 # boundary; transfer, approval, swap preparation, signing, and broadcast stay
@@ -43,7 +57,11 @@ READ_ONLY_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "price_lookup",
-            "description": "Read the current USD price of a specified asset.",
+            "description": (
+                "Read the current USD price of a specified asset. Use chain and symbol first; "
+                "the server resolves token addresses and decimals. Do not ask the user for "
+                "contract addresses or decimals when asset discovery can resolve them."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -109,7 +127,11 @@ READ_ONLY_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "market_details",
-            "description": "Read market metadata such as liquidity or volume for an asset.",
+            "description": (
+                "Read market metadata such as liquidity or volume for an asset. Prefer chain "
+                "and symbol; the server resolves token addresses and decimals instead of "
+                "asking the user."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -126,7 +148,10 @@ READ_ONLY_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "price_history",
-            "description": "Read historical price candles for an asset.",
+            "description": (
+                "Read historical price candles for an asset. Prefer chain and symbol; the "
+                "server resolves token addresses and decimals instead of asking the user."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {

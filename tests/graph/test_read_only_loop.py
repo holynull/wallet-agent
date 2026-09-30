@@ -2,8 +2,10 @@ import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 from wallet_agent.graph.read_only import (
+    READ_ONLY_MAX_PARALLEL_TOOLS,
     READ_ONLY_TOOL_NAMES,
     ReadOnlyToolCall,
+    read_tool_signature,
     route_read_only,
     run_read_only_round,
 )
@@ -23,6 +25,18 @@ def test_registry_contains_only_read_capabilities():
             "portfolio_snapshot",
         }
     )
+
+
+def test_read_tool_signature_is_stable_for_equivalent_arguments():
+    assert read_tool_signature(
+        "price_lookup", {"symbol": "ETH", "chain": "BASE"}
+    ) == read_tool_signature(
+        "price_lookup", {"chain": "BASE", "symbol": "ETH"}
+    )
+
+
+def test_native_read_batch_limit_is_bounded():
+    assert READ_ONLY_MAX_PARALLEL_TOOLS == 4
 
 
 def test_route_stops_after_two_rounds():
@@ -99,6 +113,86 @@ async def test_native_read_tool_call_round_executes_tool_and_returns_to_model():
     assert route_read_only(
         {"read_loop_count": 1, "read_tool_call": None, "read_only_complete": True}
     ) == "response"
+
+
+@pytest.mark.asyncio
+async def test_repeated_native_tool_call_reuses_verified_fact_without_requerying_provider():
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import TokenPrice
+    from wallet_agent.graph.build import build_graph
+
+    class PriceProvider:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_prices(self, assets):
+            self.calls += 1
+            return [TokenPrice(asset=assets[0], usd_price=Decimal("1800"), provider="okx")]
+
+    class RepeatingReadModel:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "price_query"}
+
+        async def extract(self, _task_kind, _request):
+            return {"symbol": "ETH", "chain": "ETH", "decimals": 18}
+
+        async def invoke_read_tools(self, messages, _tools):
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": f"call-price-{len(messages)}",
+                        "name": "price_lookup",
+                        "args": {"symbol": "ETH", "chain": "ETH", "decimals": 18},
+                    }
+                ],
+            )
+
+    provider = PriceProvider()
+    result = await build_graph(model=RepeatingReadModel(), price_provider=provider).ainvoke(
+        {"request": {"message": "ETH 现在多少钱"}},
+        config={"configurable": {"thread_id": "native-repeat-read-only"}},
+    )
+
+    assert result["response"]["kind"] == "price_query"
+    assert provider.calls == 1
+    assert len(result["read_tool_calls"]) == 2
+    assert result["read_tool_calls"][0]["status"] == "completed"
+    assert result["read_tool_calls"][1]["status"] == "reused"
+
+
+@pytest.mark.asyncio
+async def test_native_read_tool_batch_over_limit_returns_safe_error():
+    from wallet_agent.graph.build import build_graph
+
+    class TooManyCallsModel:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "price_query"}
+
+        async def extract(self, _task_kind, _request):
+            return {"symbol": "ETH", "chain": "ETH"}
+
+        async def invoke_read_tools(self, _messages, _tools):
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": f"call-{index}", "name": "price_lookup", "args": {"symbol": "ETH"}}
+                    for index in range(READ_ONLY_MAX_PARALLEL_TOOLS + 1)
+                ],
+            )
+
+    result = await build_graph(model=TooManyCallsModel()).ainvoke(
+        {"request": {"message": "ETH 现在多少钱"}},
+        config={"configurable": {"thread_id": "native-over-limit-read-only"}},
+    )
+
+    assert result["response"]["kind"] == "error"
+    assert result["response"]["errors"][0]["code"] == "READ_TOOL_BATCH_TOO_LARGE"
 
 
 @pytest.mark.asyncio
