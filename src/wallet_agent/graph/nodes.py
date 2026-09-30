@@ -968,6 +968,74 @@ def _looks_like_swap_message(message: str) -> bool:
     return any(token in text for token in ("swap", "exchange", "兑换", "换成", "换"))
 
 
+def _looks_like_transfer_message(message: str) -> bool:
+    """Recognize explicit transfer language before an unfinished swap can claim it."""
+    text = "".join(str(message).lower().split())
+    return any(
+        token in text
+        for token in (
+            "转账",
+            "转给",
+            "转到",
+            "给自己转",
+            "自己转",
+            "发送",
+            "transfer",
+            "send",
+        )
+    )
+
+
+def _looks_like_other_chain_balance_request(message: str) -> bool:
+    text = "".join(str(message).lower().split())
+    return (
+        any(token in text for token in ("其他链", "别的链", "otherchain", "anotherchain"))
+        and any(token in text for token in ("余额", "资产", "balance", "portfolio"))
+    )
+
+
+def _looks_like_swap_status_message(message: str) -> bool:
+    """Recognize a status question about a previously displayed swap."""
+    text = "".join(str(message).lower().split())
+    return (
+        any(token in text for token in ("兑换", "换的", "swap"))
+        and any(token in text for token in ("到账", "状态", "完成", "现在", "刚才"))
+    )
+
+
+def _operation_snapshot(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Capture restart-safe lifecycle data before a new operation replaces the projection."""
+    orders = _dump(state.get("provider_orders") or {})
+    broadcast_hash = state.get("broadcast_tx_hash")
+    selected_quote = _dump(state.get("selected_quote"))
+    if not orders and not broadcast_hash and not selected_quote:
+        return None
+    task = _dump(state.get("active_task") or {})
+    return {
+        "task_id": task.get("task_id"),
+        "kind": task.get("kind") or "swap",
+        "status": task.get("status"),
+        "stage": task.get("stage"),
+        "task": task,
+        "selected_quote": selected_quote,
+        "provider_orders": orders if isinstance(orders, Mapping) else {},
+        "provider_order_ids": _dump(state.get("provider_order_ids") or {}),
+        "status_snapshot": _dump(state.get("status_snapshot")),
+        "broadcast_tx_hash": str(broadcast_hash) if broadcast_hash else None,
+        "broadcast_status": state.get("broadcast_status"),
+        "confirmation_state": _dump(state.get("confirmation_state")),
+    }
+
+
+def _latest_historical_swap(history: Any) -> dict[str, Any] | None:
+    for item in reversed(history or []):
+        if not isinstance(item, Mapping) or str(item.get("kind") or "") != "swap":
+            continue
+        if item.get("provider_orders") or item.get("broadcast_tx_hash"):
+            return dict(item)
+    return None
+
+
 def _active_task_followup_intent(
     active_task: Any, message: str, suggestion_data: Any
 ) -> str | None:
@@ -3135,6 +3203,39 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         request["dialogue"] = state.get("dialogue")
         request["read_facts"] = state.get("read_facts") or {}
         request["read_loop_count"] = state.get("read_loop_count", 0)
+        if intent == "wallet_query" and _looks_like_other_chain_balance_request(
+            str(request.get("message") or "")
+        ):
+            supported_chains = sorted(
+                {
+                    str(value).upper()
+                    for value in (
+                        set(getattr(runtime.wallet_provider, "chain_index_by_name", {}) or {})
+                        | set(runtime.chains)
+                    )
+                }
+            )
+            message = (
+                f"请指定要查询的网络。当前支持：{'、'.join(supported_chains) or '暂无'}。"
+            )
+            return {
+                "response": {
+                    "kind": "clarification",
+                    "message": message,
+                    "missing_fields": ["wallet_chain"],
+                    "supported_chains": supported_chains,
+                    "errors": [
+                        _error(
+                            "WALLET_CHAIN_REQUIRED",
+                            "查询其他链余额时必须明确指定网络。",
+                            details={"supported_chains": supported_chains},
+                        )
+                    ],
+                },
+                "read_tool_call": None,
+                "read_only_complete": True,
+                "read_only_pending": False,
+            }
         call = await read_only_decision(runtime.model, request)
         if call is None:
             if state.get("read_loop_count", 0) == 0:
@@ -3271,6 +3372,58 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             result = {"kind": "asset_discovery", **latest}
         if not result:
             error = facts.get("error") or {}
+            unsupported_chain = (
+                isinstance(latest, Mapping)
+                and latest.get("code") == "OKX_CHAIN_UNSUPPORTED"
+            )
+            if unsupported_chain:
+                requested_chain = str(
+                    ((state.get("read_tool_calls") or [{}])[-1].get("args") or {}).get(
+                        "chain"
+                    )
+                    or ""
+                ).upper()
+                supported_chains = sorted(
+                    {
+                        str(value).upper()
+                        for value in (
+                            set(getattr(runtime.wallet_provider, "chain_index_by_name", {}) or {})
+                            | set(runtime.chains)
+                        )
+                    }
+                )
+                message = (
+                    f"当前暂不支持 {requested_chain or '该'} 链的余额查询。"
+                    f"可查询的网络：{'、'.join(supported_chains) or '暂无'}。你想查询哪条链？"
+                )
+                detail = _error(
+                    "OKX_CHAIN_UNSUPPORTED",
+                    str(latest.get("error") or message),
+                    details={
+                        "requested_chain": requested_chain,
+                        "supported_chains": supported_chains,
+                    },
+                )
+                update = {
+                    "response": {
+                        "kind": "clarification",
+                        "message": message,
+                        "missing_fields": ["wallet_chain"],
+                        "supported_chains": supported_chains,
+                        "errors": [detail],
+                    },
+                    "read_only_complete": True,
+                    "read_only_pending": False,
+                }
+                wallet_event(
+                    "read_only_observe",
+                    "recoverable_error",
+                    duration_ms=(perf_counter() - started) * 1000,
+                    state=state,
+                    error_code="OKX_CHAIN_UNSUPPORTED",
+                    tool_name=call_name,
+                )
+                return update
             update = {
                 "response": {
                     "kind": "error",
@@ -3331,24 +3484,29 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         suggestion_data = _suggestion_data_for_model(
             metadata.get("suggestion_data") if isinstance(metadata, Mapping) else None
         )
+        message = str(request.get("message", ""))
+        explicit_transfer = _looks_like_transfer_message(message)
+        historical_swap = _latest_historical_swap(state.get("operation_history"))
         followup_intent = (
             _active_task_followup_intent(
-                state.get("active_task"), str(request.get("message", "")), suggestion_data
+                state.get("active_task"), message, suggestion_data
             )
             if hasattr(runtime.model, "extract")
             else None
         )
         history_followup_intent = _history_followup_intent(
-            str(request.get("message", "")), state.get("conversation_history")
+            message, state.get("conversation_history")
         )
         resolved_reference = resolve_read_reference(
-            str(request.get("message", "")), state.get("dialogue")
+            message, state.get("dialogue")
         )
         selected_quote_reference = resolve_quote_reference(
-            str(request.get("message", "")),
+            message,
             (state.get("dialogue") or {}).get("referent"),
         )
-        if _looks_like_cancel_message(str(request.get("message", ""))) and (
+        if explicit_transfer and not _looks_like_cancel_message(message):
+            decision = {"intent": "transfer", "source": "explicit_transfer"}
+        elif _looks_like_cancel_message(message) and (
             state.get("active_task")
             or state.get("conversation_state")
             or state.get("swap_draft")
@@ -3357,6 +3515,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             decision = {"intent": "clarification", "source": "command_guard"}
         elif forced in _VALID_INTENTS:
             decision = {"intent": forced, "source": "api"}
+        elif historical_swap and _looks_like_swap_status_message(message):
+            decision = {
+                "intent": "swap_status",
+                "source": "operation_history",
+                "operation_reference_task_id": historical_swap.get("task_id"),
+            }
         elif followup_intent in _VALID_INTENTS:
             decision = {"intent": followup_intent, "source": "active_task"}
         elif history_followup_intent in _VALID_INTENTS:
@@ -3435,7 +3599,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             decision.get("intent") == "transaction_status"
             and state.get("provider_orders")
             and state.get("broadcast_tx_hash")
-            and not transaction_query_hints(str(request.get("message", ""))).get(
+            and not transaction_query_hints(message).get(
                 "transaction_hash"
             )
         ):
@@ -3464,6 +3628,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             and decision.get("intent")
             in {"wallet_query", "price_query", "transaction_status", "gas_check", "asset_discovery"}
         )
+        if decision.get("source") == "operation_history" and historical_swap is not None:
+            update.update(
+                operation_reference="history",
+                operation_reference_task_id=historical_swap.get("task_id"),
+                provider_orders=historical_swap.get("provider_orders") or {},
+                provider_order_ids=historical_swap.get("provider_order_ids") or {},
+                status_snapshot=historical_swap.get("status_snapshot"),
+                broadcast_tx_hash=historical_swap.get("broadcast_tx_hash"),
+                broadcast_status=historical_swap.get("broadcast_status"),
+                selected_quote=historical_swap.get("selected_quote"),
+            )
         if decision.get("source") == "dialogue_reference":
             update["read_reference"] = resolved_reference
         if decision.get("source") == "quote_reference":
@@ -4177,6 +4352,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 or intent_value in {"transfer", "swap_quote"}
             )
             if operation_reset:
+                prior_snapshot = _operation_snapshot(state)
+                if prior_snapshot is not None:
+                    prior_history = [
+                        dict(item)
+                        for item in (state.get("operation_history") or [])
+                        if isinstance(item, Mapping)
+                    ]
+                    task_update["operation_history"] = [
+                        *prior_history,
+                        prior_snapshot,
+                    ][-20:]
                 # Preserve conversation history, but remove the previous
                 # operation's irreversible lifecycle and authorization state.
                 task_update.update(
@@ -4185,6 +4371,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     quote_candidates=[{"__clear__": True}],
                     provider_orders={},
                     provider_order_ids={},
+                    swap_draft=None,
+                    transfer_draft=None,
                     status_snapshot=None,
                     transaction_query=None,
                     transaction_status_snapshot=None,
@@ -6324,6 +6512,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             provider_message = status_messages.get(
                 provider_status, "兑换订单状态已更新，建议稍后重新查询。"
             )
+            if provider_status == "processing":
+                provider_message = "兑换服务仍在处理中，目标链资产尚未到账。"
+            elif provider_status == "pending":
+                provider_message = "兑换订单已提交，目标链资产尚未到账，Provider 仍在处理中。"
             message = (
                 f"{broadcast_message}；{provider_message}"
                 if broadcast_message

@@ -6,6 +6,7 @@ from wallet_agent.domain.models import (
     Asset,
     AssetQuery,
     FeeEstimate,
+    NormalizedOrderStatus,
     NormalizedQuote,
     ProviderOrder,
     TokenBalance,
@@ -404,7 +405,7 @@ async def test_transfer_uses_wallet_provider_for_token_metadata_when_context_has
 
 
 @pytest.mark.asyncio
-async def test_new_transfer_resets_completed_swap_lifecycle_state():
+async def test_new_transfer_preserves_completed_swap_lifecycle_in_operation_history():
     old_order = ProviderOrder(
         provider="bridgers",
         provider_order_id="old-order",
@@ -448,6 +449,106 @@ async def test_new_transfer_resets_completed_swap_lifecycle_state():
     assert result["provider_orders"] == {}
     assert result.get("selected_quote") is None
     assert result.get("broadcast_tx_hash") is None
+    assert (
+        result["operation_history"][0]["provider_orders"]["bridgers"]["provider_order_id"]
+        == "old-order"
+    )
+    assert result["operation_history"][0]["broadcast_tx_hash"] == old_order.tx_hash
+
+
+@pytest.mark.asyncio
+async def test_explicit_transfer_correction_breaks_out_of_active_swap_task():
+    model = UnderstandingModel(
+        ["transfer"],
+        transfer=[
+            TransferSlotPatch(chain="BASE", symbol="ETH", amount="0.0001"),
+        ],
+        swap=[SwapSlotPatch(output_amount="0.0001", amount_mode="exact_out")],
+    )
+    graph = build_graph(model=model, chains={"BASE": Chain()})
+
+    result = await graph.ainvoke(
+        {
+            **turn("不是兑换，是给自己转 0.0001 ETH"),
+            "active_task": {
+                "task_id": "old-swap",
+                "kind": "swap",
+                "status": "ready",
+                "stage": "awaiting_confirmation",
+                "revision": 2,
+                "slots": {"source_symbol": "USDC", "destination_symbol": "ETH"},
+                "slot_sources": {"source_symbol": "user", "destination_symbol": "user"},
+            },
+            "swap_draft": {"source_symbol": "USDC", "destination_symbol": "ETH"},
+            "selected_quote": {"provider_reference": "old-reference"},
+            "confirmation_state": {"status": "requested"},
+        },
+        config={"configurable": {"thread_id": "explicit-transfer-correction"}},
+    )
+
+    assert result["response"]["kind"] == "transfer_prepare"
+    assert result["active_task"]["kind"] == "transfer"
+    assert result["active_task"]["slots"]["amount"] == "0.0001"
+    assert result["transfer_request"]["amount"] == "0.0001"
+    assert result.get("swap_draft") in (None, {})
+    assert result.get("selected_quote") is None
+
+
+@pytest.mark.asyncio
+async def test_swap_status_followup_uses_previous_operation_history_after_transfer_switch():
+    old_order = ProviderOrder(
+        provider="bridgers",
+        provider_order_id="old-order",
+        provider_reference="old-reference",
+        tx_hash="0x" + "a" * 64,
+    )
+
+    class StatusProvider:
+        provider_name = "bridgers"
+
+        async def get_status(self, order):
+            assert order.provider_order_id == "old-order"
+            return NormalizedOrderStatus(
+                provider="bridgers",
+                provider_order_id="old-order",
+                provider_reference="old-reference",
+                status="processing",
+                tx_hash=old_order.tx_hash,
+            )
+
+    graph = build_graph(
+        model=UnderstandingModel(["clarification"]),
+        providers={"bridgers": StatusProvider()},
+    )
+    result = await graph.ainvoke(
+        {
+            **turn("刚才的兑换到账了吗"),
+            "active_task": {
+                "task_id": "new-transfer",
+                "kind": "transfer",
+                "status": "collecting",
+                "stage": "collecting_parameters",
+                "revision": 1,
+                "slots": {},
+                "slot_sources": {},
+            },
+            "operation_history": [
+                {
+                    "task_id": "old-swap",
+                    "kind": "swap",
+                    "provider_orders": {"bridgers": old_order.model_dump(mode="json")},
+                    "provider_order_ids": {"bridgers": "old-order"},
+                    "broadcast_tx_hash": old_order.tx_hash,
+                    "broadcast_status": "confirmed",
+                }
+            ],
+        },
+        config={"configurable": {"thread_id": "historical-swap-status"}},
+    )
+
+    assert result["response"]["kind"] == "swap_status"
+    assert result["response"]["provider_status"] == "processing"
+    assert "目标链资产尚未到账" in result["response"]["message"]
 
 
 @pytest.mark.asyncio

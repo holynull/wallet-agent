@@ -150,3 +150,69 @@ async def test_graph_uses_opt_in_read_planner_without_entering_write_path():
     assert result["read_only_complete"] is True
     assert result.get("transfer_request") is None
     assert result.get("swap_request") is None
+
+
+@pytest.mark.asyncio
+async def test_unsupported_wallet_chain_returns_recoverable_supported_chain_prompt():
+    from wallet_agent.graph.build import build_graph
+
+    class Wallet:
+        chain_index_by_name = {"ETH": "1", "BASE": "8453"}
+
+        async def get_token_balances(self, _address, _chain_indexes):
+            raise AssertionError("unsupported chain must be rejected before provider call")
+
+    class Planner:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "wallet_query"}
+
+        async def plan_read(self, _request):
+            return {
+                "name": "wallet_balance",
+                "arguments": {"chain": "BTC", "address": "0x" + "1" * 40},
+            }
+
+    result = await build_graph(model=Planner(), wallet_provider=Wallet()).ainvoke(
+        {
+            "request": {"message": "查询 BTC 余额", "address": "0x" + "1" * 40, "chain": "ETH"},
+            "wallet_context": {"address": "0x" + "1" * 40, "chain": "ETH"},
+        },
+        config={"configurable": {"thread_id": "unsupported-wallet-chain"}},
+    )
+
+    assert result["response"]["kind"] == "clarification"
+    assert result["response"]["errors"][0]["code"] == "OKX_CHAIN_UNSUPPORTED"
+    assert result["response"]["errors"][0]["details"]["requested_chain"] == "BTC"
+    assert result["response"]["supported_chains"] == ["BASE", "ETH"]
+    assert "BTC" in result["response"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_other_chain_balance_question_short_circuits_planner_and_asks_for_chain():
+    from wallet_agent.graph.build import build_graph
+
+    class Wallet:
+        chain_index_by_name = {"ETH": "1", "BASE": "8453"}
+
+    class Planner:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "wallet_query"}
+
+        async def plan_read(self, _request):
+            raise AssertionError("ambiguous other-chain request should not invoke the planner")
+
+    result = await build_graph(model=Planner(), wallet_provider=Wallet()).ainvoke(
+        {
+            "request": {"message": "其他链的余额呢", "address": "0x" + "1" * 40, "chain": "ETH"},
+            "wallet_context": {"address": "0x" + "1" * 40, "chain": "ETH"},
+        },
+        config={"configurable": {"thread_id": "other-chain-balance"}},
+    )
+
+    assert result["response"]["kind"] == "clarification"
+    assert result["response"]["errors"][0]["code"] == "WALLET_CHAIN_REQUIRED"
+    assert result["response"]["supported_chains"] == ["BASE", "ETH"]

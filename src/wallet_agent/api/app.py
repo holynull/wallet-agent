@@ -833,6 +833,13 @@ def create_app(
         state = {str(key): _jsonable(value) for key, value in state.items()}
         changes: dict[str, Any] = {}
         operation_reset = bool(state.get("operation_reset"))
+        historical_reference = state.get("operation_reference") == "history"
+        if "operation_history" in state:
+            changes["operation_history"] = [
+                _jsonable(item)
+                for item in (state.get("operation_history") or [])
+                if isinstance(item, Mapping)
+            ][-20:]
         if operation_reset:
             # A session is the projection of the current wallet operation.
             # Conversation history retains completed cards; stale swap
@@ -871,7 +878,7 @@ def create_app(
             or state.get("provider_orders")
             or state.get("status_snapshot")
         )
-        selected = state.get("selected_quote")
+        selected = None if historical_reference else state.get("selected_quote")
         if selected:
             selected_reference = (
                 selected.get("provider_reference")
@@ -885,13 +892,13 @@ def create_app(
             )
             if selected_reference:
                 changes["selected_provider_reference"] = str(selected_reference)
-        candidates = state.get("quote_candidates") or []
+        candidates = [] if historical_reference else state.get("quote_candidates") or []
         if candidates:
             changes["quote_candidates"] = [
                 item if isinstance(item, NormalizedQuote) else NormalizedQuote.model_validate(item)
                 for item in candidates
             ]
-        if "pending_transaction" in state:
+        if "pending_transaction" in state and not historical_reference:
             pending = state["pending_transaction"]
             if pending is None:
                 changes["pending_transaction"] = None
@@ -902,7 +909,7 @@ def create_app(
                     changes["pending_transaction"] = UnsignedTransaction.model_validate(pending)
                 except Exception:
                     changes["pending_transaction"] = DepositOrder.model_validate(pending)
-        orders = state.get("provider_orders") or {}
+        orders = {} if historical_reference else state.get("provider_orders") or {}
         if orders:
             raw_order = next(iter(orders.values()))
             changes["provider_order"] = (
@@ -910,18 +917,18 @@ def create_app(
                 if isinstance(raw_order, ProviderOrder)
                 else ProviderOrder.model_validate(raw_order)
             )
-        snapshot = state.get("status_snapshot")
+        snapshot = None if historical_reference else state.get("status_snapshot")
         if snapshot:
             changes["order_status"] = (
                 snapshot
                 if isinstance(snapshot, NormalizedOrderStatus)
                 else NormalizedOrderStatus.model_validate(snapshot)
             )
-        if "broadcast_tx_hash" in state:
+        if "broadcast_tx_hash" in state and not historical_reference:
             changes["broadcast_tx_hash"] = (
                 str(effective_broadcast_tx_hash) if effective_broadcast_tx_hash else None
             )
-        if "broadcast_status" in state:
+        if "broadcast_status" in state and not historical_reference:
             changes["broadcast_status"] = (
                 str(effective_broadcast_status) if effective_broadcast_status else None
             )
@@ -931,6 +938,27 @@ def create_app(
             elif state.get("task_stage") is not None:
                 changes["stage"] = state["task_stage"]
         response = state.get("response") or {}
+        if historical_reference and response.get("kind") == "swap_status":
+            history = [
+                dict(item)
+                for item in (current.operation_history or [])
+                if isinstance(item, Mapping)
+            ]
+            task_id = state.get("operation_reference_task_id")
+            updated = False
+            for item in history:
+                if task_id and item.get("task_id") != task_id:
+                    continue
+                if isinstance(response.get("status"), Mapping):
+                    item["status_snapshot"] = _jsonable(response["status"])
+                if response.get("provider_status"):
+                    item["provider_status"] = response["provider_status"]
+                if response.get("broadcast_status"):
+                    item["broadcast_status"] = response["broadcast_status"]
+                updated = True
+                break
+            if updated:
+                changes["operation_history"] = history[-20:]
         if response.get("kind") == "transfer_prepare":
             changes.update(
                 broadcast_tx_hash=None,
@@ -938,7 +966,7 @@ def create_app(
                 stage="transfer_ready",
             )
             broadcast_lifecycle_active = False
-        if response.get("kind") == "swap_status":
+        if response.get("kind") == "swap_status" and not historical_reference:
             raw_status = response.get("status")
             order_state = (
                 raw_status.get("status") if isinstance(raw_status, Mapping) else raw_status
@@ -1238,6 +1266,11 @@ def create_app(
                         task_stage = result.get("task_stage") or active_task.get("stage")
                         if task_stage == "collecting_parameters":
                             session_status = "collecting_parameters"
+                    if result.get("operation_reference") == "history":
+                        # A historical status lookup updates only the archived
+                        # operation snapshot; it must not replace the current
+                        # transfer/swap session status.
+                        session_status = None
                     await project_session(session_id, result, status=session_status, run_id=run_id)
             if await event_store.get_status(run_id) == "running":
                 await event_store.set_status(run_id, "complete")
@@ -1403,6 +1436,8 @@ def create_app(
             "operation_reset": False,
         }
         if existing_session is not None:
+            if existing_session.operation_history:
+                input_state["operation_history"] = _jsonable(existing_session.operation_history)
             if existing_session.quote is not None:
                 input_state["selected_quote"] = existing_session.quote.model_dump(mode="json")
             if existing_session.approval_tx_hash is not None:

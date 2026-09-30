@@ -43,6 +43,7 @@ class SwapSessionRecord(DomainModel):
     preflight: dict | None = None
     confirmation_state: dict | None = None
     gas_estimate: dict | None = None
+    operation_history: list[dict] = Field(default_factory=list)
     state_schema_version: int = 1
     revision: int = 0
     last_run_id: str | None = None
