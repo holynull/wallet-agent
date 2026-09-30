@@ -200,6 +200,15 @@ class ModelRegistry:
     def model_ids(self) -> tuple[str, ...]:
         return tuple(self._models)
 
+    @property
+    def role_model_ids(self) -> dict[str, str]:
+        return {
+            "classifier": self.classifier_model_id,
+            "extractor": self.extractor_model_id,
+            "response": self.response_model_id,
+            "read_agent": self.read_agent_model_id,
+        }
+
     def get(self, model_id: str | None = None) -> Any:
         selected = model_id or self.default_model_id
         try:
@@ -236,9 +245,21 @@ class ModelRouter:
     def __init__(self, registry: ModelRegistry) -> None:
         self.registry = registry
         self.read_agent_enabled = registry.read_agent_enabled
+        self._model_trace: list[dict[str, str]] = []
+
+    def _record_model(self, role: str, model_id: str, **details: str) -> None:
+        entry = {"role": role, "model_id": model_id, **details}
+        self._model_trace.append(entry)
+
+    def consume_model_trace(self) -> list[dict[str, str]]:
+        trace = list(self._model_trace)
+        self._model_trace.clear()
+        return trace
 
     async def plan_read(self, request: Mapping[str, Any]) -> ReadToolPlan:
-        model = self.registry.get_read_model()
+        model_id = str(request.get("read_agent_model_id") or self.registry.read_agent_model_id)
+        model = self.registry.get_read_model(model_id)
+        self._record_model("read_agent", model_id)
         model_request = _read_model_input(request)
         if hasattr(model, "ainvoke"):
             result = await model.ainvoke(model_request)
@@ -247,7 +268,9 @@ class ModelRouter:
         return result if isinstance(result, ReadToolPlan) else ReadToolPlan.model_validate(result)
 
     async def classify(self, request: Mapping[str, Any]) -> RouteDecision:
-        model = self.registry.get(request.get("model_id") or self.registry.classifier_model_id)
+        model_id = str(request.get("model_id") or self.registry.classifier_model_id)
+        model = self.registry.get(model_id)
+        self._record_model("classifier", model_id)
         model_request = _model_input(request) if isinstance(request, Mapping) else request
         if hasattr(model, "ainvoke"):
             result = await model.ainvoke(model_request)
@@ -258,7 +281,9 @@ class ModelRouter:
     async def extract(
         self, task_kind: str, request: Mapping[str, Any]
     ) -> TransferSlotPatch | SwapSlotPatch | TransactionStatusSlotPatch:
-        model = self.registry.get_extractor(task_kind, request.get("model_id"))
+        model_id = str(request.get("model_id") or self.registry.extractor_model_id)
+        model = self.registry.get_extractor(task_kind, model_id)
+        self._record_model("extractor", model_id, task_kind=task_kind)
         model_request = _slot_model_input(task_kind, request)
         if hasattr(model, "ainvoke"):
             result = await model.ainvoke(model_request)
@@ -279,7 +304,9 @@ class ModelRouter:
     async def respond(
         self, request: Mapping[str, Any], facts: Mapping[str, Any]
     ) -> AgentResponseDraft:
-        model = self.registry.get_response_model(request.get("model_id"))
+        model_id = str(request.get("model_id") or self.registry.response_model_id)
+        model = self.registry.get_response_model(model_id)
+        self._record_model("response", model_id)
         model_request = _response_model_input(request, facts)
         if hasattr(model, "ainvoke"):
             result = await model.ainvoke(model_request)

@@ -43,6 +43,7 @@ main { width: min(1180px, 100%); min-height: 100dvh; margin: 0 auto; background:
 .user .bubble { background: #2f5fc9; border-bottom-right-radius: 4px; }
 .assistant .bubble { background: #202a37; border: 1px solid #304055; border-bottom-left-radius: 4px; }
 .card { margin: 10px 0; padding: 13px; border: 1px solid #344256; border-radius: 10px; background: #18212d; }
+.model-trace { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 2px 0 8px; color: #8fa7c1; font-size: 10px; }.model-trace > div { display: flex; flex-wrap: wrap; gap: 5px; }.model-trace code { padding: 3px 6px; border: 1px solid #34485b; border-radius: 4px; color: #bfcedd; background: #121b25; font: inherit; }.model-trace-panel .progress-list { margin-top: 9px; }
 .card h3 { margin: 0 0 9px; font-size: 14px; }
 .progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }.progress-heading h3 { margin: 0; font-size: 12px; font-weight: 600; line-height: 1.35; }.progress-heading > span { color: #8fa7c1; font-size: 11px; }
 .progress-list { display: grid; gap: 7px; margin: 12px 0 0; padding: 0; list-style: none; }.progress-list li { display: flex; align-items: baseline; gap: 8px; color: #aab8c9; font-size: 12px; }.progress-list li i { flex: 0 0 auto; width: 6px; height: 6px; margin-left: 2px; border-radius: 50%; background: #4d78c9; }.progress-list li:last-child { color: #dce7f3; }.progress-list li:last-child i { background: #57c58c; box-shadow: 0 0 0 3px rgba(87,197,140,.12); }

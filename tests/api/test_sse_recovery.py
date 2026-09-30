@@ -105,6 +105,38 @@ async def test_graph_interrupt_is_serialized_before_run_store_append():
     assert "AGENT_EXECUTION_ERROR" not in stream.text
 
 
+@pytest.mark.asyncio
+async def test_model_trace_is_emitted_in_sse_and_final_state():
+    class TraceRouter:
+        def consume_model_trace(self):
+            return [{"role": "classifier", "model_id": "deepseek-chat"}]
+
+    class TraceGraph:
+        _model = TraceRouter()
+
+        async def astream(self, _value, *, config, stream_mode):
+            del config, stream_mode
+            yield ("updates", {"response": {"kind": "clarification", "message": "你好"}})
+
+        async def aget_state(self, _config):
+            class Snapshot:
+                values = {"response": {"kind": "clarification", "message": "你好"}}
+                tasks = ()
+                next = ()
+
+            return Snapshot()
+
+    store = InMemoryRunStore()
+    app = create_app(graph=TraceGraph(), run_store=store)
+    async with client_for(app) as client:
+        turn = await client.post("/v1/agent/turn", json={"user_id": "alice", "message": "你好"})
+        await app.state.runs[turn.json()["run_id"]]["task"]
+        stream = await client.get(f"/v1/agent/stream/{turn.json()['run_id']}")
+
+    assert '"event": "model"' in stream.text
+    assert '"model_id": "deepseek-chat"' in stream.text
+
+
 class UnavailableRunStore(InMemoryRunStore):
     async def ready(self) -> bool:
         return False

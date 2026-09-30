@@ -84,6 +84,7 @@ export function responseMessage(response: any): string {
 
 export type ConversationArtifacts = {
   response: any;
+  model_trace?: Array<{ role?: string; model_id?: string; task_kind?: string }>;
   quotes?: any[];
   confirmation?: any;
   preflight?: any;
@@ -108,6 +109,8 @@ export function extractConversationArtifacts(state: any): ConversationArtifacts 
   const kind = response.kind;
   const stage = response.stage || (!kind ? state.authorization_stage : undefined);
   const artifacts: ConversationArtifacts = { response };
+  const modelTrace = state.model_trace || state.artifacts?.model_trace;
+  if (Array.isArray(modelTrace) && modelTrace.length) artifacts.model_trace = modelTrace;
 
   if (kind === "swap_quote") artifacts.quotes = response.quotes || state.quote_candidates || [];
   if (kind === "confirmation_required") artifacts.confirmation = response.confirmation || state.confirmation_state;

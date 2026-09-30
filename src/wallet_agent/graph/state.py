@@ -123,6 +123,7 @@ class AgentState(TypedDict, total=False):
     active_task: NotRequired[ActiveTask | None]
     supervisor_decision: NotRequired[dict[str, Any] | None]
     supervisor_output: NotRequired[dict[str, Any] | None]
+    model_trace: NotRequired[list[dict[str, Any]]]
     conversation_state: NotRequired[ConversationState | None]
     dialogue: NotRequired[DialogueState | None]
     read_reference: NotRequired[dict[str, Any] | None]

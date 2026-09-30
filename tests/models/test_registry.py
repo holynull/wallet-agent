@@ -9,6 +9,60 @@ class FakeModel:
     pass
 
 
+def test_model_registry_exposes_role_model_ids():
+    registry = ModelRegistry(
+        {"deepseek-v4-pro": FakeModel(), "deepseek-chat": FakeModel()},
+        default_model_id="deepseek-v4-pro",
+        classifier_model_id="deepseek-chat",
+        extractor_model_id="deepseek-chat",
+        response_model_id="deepseek-v4-pro",
+        read_agent_model_id="deepseek-chat",
+    )
+
+    assert registry.role_model_ids == {
+        "classifier": "deepseek-chat",
+        "extractor": "deepseek-chat",
+        "response": "deepseek-v4-pro",
+        "read_agent": "deepseek-chat",
+    }
+
+
+@pytest.mark.asyncio
+async def test_model_router_records_models_used_by_each_call():
+    class RoleModel:
+        def __init__(self, result):
+            self.result = result
+
+        async def ainvoke(self, _value):
+            return self.result
+
+    route_model = RoleModel({"intent": "clarification"})
+    slot_model = RoleModel({})
+    response_model = RoleModel({"language": "zh", "message": "你好", "suggestions": []})
+    reader_model = RoleModel({"name": None, "arguments": {}})
+
+    router = ModelRouter(
+        ModelRegistry(
+            {"deepseek-chat": route_model},
+            default_model_id="deepseek-chat",
+            extractors={"transfer": {"deepseek-chat": slot_model}},
+            responses={"deepseek-chat": response_model},
+            readers={"deepseek-chat": reader_model},
+        )
+    )
+    await router.classify({"message": "你好"})
+    await router.extract("transfer", {"message": "转账"})
+    await router.respond({"message": "你好"}, {})
+    await router.plan_read({"message": "余额", "read_facts": {}})
+
+    assert router.consume_model_trace() == [
+        {"role": "classifier", "model_id": "deepseek-chat"},
+        {"role": "extractor", "model_id": "deepseek-chat", "task_kind": "transfer"},
+        {"role": "response", "model_id": "deepseek-chat"},
+        {"role": "read_agent", "model_id": "deepseek-chat"},
+    ]
+
+
 def test_registry_has_default_and_allows_whitelisted_temporary_selection():
     default = FakeModel()
     reasoner = FakeModel()

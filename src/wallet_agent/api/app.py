@@ -137,6 +137,12 @@ class ConfirmRequest(BaseModel):
     approved: bool
 
 
+class CancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str | None = None
+
+
 class BroadcastRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -196,6 +202,9 @@ def _conversation_artifacts(state: Mapping[str, Any]) -> dict[str, Any] | None:
     kind = response.get("kind")
     stage = response.get("stage") or (state.get("authorization_stage") if not kind else None)
     artifacts: dict[str, Any] = {"response": response}
+    model_trace = state.get("model_trace")
+    if isinstance(model_trace, list) and model_trace:
+        artifacts["model_trace"] = _jsonable(model_trace)
 
     if kind == "swap_quote":
         artifacts["quotes"] = response.get("quotes") or _jsonable(
@@ -330,6 +339,20 @@ def _stream_state(state: Mapping[str, Any]) -> dict[str, Any]:
             for item in history
         ]
     return public_state
+
+
+def _model_trace_for_state(
+    state: Mapping[str, Any], model_registry: Any = None
+) -> list[dict[str, Any]]:
+    trace = state.get("model_trace")
+    if isinstance(trace, list):
+        return [_jsonable(item) for item in trace if isinstance(item, Mapping)]
+    if model_registry is not None and hasattr(model_registry, "role_model_ids"):
+        return [
+            {"role": role, "model_id": model_id}
+            for role, model_id in model_registry.role_model_ids.items()
+        ]
+    return []
 
 
 def _broadcast_response(
@@ -643,6 +666,7 @@ def create_app(
     app.state.token_verifier = token_verifier
     app.state.require_auth = require_auth
     app.state.model_registry = model_registry
+    app.state.model_router = getattr(graph, "_model", None)
     app.state.transports: list[Any] = []
 
     def graph_lock(thread_id: str) -> Any:
@@ -772,6 +796,7 @@ def create_app(
             "session": _jsonable(session),
             "messages": _jsonable(state.get("conversation_history") or []),
             "latest_artifacts": _conversation_artifacts(state),
+            "model_trace": _model_trace_for_state(state, model_registry),
         }
 
     @app.delete("/v1/agent/conversations/{conversation_id}")
@@ -1098,6 +1123,13 @@ def create_app(
                 )
             else:
 
+                router = getattr(app.state.graph, "_model", None)
+
+                def collect_model_trace() -> list[dict[str, Any]]:
+                    if router is None or not hasattr(router, "consume_model_trace"):
+                        return []
+                    return [_jsonable(item) for item in router.consume_model_trace()]
+
                 async def get_snapshot() -> Any:
                     if hasattr(app.state.graph, "aget_state"):
                         return await app.state.graph.aget_state(config)
@@ -1181,10 +1213,28 @@ def create_app(
                             run_id,
                             {"event": event_name, "data": event}
                         )
+                        trace = collect_model_trace()
+                        if trace:
+                            await append_run_event(
+                                run_id,
+                                {"event": "model", "data": {"model_trace": trace}},
+                            )
                     snapshot = await get_snapshot()
                     final_state = dict(snapshot.values)
+                    trace = collect_model_trace()
+                    if trace:
+                        prior_trace = [
+                            *(_jsonable(final_state.get("model_trace") or [])),
+                            *trace,
+                        ]
+                        final_state["model_trace"] = prior_trace
+                        if hasattr(app.state.graph, "aupdate_state"):
+                            await app.state.graph.aupdate_state(
+                                config, {"model_trace": prior_trace}
+                            )
+                            snapshot = await get_snapshot()
+                            final_state = dict(snapshot.values)
                     return final_state
-
                 result = await execute(input_state)
                 # A swap turn owns a business session. Once quotes are available,
                 # continue the same thread into the confirmation interrupt so the
@@ -1661,7 +1711,7 @@ def create_app(
         return payload
 
     @app.post("/v1/swap/{session_id}/cancel")
-    async def cancel(request: Request, session_id: str, payload: ConfirmRequest) -> dict[str, Any]:
+    async def cancel(request: Request, session_id: str, payload: CancelRequest) -> dict[str, Any]:
         user_id = await authenticated_user(
             request,
             verifier=token_verifier,

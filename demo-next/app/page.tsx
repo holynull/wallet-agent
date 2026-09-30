@@ -5,6 +5,7 @@ import { classifyAgentTest, ConversationArtifacts, extractConversationArtifacts,
 
 type Message = { id?: string; role: "user" | "assistant" | "system"; content: string; fullContent?: string; typing?: boolean; suggestions?: any[]; artifacts?: ConversationArtifacts; responseKey?: string };
 type ProgressEntry = { text: string; elapsed?: number };
+type ModelTraceEntry = { role?: string; model_id?: string; task_kind?: string };
 type Conversation = { conversation_id: string; session_id?: string; summary: string; status: string; updated_at: string };
 type Provider = { request: (args: { method: string; params?: unknown[] }) => Promise<any>; on?: (event: string, callback: (...args: any[]) => void) => void; providers?: Provider[]; name?: string; providerName?: string; walletName?: string; _name?: string; isMetaMask?: boolean; isCatWallet?: boolean; isCatwallet?: boolean; _isCatWallet?: boolean };
 type Quote = { provider?: string; provider_reference?: string; input_amount?: string; expected_output?: string; source_asset?: { symbol?: string }; destination_asset?: { symbol?: string } };
@@ -70,6 +71,7 @@ export default function Home() {
   const [processingElapsed, setProcessingElapsed] = useState(0);
   const [lastMessage, setLastMessage] = useState("");
   const abortRef = useRef<AbortController | null>(null);
+  const cancellingRef = useRef(false);
   const [debug, setDebug] = useState<string[]>([]);
   const [wallet, setWallet] = useState<{ provider: Provider; address: string; chainId: string; chain: string } | null>(null);
   const [walletProviders, setWalletProviders] = useState<Array<{ info?: any; provider: Provider; source?: string }>>([]);
@@ -94,6 +96,7 @@ export default function Home() {
   const [readOnlyTrace, setReadOnlyTrace] = useState<ReadOnlyTrace | null>(null);
   const [backendDuration, setBackendDuration] = useState<number | null>(null);
   const [backendStage, setBackendStage] = useState("等待请求");
+  const [modelTrace, setModelTrace] = useState<ModelTraceEntry[]>([]);
   const [agentTests, setAgentTests] = useState<Record<string, string>>({});
   const [historyOpen, setHistoryOpen] = useState(false);
   const messagesRef = useRef<HTMLDivElement>(null);
@@ -121,7 +124,7 @@ export default function Home() {
     try {
       clearConversationState();
       const body = await requestApi(`/v1/agent/conversations/${encodeURIComponent(id)}?user_id=browser-demo`, { headers });
-      const latestArtifacts = body.latest_artifacts || extractConversationArtifacts(body.session);
+      const latestArtifacts = body.latest_artifacts || extractConversationArtifacts({ ...body.session, model_trace: body.model_trace });
       setConversationId(body.conversation_id);
       setSessionId(body.session_id ?? null);
       setMessages(restoreConversationMessages(body.messages ?? [], latestArtifacts));
@@ -145,7 +148,7 @@ export default function Home() {
     try { return await action(); }
     finally { setActionLoading(null); endProcessing(); }
   }
-  function clearConversationState() { abortRef.current?.abort(); abortRef.current = null; setBusy(false); setActionLoading(null); endProcessing(); setConversationId(null); setSessionId(null); setQuotes([]); setSelectedQuote(null); setPendingTransaction(null); setPendingKind("swap"); setBroadcastHash(null); setConfirmation(null); setApproval(null); setPreflight(null); setStatus(null); setWalletData(null); setPortfolioData(null); setPriceData(null); setGasData(null); setAssetsData(null); setSuggestions([]); setTokenCandidates([]); setProgress([]); setReadOnlyTrace(null); setBackendDuration(null); setBackendStage("等待请求"); responseKeysRef.current.clear(); }
+  function clearConversationState() { abortRef.current?.abort(); abortRef.current = null; setBusy(false); setActionLoading(null); endProcessing(); setConversationId(null); setSessionId(null); setQuotes([]); setSelectedQuote(null); setPendingTransaction(null); setPendingKind("swap"); setBroadcastHash(null); setConfirmation(null); setApproval(null); setPreflight(null); setStatus(null); setWalletData(null); setPortfolioData(null); setPriceData(null); setGasData(null); setAssetsData(null); setSuggestions([]); setTokenCandidates([]); setProgress([]); setReadOnlyTrace(null); setModelTrace([]); setBackendDuration(null); setBackendStage("等待请求"); responseKeysRef.current.clear(); }
   function applyActiveArtifacts(artifacts?: ConversationArtifacts | null) {
     setQuotes(artifacts?.quotes || []);
     setConfirmation(artifacts?.confirmation || null);
@@ -162,6 +165,7 @@ export default function Home() {
     setStatus(artifacts?.status || null);
     setBroadcastHash(artifacts?.broadcast_hash || null);
     setReadOnlyTrace(artifacts?.readOnly || null);
+    setModelTrace(artifacts?.model_trace || []);
   }
   function appendAssistantMessage(content: string, suggestions: any[] = [], artifacts?: ConversationArtifacts | null, responseKey?: string) {
     if (responseKey && responseKeysRef.current.has(responseKey)) {
@@ -327,6 +331,7 @@ export default function Home() {
     // Each request owns its own progress timeline; do not mix it with the prior turn.
     setProgress([]);
     setReadOnlyTrace(null);
+    setModelTrace([]);
     setBackendDuration(null);
     setBackendStage("正在处理请求");
     const requestStartedAt = performance.now();
@@ -346,6 +351,8 @@ export default function Home() {
         if (parsedFrame.id) lastEventId = parsedFrame.id;
         if (["complete", "error", "action_required"].includes(eventName)) terminalReceived = true;
         log(`SSE ${eventName}`, payload);
+        const streamedModels = payload?.data?.model_trace || payload?.model_trace;
+        if (Array.isArray(streamedModels)) setModelTrace((items) => [...items, ...streamedModels].filter((item, index, all) => all.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(item)) === index));
         const current = payload?.state || payload?.data?.state || payload?.data || payload;
         events.push({ event: eventName, payload, state: current });
         const streamedResponse = ["response", "complete", "action_required"].includes(eventName)
@@ -440,6 +447,8 @@ export default function Home() {
   function applyState(value: any) {
     const eventName = value?.event;
     const current = value?.state || value?.data?.state || value?.data || value;
+    const stateModels = current?.model_trace;
+    if (Array.isArray(stateModels)) setModelTrace(stateModels);
     const trace = extractReadOnlyTrace(current);
     if (trace) setReadOnlyTrace(trace);
     if (eventName === "progress" || current?.progress) {
@@ -454,6 +463,8 @@ export default function Home() {
         setProgress((items) => items.some((item) => item.text === text) ? items : [...items, { text, elapsed: Number.isFinite(elapsed) ? elapsed : undefined }].slice(-20));
       }
     }
+    const eventModels = value?.data?.model_trace || value?.model_trace;
+    if (Array.isArray(eventModels)) setModelTrace(eventModels);
     if (current?.selected_provider_reference) setSelectedQuote(current.selected_provider_reference);
     let response = ["response", "complete", "action_required"].includes(eventName)
       ? current?.response?.response || current?.response || current
@@ -471,7 +482,7 @@ export default function Home() {
       const nextSuggestions = response.suggestions || [];
       setSuggestions(nextSuggestions);
     }
-    const artifacts = response ? extractConversationArtifacts({ ...current, response }) : null;
+    const artifacts = response ? extractConversationArtifacts({ ...current, response, model_trace: current?.model_trace || modelTrace }) : null;
     if (response) applyActiveArtifacts(artifacts);
     const summary = formatResponseSummary(response);
     const finalMessage = response?.message || summary;
@@ -509,11 +520,23 @@ export default function Home() {
     }
   }
   async function cancelRequest() {
-    if (sessionId) {
-      try { await requestApi(`/v1/swap/${sessionId}/cancel`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo" }) }); }
-      catch (error) { setMessages((current) => [...current, { role: "assistant", content: `取消兑换失败：${error instanceof Error ? error.message : String(error)}` }]); return; }
+    if (cancellingRef.current) return;
+    cancellingRef.current = true;
+    const activeSessionId = sessionId;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setBusy(false);
+    endProcessing();
+    setMessages((current) => [...current, { role: "system", content: activeSessionId ? "已取消当前兑换和请求。" : "已取消本次请求。" }]);
+    try {
+      if (activeSessionId) {
+        await requestApi(`/v1/swap/${activeSessionId}/cancel`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo" }) });
+      }
+    } catch (error) {
+      setMessages((current) => [...current, { role: "system", content: `本地请求已停止，但后端取消同步失败：${error instanceof Error ? error.message : String(error)}` }]);
+    } finally {
+      cancellingRef.current = false;
     }
-    abortRef.current?.abort(); setBusy(false); endProcessing(); setMessages((current) => [...current, { role: "system", content: sessionId ? "已取消当前兑换和请求。" : "已取消本次请求。" }]);
   }
   async function chooseSuggestion(text: string, data?: Record<string, unknown>) { if (busy || actionLoading) return; setMessage(text); setMessages((current) => [...current, { role: "user", content: text }]); setLastMessage(text); setBusy(true); beginProcessing("正在处理请求"); abortRef.current = new AbortController(); try { await sendText(text, false, data ? { suggestion_data: data } : {}); } catch (error) { if ((error as Error).name !== "AbortError") setMessages((current) => [...current, { role: "assistant", content: `请求失败：${error instanceof Error ? error.message : String(error)}` }]); } finally { setBusy(false); endProcessing(); abortRef.current = null; setMessage(""); } }
   async function chooseToken(candidate: any) {
@@ -580,6 +603,7 @@ export default function Home() {
       {artifacts.gas && <section className="card" data-card-kind="gas"><h3>Gas 检查</h3><pre className="debug">{JSON.stringify(artifacts.gas, null, 2)}</pre></section>}
       {artifacts.assets && <section className="card" data-card-kind="assets"><h3>Token 资产发现</h3><pre className="debug">{JSON.stringify(artifacts.assets, null, 2)}</pre></section>}
       {cardStatus && <section className="card" data-card-kind="status"><h3>订单状态</h3><p>{cardStatus.message || responseMessage(cardStatus) || cardStatus.status?.status || "处理中"}</p><pre className="debug">{JSON.stringify(cardStatus, null, 2)}</pre></section>}
+      {artifacts.model_trace?.length ? <section className="model-trace" data-testid="model-trace"><span>本轮模型</span><div>{artifacts.model_trace.map((item, index) => <code key={`${item.role}-${item.model_id}-${index}`}>{item.role}{item.task_kind ? `:${item.task_kind}` : ""} · {item.model_id}</code>)}</div></section> : null}
     </>;
   }
   return <main>
@@ -593,7 +617,7 @@ export default function Home() {
         </div>
         <form className="composer" onSubmit={send}><div className="composer-row"><textarea onKeyDown={handleComposerKeyDown} value={message} onChange={(event) => setMessage(event.target.value)} placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled={busy || Boolean(actionLoading)} /><button disabled={busy || Boolean(actionLoading)}>{busy ? <><i className="loading-spinner" />处理中…</> : "发送"}</button></div><div className="toolbar"><span className="muted">{processing ? `${processing.label} · ${formatProcessingDuration(processingElapsed)}` : "就绪"}</span>{busy && <button type="button" className="secondary" onClick={cancelRequest}>取消请求</button>}{!busy && !actionLoading && lastMessage && <button type="button" className="secondary" onClick={() => void retryLastMessage()}>重试</button>}</div><div className="meta"><span>conversation: {conversationId ?? "新会话"}</span><span>session: {sessionId ?? "未创建"}</span></div></form>
       </section>
-      <aside className="side-column"><div className="side-card"><div className="side-title"><span>运行状态</span><b className={processing ? "busy" : "ready"}>{processing ? "处理中" : "就绪"}</b></div><div className="stat"><span>网络</span><strong>{wallet?.chain || "未连接"}</strong></div><div className="stat"><span>会话</span><strong>{sessionId ? "已建立" : "新会话"}</strong></div><div className="stat"><span>请求耗时</span><strong>{processing ? formatProcessingDuration(processingElapsed) : "--"}</strong></div><div className="stat"><span>后端耗时</span><strong>{backendDuration == null ? "--" : `${backendDuration} ms`}</strong></div><div className="stat"><span>当前阶段</span><strong className="stage-value">{processing?.label || latestProgressText(progress, backendStage)}</strong></div></div>{progress.length > 0 && <section className="side-card progress-card"><div className="progress-heading"><h3>处理过程</h3><span>{backendDuration == null ? "进行中" : `${backendDuration} ms`}</span></div><ol className="progress-list">{progress.map((item, index) => <li key={`${item.text}-${index}`}><i /> <span>{item.text}{item.elapsed != null ? ` · ${item.elapsed} ms` : ""}</span></li>)}</ol></section>}{readOnlyTrace && <section className="side-card read-only-card" data-testid="read-only-trace"><div className="progress-heading"><h3>只读查询</h3><span>{readOnlyTrace.loopCount}/2 轮</span></div>{readOnlyTrace.reference && <p className="trace-reference">引用：{readOnlyTrace.reference.id || readOnlyTrace.reference.kind || "已解析"}</p>}<ol className="progress-list">{readOnlyTrace.toolCalls.map((call, index) => <li key={`${call.name || "tool"}-${index}`}><i className={call.status === "failed" || call.status === "rejected" ? "failed" : ""} /><span>{call.name || "只读工具"} · {call.status || "处理中"}{call.elapsed_ms != null ? ` · ${call.elapsed_ms} ms` : ""}</span></li>)}</ol>{Object.keys(readOnlyTrace.facts).length > 0 && <details><summary>验证事实</summary><pre className="debug">{JSON.stringify(sanitizeDebug(readOnlyTrace.facts), null, 2)}</pre></details>}</section>}<details className="panel debug-panel"><summary>后端调试数据（{debug.length} 条）</summary><div className="toolbar"><button className="secondary" onClick={() => navigator.clipboard?.writeText(debug.join("\n\n"))}>复制</button><button className="secondary" onClick={() => setDebug([])}>清空</button></div><pre className="debug">{debug.join("\n\n") || "等待后端响应…"}</pre></details>{Object.keys(agentTests).length > 0 && <div className="side-card test-card"><div className="side-title"><span>Agent 测试</span><b>{Object.values(agentTests).filter((value) => value.startsWith("通过")).length}/{AGENT_TESTS.length}</b></div><div className="test-list">{AGENT_TESTS.map((item) => <div key={item.id}><span>{item.name}</span><em>{agentTests[item.id] || "未运行"}</em></div>)}</div></div>}</aside>
+      <aside className="side-column"><div className="side-card"><div className="side-title"><span>运行状态</span><b className={processing ? "busy" : "ready"}>{processing ? "处理中" : "就绪"}</b></div><div className="stat"><span>网络</span><strong>{wallet?.chain || "未连接"}</strong></div><div className="stat"><span>会话</span><strong>{sessionId ? "已建立" : "新会话"}</strong></div><div className="stat"><span>请求耗时</span><strong>{processing ? formatProcessingDuration(processingElapsed) : "--"}</strong></div><div className="stat"><span>后端耗时</span><strong>{backendDuration == null ? "--" : `${backendDuration} ms`}</strong></div><div className="stat"><span>当前阶段</span><strong className="stage-value">{processing?.label || latestProgressText(progress, backendStage)}</strong></div><div className="stat"><span>当前模型</span><strong className="stage-value" data-testid="current-model">{modelTrace.length ? modelTrace[modelTrace.length - 1]?.model_id : "等待模型调用"}</strong></div></div>{modelTrace.length > 0 && <section className="side-card model-trace-panel" data-testid="model-trace-panel"><div className="progress-heading"><h3>模型调用</h3><span>{modelTrace.length} 次</span></div><ol className="progress-list">{modelTrace.map((item, index) => <li key={`${item.role}-${item.model_id}-${index}`}><i /><span>{item.role}{item.task_kind ? `:${item.task_kind}` : ""} · {item.model_id}</span></li>)}</ol></section>}{progress.length > 0 && <section className="side-card progress-card"><div className="progress-heading"><h3>处理过程</h3><span>{backendDuration == null ? "进行中" : `${backendDuration} ms`}</span></div><ol className="progress-list">{progress.map((item, index) => <li key={`${item.text}-${index}`}><i /> <span>{item.text}{item.elapsed != null ? ` · ${item.elapsed} ms` : ""}</span></li>)}</ol></section>}{readOnlyTrace && <section className="side-card read-only-card" data-testid="read-only-trace"><div className="progress-heading"><h3>只读查询</h3><span>{readOnlyTrace.loopCount}/2 轮</span></div>{readOnlyTrace.reference && <p className="trace-reference">引用：{readOnlyTrace.reference.id || readOnlyTrace.reference.kind || "已解析"}</p>}<ol className="progress-list">{readOnlyTrace.toolCalls.map((call, index) => <li key={`${call.name || "tool"}-${index}`}><i className={call.status === "failed" || call.status === "rejected" ? "failed" : ""} /><span>{call.name || "只读工具"} · {call.status || "处理中"}{call.elapsed_ms != null ? ` · ${call.elapsed_ms} ms` : ""}</span></li>)}</ol>{Object.keys(readOnlyTrace.facts).length > 0 && <details><summary>验证事实</summary><pre className="debug">{JSON.stringify(sanitizeDebug(readOnlyTrace.facts), null, 2)}</pre></details>}</section>}<details className="panel debug-panel"><summary>后端调试数据（{debug.length} 条）</summary><div className="toolbar"><button className="secondary" onClick={() => navigator.clipboard?.writeText(debug.join("\n\n"))}>复制</button><button className="secondary" onClick={() => setDebug([])}>清空</button></div><pre className="debug">{debug.join("\n\n") || "等待后端响应…"}</pre></details>{Object.keys(agentTests).length > 0 && <div className="side-card test-card"><div className="side-title"><span>Agent 测试</span><b>{Object.values(agentTests).filter((value) => value.startsWith("通过")).length}/{AGENT_TESTS.length}</b></div><div className="test-list">{AGENT_TESTS.map((item) => <div key={item.id}><span>{item.name}</span><em>{agentTests[item.id] || "未运行"}</em></div>)}</div></div>}</aside>
     </div>
   </main>;
 }

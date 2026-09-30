@@ -171,4 +171,8 @@ def build_graph(
     builder.add_conditional_edges(
         "status_poll", route_after_status, {"status_poll": "status_poll", "response": "response"}
     )
-    return builder.compile(checkpointer=checkpointer or MemorySaver())
+    compiled = builder.compile(checkpointer=checkpointer or MemorySaver())
+    # Keep the router available to the API transport for non-checkpointed
+    # observability metadata. The model trace itself is emitted as SSE data.
+    setattr(compiled, "_model", model)
+    return compiled
