@@ -16,15 +16,15 @@ cp .env.example .env
 
 ```dotenv
 DEEPSEEK_API_KEY=你的-DeepSeek-API-Key
-OPENAI_MODEL=deepseek-chat
-INTENT_MODEL=deepseek-chat
-SLOT_EXTRACTION_MODEL=deepseek-chat
-RESPONSE_MODEL=deepseek-chat
+OPENAI_MODEL=deepseek-flash
+INTENT_MODEL=deepseek-flash
+SLOT_EXTRACTION_MODEL=deepseek-flash
+RESPONSE_MODEL=deepseek-flash
 READ_AGENT_MODEL=deepseek-flash
 OPENAI_BASE_URL=https://api.deepseek.com
 ```
 
-意图识别、参数提取和自然语言回复默认使用 `deepseek-chat`；只读工具规划默认使用支持工具调用的 `deepseek-flash`。客户端不能切换到未纳入服务端允许列表的模型。
+意图识别、参数提取、自然语言回复和只读工具规划默认使用支持工具调用及结构化输出的 `deepseek-flash`；`deepseek-v4-pro` 可作为显式复杂推理模型。客户端不能切换到未纳入服务端允许列表的模型。
 
 ### 配置 EVM RPC
 
@@ -350,7 +350,7 @@ curl -sS -X POST http://localhost:8000/v1/agent/turn \
   -d '{
     "user_id": "debug-user",
     "message": "你好，请回复一句简短的问候。",
-    "model_id": "deepseek-chat"
+    "model_id": "deepseek-flash"
   }'
 ```
 

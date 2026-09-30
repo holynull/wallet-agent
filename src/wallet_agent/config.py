@@ -28,15 +28,15 @@ class Settings(BaseSettings):
     # remain supported for backwards compatibility with existing deployments.
     deepseek_api_key: str | None = None
     openai_api_key: str | None = None
-    openai_model: str = "deepseek-chat"
-    intent_model: str = "deepseek-chat"
-    slot_extraction_model: str = "deepseek-chat"
-    response_model: str = "deepseek-chat"
+    openai_model: str = "deepseek-flash"
+    intent_model: str = "deepseek-flash"
+    slot_extraction_model: str = "deepseek-flash"
+    response_model: str = "deepseek-flash"
     read_agent_enabled: bool = True
     read_agent_model: str = "deepseek-flash"
     openai_base_url: str | None = "https://api.deepseek.com"
     allowed_model_ids: list[str] = Field(
-        default_factory=lambda: ["deepseek-chat", "deepseek-flash"]
+        default_factory=lambda: ["deepseek-flash", "deepseek-v4-pro"]
     )
 
     provider_timeout_seconds: float = Field(default=15, gt=0)
