@@ -42,7 +42,7 @@ def route_after_intent(state: dict[str, Any]) -> str:
     ):
         return "swap_allowance"
     if intent == "wallet_query":
-        return "wallet_query"
+        return "read_only" if state.get("read_only_enabled") else "wallet_query"
     if intent == "transfer":
         return "transfer"
     if intent == "swap_select":
@@ -50,15 +50,15 @@ def route_after_intent(state: dict[str, Any]) -> str:
     if intent == "swap_allowance":
         return "swap_allowance"
     if intent == "price_query":
-        return "price_query"
+        return "read_only" if state.get("read_only_enabled") else "price_query"
     if intent == "transaction_status":
-        return "transaction_status"
+        return "read_only" if state.get("read_only_enabled") else "transaction_status"
     if intent == "portfolio_query":
         return "portfolio_query"
     if intent == "gas_check":
-        return "gas_check"
+        return "read_only" if state.get("read_only_enabled") else "gas_check"
     if intent == "asset_discovery":
-        return "asset_discovery"
+        return "read_only" if state.get("read_only_enabled") else "asset_discovery"
     if intent == "swap_quote":
         return "swap_resolve"
     if intent == "swap_prepare":

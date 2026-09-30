@@ -94,6 +94,9 @@ def build_graph(
     builder.add_node("register_broadcast", n["register_broadcast"])
     builder.add_node("status_poll", n["status_poll"])
     builder.add_node("response", n["response"])
+    builder.add_node("read_only_agent", n["read_only_agent"])
+    builder.add_node("read_only_tool", n["read_only_tool"])
+    builder.add_node("read_only_observe", n["read_only_observe"])
     builder.add_edge(START, "dialogue_manager")
     builder.add_edge("dialogue_manager", "supervisor")
     builder.add_edge("supervisor", "intent")
@@ -110,12 +113,24 @@ def build_graph(
             "portfolio_query": "portfolio_query",
             "gas_check": "gas_tool_call",
             "asset_discovery": "asset_tool_call",
+            "read_only": "read_only_agent",
             "swap_resolve": "resolve_swap",
             "swap_resolve_prepare": "resolve_swap",
             "status_poll": "status_poll",
             "register_broadcast": "register_broadcast",
             "response": "response",
         },
+    )
+    builder.add_conditional_edges(
+        "read_only_agent",
+        n["route_read_only"],
+        {"tool": "read_only_tool", "agent": "read_only_agent", "response": "response"},
+    )
+    builder.add_edge("read_only_tool", "read_only_observe")
+    builder.add_conditional_edges(
+        "read_only_observe",
+        n["route_read_only"],
+        {"tool": "read_only_tool", "agent": "read_only_agent", "response": "response"},
     )
     builder.add_conditional_edges(
         "resolve_swap",

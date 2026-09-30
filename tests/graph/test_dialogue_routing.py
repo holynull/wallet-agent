@@ -2,6 +2,7 @@ import pytest
 
 from wallet_agent.domain.models import Asset, TokenBalance
 from wallet_agent.graph import build_graph
+from wallet_agent.graph.dialogue import resolve_quote_reference, resolve_read_reference
 from wallet_agent.graph.nodes import GraphRuntime, make_nodes
 from wallet_agent.models import RouteDecision
 
@@ -106,3 +107,74 @@ async def test_read_terminal_fallback_has_a_natural_language_message():
 
     assert result["response"]["kind"] == "swap_quote"
     assert result["response"]["message"]
+
+
+def test_price_followup_reuses_chain_and_replaces_symbol():
+    dialogue = {
+        "active_topic": "price",
+        "referent": {
+            "kind": "asset",
+            "id": "ETH:BTC",
+            "facts": {"chain": "ETH", "symbol": "BTC", "usd_price": "60000"},
+        },
+    }
+
+    result = resolve_read_reference("那 ETH 呢？", dialogue)
+
+    assert result == {
+        "intent": "price_query",
+        "referent": {"kind": "asset", "id": "ETH:BTC"},
+        "arguments": {"chain": "ETH", "symbol": "ETH"},
+    }
+
+
+def test_transaction_followup_reuses_only_explicit_previous_hash_and_chain():
+    dialogue = {
+        "active_topic": "transaction",
+        "referent": {
+            "kind": "transaction",
+            "id": "BASE:0xabc",
+            "facts": {"chain": "BASE", "tx_hash": "0xabc", "status": "pending"},
+        },
+    }
+
+    result = resolve_read_reference("刚才那笔交易到账了吗？", dialogue)
+
+    assert result == {
+        "intent": "transaction_status",
+        "referent": {"kind": "transaction", "id": "BASE:0xabc"},
+        "arguments": {"chain": "BASE", "tx_hash": "0xabc"},
+    }
+
+
+def test_quote_comparison_uses_only_displayed_candidates():
+    referent = {
+        "kind": "quote",
+        "id": "quote-set",
+        "facts": {"quotes": [{"provider": "a"}, {"provider": "b"}]},
+    }
+
+    result = resolve_read_reference("哪个报价更划算？", {"referent": referent})
+
+    assert result == {
+        "intent": "quote_compare",
+        "referent": {"kind": "quote", "id": "quote-set"},
+        "arguments": {"quotes": [{"provider": "a"}, {"provider": "b"}]},
+    }
+
+
+def test_quote_ordinal_selects_displayed_candidate_without_execution():
+    referent = {
+        "kind": "quote",
+        "id": "quote-set",
+        "facts": {"quotes": [{"provider": "a"}, {"provider": "b"}]},
+    }
+
+    result = resolve_quote_reference("第二个", referent)
+
+    assert result == {
+        "intent": "swap_quote",
+        "referent": {"kind": "quote", "id": "quote-set"},
+        "arguments": {"selected_quote": {"provider": "b"}},
+        "requires_confirmation": True,
+    }

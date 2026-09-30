@@ -44,6 +44,15 @@ from wallet_agent.domain.normalization import (
 )
 from wallet_agent.observability import wallet_event
 
+from .dialogue import resolve_quote_reference, resolve_read_reference
+from .facts import validate_response_draft
+from .read_only import (
+    READ_ONLY_MAX_ROUNDS,
+    ReadOnlyToolCall,
+    read_only_decision,
+    read_only_tool_name_for_intent,
+    run_read_only_round,
+)
 from .state import DialogueState
 from .tasks import (
     hydrate_active_task,
@@ -666,6 +675,57 @@ def _latest_read_response(history: Any) -> dict[str, Any] | None:
     return None
 
 
+def _dialogue_referent(response: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not response:
+        return None
+    kind = str(response.get("kind") or "")
+    if kind == "price_query":
+        prices = response.get("prices") or []
+        if len(prices) != 1 or not isinstance(prices[0], Mapping):
+            return None
+        price = prices[0]
+        asset = price.get("asset") or {}
+        if not isinstance(asset, Mapping) or not asset.get("symbol"):
+            return None
+        facts = {
+            "chain": asset.get("chain"),
+            "symbol": asset.get("symbol"),
+            "usd_price": price.get("usd_price"),
+        }
+        return {
+            "kind": "asset",
+            "id": f"{facts['chain']}:{facts['symbol']}",
+            "facts": {key: value for key, value in facts.items() if value is not None},
+        }
+    if kind == "transaction_status":
+        chain = response.get("chain")
+        tx_hash = response.get("tx_hash")
+        if not chain or not tx_hash:
+            return None
+        facts = {
+            "chain": chain,
+            "tx_hash": tx_hash,
+            "status": response.get("status"),
+        }
+        return {
+            "kind": "transaction",
+            "id": f"{chain}:{tx_hash}",
+            "facts": {key: value for key, value in facts.items() if value is not None},
+        }
+    if kind == "swap_quote":
+        quotes = response.get("quotes") or []
+        if not quotes:
+            return None
+        return {
+            "kind": "quote",
+            "id": "quote-set",
+            "facts": {"quotes": quotes},
+        }
+    if kind in {"wallet_query", "portfolio_query"}:
+        return {"kind": kind, "id": kind, "facts": dict(response)}
+    return None
+
+
 def dialogue_snapshot(state: Mapping[str, Any]) -> DialogueState:
     """Project one compact, JSON-safe dialogue context from graph state."""
     request = state.get("request") or {}
@@ -702,7 +762,7 @@ def dialogue_snapshot(state: Mapping[str, Any]) -> DialogueState:
     return DialogueState(
         goal=goal,
         active_topic=active_topic or "unknown",
-        referent=result,
+        referent=_dialogue_referent(result),
         language=_response_language(message, state.get("conversation_history")),
         last_result_kind=kind or None,
     )
@@ -2787,16 +2847,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
                 for item in _wallet_balance_items(wallet)
             ]
+        if kind == "price_query":
+            facts["prices"] = result.get("prices") or []
+        if kind == "transaction_status":
+            facts["transaction"] = result
         responder = getattr(runtime.model, "respond", None)
         if callable(responder):
             try:
                 draft = _dump(await responder(request, facts)) or {}
-                if isinstance(draft, Mapping) and str(draft.get("message") or "").strip():
-                    language = str(draft.get("language") or facts["language_hint"])
+                validated = validate_response_draft(draft, facts)
+                if isinstance(validated, Mapping) and str(validated.get("message") or "").strip():
+                    language = str(validated.get("language") or facts["language_hint"])
                     if language.split("-")[0].lower() == facts["language_hint"]:
-                        result["message"] = str(draft["message"]).strip()
+                        result["message"] = str(validated["message"]).strip()
                         result["suggestions"] = _sanitize_response_suggestions(
-                            draft.get("suggestions"), intent=kind, facts=facts
+                            validated.get("suggestions"), intent=kind, facts=facts
                         )
             except Exception:
                 pass
@@ -3063,6 +3128,134 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         """Project conversational context before capability routing."""
         return {"dialogue": dialogue_snapshot(state)}
 
+    async def read_only_agent(state: dict[str, Any]) -> dict[str, Any]:
+        intent = str(state.get("intent") or "")
+        request = dict(state.get("request") or {})
+        request["dialogue"] = state.get("dialogue")
+        request["read_facts"] = state.get("read_facts") or {}
+        request["read_loop_count"] = state.get("read_loop_count", 0)
+        call = await read_only_decision(runtime.model, request)
+        if call is None:
+            if state.get("read_loop_count", 0) == 0:
+                name = read_only_tool_name_for_intent(intent)
+                if name == "wallet_balance":
+                    context = state.get("wallet_context") or {}
+                    address = context.get("address") or request.get("address")
+                    chain = context.get("chain") or request.get("chain")
+                    if address and chain:
+                        call = ReadOnlyToolCall(
+                            name=name,
+                            arguments={"address": str(address), "chain": str(chain)},
+                        )
+                elif name == "transaction_status":
+                    raw = state.get("transaction_query") or {}
+                    call = ReadOnlyToolCall(
+                        name=name,
+                        arguments={
+                            "chain": raw.get("chain") or raw.get("transaction_chain"),
+                            "tx_hash": raw.get("tx_hash") or raw.get("transaction_hash"),
+                        },
+                    )
+            if call is None:
+                return {"read_tool_call": None, "read_loop_count": READ_ONLY_MAX_ROUNDS}
+        return {
+            "read_tool_call": {
+                "name": call.name,
+                "arguments": call.arguments,
+            }
+        }
+
+    async def read_only_tool(state: dict[str, Any]) -> dict[str, Any]:
+        raw_call = state.get("read_tool_call") or {}
+        name = str(raw_call.get("name") or "")
+        arguments = raw_call.get("arguments") or {}
+
+        async def price_lookup(args: dict[str, Any]) -> dict[str, Any]:
+            raw = state.get("price_request") or {}
+            asset = Asset.model_validate({**raw, **args})
+            if runtime.price_provider is None:
+                return {
+                    "ok": False,
+                    "code": "PRICE_PROVIDER_UNAVAILABLE",
+                    "error": "价格服务暂不可用。",
+                }
+            prices = await runtime.price_provider.get_prices([asset])
+            return {"ok": True, "prices": [_dump(item) for item in prices]}
+
+        async def wallet_balance(args: dict[str, Any]) -> dict[str, Any]:
+            return await wallet_balance_tool(str(args.get("chain")), str(args.get("address")))
+
+        async def transaction_status(args: dict[str, Any]) -> dict[str, Any]:
+            return await transaction_status_tool(
+                str(args.get("chain")),
+                str(args.get("tx_hash")),
+                state.get("broadcast_status"),
+            )
+
+        async def gas_estimate(args: dict[str, Any]) -> dict[str, Any]:
+            return await gas_estimate_tool(
+                str(args.get("chain")),
+                str(args.get("address")),
+                args.get("to"),
+                args.get("data"),
+            )
+
+        async def asset_discovery(args: dict[str, Any]) -> dict[str, Any]:
+            return await asset_discovery_tool(
+                args.get("chain"), args.get("search"), args.get("provider_name")
+            )
+
+        tools = {
+            "wallet_balance": wallet_balance,
+            "price_lookup": price_lookup,
+            "gas_estimate": gas_estimate,
+            "asset_discovery": asset_discovery,
+            "transaction_status": transaction_status,
+        }
+        return await run_read_only_round(
+            state,
+            ReadOnlyToolCall(name=name, arguments=dict(arguments)),
+            tools,
+        )
+
+    async def read_only_observe(state: dict[str, Any]) -> dict[str, Any]:
+        facts = state.get("read_facts") or {}
+        result: dict[str, Any] = {}
+        if "wallet_balance" in facts and facts["wallet_balance"].get("ok"):
+            result = {"kind": "wallet_query", "wallet": facts["wallet_balance"].get("wallet") or {}}
+        elif "price_lookup" in facts and facts["price_lookup"].get("ok"):
+            result = {"kind": "price_query", "prices": facts["price_lookup"].get("prices") or []}
+        elif "transaction_status" in facts and facts["transaction_status"].get("ok"):
+            result = {
+                "kind": "transaction_status",
+                **(facts["transaction_status"].get("transaction") or {}),
+            }
+        elif "gas_estimate" in facts and facts["gas_estimate"].get("ok"):
+            result = {"kind": "gas_check", **(facts["gas_estimate"].get("gas") or {})}
+        elif "asset_discovery" in facts and facts["asset_discovery"].get("ok"):
+            result = {"kind": "asset_discovery", **facts["asset_discovery"]}
+        if not result:
+            error = facts.get("error") or {}
+            return {
+                "response": {
+                    "kind": "error",
+                    "errors": [
+                        _error(
+                            error.get("code", "READ_TOOL_FAILED"),
+                            error.get("message", "只读查询失败。"),
+                        )
+                    ],
+                }
+            }
+        return {"response": await naturalize_read_response(state, result), "read_tool_call": None}
+
+    def route_read_only(state: dict[str, Any]) -> str:
+        from .read_only import route_read_only as route
+
+        if state.get("response"):
+            return "response"
+        return route(state)
+
     async def supervisor(state: dict[str, Any]) -> dict[str, Any]:
         """Plan one turn; execution remains in the existing graph nodes."""
         started = perf_counter()
@@ -3087,6 +3280,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         history_followup_intent = _history_followup_intent(
             str(request.get("message", "")), state.get("conversation_history")
         )
+        resolved_reference = resolve_read_reference(
+            str(request.get("message", "")), state.get("dialogue")
+        )
+        selected_quote_reference = resolve_quote_reference(
+            str(request.get("message", "")),
+            (state.get("dialogue") or {}).get("referent"),
+        )
         if _looks_like_cancel_message(str(request.get("message", ""))) and (
             state.get("active_task")
             or state.get("conversation_state")
@@ -3100,6 +3300,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             decision = {"intent": followup_intent, "source": "active_task"}
         elif history_followup_intent in _VALID_INTENTS:
             decision = {"intent": history_followup_intent, "source": "history_followup"}
+        elif resolved_reference is not None:
+            decision = {
+                "intent": resolved_reference["intent"],
+                "source": "dialogue_reference",
+            }
+        elif selected_quote_reference is not None:
+            decision = {
+                "intent": "swap_select",
+                "source": "quote_reference",
+                "selected_quote": selected_quote_reference["arguments"]["selected_quote"],
+            }
         elif state.get("intent") in _VALID_INTENTS and not request.get("message"):
             decision = {"intent": state["intent"], "source": "graph_resume"}
         else:
@@ -3180,6 +3391,15 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             # representation serializable for subsequent resume calls.
             "request": request,
         }
+        update["read_only_enabled"] = bool(
+            hasattr(runtime.model, "plan_read")
+            and decision.get("intent")
+            in {"wallet_query", "price_query", "transaction_status", "gas_check", "asset_discovery"}
+        )
+        if decision.get("source") == "dialogue_reference":
+            update["read_reference"] = resolved_reference
+        if decision.get("source") == "quote_reference":
+            update["selected_quote"] = decision["selected_quote"]
         # Checkpoints created before the Supervisor stored Pydantic requests
         # directly.  Normalize them at this boundary while retaining the
         # original request fields for the legacy graph routes.
