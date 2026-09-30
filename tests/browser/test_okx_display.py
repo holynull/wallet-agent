@@ -37,7 +37,7 @@ def test_demo_renders_okx_price_history_candles_and_broadcast_diagnostics(demo_p
             });
             renderPreflight({
               ok: true,
-              gas_sources: { rpc: true, okx: true, simulation: false },
+              gas_sources: { rpc: '21000', okx: 'unavailable', simulation: 'failed' },
               simulation: {
                 success: false, error: 'simulation unavailable'
               },
@@ -54,6 +54,9 @@ def test_demo_renders_okx_price_history_candles_and_broadcast_diagnostics(demo_p
     assert "K 线" in text
     assert "not_propagated" in text
     assert "simulation unavailable" in text
+    assert "rpc=成功" in text
+    assert "okx=不可用" in text
+    assert "simulation=失败" in text
 
 
 @pytest.mark.browser

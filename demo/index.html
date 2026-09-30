@@ -712,7 +712,7 @@
     if (!preflight) return;
     const card = document.createElement('div'); card.className = 'card';
     const title = document.createElement('h3'); title.textContent = preflight.ok ? '交易预检查通过' : '交易预检查未通过';
-    const sourceText = preflight.gas_sources ? `Gas 来源：${Object.entries(preflight.gas_sources).map(([name, used]) => `${name}=${used ? '已用' : '未用'}`).join('、')}` : '';
+    const sourceText = preflight.gas_sources ? `Gas 来源：${Object.entries(preflight.gas_sources).map(([name, used]) => `${name}=${used === null || used === undefined ? '未返回' : used === 'unavailable' ? '不可用' : used === 'failed' ? '失败' : '成功'}`).join('、')}` : '';
     const simulation = preflight.simulation;
     const simulationText = simulation && simulation.success === false ? `模拟警告：${simulation.error || simulation.fail_reason || 'simulation failed'}` : '';
     const summary = document.createElement('p'); summary.textContent = [sourceText, simulationText, ...(preflight.checks || []).map((item) => `${item.status === 'passed' ? '✓' : item.status === 'warning' ? '!' : '×'} ${item.message}`)].filter(Boolean).join('\n');

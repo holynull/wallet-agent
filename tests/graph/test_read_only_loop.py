@@ -153,6 +153,76 @@ async def test_graph_uses_opt_in_read_planner_without_entering_write_path():
 
 
 @pytest.mark.asyncio
+async def test_price_lookup_infers_native_asset_metadata_from_symbol():
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import TokenPrice
+    from wallet_agent.graph.build import build_graph
+
+    class PriceProvider:
+        def __init__(self):
+            self.assets = []
+
+        async def get_prices(self, assets):
+            self.assets.extend(assets)
+            return [TokenPrice(asset=assets[0], usd_price=Decimal("1800"), provider="okx")]
+
+    class Planner:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "price_query"}
+
+        async def extract(self, _task_kind, _request):
+            return {"symbol": "ETH"}
+
+        async def plan_read(self, request):
+            if request["read_loop_count"]:
+                return None
+            return {"name": "price_lookup", "arguments": {"symbol": "ETH"}}
+
+    provider = PriceProvider()
+    result = await build_graph(model=Planner(), price_provider=provider).ainvoke(
+        {"request": {"message": "ETH 价值多少 u"}},
+        config={"configurable": {"thread_id": "price-native-inference"}},
+    )
+
+    assert result["response"]["kind"] == "price_query"
+    assert result["response"]["prices"][0]["usd_price"] == "1800"
+    assert provider.assets[0].chain == "ETH"
+    assert provider.assets[0].decimals == 18
+    assert provider.assets[0].chain_id == 1
+
+
+@pytest.mark.asyncio
+async def test_price_lookup_requests_chain_for_ambiguous_token():
+    from wallet_agent.graph.build import build_graph
+
+    class Planner:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "price_query"}
+
+        async def extract(self, _task_kind, _request):
+            return {"symbol": "USDC"}
+
+        async def plan_read(self, request):
+            if request["read_loop_count"]:
+                return None
+            return {"name": "price_lookup", "arguments": {"symbol": "USDC"}}
+
+    result = await build_graph(model=Planner()).ainvoke(
+        {"request": {"message": "USDC 价值多少 u"}},
+        config={"configurable": {"thread_id": "price-ambiguous-token"}},
+    )
+
+    assert result["response"]["kind"] == "clarification"
+    assert result["response"]["errors"][0]["code"] == "PRICE_CHAIN_REQUIRED"
+    assert "Field required" not in result["response"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_unsupported_wallet_chain_returns_recoverable_supported_chain_prompt():
     from wallet_agent.graph.build import build_graph
 

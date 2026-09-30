@@ -15,7 +15,7 @@ def test_settings_load_non_secret_defaults(monkeypatch):
     assert settings.openai_model == "deepseek-v4-pro"
     assert settings.intent_model == "deepseek-chat"
     assert settings.slot_extraction_model == "deepseek-chat"
-    assert settings.response_model == "deepseek-chat"
+    assert settings.response_model == "deepseek-v4-pro"
     assert settings.read_agent_enabled is True
     assert settings.read_agent_model == "deepseek-chat"
     assert settings.allowed_model_ids == ["deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]

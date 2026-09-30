@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     openai_model: str = "deepseek-v4-pro"
     intent_model: str = "deepseek-chat"
     slot_extraction_model: str = "deepseek-chat"
-    response_model: str = "deepseek-chat"
+    response_model: str = "deepseek-v4-pro"
     read_agent_enabled: bool = True
     read_agent_model: str = "deepseek-chat"
     openai_base_url: str | None = "https://api.deepseek.com"

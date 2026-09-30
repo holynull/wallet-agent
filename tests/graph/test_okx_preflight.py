@@ -119,3 +119,25 @@ async def test_preflight_blocks_explicit_simulation_failure_but_warns_when_unava
     )
     assert available["ok"] is True
     assert any(item.get("code") == "SIMULATION_UNAVAILABLE" for item in available["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_preflight_marks_native_balance_failed_when_simulation_reports_insufficient_funds():
+    class InsufficientFundsOkx(Okx):
+        async def simulate_transaction(self, transaction):
+            return SimulationResult(
+                success=False,
+                failure_reason="insufficient funds for gas * price + value",
+                chain=transaction.chain,
+            )
+
+    tx = UnsignedTransaction(chain="BASE", to=RECIPIENT, data="0x", value="0")
+    result = await _transaction_preflight(
+        adapter=Adapter(), chain="BASE", sender=OWNER, recipient=RECIPIENT,
+        amount_raw="1", token=None, transaction=tx,
+        wallet_context={"address": OWNER, "chain": "BASE"},
+        wallet_provider=InsufficientFundsOkx(),
+    )
+    balance = next(item for item in result["checks"] if item["name"] == "balance")
+    assert balance["status"] == "failed"
+    assert balance["code"] == "INSUFFICIENT_BALANCE"

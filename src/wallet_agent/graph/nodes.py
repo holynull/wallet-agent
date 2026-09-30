@@ -81,6 +81,60 @@ _RESPONSE_DATA_KEYS = {
 }
 
 
+def _normalize_price_asset(
+    raw: Mapping[str, Any],
+    args: Mapping[str, Any],
+    wallet_context: Mapping[str, Any] | None = None,
+) -> tuple[Asset | None, dict[str, Any] | None]:
+    """Resolve trusted metadata required by the price provider."""
+    values = {**dict(raw), **dict(args)}
+    symbol = canonical_symbol(str(values.get("symbol") or ""))
+    if not symbol:
+        return None, {"code": "PRICE_ASSET_UNRESOLVED", "error": "请指定要查询的资产。"}
+    values["symbol"] = symbol
+    context = wallet_context or {}
+    chain_value = values.get("chain") or context.get("chain")
+    chain = canonical_chain(str(chain_value)) if chain_value else ""
+    explicit_address = values.get("address") or values.get("token_address")
+    if not chain:
+        inferred = _unique_native_chain(symbol, explicit_address)
+        if not inferred and symbol == "ETH":
+            inferred = "ETH"
+        if inferred:
+            chain = inferred
+        else:
+            return None, {
+                "code": "PRICE_CHAIN_REQUIRED",
+                "error": "请指定要查询的网络，例如 Ethereum 主网、BSC 或 Base。",
+                "symbol": symbol,
+            }
+    values["chain"] = chain
+    if (
+        values.get("decimals") is None
+        and _native_symbol(chain, None) == symbol
+        and not _explicit_token_address(explicit_address)
+    ):
+        values["decimals"] = _NATIVE_ASSET_DECIMALS.get(chain)
+    if values.get("chain_id") is None:
+        values["chain_id"] = chain_id_for(chain)
+    if values.get("decimals") is None:
+        return None, {
+            "code": "PRICE_ASSET_UNRESOLVED",
+            "error": f"暂时无法确认 {symbol} 在 {chain} 上的资产信息，请补充合约地址或精度。",
+            "symbol": symbol,
+            "chain": chain,
+        }
+    try:
+        return Asset.model_validate(values), None
+    except Exception:
+        return None, {
+            "code": "PRICE_ASSET_UNRESOLVED",
+            "error": f"暂时无法确认 {symbol} 的资产信息，请补充网络或合约地址。",
+            "symbol": symbol,
+            "chain": chain,
+        }
+
+
 def _suggestion_data_for_model(value: Any) -> dict[str, Any] | None:
     """Expose only user-confirmable slot fields from UI suggestion metadata."""
     if not isinstance(value, Mapping):
@@ -1886,6 +1940,11 @@ async def _transaction_preflight(
         "okx": None,
         "simulation": None,
     }
+    if wallet_provider is not None:
+        if not hasattr(wallet_provider, "estimate_gas_limit"):
+            gas_sources["okx"] = "unavailable"
+        if not hasattr(wallet_provider, "simulate_transaction"):
+            gas_sources["simulation"] = "unavailable"
     simulation = None
     if wallet_provider is not None:
         tx_context = TransactionContext(
@@ -1900,6 +1959,7 @@ async def _transaction_preflight(
                 estimate = await wallet_provider.estimate_gas_limit(tx_context)
                 gas_sources["okx"] = str(estimate.gas_limit)
             except Exception:
+                gas_sources["okx"] = "unavailable"
                 add(
                     "okx_gas",
                     "warning",
@@ -1914,6 +1974,15 @@ async def _transaction_preflight(
                 if simulation.success:
                     add("simulation", "passed", "OKX 交易模拟通过。")
                 else:
+                    failure_reason = simulation.failure_reason or ""
+                    if "insufficient funds" in failure_reason.lower():
+                        add(
+                            "balance",
+                            "failed",
+                            "模拟显示原生币余额不足以支付交易金额和网络手续费。",
+                            code="INSUFFICIENT_BALANCE",
+                            details={"failure_reason": failure_reason},
+                        )
                     add(
                         "simulation",
                         "failed",
@@ -1922,13 +1991,18 @@ async def _transaction_preflight(
                         details={"failure_reason": simulation.failure_reason},
                     )
             except Exception:
+                gas_sources["simulation"] = "unavailable"
                 add(
                     "simulation",
                     "warning",
                     "OKX 交易模拟暂时不可用，签名前请在钱包中确认。",
                     code="SIMULATION_UNAVAILABLE",
                 )
-    if fee is not None and any(gas_sources.get(key) for key in ("okx", "simulation")):
+    if fee is not None and any(
+        isinstance(gas_sources.get(key), str)
+        and gas_sources[key].isdigit()
+        for key in ("okx", "simulation")
+    ):
         values = [
             int(value)
             for value in (
@@ -1936,7 +2010,7 @@ async def _transaction_preflight(
                 gas_sources.get("okx"),
                 gas_sources.get("simulation"),
             )
-            if value is not None
+            if isinstance(value, str) and value.isdigit()
         ]
         fee = _fee_dump(fee)
         fee["gas_limit"] = str(max(values))
@@ -1977,7 +2051,11 @@ async def _transaction_preflight(
                     },
                 )
             else:
-                add("balance", "passed", "原生币余额足够覆盖金额和手续费。")
+                if not any(
+                    item["name"] == "balance" and item["status"] == "failed"
+                    for item in checks
+                ):
+                    add("balance", "passed", "原生币余额足够覆盖金额和网络手续费。")
     else:
         if not hasattr(adapter, "get_token_balance"):
             add(
@@ -3297,7 +3375,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
 
         async def price_lookup(args: dict[str, Any]) -> dict[str, Any]:
             raw = state.get("price_request") or {}
-            asset = Asset.model_validate({**raw, **args})
+            asset, error = _normalize_price_asset(raw, args, state.get("wallet_context"))
+            if error:
+                return {"ok": False, **error}
             if runtime.price_provider is None:
                 return {
                     "ok": False,
@@ -3372,6 +3452,32 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             result = {"kind": "asset_discovery", **latest}
         if not result:
             error = facts.get("error") or {}
+            latest_error = latest if isinstance(latest, Mapping) else {}
+            if latest_error.get("code") in {"PRICE_CHAIN_REQUIRED", "PRICE_ASSET_UNRESOLVED"}:
+                message = str(latest_error.get("error") or "请补充资产所属网络。")
+                detail = _error(
+                    str(latest_error["code"]),
+                    message,
+                    details={
+                        key: latest_error[key]
+                        for key in ("symbol", "chain")
+                        if key in latest_error
+                    },
+                )
+                return {
+                    "response": {
+                        "kind": "clarification",
+                        "message": message,
+                        "missing_fields": (
+                            ["price_chain"]
+                            if latest_error["code"] == "PRICE_CHAIN_REQUIRED"
+                            else []
+                        ),
+                        "errors": [detail],
+                    },
+                    "read_only_complete": True,
+                    "read_only_pending": False,
+                }
             unsupported_chain = (
                 isinstance(latest, Mapping)
                 and latest.get("code") == "OKX_CHAIN_UNSUPPORTED"
@@ -5128,14 +5234,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     },
                     "route": "response",
                 }
-            chain = current.get("chain") or "ETH"
-            symbol = str(current["symbol"]).upper()
-            decimals = int(current.get("decimals") or 18)
+            symbol = canonical_symbol(str(current["symbol"]))
+            chain = current.get("chain") or (state.get("wallet_context") or {}).get("chain")
             return {
                 "price_request": {
                     "chain": chain,
                     "symbol": symbol,
-                    "decimals": decimals,
+                    "decimals": current.get("decimals"),
+                    "chain_id": current.get("chain_id"),
                     "address": current.get("token_address"),
                 },
                 "route": "price_query",
