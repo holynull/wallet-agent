@@ -142,7 +142,7 @@ def _read_model_input(request: Mapping[str, Any]) -> list[HumanMessage]:
         "transaction_status。不要执行转账、兑换、授权、签名或广播。"
         "已有 read_facts 足以回答用户时返回 name=null；需要补充事实时才选择工具。"
         "arguments 只能填写用户请求、对话引用或已验证事实中明确可用的参数。"
-        "只返回结构化 JSON。"
+        "只返回结构化 JSON。不要输出 reasoning、Markdown 或额外字段。"
     )
     return [HumanMessage(content=f"{instructions}\n\nrequest JSON：\n{payload}")]
 

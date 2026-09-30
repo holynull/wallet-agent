@@ -112,7 +112,7 @@ python scripts/smoke_test.py --base-url http://localhost:8000
 The default model backend is DeepSeek's official OpenAI-compatible API:
 `https://api.deepseek.com` with `deepseek-chat`. To use another compatible
 backend, set `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_BASE_URL` instead.
-All agent roles use `deepseek-chat` by default, including read-only planning,
+Classification, slot extraction, and response generation use `deepseek-chat` by default. Read-only planning uses `deepseek-flash` by default,
 and are bounded to two tool rounds. Configure `READ_AGENT_ENABLED=false` to
 keep the legacy deterministic read routes. The planner can only call balance, price, gas,
 asset-discovery, and transaction-status tools; it cannot reach signing,

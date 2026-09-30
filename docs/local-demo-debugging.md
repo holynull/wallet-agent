@@ -20,10 +20,11 @@ OPENAI_MODEL=deepseek-chat
 INTENT_MODEL=deepseek-chat
 SLOT_EXTRACTION_MODEL=deepseek-chat
 RESPONSE_MODEL=deepseek-chat
+READ_AGENT_MODEL=deepseek-flash
 OPENAI_BASE_URL=https://api.deepseek.com
 ```
 
-所有意图识别、参数提取、只读工具规划和自然语言回复默认统一使用 `deepseek-chat`。客户端不能切换到未纳入服务端允许列表的模型；当前示例仅允许 `deepseek-chat`。
+意图识别、参数提取和自然语言回复默认使用 `deepseek-chat`；只读工具规划默认使用支持工具调用的 `deepseek-flash`。客户端不能切换到未纳入服务端允许列表的模型。
 
 ### 配置 EVM RPC
 

@@ -17,8 +17,8 @@ def test_settings_load_non_secret_defaults(monkeypatch):
     assert settings.slot_extraction_model == "deepseek-chat"
     assert settings.response_model == "deepseek-chat"
     assert settings.read_agent_enabled is True
-    assert settings.read_agent_model == "deepseek-chat"
-    assert settings.allowed_model_ids == ["deepseek-chat"]
+    assert settings.read_agent_model == "deepseek-flash"
+    assert settings.allowed_model_ids == ["deepseek-chat", "deepseek-flash"]
     assert settings.openai_base_url == "https://api.deepseek.com"
     assert settings.redis_url is None
     assert settings.redis_key_prefix == "wallet-agent"
