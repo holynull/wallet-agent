@@ -98,14 +98,14 @@ def _normalize_price_asset(
     explicit_address = values.get("address") or values.get("token_address")
     if not chain:
         inferred = _unique_native_chain(symbol, explicit_address)
-        if not inferred and symbol == "ETH":
+        if inferred is None and symbol == "ETH":
             inferred = "ETH"
         if inferred:
             chain = inferred
         else:
             return None, {
                 "code": "PRICE_CHAIN_REQUIRED",
-                "error": "请指定要查询的网络，例如 Ethereum 主网、BSC 或 Base。",
+                "error": f"请问你想查询哪个网络上的 {symbol}？例如 Ethereum、BSC 或 Base。",
                 "symbol": symbol,
             }
     values["chain"] = chain
@@ -120,7 +120,7 @@ def _normalize_price_asset(
     if values.get("decimals") is None:
         return None, {
             "code": "PRICE_ASSET_UNRESOLVED",
-            "error": f"暂时无法确认 {symbol} 在 {chain} 上的资产信息，请补充合约地址或精度。",
+            "error": f"正在通过资产目录确认 {symbol} 在 {chain} 上的信息。",
             "symbol": symbol,
             "chain": chain,
         }
@@ -129,7 +129,7 @@ def _normalize_price_asset(
     except Exception:
         return None, {
             "code": "PRICE_ASSET_UNRESOLVED",
-            "error": f"暂时无法确认 {symbol} 的资产信息，请补充网络或合约地址。",
+            "error": f"暂时无法确认 {symbol} 的资产信息，请确认资产和网络是否受支持。",
             "symbol": symbol,
             "chain": chain,
         }
@@ -222,8 +222,6 @@ def _response_fallback(intent: str, missing: list[str], language: str) -> str:
                 "transfer_amount": "转账金额",
                 "transfer_chain": "转账网络",
                 "transfer_symbol": "转账资产",
-                "transfer_token_address": "Token 合约地址",
-                "transfer_decimals": "Token 精度",
             }
             labels = [phrases[item] for item in missing if item in phrases]
             return f"请补充{'、'.join(labels) or '这笔转账所需的信息'}。"
@@ -243,8 +241,6 @@ def _response_fallback(intent: str, missing: list[str], language: str) -> str:
             "transfer_amount": "the transfer amount",
             "transfer_chain": "the network",
             "transfer_symbol": "the asset",
-            "transfer_token_address": "the token contract address",
-            "transfer_decimals": "the token precision",
         }
         labels = [phrases[item] for item in missing if item in phrases]
         return f"Please provide {', '.join(labels) or 'the missing transfer details'}."
