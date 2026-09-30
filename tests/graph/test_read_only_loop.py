@@ -223,6 +223,62 @@ async def test_price_lookup_requests_chain_for_ambiguous_token():
 
 
 @pytest.mark.asyncio
+async def test_price_lookup_resolves_token_metadata_from_catalog():
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenPrice
+    from wallet_agent.graph.build import build_graph
+
+    class Catalog:
+        async def list_assets(self, query):
+            assert query.chain == "ETH"
+            assert query.search == "USDC"
+            return [
+                Asset(
+                    chain="ETH",
+                    chain_id=1,
+                    symbol="USDC",
+                    decimals=6,
+                    address="0x" + "1" * 40,
+                )
+            ]
+
+    class PriceProvider:
+        def __init__(self):
+            self.asset = None
+
+        async def get_prices(self, assets):
+            self.asset = assets[0]
+            return [TokenPrice(asset=self.asset, usd_price=Decimal("1"), provider="okx")]
+
+    class Planner:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "price_query"}
+
+        async def extract(self, _task_kind, _request):
+            return {"symbol": "USDC", "chain": "ETH"}
+
+        async def plan_read(self, request):
+            if request["read_loop_count"]:
+                return None
+            return {"name": "price_lookup", "arguments": {"symbol": "USDC", "chain": "ETH"}}
+
+    provider = PriceProvider()
+    result = await build_graph(
+        model=Planner(), providers={"catalog": Catalog()}, price_provider=provider
+    ).ainvoke(
+        {"request": {"message": "ETH 链 USDC 价格"}},
+        config={"configurable": {"thread_id": "price-catalog-resolution"}},
+    )
+
+    assert result["response"]["kind"] == "price_query"
+    assert provider.asset.address == "0x" + "1" * 40
+    assert provider.asset.decimals == 6
+
+
+@pytest.mark.asyncio
 async def test_unsupported_wallet_chain_returns_recoverable_supported_chain_prompt():
     from wallet_agent.graph.build import build_graph
 

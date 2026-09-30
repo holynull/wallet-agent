@@ -135,6 +135,51 @@ def _normalize_price_asset(
         }
 
 
+async def _resolve_asset_metadata(
+    values: Mapping[str, Any],
+    providers: Mapping[str, Any],
+    wallet_context: Mapping[str, Any] | None = None,
+) -> tuple[Asset | None, list[dict[str, Any]]]:
+    """Resolve asset identifiers using chain-specific wallet/provider catalogs."""
+    merged = dict(values)
+    context = wallet_context or {}
+    symbol = canonical_symbol(str(merged.get("symbol") or ""))
+    chain_value = merged.get("chain") or context.get("chain")
+    if not symbol or not chain_value:
+        return None, []
+    chain = canonical_chain(str(chain_value))
+    explicit_address = merged.get("address") or merged.get("token_address")
+    matches: list[Asset] = []
+    for provider in providers.values():
+        if not hasattr(provider, "list_assets"):
+            continue
+        try:
+            matches.extend(await provider.list_assets(AssetQuery(chain=chain, search=symbol)))
+        except Exception:
+            continue
+    unique = {
+        (str(item.address or "").lower(), int(item.decimals)): item
+        for item in matches
+        if canonical_chain(str(item.chain)) == chain
+        and canonical_symbol(str(item.symbol)) == symbol
+        and (
+            not explicit_address
+            or str(item.address or "").lower() == str(explicit_address).lower()
+        )
+    }
+    if len(unique) == 1:
+        return next(iter(unique.values())), []
+    return None, [
+        {
+            "chain": item.chain,
+            "symbol": item.symbol,
+            "address": item.address,
+            "decimals": item.decimals,
+        }
+        for item in unique.values()
+    ]
+
+
 def _suggestion_data_for_model(value: Any) -> dict[str, Any] | None:
     """Expose only user-confirmable slot fields from UI suggestion metadata."""
     if not isinstance(value, Mapping):
@@ -350,52 +395,13 @@ def _sanitize_response_suggestions(
                 asset_key = (str(clean[chain_key]).upper(), str(clean[symbol_key]).upper())
                 if asset_key not in asset_keys:
                     invalid = True
-                if (
-                    side == "source"
-                    and balance_keys
-                    and (str(clean[chain_key]).upper(), str(clean[symbol_key]).upper())
-                    not in balance_keys
-                ):
+                if side == "source" and balance_keys and asset_key not in balance_keys:
                     invalid = True
-            amount = clean.get("input_amount")
-            if (
-                side == "source"
-                and amount is not None
-                and clean.get(symbol_key)
-                and clean.get(chain_key)
-            ):
-                balance = next(
-                    (
-                        item
-                        for item in facts.get("balances", [])
-                        if isinstance(item, Mapping)
-                        and str(item.get("chain", "")).upper() == str(clean[chain_key]).upper()
-                        and str(item.get("symbol", "")).upper() == str(clean[symbol_key]).upper()
-                    ),
-                    None,
-                )
-                try:
-                    if balance is not None and Decimal(str(amount)) > Decimal(
-                        str(balance["amount"])
-                    ):
-                        invalid = True
-                except Exception:
-                    invalid = True
-        if clean.get("symbol") and clean.get("chain") and (asset_keys or intent == "transfer"):
-            if (str(clean["chain"]).upper(), str(clean["symbol"]).upper()) not in asset_keys:
-                invalid = True
         if invalid:
             continue
-        output.append(
-            {
-                "label": str(item.get("label") or "")[:120],
-                "message": str(item.get("message") or "")[:500],
-                "data": clean,
-            }
-        )
-        if len(output) == 3:
-            break
-    return [item for item in output if item["label"] and item["message"]]
+        output.append({**dict(item), "data": clean})
+    return output
+
 
 
 @dataclass(frozen=True)
@@ -451,6 +457,18 @@ _USER_SWAP_FIELDS = frozenset(
         "sender_address",
         "recipient_address",
         "slippage_bps",
+    }
+)
+
+# These are internal provider-resolved fields. Never expose them as a user
+# clarification: users provide asset names/networks, while providers supply
+# contract addresses and decimals.
+_INTERNAL_ASSET_FIELDS = frozenset(
+    {
+        "source_token_address",
+        "destination_token_address",
+        "source_decimals",
+        "destination_decimals",
     }
 )
 
@@ -3375,7 +3393,27 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
 
         async def price_lookup(args: dict[str, Any]) -> dict[str, Any]:
             raw = state.get("price_request") or {}
-            asset, error = _normalize_price_asset(raw, args, state.get("wallet_context"))
+            merged = {**raw, **args}
+            asset, error = _normalize_price_asset(
+                merged, {}, state.get("wallet_context")
+            )
+            if error and error.get("code") == "PRICE_ASSET_UNRESOLVED" and merged.get("chain"):
+                discovered, candidates = await _resolve_asset_metadata(
+                    merged, runtime.providers, state.get("wallet_context")
+                )
+                if discovered is not None:
+                    asset, error = discovered, None
+                elif candidates:
+                    error = {
+                        "code": "PRICE_ASSET_AMBIGUOUS",
+                        "error": (
+                            f"{merged.get('symbol')} 在 {merged.get('chain')} 上有多个同名资产，"
+                            "请选择要使用的资产。"
+                        ),
+                        "symbol": merged.get("symbol"),
+                        "chain": merged.get("chain"),
+                        "candidates": candidates,
+                    }
             if error:
                 return {"ok": False, **error}
             if runtime.price_provider is None:
@@ -3453,7 +3491,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         if not result:
             error = facts.get("error") or {}
             latest_error = latest if isinstance(latest, Mapping) else {}
-            if latest_error.get("code") in {"PRICE_CHAIN_REQUIRED", "PRICE_ASSET_UNRESOLVED"}:
+            if latest_error.get("code") in {
+                "PRICE_CHAIN_REQUIRED",
+                "PRICE_ASSET_UNRESOLVED",
+                "PRICE_ASSET_AMBIGUOUS",
+            }:
                 message = str(latest_error.get("error") or "请补充资产所属网络。")
                 detail = _error(
                     str(latest_error["code"]),
@@ -4821,7 +4863,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 descriptions = [
                     (
                         f"{'来源' if item['side'] == 'source' else '目标'} "
-                        f"{item['symbol']} ({item['chain']})：{item['address']}"
+                        f"{item['symbol']} ({item['chain']})"
                     )
                     for item in token_candidates
                 ]
@@ -4850,8 +4892,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "response": {
                         "kind": "clarification",
                         "message": (
-                            "我找到了多个同名 Token，不能直接替你猜地址。"
-                            f"请确认你要使用哪一个：{'；'.join(descriptions)}。"
+                            "我找到了多个同名 Token。请确认你要使用哪个网络："
+                            f"{'；'.join(descriptions)}。"
                         ),
                         "token_candidates": token_candidates,
                     },
@@ -4882,7 +4924,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             ],
                         },
                     }
-                user_missing = [field for field in missing if field in _USER_SWAP_FIELDS]
+                user_missing = [
+                    field
+                    for field in missing
+                    if field in _USER_SWAP_FIELDS and field not in _INTERNAL_ASSET_FIELDS
+                ]
                 if draft.get("target_value_amount"):
                     user_missing = [field for field in user_missing if field != "input_amount"]
                 if "input_amount_raw" in missing and "input_amount" not in user_missing:
@@ -4927,6 +4973,35 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             ),
                         ),
                     }
+                unresolved_assets = [
+                    field
+                    for field in missing
+                    if field in _INTERNAL_ASSET_FIELDS
+                ]
+                if unresolved_assets:
+                    missing_networks = [
+                        field
+                        for field in ("source_chain", "destination_chain")
+                        if draft.get(field) in (None, "")
+                        and draft.get(field.replace("_chain", "_symbol"))
+                    ]
+                    if missing_networks:
+                        message = _swap_clarification_message(
+                            {"swap_draft": draft, "request": state.get("request") or {}},
+                            missing_networks,
+                            _response_language(message, state.get("conversation_history")),
+                        )
+                        return {
+                            **common_update,
+                            "intent": "clarification",
+                            "route": "clarification",
+                            "missing_fields": missing_networks,
+                            "response": {
+                                "kind": "clarification",
+                                "message": message,
+                                "missing_fields": missing_networks,
+                            },
+                        }
                 errors = resolution_errors or [
                     _error(
                         "ASSET_RESOLUTION_FAILED",
@@ -6261,9 +6336,30 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             }
         try:
-            from wallet_agent.domain.models import Asset
-
-            asset = Asset.model_validate(raw)
+            asset, error = _normalize_price_asset(raw, {}, state.get("wallet_context"))
+            if error and error.get("code") == "PRICE_ASSET_UNRESOLVED":
+                discovered, candidates = await _resolve_asset_metadata(
+                    raw, runtime.providers, state.get("wallet_context")
+                )
+                if discovered is not None:
+                    asset, error = discovered, None
+                elif candidates:
+                    error = {
+                        "code": "PRICE_ASSET_AMBIGUOUS",
+                        "error": "该网络存在多个同名资产。请补充资产名称以便区分。",
+                        "symbol": raw.get("symbol"),
+                        "chain": raw.get("chain"),
+                        "candidates": candidates,
+                    }
+            if error:
+                return {
+                    "response": {
+                        "kind": "clarification",
+                        "message": error["error"],
+                        "missing_fields": [],
+                        "errors": [_error(error["code"], error["error"])],
+                    }
+                }
             prices = await runtime.price_provider.get_prices([asset])
             return {
                 "response": await naturalize_read_response(
