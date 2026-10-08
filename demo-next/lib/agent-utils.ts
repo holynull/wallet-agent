@@ -354,7 +354,19 @@ export function formatResponseSummary(response: any): string {
   }
   if (response.kind === "portfolio_query") {
     const portfolio = response.portfolio || response;
-    return `你在 ${portfolio.chain || "当前网络"} 上共有 ${portfolio.assets?.length || 0} 项资产，USD 估值为 ${portfolio.total_usd_value ?? "暂不可用"}。`;
+    const legacyWallet = portfolio.wallet || {};
+    const legacyAssets = [
+      ...(legacyWallet.native_balance ? [legacyWallet.native_balance] : []),
+      ...(legacyWallet.token_balances || []),
+    ];
+    const assets = portfolio.assets || legacyAssets;
+    const chains = Array.isArray(portfolio.chains) && portfolio.chains.length
+      ? portfolio.chains.join("、")
+      : portfolio.chain || legacyWallet.chain || "当前网络";
+    const total = portfolio.total_usd_value
+      ?? portfolio.total_value?.total_value
+      ?? "暂不可用";
+    return `你在 ${chains} 上共有 ${portfolio.asset_count ?? assets.length} 项资产，USD 估值为 ${total}。`;
   }
   if (response.kind === "gas_check") {
     return response.sufficient

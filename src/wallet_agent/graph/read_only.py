@@ -48,6 +48,10 @@ READ_ONLY_TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "chain": {"type": "string", "description": "Network name."},
                     "address": {"type": "string", "description": "Wallet address."},
+                    "symbol": {
+                        "type": "string",
+                        "description": "Optional asset symbol. When set, return only this asset.",
+                    },
                 },
                 "required": ["chain", "address"],
                 "additionalProperties": False,
@@ -181,6 +185,10 @@ READ_ONLY_TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "chain": {"type": "string"},
                     "address": {"type": "string"},
+                    "symbol": {
+                        "type": "string",
+                        "description": "Optional asset symbol. When set, return only this asset.",
+                    },
                 },
                 "required": ["address"],
                 "additionalProperties": False,

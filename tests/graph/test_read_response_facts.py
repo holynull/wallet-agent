@@ -59,3 +59,14 @@ def test_accepts_draft_that_only_repeats_verified_facts():
     )
 
     assert result == draft
+
+
+def test_rejects_portfolio_asset_count_that_does_not_match_facts():
+    facts = {
+        "asset_count": 7,
+        "balances": [{"symbol": "BNB", "amount": "0"}],
+    }
+    for message in ("当前资产组合包含 0 项资产。", "当前资产组合包含 1 项资产。"):
+        assert validate_response_draft(
+            {"language": "zh", "message": message, "suggestions": []}, facts
+        ) is None

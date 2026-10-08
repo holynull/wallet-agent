@@ -1149,14 +1149,39 @@ def _read_response_fallback(response: Mapping[str, Any], language: str) -> str:
     if kind == "wallet_query":
         return _wallet_summary_message(response.get("wallet") or {}, language)
     if kind == "portfolio_query":
-        portfolio = response.get("portfolio") or {}
-        assets = portfolio.get("assets") or []
+        portfolio = response.get("portfolio") or response
+        wallet = portfolio.get("wallet") or {}
+        assets = portfolio.get("assets") or _wallet_balance_items(wallet)
         total = portfolio.get("total_usd_value")
+        if total is None:
+            total_value = portfolio.get("total_value") or {}
+            if isinstance(total_value, Mapping):
+                total = total_value.get("total_value")
         if language == "zh":
             suffix = f"，总价值约 ${total}" if total is not None else ""
-            return f"当前资产组合包含 {len(assets)} 项资产{suffix}。"
+            return (
+                f"当前资产组合包含 {len(assets)} 项资产{suffix}：\n"
+                + "\n".join(
+                    "- "
+                    f"{(item.get('asset') or {}).get('symbol', '未知资产')}："
+                    f"{item.get('amount', '0')}"
+                    for item in assets
+                )
+                if assets
+                else "当前钱包没有查到可用余额。"
+            )
         suffix = f", worth about ${total} in total" if total is not None else ""
-        return f"Your portfolio contains {len(assets)} assets{suffix}."
+        return (
+            f"Your portfolio contains {len(assets)} assets{suffix}:\n"
+            + "\n".join(
+                "- "
+                f"{(item.get('asset') or {}).get('symbol', 'Unknown asset')}: "
+                f"{item.get('amount', '0')}"
+                for item in assets
+            )
+            if assets
+            else "I couldn't find any available balance in this wallet."
+        )
     if kind == "price_query":
         prices = response.get("prices") or []
         if prices:
@@ -1347,6 +1372,187 @@ def _looks_like_other_chain_balance_request(message: str) -> bool:
         any(token in text for token in ("其他链", "别的链", "otherchain", "anotherchain"))
         and any(token in text for token in ("余额", "资产", "balance", "portfolio"))
     )
+
+
+def _looks_like_all_chain_balance_request(message: str) -> bool:
+    text = "".join(str(message).lower().split())
+    return (
+        any(
+            token in text
+            for token in (
+                "所有链",
+                "全部链",
+                "全链",
+                "所有网络",
+                "全部网络",
+                "allchains",
+                "allnetworks",
+            )
+        )
+        and any(token in text for token in ("余额", "资产", "balance", "portfolio"))
+    )
+
+
+_BALANCE_SYMBOL = re.compile(
+    r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]{1,11})(?![A-Za-z0-9])"
+)
+_BALANCE_SYMBOL_STOP_WORDS = frozenset(
+    {
+        "ALL",
+        "ASSET",
+        "ASSETS",
+        "BALANCE",
+        "BALANCES",
+        "CHAIN",
+        "CHAINS",
+        "CHECK",
+        "HOW",
+        "MUCH",
+        "MY",
+        "NETWORK",
+        "NETWORKS",
+        "OF",
+        "ON",
+        "OTHER",
+        "PLEASE",
+        "PORTFOLIO",
+        "THE",
+        "VALUE",
+        "WALLET",
+        "WHAT",
+        "WORTH",
+    }
+)
+_BALANCE_SYMBOL_ALIASES = {
+    "比特币": "BTC",
+    "以太币": "ETH",
+    "币安币": "BNB",
+    "泰达币": "USDT",
+}
+
+
+def _requested_balance_symbol(message: str, supported_chains: set[str]) -> str | None:
+    """Extract an asset scope only from the current balance request.
+
+    This intentionally does not consult previous portfolio facts: a fresh
+    request such as ``我的 BNB 余额`` must override any previously displayed
+    asset list. Network identifiers are excluded unless they are also used in
+    an asset-shaped phrase (for example ``ETH 余额``).
+    """
+    text = str(message or "").strip()
+    lowered = text.lower()
+    if not any(
+        token in lowered
+        for token in ("余额", "持有", "有多少", "balance", "holding", "holdings")
+    ):
+        return None
+    for alias, symbol in _BALANCE_SYMBOL_ALIASES.items():
+        if alias in text:
+            return symbol
+    candidates = [canonical_symbol(match) for match in _BALANCE_SYMBOL.findall(text)]
+    candidates = [
+        symbol
+        for symbol in candidates
+        if symbol and symbol not in _BALANCE_SYMBOL_STOP_WORDS
+    ]
+    for symbol in candidates:
+        # BSC/Base/etc. are networks in balance requests. ETH and SOL are also
+        # asset symbols, so keep them unless the user explicitly writes 链 or
+        # network immediately around the identifier.
+        if symbol in supported_chains:
+            network_pattern = re.compile(
+                rf"(?:{re.escape(symbol)}\s*(?:链|网络|chain|network)|"
+                rf"(?:链|网络|chain|network)\s*{re.escape(symbol)})",
+                re.IGNORECASE,
+            )
+            if symbol not in {"ETH", "SOL", "TRX", "BNB"} or network_pattern.search(text):
+                continue
+        return symbol
+    return None
+
+
+def _is_positive_usd_asset(item: Mapping[str, Any]) -> bool:
+    """Keep assets unless the provider has explicitly valued them at zero."""
+    value = item.get("usd_value")
+    if value is None:
+        return True
+    try:
+        return Decimal(str(value)) > 0
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+
+
+def _filter_balance_assets(
+    assets: list[Mapping[str, Any]],
+    requested_symbol: str | None,
+    *,
+    positive_only: bool = False,
+) -> list[Mapping[str, Any]]:
+    symbol = canonical_symbol(requested_symbol or "")
+    return [
+        item
+        for item in assets
+        if (not positive_only or _is_positive_usd_asset(item))
+        and (
+            not symbol
+            or canonical_symbol(str((item.get("asset") or {}).get("symbol") or ""))
+            == symbol
+        )
+    ]
+
+
+def _explicit_balance_chain(message: str, supported_chains: set[str]) -> str | None:
+    text = "".join(str(message).upper().split())
+    aliases = {
+        "ETH": ("ETH", "ETHEREUM", "ERC20", "以太", "以太坊"),
+        "BSC": ("BSC", "BEP20", "币安链", "币安智能链"),
+        "BASE": ("BASE",),
+        "ARBITRUM": ("ARBITRUM",),
+        "OPTIMISM": ("OPTIMISM", "OPMAINNET"),
+        "POLYGON": ("POLYGON",),
+        "TRON": ("TRON", "TRX", "波场"),
+        "SOLANA": ("SOLANA", "SOL", "索拉纳"),
+    }
+    for chain in supported_chains:
+        candidates = aliases.get(chain, (chain,))
+        for alias in candidates:
+            normalized_alias = alias.upper().replace(" ", "")
+            if any(ord(char) > 127 for char in normalized_alias):
+                if normalized_alias in text:
+                    return chain
+            elif re.search(
+                rf"(?<![A-Z0-9]){re.escape(normalized_alias)}(?![A-Z0-9])",
+                text,
+            ):
+                return chain
+    return None
+
+
+def _mentioned_balance_chain(message: str) -> str | None:
+    """Recognize common network names, including unsupported ones."""
+    text = "".join(str(message).upper().split())
+    aliases = {
+        "BTC": ("BTC", "BITCOIN", "比特币"),
+        "ETH": ("ETH", "ETHEREUM", "ERC20", "以太", "以太坊"),
+        "BSC": ("BSC", "BEP20", "币安链", "币安智能链"),
+        "BASE": ("BASE",),
+        "ARBITRUM": ("ARBITRUM",),
+        "OPTIMISM": ("OPTIMISM", "OPMAINNET"),
+        "POLYGON": ("POLYGON",),
+        "TRON": ("TRON", "TRX", "波场"),
+        "SOLANA": ("SOLANA", "SOL", "索拉纳"),
+    }
+    for chain, candidates in aliases.items():
+        for alias in candidates:
+            normalized = alias.upper().replace(" ", "")
+            if any(ord(char) > 127 for char in normalized):
+                if normalized in text:
+                    return chain
+            elif re.search(
+                rf"(?<![A-Z0-9]){re.escape(normalized)}(?![A-Z0-9])", text
+            ):
+                return chain
+    return None
 
 
 def _looks_like_swap_status_message(message: str) -> bool:
@@ -3269,6 +3475,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         state: Mapping[str, Any], response: Mapping[str, Any]
     ) -> dict[str, Any]:
         """Turn verified read facts into user-facing language at one boundary."""
+        started = perf_counter()
         result = _dump(response)
         if not isinstance(result, dict):
             return dict(response)
@@ -3311,6 +3518,28 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
                 for item in _wallet_balance_items(wallet)
             ]
+            if isinstance(result.get("asset_scope"), Mapping):
+                facts["asset_scope"] = dict(result["asset_scope"])
+            if result.get("asset_count") is not None:
+                facts["asset_count"] = result.get("asset_count")
+        if kind == "portfolio_query":
+            portfolio = result.get("portfolio") or result
+            wallet = portfolio.get("wallet") or {}
+            assets = portfolio.get("assets") or _wallet_balance_items(wallet)
+            facts["portfolio_result"] = portfolio
+            facts["wallet_result"] = wallet
+            facts["balances"] = [
+                {
+                    "chain": (item.get("asset") or {}).get("chain"),
+                    "symbol": (item.get("asset") or {}).get("symbol"),
+                    "amount": item.get("amount"),
+                    "usd_value": item.get("usd_value"),
+                }
+                for item in assets
+                if isinstance(item, Mapping)
+            ]
+            facts["asset_count"] = len(assets)
+            facts["total_usd_value"] = portfolio.get("total_usd_value")
         if kind == "price_query":
             facts["prices"] = result.get("prices") or []
         if kind == "asset_value":
@@ -3323,6 +3552,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         if kind == "transaction_status":
             facts["transaction"] = result
         responder = getattr(runtime.model, "respond", None)
+        response_validation = "deterministic"
         if callable(responder):
             try:
                 draft = _dump(await responder(request, facts)) or {}
@@ -3334,41 +3564,102 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         result["suggestions"] = _sanitize_response_suggestions(
                             validated.get("suggestions"), intent=kind, facts=facts
                         )
+                        response_validation = "accepted"
+                else:
+                    response_validation = "rejected"
             except Exception:
-                pass
+                response_validation = "fallback"
         if not str(result.get("message") or "").strip():
             result["message"] = _read_response_fallback(result, facts["language_hint"])
+            if response_validation == "deterministic":
+                response_validation = "fallback"
+        portfolio = result.get("portfolio") or result if kind == "portfolio_query" else {}
+        scope = portfolio.get("scope") or {} if isinstance(portfolio, Mapping) else {}
+        wallet_event(
+            "response_generation",
+            "success",
+            duration_ms=(perf_counter() - started) * 1000,
+            state=state,
+            query_scope=(str(scope.get("requested")) if scope.get("requested") else None),
+            resolved_chain_count=(
+                len(scope.get("resolved_chains") or [])
+                if isinstance(scope, Mapping)
+                else None
+            ),
+            asset_count=(
+                int(portfolio.get("asset_count"))
+                if isinstance(portfolio, Mapping) and portfolio.get("asset_count") is not None
+                else None
+            ),
+            response_validation=response_validation,
+        )
         return result
 
     async def wallet_balance_tool(
         chain: str,
         address: str,
+        symbol: str | None = None,
     ) -> dict[str, Any]:
         """Read native and token balances for a connected wallet."""
         if runtime.wallet_provider is not None and hasattr(
             runtime.wallet_provider, "get_token_balances"
         ):
-            index = okx_chain_index(chain)
-            if index is None:
+            normalized_chain = canonical_chain(chain)
+            chain_index_by_name = dict(
+                getattr(runtime.wallet_provider, "chain_index_by_name", {}) or {}
+            )
+            if normalized_chain in {"ALL", ""}:
+                indexes = list(
+                    dict.fromkeys(str(value) for value in chain_index_by_name.values())
+                )
+            else:
+                index = chain_index_by_name.get(normalized_chain) or okx_chain_index(
+                    normalized_chain
+                )
+                indexes = [str(index)] if index else []
+            if not indexes:
                 return {
                     "ok": False,
-                    "error": f"当前暂不支持 {chain} 链的余额查询。",
+                    "error": f"当前暂不支持 {chain or '该'} 链的余额查询。",
                     "code": "OKX_CHAIN_UNSUPPORTED",
                 }
             try:
-                balances = await runtime.wallet_provider.get_token_balances(address, [index])
-                native = next((item for item in balances if item.asset.address is None), None)
+                balances = await runtime.wallet_provider.get_token_balances(address, indexes)
+                assets = [_dump(item) for item in balances]
+                requested_symbol = canonical_symbol(str(symbol or ""))
+                assets = _filter_balance_assets(
+                    assets,
+                    requested_symbol or None,
+                )
+                native = next(
+                    (
+                        item
+                        for item in assets
+                        if not (item.get("asset") or {}).get("address")
+                    ),
+                    None,
+                )
+                reverse_names = {
+                    str(index): str(name).upper()
+                    for name, index in chain_index_by_name.items()
+                }
                 return {
                     "ok": True,
                     "wallet": {
                         "address": address,
-                        "chain": chain,
-                        "native_balance": _dump(native) if native else None,
+                        "chain": (
+                            reverse_names.get(indexes[0], indexes[0])
+                            if len(indexes) == 1
+                            else "ALL"
+                        ),
+                        "native_balance": native,
                         "token_balances": [
-                            _dump(item) for item in balances if item.asset.address is not None
+                            item for item in assets if item is not native
                         ],
                         "source": "okx",
                     },
+                    "asset_scope": ({"symbol": requested_symbol} if requested_symbol else None),
+                    "asset_count": len(assets),
                 }
             except Exception as exc:
                 return {"ok": False, "error": str(exc), "code": "WALLET_QUERY_FAILED"}
@@ -3625,18 +3916,59 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             ],
             "max_parallel_tools": READ_ONLY_MAX_PARALLEL_TOOLS,
         }
-        if intent == "wallet_query" and _looks_like_other_chain_balance_request(
-            str(request.get("message") or "")
-        ):
-            supported_chains = sorted(
-                {
-                    str(value).upper()
-                    for value in (
-                        set(getattr(runtime.wallet_provider, "chain_index_by_name", {}) or {})
-                        | set(runtime.chains)
-                    )
-                }
+        request_message = str(request.get("message") or "")
+        other_chain_scope = _looks_like_other_chain_balance_request(request_message)
+        supported_chain_names = {
+            str(value).upper()
+            for value in (
+                set(getattr(runtime.wallet_provider, "chain_index_by_name", {}) or {})
+                | set(runtime.chains)
             )
+        }
+        explicit_other_chain = _explicit_balance_chain(
+            request_message, supported_chain_names
+        )
+        requested_balance_symbol = _requested_balance_symbol(
+            request_message, supported_chain_names
+        )
+        mentioned_chain = _mentioned_balance_chain(request_message)
+        if (
+            intent in {"wallet_query", "portfolio_query"}
+            and mentioned_chain
+            and mentioned_chain not in supported_chain_names
+        ):
+            supported_chains = sorted(supported_chain_names)
+            message = (
+                f"当前暂不支持 {mentioned_chain} 链的余额查询。"
+                f"可查询的网络：{'、'.join(supported_chains) or '暂无'}。你想查询哪条链？"
+            )
+            return {
+                "response": {
+                    "kind": "clarification",
+                    "message": message,
+                    "missing_fields": ["wallet_chain"],
+                    "supported_chains": supported_chains,
+                    "errors": [
+                        _error(
+                            "OKX_CHAIN_UNSUPPORTED",
+                            message,
+                            details={
+                                "requested_chain": mentioned_chain,
+                                "supported_chains": supported_chains,
+                            },
+                        )
+                    ],
+                },
+                "read_tool_call": None,
+                "read_only_complete": True,
+                "read_only_pending": False,
+            }
+        if (
+            intent in {"wallet_query", "portfolio_query"}
+            and other_chain_scope
+            and not explicit_other_chain
+        ):
+            supported_chains = sorted(supported_chain_names)
             message = (
                 f"请指定要查询的网络。当前支持：{'、'.join(supported_chains) or '暂无'}。"
             )
@@ -3658,6 +3990,33 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "read_only_complete": True,
                 "read_only_pending": False,
             }
+        if intent in {"wallet_query", "portfolio_query"}:
+            if "portfolio_snapshot" in (state.get("read_facts") or {}):
+                return {
+                    "read_tool_call": None,
+                    "read_only_complete": True,
+                    "read_only_pending": False,
+                }
+            address = (state.get("wallet_context") or {}).get("address") or request.get(
+                "address"
+            )
+            if address:
+                arguments = {
+                    "address": str(address),
+                    "symbol": requested_balance_symbol,
+                }
+                if explicit_other_chain:
+                    arguments["chain"] = explicit_other_chain
+                return {
+                    "read_tool_call": {
+                        "name": "portfolio_snapshot",
+                        "arguments": {
+                            key: value for key, value in arguments.items() if value
+                        },
+                    },
+                    "read_only_complete": False,
+                    "read_only_pending": True,
+                }
         native_invoker = getattr(runtime.model, "invoke_read_tools", None)
         if callable(native_invoker):
             messages = list(state.get("read_messages") or [])
@@ -3943,7 +4302,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "code": "WALLET_CONTEXT_REQUIRED",
                     "error": "请先连接钱包并明确查询网络。",
                 }
-            return await wallet_balance_tool(str(chain), str(address))
+            requested_symbol = canonical_symbol(str(args.get("symbol") or ""))
+            return await wallet_balance_tool(
+                str(chain), str(address), requested_symbol or None
+            )
 
         async def transaction_status(args: dict[str, Any]) -> dict[str, Any]:
             """Read a transaction status."""
@@ -4026,30 +4388,138 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             """Read a wallet portfolio snapshot."""
             context = state.get("wallet_context") or {}
             address = str(args.get("address") or context.get("address") or "")
-            chain = str(args.get("chain") or context.get("chain") or "")
+            requested_symbol = canonical_symbol(str(args.get("symbol") or ""))
+            chain = canonical_chain(str(args.get("chain") or ""))
+            query_all_chains = not chain
             if not address:
                 return {"ok": False, "code": "WALLET_ADDRESS_REQUIRED", "error": "请先连接钱包。"}
             try:
-                balances = await wallet_balance_tool(chain, address)
-                if not balances.get("ok"):
-                    return balances
-                total = None
                 provider = runtime.wallet_provider
-                if provider and hasattr(provider, "get_total_value"):
-                    indexes = (
-                        [okx_chain_index(chain)]
-                        if chain
-                        else list(getattr(provider, "chain_name_by_index", {}))
+                if provider is None or not hasattr(provider, "get_token_balances"):
+                    return {
+                        "ok": False,
+                        "code": "OKX_CAPABILITY_UNAVAILABLE",
+                        "error": "OKX 钱包数据服务暂不可用。",
+                    }
+                chain_index_by_name = dict(
+                    getattr(provider, "chain_index_by_name", {}) or {}
+                )
+                if query_all_chains:
+                    indexes = list(
+                        dict.fromkeys(str(value) for value in chain_index_by_name.values())
                     )
+                    if not indexes:
+                        return {
+                            "ok": False,
+                            "code": "OKX_CHAIN_UNSUPPORTED",
+                            "error": "当前没有可用于全链资产查询的网络。",
+                        }
+                    reverse_names = {
+                        str(index): str(name).upper()
+                        for name, index in chain_index_by_name.items()
+                    }
+                    resolved_chains = [reverse_names.get(index, index) for index in indexes]
+                    requested_scope = "all"
+                else:
+                    index = chain_index_by_name.get(chain) or okx_chain_index(chain)
+                    if not index:
+                        return {
+                            "ok": False,
+                            "code": "OKX_CHAIN_UNSUPPORTED",
+                            "error": f"当前暂不支持 {chain} 链的余额查询。",
+                        }
+                    indexes = [str(index)]
+                    resolved_chains = [chain] if chain else []
+                    requested_scope = "specified"
+                raw_balances = await provider.get_token_balances(address, indexes)
+                assets = [_dump(item) for item in raw_balances]
+                if runtime.price_provider is not None and raw_balances:
+                    try:
+                        prices = await runtime.price_provider.get_prices(
+                            [balance.asset for balance in raw_balances]
+                        )
+                    except Exception:
+                        prices = []
+                    price_map = {
+                        (
+                            canonical_chain(str(price.asset.chain)),
+                            canonical_symbol(str(price.asset.symbol)),
+                            str(price.asset.address or "").lower(),
+                        ): price
+                        for price in prices
+                    }
+                    for item, balance in zip(assets, raw_balances, strict=False):
+                        if item.get("usd_value") is not None:
+                            continue
+                        price = price_map.get(
+                            (
+                                canonical_chain(str(balance.asset.chain)),
+                                canonical_symbol(str(balance.asset.symbol)),
+                                str(balance.asset.address or "").lower(),
+                            )
+                        )
+                        if price is not None:
+                            item["usd_value"] = str(balance.amount * price.usd_price)
+                assets = _filter_balance_assets(
+                    assets,
+                    requested_symbol or None,
+                    positive_only=True,
+                )
+                native = next(
+                    (
+                        item
+                        for item in assets
+                        if not (item.get("asset") or {}).get("address")
+                        and not query_all_chains
+                    ),
+                    None,
+                )
+                wallet: dict[str, Any] = {
+                    "address": address,
+                    "chain": "ALL" if query_all_chains else chain,
+                    "native_balance": native,
+                    "token_balances": [item for item in assets if item is not native],
+                    "source": "okx",
+                }
+                total = None
+                if hasattr(provider, "get_total_value"):
                     value = await provider.get_total_value(
                         address, [item for item in indexes if item]
                     )
                     total = _dump(value)
+                known_values = [
+                    Decimal(str(item["usd_value"]))
+                    for item in assets
+                    if item.get("usd_value") is not None
+                ]
+                total_usd_value = (
+                    str(sum(known_values, Decimal("0")))
+                    if requested_symbol and len(known_values) == len(assets)
+                    else (
+                        total.get("total_value")
+                        if isinstance(total, Mapping)
+                        else None
+                    )
+                )
                 return {
                     "ok": True,
                     "portfolio": {
-                        "wallet": balances.get("wallet"),
+                        "wallet": wallet,
+                        "assets": assets,
+                        "asset_count": len(assets),
+                        "chains": resolved_chains,
+                        "scope": {
+                            "requested": requested_scope,
+                            "resolved_chains": resolved_chains,
+                        },
+                        "asset_scope": (
+                            {"symbol": requested_symbol}
+                            if requested_symbol
+                            else None
+                        ),
                         "total_value": total,
+                        "total_usd_value": total_usd_value,
+                        "complete": True,
                     },
                 }
             except Exception:
@@ -4086,10 +4556,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             )
 
         async def native_wallet_balance(
-            chain: str | None = None, address: str | None = None
+            chain: str | None = None,
+            address: str | None = None,
+            symbol: str | None = None,
         ) -> dict[str, Any]:
             """Read wallet balances."""
-            return await wallet_balance({"chain": chain, "address": address})
+            return await wallet_balance(
+                {"chain": chain, "address": address, "symbol": symbol}
+            )
 
         async def native_transaction_status(
             tx_hash: str | None = None, chain: str | None = None
@@ -4155,10 +4629,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             )
 
         async def native_portfolio_snapshot(
-            address: str | None = None, chain: str | None = None
+            address: str | None = None,
+            chain: str | None = None,
+            symbol: str | None = None,
         ) -> dict[str, Any]:
             """Read a wallet portfolio snapshot."""
-            return await portfolio_snapshot({"address": address, "chain": chain})
+            return await portfolio_snapshot(
+                {"address": address, "chain": chain, "symbol": symbol}
+            )
 
         native_tools = [
             native_wallet_balance,
@@ -4328,7 +4806,19 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         elif call_name == "price_history" and isinstance(latest, dict) and latest.get("ok"):
             result = {"kind": "price_history", **latest}
         elif call_name == "portfolio_snapshot" and isinstance(latest, dict) and latest.get("ok"):
-            result = {"kind": "portfolio_query", **(latest.get("portfolio") or {})}
+            portfolio = latest.get("portfolio") or {}
+            asset_scope = portfolio.get("asset_scope")
+            if isinstance(asset_scope, Mapping) and asset_scope.get("symbol"):
+                result = {
+                    "kind": "wallet_query",
+                    "wallet": portfolio.get("wallet") or {},
+                    "assets": portfolio.get("assets") or [],
+                    "asset_count": portfolio.get("asset_count"),
+                    "asset_scope": dict(asset_scope),
+                    "scope": portfolio.get("scope") or {},
+                }
+            else:
+                result = {"kind": "portfolio_query", **portfolio}
         if not result:
             error = facts.get("error") or {}
             latest_error = latest if isinstance(latest, Mapping) else {}

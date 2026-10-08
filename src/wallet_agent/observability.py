@@ -28,6 +28,10 @@ def wallet_event(
     error_code: str | None = None,
     tool_name: str | None = None,
     tool_status: str | None = None,
+    query_scope: str | None = None,
+    resolved_chain_count: int | None = None,
+    asset_count: int | None = None,
+    response_validation: str | None = None,
 ) -> None:
     """Log only an allowlisted operational projection of graph state."""
     task = state.get("active_task") or {}
@@ -47,5 +51,9 @@ def wallet_event(
         "read_loop_count": state.get("read_loop_count"),
         "read_tool_name": tool_name,
         "read_tool_status": tool_status,
+        "query_scope": query_scope,
+        "resolved_chain_count": resolved_chain_count,
+        "asset_count": asset_count,
+        "response_validation": response_validation,
     }
     logger.info(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))

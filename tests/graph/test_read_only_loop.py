@@ -320,6 +320,15 @@ def test_asset_value_followup_is_recognized_from_explicit_value_language():
     assert _looks_like_asset_value_query("我的 bnb 余额是多少") is False
 
 
+def test_explicit_balance_chain_does_not_treat_token_symbols_as_networks():
+    from wallet_agent.graph.nodes import _explicit_balance_chain
+
+    supported = {"ETH", "SOLANA", "BASE"}
+    assert _explicit_balance_chain("查询其他链上的 WETH 余额", supported) is None
+    assert _explicit_balance_chain("查询其他链上的 SOLV 余额", supported) is None
+    assert _explicit_balance_chain("查询其他链 Base 的余额", supported) == "BASE"
+
+
 @pytest.mark.asyncio
 async def test_preflight_balance_followup_explains_the_previous_failure():
     from wallet_agent.graph.build import build_graph
@@ -759,3 +768,599 @@ async def test_other_chain_balance_question_short_circuits_planner_and_asks_for_
     assert result["response"]["kind"] == "clarification"
     assert result["response"]["errors"][0]["code"] == "WALLET_CHAIN_REQUIRED"
     assert result["response"]["supported_chains"] == ["BASE", "ETH"]
+
+
+@pytest.mark.asyncio
+async def test_portfolio_snapshot_summarizes_wallet_balances_instead_of_zero_assets():
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+    from wallet_agent.graph.build import build_graph
+
+    class Wallet:
+        chain_index_by_name = {"BSC": "56"}
+        chain_name_by_index = {"56": "BSC"}
+
+        async def get_token_balances(self, _address, chain_indexes):
+            assert chain_indexes == ["56"]
+            return [
+                TokenBalance(
+                    asset=Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18),
+                    amount=Decimal("0.5"),
+                    amount_raw="500000000000000000",
+                ),
+                TokenBalance(
+                    asset=Asset(
+                        chain="BSC",
+                        chain_id=56,
+                        symbol="USDC",
+                        decimals=18,
+                        address="0x" + "2" * 40,
+                    ),
+                    amount=Decimal("12"),
+                    amount_raw="12000000000000000000",
+                ),
+            ]
+
+        async def get_total_value(self, _address, chain_indexes):
+            assert chain_indexes == ["56"]
+            return {"total_value": "20", "chain_indexes": chain_indexes}
+
+    class Model:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "wallet_query"}
+
+        async def invoke_read_tools(self, messages, _tools):
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-portfolio",
+                            "name": "portfolio_snapshot",
+                            "args": {
+                                "chain": "BSC",
+                                "address": "0x" + "1" * 40,
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(content="")
+
+    result = await build_graph(model=Model(), wallet_provider=Wallet()).ainvoke(
+        {
+            "request": {
+                "message": "我的 BSC 资产组合",
+                "address": "0x" + "1" * 40,
+                "chain": "BSC",
+            },
+            "wallet_context": {
+                "address": "0x" + "1" * 40,
+                "chain": "BSC",
+            },
+        },
+        config={"configurable": {"thread_id": "portfolio-summary-contract"}},
+    )
+
+    assert result["response"]["kind"] == "portfolio_query"
+    assert "2 项资产" in result["response"]["message"]
+    assert "BNB" in result["response"]["message"]
+    assert "USDC" in result["response"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_other_chain_portfolio_question_requires_chain_before_tool_call():
+    from wallet_agent.graph.build import build_graph
+
+    class Wallet:
+        chain_index_by_name = {"ETH": "1", "BASE": "8453"}
+
+    class Model:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "wallet_query"}
+
+        async def invoke_read_tools(self, *_args):
+            raise AssertionError("ambiguous other-chain portfolio must not call a tool")
+
+    result = await build_graph(model=Model(), wallet_provider=Wallet()).ainvoke(
+        {
+            "request": {
+                "message": "我的其他链的全部余额呢？",
+                "address": "0x" + "1" * 40,
+                "chain": "ETH",
+            },
+            "wallet_context": {
+                "address": "0x" + "1" * 40,
+                "chain": "ETH",
+            },
+        },
+        config={"configurable": {"thread_id": "other-chain-portfolio"}},
+    )
+
+    assert result["response"]["kind"] == "clarification"
+    assert result["response"]["errors"][0]["code"] == "WALLET_CHAIN_REQUIRED"
+    assert result["response"]["supported_chains"] == ["BASE", "ETH"]
+
+
+@pytest.mark.asyncio
+async def test_other_chain_portfolio_with_explicit_network_queries_that_network():
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+    from wallet_agent.graph.build import build_graph
+
+    class Wallet:
+        chain_index_by_name = {"ETH": "1", "BASE": "8453"}
+        chain_name_by_index = {"1": "ETH", "8453": "BASE"}
+
+        async def get_token_balances(self, _address, chain_indexes):
+            assert chain_indexes == ["8453"]
+            return [
+                TokenBalance(
+                    asset=Asset(chain="BASE", chain_id=8453, symbol="ETH", decimals=18),
+                    amount=Decimal("0.1"),
+                    amount_raw="100000000000000000",
+                )
+            ]
+
+    class Model:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "portfolio_query"}
+
+        async def invoke_read_tools(self, messages, _tools):
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-explicit-other-chain",
+                            "name": "portfolio_snapshot",
+                            "args": {
+                                "chain": "BASE",
+                                "address": "0x" + "1" * 40,
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(content="")
+
+    result = await build_graph(model=Model(), wallet_provider=Wallet()).ainvoke(
+        {
+            "request": {
+                "message": "查询其他链 Base 的全部余额",
+                "address": "0x" + "1" * 40,
+                "chain": "ETH",
+            },
+            "wallet_context": {
+                "address": "0x" + "1" * 40,
+                "chain": "ETH",
+            },
+        },
+        config={"configurable": {"thread_id": "explicit-other-chain-portfolio"}},
+    )
+
+    assert result["response"]["kind"] == "portfolio_query"
+    assert result["response"]["scope"]["resolved_chains"] == ["BASE"]
+
+
+@pytest.mark.asyncio
+async def test_all_chain_portfolio_queries_every_supported_network():
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+    from wallet_agent.graph.build import build_graph
+
+    class Wallet:
+        chain_index_by_name = {"ETH": "1", "BASE": "8453"}
+        chain_name_by_index = {"1": "ETH", "8453": "BASE"}
+
+        async def get_token_balances(self, _address, chain_indexes):
+            assert chain_indexes == ["1", "8453"]
+            return [
+                TokenBalance(
+                    asset=Asset(chain="ETH", chain_id=1, symbol="ETH", decimals=18),
+                    amount=Decimal("0.1"),
+                    amount_raw="100000000000000000",
+                ),
+                TokenBalance(
+                    asset=Asset(chain="BASE", chain_id=8453, symbol="USDC", decimals=6),
+                    amount=Decimal("5"),
+                    amount_raw="5000000",
+                ),
+            ]
+
+        async def get_total_value(self, _address, chain_indexes):
+            assert chain_indexes == ["1", "8453"]
+            return {"total_value": "305", "chain_indexes": chain_indexes}
+
+    class Model:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "portfolio_query"}
+
+        async def invoke_read_tools(self, messages, _tools):
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-all-chains",
+                            "name": "portfolio_snapshot",
+                            "args": {"address": "0x" + "1" * 40},
+                        }
+                    ],
+                )
+            return AIMessage(content="")
+
+    result = await build_graph(model=Model(), wallet_provider=Wallet()).ainvoke(
+        {
+            "request": {
+                "message": "查询我所有链的全部余额",
+                "address": "0x" + "1" * 40,
+                "chain": "ETH",
+            },
+            "wallet_context": {
+                "address": "0x" + "1" * 40,
+                "chain": "ETH",
+            },
+        },
+        config={"configurable": {"thread_id": "all-chain-portfolio"}},
+    )
+
+    assert result["response"]["scope"]["requested"] == "all"
+    assert result["response"]["scope"]["resolved_chains"] == ["ETH", "BASE"]
+    assert result["response"]["asset_count"] == 2
+    assert "2 项资产" in result["response"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_portfolio_rejects_model_message_that_contradicts_asset_count():
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+    from wallet_agent.graph.build import build_graph
+    from wallet_agent.models.contracts import AgentResponseDraft
+
+    class Wallet:
+        chain_index_by_name = {"BSC": "56"}
+        chain_name_by_index = {"56": "BSC"}
+
+        async def get_token_balances(self, _address, _indexes):
+            return [
+                TokenBalance(
+                    asset=Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18),
+                    amount=Decimal("0.5"),
+                    amount_raw="500000000000000000",
+                )
+            ]
+
+    class Model:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "portfolio_query"}
+
+        async def invoke_read_tools(self, messages, _tools):
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-portfolio-contradiction",
+                            "name": "portfolio_snapshot",
+                            "args": {
+                                "chain": "BSC",
+                                "address": "0x" + "1" * 40,
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(content="")
+
+        async def respond(self, _request, _facts):
+            return AgentResponseDraft(
+                language="zh",
+                message="当前没有查到任何资产。",
+                suggestions=[],
+            )
+
+    result = await build_graph(model=Model(), wallet_provider=Wallet()).ainvoke(
+        {
+            "request": {
+                "message": "我的 BSC 资产组合",
+                "address": "0x" + "1" * 40,
+                "chain": "BSC",
+            },
+            "wallet_context": {
+                "address": "0x" + "1" * 40,
+                "chain": "BSC",
+            },
+        },
+        config={"configurable": {"thread_id": "portfolio-fact-validation"}},
+    )
+
+    assert "没有查到任何资产" not in result["response"]["message"]
+    assert "1 项资产" in result["response"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_bnb_balance_returns_only_bnb_not_the_full_chain_portfolio():
+    """An asset-scoped balance request must not leak sibling token balances."""
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+    from wallet_agent.graph.build import build_graph
+
+    class Wallet:
+        chain_index_by_name = {"BSC": "56"}
+        chain_name_by_index = {"56": "BSC"}
+
+        async def get_token_balances(self, _address, chain_indexes):
+            assert chain_indexes == ["56"]
+            return [
+                TokenBalance(
+                    asset=Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18),
+                    amount=Decimal("0.5"),
+                    amount_raw="500000000000000000",
+                    usd_value=Decimal("150"),
+                ),
+                TokenBalance(
+                    asset=Asset(
+                        chain="BSC",
+                        chain_id=56,
+                        symbol="USDC",
+                        decimals=6,
+                        address="0x" + "2" * 40,
+                    ),
+                    amount=Decimal("12"),
+                    amount_raw="12000000",
+                    usd_value=Decimal("12"),
+                ),
+            ]
+
+    class Model:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "wallet_query"}
+
+        async def plan_read(self, request):
+            if request["read_loop_count"]:
+                return None
+            return {
+                "name": "wallet_balance",
+                "arguments": {"chain": "BSC", "address": "0x" + "1" * 40},
+            }
+
+    result = await build_graph(model=Model(), wallet_provider=Wallet()).ainvoke(
+        {
+            "request": {
+                "message": "我的 BNB 余额",
+                "address": "0x" + "1" * 40,
+                "chain": "BSC",
+            },
+            "wallet_context": {"address": "0x" + "1" * 40, "chain": "BSC"},
+        },
+        config={"configurable": {"thread_id": "asset-scoped-bnb"}},
+    )
+
+    assert result["response"]["kind"] == "wallet_query"
+    assert result["response"]["asset_scope"]["symbol"] == "BNB"
+    assert result["response"]["asset_count"] == 1
+    assert "BNB" in result["response"]["message"]
+    assert "USDC" not in result["response"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_all_chain_balance_filters_assets_with_zero_usd_value():
+    """All-chain balance responses include only assets whose USD value is positive."""
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+    from wallet_agent.graph.build import build_graph
+
+    class Wallet:
+        chain_index_by_name = {"ETH": "1", "BASE": "8453"}
+        chain_name_by_index = {"1": "ETH", "8453": "BASE"}
+
+        async def get_token_balances(self, _address, chain_indexes):
+            assert chain_indexes == ["1", "8453"]
+            return [
+                TokenBalance(
+                    asset=Asset(chain="ETH", chain_id=1, symbol="ETH", decimals=18),
+                    amount=Decimal("0.1"),
+                    amount_raw="100000000000000000",
+                    usd_value=Decimal("250"),
+                ),
+                TokenBalance(
+                    asset=Asset(
+                        chain="BASE",
+                        chain_id=8453,
+                        symbol="DUST",
+                        decimals=18,
+                        address="0x" + "3" * 40,
+                    ),
+                    amount=Decimal("1"),
+                    amount_raw="1000000000000000000",
+                    usd_value=Decimal("0"),
+                ),
+            ]
+
+        async def get_total_value(self, _address, chain_indexes):
+            return {"total_value": "250", "chain_indexes": chain_indexes}
+
+    class Model:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "wallet_query"}
+
+        async def invoke_read_tools(self, messages, _tools):
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-all-positive",
+                            "name": "portfolio_snapshot",
+                            "args": {"address": "0x" + "1" * 40},
+                        }
+                    ],
+                )
+            return AIMessage(content="")
+
+    result = await build_graph(model=Model(), wallet_provider=Wallet()).ainvoke(
+        {
+            "request": {
+                "message": "我的余额",
+                "address": "0x" + "1" * 40,
+                "chain": "ETH",
+            },
+            "wallet_context": {"address": "0x" + "1" * 40, "chain": "ETH"},
+        },
+        config={"configurable": {"thread_id": "all-positive-balances"}},
+    )
+
+    assert result["response"]["scope"]["requested"] == "all"
+    assert result["response"]["asset_count"] == 1
+    assert [item["asset"]["symbol"] for item in result["response"]["assets"]] == ["ETH"]
+    assert "DUST" not in result["response"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_asset_symbol_is_not_reused_from_previous_portfolio_result():
+    """A new explicit symbol request must be scoped to that symbol, not stale facts."""
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+    from wallet_agent.graph.build import build_graph
+
+    class Wallet:
+        chain_index_by_name = {"BSC": "56"}
+        chain_name_by_index = {"56": "BSC"}
+
+        async def get_token_balances(self, _address, chain_indexes):
+            return [
+                TokenBalance(
+                    asset=Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18),
+                    amount=Decimal("0.5"),
+                    amount_raw="500000000000000000",
+                    usd_value=Decimal("150"),
+                ),
+            ]
+
+    class Model:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "wallet_query"}
+
+        async def plan_read(self, request):
+            if request["read_loop_count"]:
+                return None
+            return {
+                "name": "wallet_balance",
+                "arguments": {"chain": "BSC", "address": "0x" + "1" * 40},
+            }
+
+    result = await build_graph(model=Model(), wallet_provider=Wallet()).ainvoke(
+        {
+            "request": {
+                "message": "我的 USDC 余额",
+                "address": "0x" + "1" * 40,
+                "chain": "BSC",
+            },
+            "wallet_context": {"address": "0x" + "1" * 40, "chain": "BSC"},
+            "conversation_history": [
+                {
+                    "role": "assistant",
+                    "artifacts": {
+                        "response": {
+                            "kind": "portfolio_query",
+                            "assets": [{"asset": {"symbol": "BNB"}, "amount": "0.5"}],
+                        }
+                    },
+                }
+            ],
+        },
+        config={"configurable": {"thread_id": "fresh-asset-scope"}},
+    )
+
+    assert result["response"]["asset_scope"]["symbol"] == "USDC"
+    assert result["response"]["asset_count"] == 0
+    assert "BNB" not in result["response"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_asset_scoped_balance_rejects_model_reply_with_other_symbols():
+    """The response model cannot expand a BNB-only result back to a portfolio."""
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+    from wallet_agent.graph.build import build_graph
+    from wallet_agent.models.contracts import AgentResponseDraft
+
+    class Wallet:
+        chain_index_by_name = {"BSC": "56"}
+        chain_name_by_index = {"56": "BSC"}
+
+        async def get_token_balances(self, _address, _chain_indexes):
+            return [
+                TokenBalance(
+                    asset=Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18),
+                    amount=Decimal("0.5"),
+                    amount_raw="500000000000000000",
+                    usd_value=Decimal("150"),
+                ),
+                TokenBalance(
+                    asset=Asset(
+                        chain="BSC",
+                        chain_id=56,
+                        symbol="USDC",
+                        decimals=6,
+                        address="0x" + "2" * 40,
+                    ),
+                    amount=Decimal("12"),
+                    amount_raw="12000000",
+                    usd_value=Decimal("12"),
+                ),
+            ]
+
+    class Model:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "wallet_query"}
+
+        async def plan_read(self, _request):
+            raise AssertionError("balance scope is deterministic")
+
+        async def respond(self, _request, _facts):
+            return AgentResponseDraft(
+                language="zh",
+                message="你的 BNB 余额是 0.5，另外还有 USDC。",
+                suggestions=[],
+            )
+
+    result = await build_graph(model=Model(), wallet_provider=Wallet()).ainvoke(
+        {
+            "request": {
+                "message": "我的 BNB 余额",
+                "address": "0x" + "1" * 40,
+                "chain": "BSC",
+            },
+            "wallet_context": {"address": "0x" + "1" * 40, "chain": "BSC"},
+        },
+        config={"configurable": {"thread_id": "asset-scope-response-guard"}},
+    )
+
+    assert result["response"]["asset_scope"] == {"symbol": "BNB"}
+    assert "BNB" in result["response"]["message"]
+    assert "USDC" not in result["response"]["message"]

@@ -243,6 +243,28 @@ test("formats readable response summaries for wallet and gas results", () => {
   assert.equal(formatResponseSummary({ kind: "gas_check", sufficient: false, shortfall_raw: "42" }), "当前 Gas 余额不足，预计还缺少 42 个最小单位。");
 });
 
+test("formats a normalized multi-chain portfolio without losing its asset count", () => {
+  assert.equal(formatResponseSummary({
+    kind: "portfolio_query",
+    chains: ["ETH", "BASE"],
+    asset_count: 2,
+    assets: [{}, {}],
+    total_usd_value: "305",
+  }), "你在 ETH、BASE 上共有 2 项资产，USD 估值为 305。");
+});
+
+test("counts legacy portfolio native and token balances", () => {
+  assert.equal(formatResponseSummary({
+    kind: "portfolio_query",
+    wallet: {
+      chain: "BSC",
+      native_balance: { amount: "0.1", asset: { symbol: "BNB" } },
+      token_balances: [{ amount: "2", asset: { symbol: "USDC" } }],
+    },
+    total_value: { total_value: "80" },
+  }), "你在 BSC 上共有 2 项资产，USD 估值为 80。");
+});
+
 test("summarizes partial quote-provider failures without changing response kind", () => {
   assert.equal(
     formatResponseSummary({

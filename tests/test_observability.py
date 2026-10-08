@@ -48,3 +48,22 @@ def test_wallet_event_logs_read_only_tool_metadata(caplog):
     assert '"read_loop_count":1' in caplog.text
     assert '"read_tool_name":"price_lookup"' in caplog.text
     assert '"read_tool_status":"completed"' in caplog.text
+
+
+def test_wallet_event_logs_safe_portfolio_consistency_metadata(caplog):
+    with caplog.at_level(logging.INFO, logger="wallet_agent.events"):
+        wallet_event(
+            "read_only_observe",
+            "success",
+            duration_ms=6,
+            state={"conversation_id": "conversation-2"},
+            query_scope="all",
+            resolved_chain_count=2,
+            asset_count=7,
+            response_validation="fallback",
+        )
+
+    assert '"query_scope":"all"' in caplog.text
+    assert '"resolved_chain_count":2' in caplog.text
+    assert '"asset_count":7' in caplog.text
+    assert '"response_validation":"fallback"' in caplog.text
