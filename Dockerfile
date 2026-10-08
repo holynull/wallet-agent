@@ -4,7 +4,6 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY src ./src
 COPY skills ./skills
-COPY demo ./demo
 RUN pip install --no-cache-dir uv && uv sync --frozen --no-dev
 
 ENV PYTHONPATH=/app/src

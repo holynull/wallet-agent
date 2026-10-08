@@ -73,7 +73,7 @@ async def test_dialogue_manager_persists_topic_and_referent_for_followup_turns()
 @pytest.mark.asyncio
 async def test_supervisor_receives_dialogue_snapshot_and_bounded_history():
     model = DialogueModel(["clarification"])
-    graph = build_graph(model=model)
+    graph = build_graph(model=model, wallet_provider=WalletProvider())
     history = [
         {"role": "user", "content": f"turn {index}"}
         for index in range(30)
@@ -93,6 +93,92 @@ async def test_supervisor_receives_dialogue_snapshot_and_bounded_history():
     assert request["dialogue"]["active_topic"] == "unknown"
     assert len(request["conversation_history"]) == 12
     assert request["conversation_history"] == history[-12:]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", ["我的全部余额", "我全钱包里全部余额是多少", "所有资产有多少"])
+async def test_balance_request_is_classified_even_after_preflight_failure(message):
+    """A new balance request must not be hijacked by stale transaction history."""
+    model = DialogueModel(["wallet_query"])
+    graph = build_graph(model=model, wallet_provider=WalletProvider())
+    result = await graph.ainvoke(
+        {
+            "request": {"message": message, "address": WALLET, "chain": "ETH"},
+            "wallet_context": {"address": WALLET, "chain": "ETH"},
+            "conversation_history": [
+                {
+                    "role": "assistant",
+                    "content": "交易预检查未通过",
+                    "artifacts": {
+                        "response": {
+                            "kind": "error",
+                            "errors": [
+                                {
+                                    "code": "TRANSACTION_PREFLIGHT_FAILED",
+                                    "details": {
+                                        "preflight": {
+                                            "chain": "BSC",
+                                            "checks": [{"code": "INSUFFICIENT_BALANCE"}],
+                                        }
+                                    },
+                                }
+                            ],
+                        }
+                    },
+                }
+            ],
+        },
+        config={"configurable": {"thread_id": f"balance-after-preflight-{message}"}},
+    )
+
+    assert model.requests, "ordinary business requests must reach the model router"
+    assert result["intent"] == "wallet_query"
+    assert result["response"]["kind"] == "wallet_query"
+    assert result["supervisor_decision"]["source"] == "model"
+    assert model.requests[0]["previous_preflight"]["chain"] == "BSC"
+
+
+@pytest.mark.asyncio
+async def test_model_route_wins_over_previous_read_topic_for_a_new_request():
+    model = DialogueModel(["price_query"])
+    graph = build_graph(model=model)
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "ETH 现在多少钱", "chain": "ETH"},
+            "conversation_history": [
+                {
+                    "role": "assistant",
+                    "content": "当前钱包有 USDC。",
+                    "artifacts": {
+                        "response": {
+                            "kind": "wallet_query",
+                            "wallet": {"chain": "ETH", "token_balances": []},
+                        }
+                    },
+                }
+            ],
+        },
+        config={"configurable": {"thread_id": "model-route-new-topic"}},
+    )
+
+    assert model.requests
+    assert result["intent"] == "price_query"
+    assert result["supervisor_decision"]["source"] == "model"
+
+
+@pytest.mark.asyncio
+async def test_invalid_model_intent_falls_back_to_safe_clarification():
+    class InvalidModel:
+        async def classify(self, _request):
+            return {"intent": "execute_arbitrary_node"}
+
+    result = await build_graph(model=InvalidModel()).ainvoke(
+        {"request": {"message": "帮我转 1 ETH"}},
+        config={"configurable": {"thread_id": "invalid-model-route"}},
+    )
+
+    assert result["intent"] == "clarification"
+    assert result["supervisor_decision"]["error"]["code"] == "SUPERVISOR_OUTPUT_INVALID"
 
 
 @pytest.mark.asyncio

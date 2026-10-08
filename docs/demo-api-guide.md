@@ -214,4 +214,4 @@ curl http://localhost:8000/v1/swap/<session-id>?user_id=demo-user
 - 服务端不会替用户签名、选择 Provider 或自动广播。
 - `pending_transaction` 的 `chain`/`chain_id` 必须和钱包当前网络一致后才能调用钱包签名方法。
 
-更完整的生命周期说明见 [mobile-integration.md](mobile-integration.md)，浏览器调试步骤见 [local-demo-debugging.md](local-demo-debugging.md)。
+更完整的生命周期说明见 [mobile-integration.md](mobile-integration.md)。

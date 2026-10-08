@@ -116,6 +116,261 @@ async def test_native_read_tool_call_round_executes_tool_and_returns_to_model():
 
 
 @pytest.mark.asyncio
+async def test_native_tool_arguments_are_forwarded_to_the_tool_node():
+    """Native tool wrappers must preserve arguments selected by DeepSeek."""
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import TokenPrice
+    from wallet_agent.graph.build import build_graph
+
+    class PriceProvider:
+        def __init__(self):
+            self.assets = []
+
+        async def get_prices(self, assets):
+            self.assets.extend(assets)
+            return [TokenPrice(asset=assets[0], usd_price=Decimal("765"), provider="okx")]
+
+    class NativeReadModel:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "price_query"}
+
+        async def extract(self, _task_kind, _request):
+            # The model tool call below deliberately corrects this stale extraction.
+            return {"symbol": "ETH", "chain": "ETH", "decimals": 18}
+
+        async def invoke_read_tools(self, messages, _tools):
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-bnb-price",
+                            "name": "price_lookup",
+                            "args": {"symbol": "BNB", "chain": "BSC"},
+                        }
+                    ],
+                )
+            return AIMessage(content="")
+
+    provider = PriceProvider()
+    result = await build_graph(model=NativeReadModel(), price_provider=provider).ainvoke(
+        {"request": {"message": "bnb 现在价值多少u"}},
+        config={"configurable": {"thread_id": "native-tool-args-forwarded"}},
+    )
+
+    assert result["response"]["kind"] == "price_query"
+    assert provider.assets[0].symbol == "BNB"
+    assert provider.assets[0].chain == "BSC"
+
+
+@pytest.mark.asyncio
+async def test_parallel_balance_and_price_calls_produce_asset_value_answer():
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance, TokenPrice
+    from wallet_agent.graph.build import build_graph
+
+    bnb = Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18, address=None)
+
+    class WalletProvider:
+        async def get_token_balances(self, _address, _indexes):
+            return [
+                TokenBalance(
+                    asset=bnb,
+                    amount=Decimal("0.004818285427772361"),
+                    amount_raw="4818285427772361",
+                    provider="okx",
+                )
+            ]
+
+    class PriceProvider:
+        async def get_prices(self, assets):
+            return [TokenPrice(asset=assets[0], usd_price=Decimal("765"), provider="okx")]
+
+    class NativeReadModel:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "price_query"}
+
+        async def extract(self, _task_kind, _request):
+            return {"symbol": "BNB", "chain": "BSC", "decimals": 18}
+
+        async def invoke_read_tools(self, messages, _tools):
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-balance",
+                            "name": "wallet_balance",
+                            "args": {"chain": "BSC", "address": "0x" + "1" * 40},
+                        },
+                        {
+                            "id": "call-price",
+                            "name": "price_lookup",
+                            "args": {"chain": "BSC", "symbol": "BNB"},
+                        },
+                    ],
+                )
+            return AIMessage(content="")
+
+    result = await build_graph(
+        model=NativeReadModel(),
+        wallet_provider=WalletProvider(),
+        price_provider=PriceProvider(),
+    ).ainvoke(
+        {
+            "request": {
+                "message": "我的 BNB 价值多少 U",
+                "address": "0x" + "1" * 40,
+                "chain": "BSC",
+            }
+        },
+        config={"configurable": {"thread_id": "parallel-asset-value"}},
+    )
+
+    assert result["response"]["kind"] == "asset_value"
+    assert result["response"]["asset"]["symbol"] == "BNB"
+    assert result["response"]["usd_value"] == "3.685988352245856165"
+    assert "请指定要查询的资产" not in result["response"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_asset_value_keeps_balance_fact_when_price_provider_fails():
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+    from wallet_agent.graph.build import build_graph
+
+    bnb = Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18, address=None)
+    usdt = Asset(
+        chain="BSC", chain_id=56, symbol="USDT", decimals=18, address="0x" + "2" * 40
+    )
+
+    class WalletProvider:
+        async def get_token_balances(self, _address, _indexes):
+            return [
+                TokenBalance(
+                    asset=bnb, amount=Decimal("0.0048"), amount_raw="4800", provider="okx"
+                ),
+                TokenBalance(asset=usdt, amount=Decimal("10"), amount_raw="10", provider="okx"),
+            ]
+
+    class PriceProvider:
+        async def get_prices(self, _assets):
+            raise RuntimeError("temporary price outage")
+
+    class NativeReadModel:
+        read_agent_enabled = True
+
+        async def classify(self, _request):
+            return {"intent": "price_query"}
+
+        async def extract(self, _task_kind, _request):
+            return {"symbol": "BNB", "chain": "BSC", "decimals": 18}
+
+        async def invoke_read_tools(self, messages, _tools):
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-balance",
+                            "name": "wallet_balance",
+                            "args": {"chain": "BSC", "address": "0x" + "1" * 40},
+                        },
+                        {
+                            "id": "call-price",
+                            "name": "price_lookup",
+                            "args": {"chain": "BSC", "symbol": "BNB"},
+                        },
+                    ],
+                )
+            return AIMessage(content="")
+
+    result = await build_graph(
+        model=NativeReadModel(),
+        wallet_provider=WalletProvider(),
+        price_provider=PriceProvider(),
+    ).ainvoke(
+        {
+            "request": {
+                "message": "我的 BNB 价值多少 U",
+                "address": "0x" + "1" * 40,
+                "chain": "BSC",
+            }
+        },
+        config={"configurable": {"thread_id": "asset-value-price-failure"}},
+    )
+
+    assert result["response"]["kind"] == "asset_value"
+    assert result["response"]["balance"]["asset"]["symbol"] == "BNB"
+    assert "暂时无法计算美元价值" in result["response"]["message"]
+    assert "请指定要查询的资产" not in result["response"]["message"]
+
+
+def test_asset_value_followup_is_recognized_from_explicit_value_language():
+    from wallet_agent.graph.nodes import _looks_like_asset_value_query
+
+    assert _looks_like_asset_value_query("我说我的bnb 价值多少 u?") is True
+    assert _looks_like_asset_value_query("我的 bnb 余额是多少") is False
+
+
+@pytest.mark.asyncio
+async def test_preflight_balance_followup_explains_the_previous_failure():
+    from wallet_agent.graph.build import build_graph
+
+    class Model:
+        async def classify(self, _request):
+            raise AssertionError("the preflight follow-up should be deterministic")
+
+    result = await build_graph(model=Model()).ainvoke(
+        {
+            "conversation_history": [
+                {
+                    "role": "assistant",
+                    "content": "交易预检查未通过",
+                    "artifacts": {
+                        "response": {
+                            "kind": "error",
+                            "errors": [
+                                {
+                                    "code": "TRANSACTION_PREFLIGHT_FAILED",
+                                    "details": {
+                                        "preflight": {
+                                            "chain": "BSC",
+                                            "checks": [
+                                                {
+                                                    "status": "failed",
+                                                    "code": "INSUFFICIENT_BALANCE",
+                                                    "message": (
+                                                        "原生币余额不足以支付交易金额和网络手续费。"
+                                                    ),
+                                                }
+                                            ],
+                                        }
+                                    },
+                                }
+                            ],
+                        }
+                    },
+                }
+            ],
+            "request": {"message": "是我的余额不足吗"},
+        },
+        config={"configurable": {"thread_id": "preflight-balance-followup"}},
+    )
+
+    assert result["response"]["kind"] == "clarification"
+    assert "余额不足" in result["response"]["message"]
+    assert result["response"]["preflight"]["chain"] == "BSC"
+
+
+@pytest.mark.asyncio
 async def test_repeated_native_tool_call_reuses_verified_fact_without_requerying_provider():
     from decimal import Decimal
 

@@ -42,6 +42,7 @@ from wallet_agent.domain.normalization import (
     transaction_query_hints,
     unambiguous_amount_with_unit,
 )
+from wallet_agent.models import RouteDecision
 from wallet_agent.observability import wallet_event
 
 from .dialogue import resolve_quote_reference, resolve_read_reference
@@ -99,7 +100,10 @@ def _normalize_price_asset(
     context = wallet_context or {}
     chain_value = values.get("chain") or context.get("chain")
     chain = canonical_chain(str(chain_value)) if chain_value else ""
-    explicit_address = values.get("address") or values.get("token_address")
+    token_address = values.pop("token_address", None)
+    if values.get("address") is None and token_address:
+        values["address"] = token_address
+    explicit_address = values.get("address")
     if not chain:
         inferred = _unique_native_chain(symbol, explicit_address)
         if inferred is None and symbol == "ETH":
@@ -749,6 +753,235 @@ def _latest_read_response(history: Any) -> dict[str, Any] | None:
     return None
 
 
+def _looks_like_asset_value_query(message: str) -> bool:
+    """Recognize an explicit request to value the user's holding.
+
+    This is intentionally narrow: a balance question is not an estimate request,
+    while phrases such as ``我的 BNB 价值多少 U`` must not depend on the
+    classifier choosing the right intent.
+    """
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    if re.search(r"(余额|持有量|有多少|balance)\s*(是多少|多少)?$", text):
+        return False
+    has_holding_reference = bool(
+        re.search(r"(我的|我有|持有|账户里|钱包里|my\s+|my wallet)", text)
+    )
+    has_value_language = bool(
+        re.search(r"(价值|worth|value|估值|值多少钱|多少\s*(?:u|usd|美元|刀))", text)
+    )
+    return has_holding_reference and has_value_language
+
+
+def _latest_preflight_failure(history: Any) -> dict[str, Any] | None:
+    """Find the most recent preflight failure persisted in assistant artifacts."""
+    for item in reversed(history or []):
+        if not isinstance(item, Mapping) or item.get("role") != "assistant":
+            continue
+        artifacts = item.get("artifacts")
+        response = artifacts.get("response") if isinstance(artifacts, Mapping) else None
+        if not isinstance(response, Mapping):
+            continue
+        errors = response.get("errors") or []
+        for error in errors:
+            if (
+                not isinstance(error, Mapping)
+                or error.get("code") != "TRANSACTION_PREFLIGHT_FAILED"
+            ):
+                continue
+            details = error.get("details")
+            preflight = details.get("preflight") if isinstance(details, Mapping) else None
+            if isinstance(preflight, Mapping):
+                return dict(preflight)
+            if isinstance(response.get("preflight"), Mapping):
+                return dict(response["preflight"])
+            return {"chain": response.get("chain"), "checks": []}
+    return None
+
+
+def _looks_like_preflight_balance_followup(message: str, history: Any) -> bool:
+    text = str(message or "").strip().lower()
+    if not text or not _latest_preflight_failure(history):
+        return False
+    # A stale preflight failure is context, not a reason to hijack a new
+    # business request. Require explicit confirmation language; phrases such
+    # as "我的全部余额" and "所有资产有多少" must reach the model router.
+    asks_about_balance = bool(
+        re.search(r"(余额|余额不足|资金|不够|insufficient|balance|funds)", text)
+    )
+    asks_for_confirmation = bool(
+        re.search(
+            r"(^|\s)(是不是|是否|对不对|right|correct|yes)(\s|$)|"
+            r"(余额|资金|balance|funds).*(吗|么|对不对|是不是|是否)($|\s)",
+            text,
+        )
+    )
+    return asks_about_balance and asks_for_confirmation
+
+
+def _preflight_balance_response(preflight: Mapping[str, Any], language: str) -> dict[str, Any]:
+    checks = preflight.get("checks") or []
+    failed = next(
+        (
+            item
+            for item in checks
+            if isinstance(item, Mapping)
+            and item.get("code") in {"INSUFFICIENT_BALANCE", "INSUFFICIENT_GAS"}
+        ),
+        None,
+    )
+    chain = str(preflight.get("chain") or "当前网络")
+    if language == "zh":
+        if failed:
+            message = f"是的，这笔交易在 {chain} 的预检查显示钱包余额不足。"
+            detail = str(failed.get("message") or "")
+            if detail:
+                message += f"{detail}"
+            message += "这还不包含后续可能产生的网络手续费。"
+        else:
+            message = f"这笔交易在 {chain} 的预检查没有通过，原因与钱包余额或手续费有关。"
+    else:
+        message = (
+            f"Yes. The preflight check on {chain} indicates that the wallet "
+            "balance is insufficient."
+            if failed
+            else (
+                f"The preflight check on {chain} did not pass; the issue is "
+                "related to balance or fees."
+            )
+        )
+    return {
+        "kind": "clarification",
+        "message": message,
+        "preflight": dict(preflight),
+        "errors": [
+            _error(
+                "INSUFFICIENT_BALANCE" if failed else "TRANSACTION_PREFLIGHT_FAILED",
+                message,
+                details={"preflight": dict(preflight)},
+            )
+        ],
+    }
+
+
+def _asset_value_response(
+    facts: Mapping[str, Any],
+    language: str,
+    *,
+    requested_symbol: str | None = None,
+    requested_chain: str | None = None,
+) -> dict[str, Any] | None:
+    """Deterministically combine verified balance and price facts."""
+    wallet_result = facts.get("wallet_balance")
+    price_result = facts.get("price_lookup")
+    wallet_ok = isinstance(wallet_result, Mapping) and wallet_result.get("ok")
+    price_ok = isinstance(price_result, Mapping) and price_result.get("ok")
+    if not wallet_ok and not price_ok:
+        return None
+
+    wallet = wallet_result.get("wallet") if wallet_ok else {}
+    balances = _wallet_balance_items(wallet if isinstance(wallet, Mapping) else {})
+    prices = price_result.get("prices") if price_ok else []
+    prices = prices if isinstance(prices, list) else []
+    selected_balance = balances[0] if len(balances) == 1 else None
+    selected_price = prices[0] if len(prices) == 1 else None
+    if selected_balance is None and requested_symbol:
+        selected_balance = next(
+            (
+                item
+                for item in balances
+                if canonical_symbol(str((item.get("asset") or {}).get("symbol") or ""))
+                == canonical_symbol(requested_symbol)
+                and (
+                    not requested_chain
+                    or canonical_chain(str((item.get("asset") or {}).get("chain") or ""))
+                    == canonical_chain(requested_chain)
+                )
+            ),
+            None,
+        )
+    if selected_balance is None and selected_price is not None:
+        price_asset = selected_price.get("asset") or {}
+        selected_balance = next(
+            (
+                item
+                for item in balances
+                if canonical_symbol(str((item.get("asset") or {}).get("symbol") or ""))
+                == canonical_symbol(str(price_asset.get("symbol") or ""))
+                and canonical_chain(str((item.get("asset") or {}).get("chain") or ""))
+                == canonical_chain(str(price_asset.get("chain") or ""))
+            ),
+            None,
+        )
+    if selected_price is None and selected_balance is not None:
+        balance_asset = selected_balance.get("asset") or {}
+        selected_price = next(
+            (
+                item
+                for item in prices
+                if canonical_symbol(str((item.get("asset") or {}).get("symbol") or ""))
+                == canonical_symbol(str(balance_asset.get("symbol") or ""))
+            ),
+            None,
+        )
+    if selected_balance is not None and selected_price is not None:
+        balance_asset = selected_balance.get("asset") or {}
+        price_asset = selected_price.get("asset") or {}
+        same_asset = (
+            canonical_symbol(str(balance_asset.get("symbol") or ""))
+            == canonical_symbol(str(price_asset.get("symbol") or ""))
+            and canonical_chain(str(balance_asset.get("chain") or ""))
+            == canonical_chain(str(price_asset.get("chain") or ""))
+        )
+        if not same_asset:
+            # Never multiply a balance by a price for a different asset.
+            selected_price = None
+    if selected_balance is None and balances:
+        selected_balance = balances[0]
+    if selected_price is None and prices:
+        selected_price = prices[0]
+
+    balance_asset = (selected_balance or {}).get("asset") or {}
+    price_asset = (selected_price or {}).get("asset") or {}
+    asset = dict(price_asset or balance_asset)
+    amount = (selected_balance or {}).get("amount")
+    usd_price = (selected_price or {}).get("usd_price")
+    response: dict[str, Any] = {
+        "kind": "asset_value",
+        "asset": asset,
+        "balance": selected_balance,
+        "price": selected_price,
+    }
+    if amount is not None and usd_price is not None:
+        try:
+            response["usd_value"] = str(Decimal(str(amount)) * Decimal(str(usd_price)))
+            response["message"] = (
+                f"你的 {asset.get('symbol', '资产')} 余额是 {amount}，"
+                f"按当前价格 ${usd_price} 计算，"
+                f"价值约为 ${response['usd_value']}。"
+                if language == "zh"
+                else (
+                    f"Your {asset.get('symbol', 'asset')} balance is {amount}; "
+                    f"at ${usd_price}, it is worth about ${response['usd_value']}."
+                )
+            )
+        except (ArithmeticError, TypeError, ValueError):
+            pass
+    if "usd_value" not in response:
+        failed = price_result if not price_ok else wallet_result
+        response["error"] = failed
+        response["message"] = (
+            f"我查到你的 {asset.get('symbol', '资产')} 余额，但暂时无法计算美元价值。"
+            if language == "zh"
+            else (
+                f"I found your {asset.get('symbol', 'asset')} balance, but "
+                "cannot calculate its USD value right now."
+            )
+        )
+    return response
+
+
 def _dialogue_referent(response: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if not response:
         return None
@@ -765,6 +998,20 @@ def _dialogue_referent(response: Mapping[str, Any] | None) -> dict[str, Any] | N
             "chain": asset.get("chain"),
             "symbol": asset.get("symbol"),
             "usd_price": price.get("usd_price"),
+        }
+        return {
+            "kind": "asset",
+            "id": f"{facts['chain']}:{facts['symbol']}",
+            "facts": {key: value for key, value in facts.items() if value is not None},
+        }
+    if kind == "asset_value":
+        asset = response.get("asset") or {}
+        if not isinstance(asset, Mapping) or not asset.get("symbol"):
+            return None
+        facts = {
+            "chain": asset.get("chain"),
+            "symbol": asset.get("symbol"),
+            "usd_value": response.get("usd_value"),
         }
         return {
             "kind": "asset",
@@ -810,6 +1057,7 @@ def dialogue_snapshot(state: Mapping[str, Any]) -> DialogueState:
         "wallet_query": "wallet",
         "portfolio_query": "portfolio",
         "price_query": "price",
+        "asset_value": "price",
         "gas_check": "gas",
         "transaction_status": "transaction",
         "swap_status": "swap_status",
@@ -922,6 +1170,23 @@ def _read_response_fallback(response: Mapping[str, Any], language: str) -> str:
                     f"${first.get('usd_price')}."
                 )
             )
+    if kind == "asset_value":
+        if response.get("message"):
+            return str(response["message"])
+        asset = response.get("asset") or {}
+        symbol = asset.get("symbol") or "资产"
+        value = response.get("usd_value")
+        if value is not None:
+            return (
+                f"你的 {symbol} 当前价值约为 ${value}。"
+                if language == "zh"
+                else f"Your {symbol} is currently worth about ${value}."
+            )
+        return (
+            f"我查到你的 {symbol} 余额，但暂时无法计算美元价值。"
+            if language == "zh"
+            else f"I found your {symbol} balance, but cannot calculate its USD value right now."
+        )
     if kind == "market_details":
         count = len(response.get("details") or [])
         return (
@@ -2572,7 +2837,19 @@ async def _resolve_swap_target_value(
 def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
     def okx_chain_index(chain: str) -> str | None:
         mapping = getattr(runtime.wallet_provider, "chain_index_by_name", {})
-        return mapping.get(str(chain).upper())
+        canonical = str(chain).upper()
+        if canonical in mapping:
+            return mapping[canonical]
+        # Keep injected wallet providers usable in tests and local deployments
+        # even when they do not expose OKX's chain-index registry.
+        return {
+            "ETH": "1",
+            "BSC": "56",
+            "POLYGON": "137",
+            "OPTIMISM": "10",
+            "BASE": "8453",
+            "ARBITRUM": "42161",
+        }.get(canonical)
 
     def execution_adapter(chain: str) -> Any:
         observer = runtime.execution_observer
@@ -3000,6 +3277,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "wallet_query",
             "portfolio_query",
             "price_query",
+            "asset_value",
             "gas_check",
             "asset_discovery",
             "market_details",
@@ -3035,6 +3313,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             ]
         if kind == "price_query":
             facts["prices"] = result.get("prices") or []
+        if kind == "asset_value":
+            facts["asset_value"] = {
+                "asset": result.get("asset"),
+                "balance": result.get("balance"),
+                "price": result.get("price"),
+                "usd_value": result.get("usd_value"),
+            }
         if kind == "transaction_status":
             facts["transaction"] = result
         responder = getattr(runtime.model, "respond", None)
@@ -3521,6 +3806,39 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "read_native": True,
                 }
         call = await read_only_decision(runtime.model, request)
+        if _looks_like_asset_value_query(str(request.get("message") or "")):
+            context = state.get("wallet_context") or {}
+            address = context.get("address") or request.get("address")
+            chain = context.get("chain") or request.get("chain")
+            if address and chain and "wallet_balance" not in state.get("read_facts", {}):
+                # The estimate is a deterministic fan-in and always needs a
+                # balance.  Ask for it even when the planner selected price first.
+                call = ReadOnlyToolCall(
+                    name="wallet_balance",
+                    arguments={"address": str(address), "chain": str(chain)},
+                )
+            elif (
+                "wallet_balance" in state.get("read_facts", {})
+                and "price_lookup" not in state.get("read_facts", {})
+            ):
+                raw_price = state.get("price_request") or {}
+                if raw_price.get("symbol"):
+                    call = ReadOnlyToolCall(
+                        name="price_lookup",
+                        arguments={
+                            key: value
+                            for key, value in {
+                                "symbol": raw_price.get("symbol"),
+                                "chain": raw_price.get("chain") or chain,
+                                "token_address": (
+                                    raw_price.get("address")
+                                    or raw_price.get("token_address")
+                                ),
+                                "decimals": raw_price.get("decimals"),
+                            }.items()
+                            if value not in (None, "")
+                        },
+                    )
         if call is None:
             if state.get("read_loop_count", 0) == 0:
                 name = read_only_tool_name_for_intent(intent)
@@ -3751,37 +4069,96 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "price_history": price_history,
             "portfolio_snapshot": portfolio_snapshot,
         }
-        async def native_price_lookup(**kwargs: Any) -> dict[str, Any]:
+        async def native_price_lookup(
+            symbol: str | None = None,
+            chain: str | None = None,
+            token_address: str | None = None,
+            decimals: int | None = None,
+        ) -> dict[str, Any]:
             """Read the current price for an asset."""
-            return await price_lookup(dict(kwargs))
+            return await price_lookup(
+                {
+                    "symbol": symbol,
+                    "chain": chain,
+                    "token_address": token_address,
+                    "decimals": decimals,
+                }
+            )
 
-        async def native_wallet_balance(**kwargs: Any) -> dict[str, Any]:
+        async def native_wallet_balance(
+            chain: str | None = None, address: str | None = None
+        ) -> dict[str, Any]:
             """Read wallet balances."""
-            return await wallet_balance(dict(kwargs))
+            return await wallet_balance({"chain": chain, "address": address})
 
-        async def native_transaction_status(**kwargs: Any) -> dict[str, Any]:
+        async def native_transaction_status(
+            tx_hash: str | None = None, chain: str | None = None
+        ) -> dict[str, Any]:
             """Read a transaction status."""
-            return await transaction_status(dict(kwargs))
+            return await transaction_status({"tx_hash": tx_hash, "chain": chain})
 
-        async def native_gas_estimate(**kwargs: Any) -> dict[str, Any]:
+        async def native_gas_estimate(
+            chain: str | None = None,
+            address: str | None = None,
+            to: str | None = None,
+            data: str | None = None,
+        ) -> dict[str, Any]:
             """Estimate a network fee."""
-            return await gas_estimate(dict(kwargs))
+            return await gas_estimate(
+                {"chain": chain, "address": address, "to": to, "data": data}
+            )
 
-        async def native_asset_discovery(**kwargs: Any) -> dict[str, Any]:
+        async def native_asset_discovery(
+            chain: str | None = None,
+            search: str | None = None,
+            provider_name: str | None = None,
+        ) -> dict[str, Any]:
             """Discover token metadata."""
-            return await asset_discovery(dict(kwargs))
+            return await asset_discovery(
+                {"chain": chain, "search": search, "provider_name": provider_name}
+            )
 
-        async def native_market_details(**kwargs: Any) -> dict[str, Any]:
+        async def native_market_details(
+            symbol: str | None = None,
+            chain: str | None = None,
+            token_address: str | None = None,
+            decimals: int | None = None,
+        ) -> dict[str, Any]:
             """Read market details for an asset."""
-            return await market_details(dict(kwargs))
+            return await market_details(
+                {
+                    "symbol": symbol,
+                    "chain": chain,
+                    "token_address": token_address,
+                    "decimals": decimals,
+                }
+            )
 
-        async def native_price_history(**kwargs: Any) -> dict[str, Any]:
+        async def native_price_history(
+            symbol: str | None = None,
+            chain: str | None = None,
+            token_address: str | None = None,
+            decimals: int | None = None,
+            period: str | None = None,
+            limit: int | None = None,
+        ) -> dict[str, Any]:
             """Read historical prices for an asset."""
-            return await price_history(dict(kwargs))
+            return await price_history(
+                {
+                    "symbol": symbol,
+                    "chain": chain,
+                    "token_address": token_address,
+                    "decimals": decimals,
+                    "period": period,
+                    "limit": limit,
+                }
+            )
 
-        async def native_portfolio_snapshot(**kwargs: Any) -> dict[str, Any]:
+        async def native_portfolio_snapshot(
+            address: str | None = None, chain: str | None = None
+        ) -> dict[str, Any]:
             """Read a wallet portfolio snapshot."""
-            return await portfolio_snapshot(dict(kwargs))
+            return await portfolio_snapshot({"address": address, "chain": chain})
 
         native_tools = [
             native_wallet_balance,
@@ -3900,9 +4277,43 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         started = perf_counter()
         facts = state.get("read_facts") or {}
         result: dict[str, Any] = {}
+        request = _mapping(state.get("request"))
+        message = str(request.get("message") or state.get("message") or "")
+        language = _response_language(message, state.get("conversation_history"))
+        # A value request is a fan-in operation.  Do this before the generic
+        # last-tool projection so a failed price call cannot hide a successful
+        # balance call (or vice versa).
+        if _looks_like_asset_value_query(message):
+            price_request = _mapping(state.get("price_request"))
+            price_calls = [
+                item
+                for item in state.get("read_tool_calls") or []
+                if str(item.get("name") or "") == "price_lookup"
+            ]
+            latest_price_args = _mapping(price_calls[-1].get("args")) if price_calls else {}
+            requested_symbol = str(
+                latest_price_args.get("symbol")
+                or price_request.get("symbol")
+                or ""
+            ) or None
+            requested_chain = str(
+                latest_price_args.get("chain")
+                or price_request.get("chain")
+                or ""
+            ) or None
+            aggregated = _asset_value_response(
+                facts,
+                language,
+                requested_symbol=requested_symbol,
+                requested_chain=requested_chain,
+            )
+            if aggregated is not None:
+                result = aggregated
         call_name = str((state.get("read_tool_calls") or [{}])[-1].get("name") or "")
         latest = facts.get(call_name) if call_name else None
-        if call_name == "wallet_balance" and isinstance(latest, dict) and latest.get("ok"):
+        if result:
+            pass
+        elif call_name == "wallet_balance" and isinstance(latest, dict) and latest.get("ok"):
             result = {"kind": "wallet_query", "wallet": latest.get("wallet") or {}}
         elif call_name == "price_lookup" and isinstance(latest, dict) and latest.get("ok"):
             result = {"kind": "price_query", "prices": latest.get("prices") or []}
@@ -4075,6 +4486,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         history_followup_intent = _history_followup_intent(
             message, state.get("conversation_history")
         )
+        preflight_followup = _latest_preflight_failure(state.get("conversation_history"))
         resolved_reference = resolve_read_reference(
             message, state.get("dialogue")
         )
@@ -4082,8 +4494,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             message,
             (state.get("dialogue") or {}).get("referent"),
         )
-        if explicit_transfer and not _looks_like_cancel_message(message):
-            decision = {"intent": "transfer", "source": "explicit_transfer"}
+        if _looks_like_preflight_balance_followup(
+            message, state.get("conversation_history")
+        ) and preflight_followup is not None:
+            decision = {
+                "intent": "clarification",
+                "source": "preflight_followup",
+                "preflight_followup": preflight_followup,
+            }
         elif _looks_like_cancel_message(message) and (
             state.get("active_task")
             or state.get("conversation_state")
@@ -4093,27 +4511,6 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             decision = {"intent": "clarification", "source": "command_guard"}
         elif forced in _VALID_INTENTS:
             decision = {"intent": forced, "source": "api"}
-        elif historical_swap and _looks_like_swap_status_message(message):
-            decision = {
-                "intent": "swap_status",
-                "source": "operation_history",
-                "operation_reference_task_id": historical_swap.get("task_id"),
-            }
-        elif followup_intent in _VALID_INTENTS:
-            decision = {"intent": followup_intent, "source": "active_task"}
-        elif history_followup_intent in _VALID_INTENTS:
-            decision = {"intent": history_followup_intent, "source": "history_followup"}
-        elif resolved_reference is not None:
-            decision = {
-                "intent": resolved_reference["intent"],
-                "source": "dialogue_reference",
-            }
-        elif selected_quote_reference is not None:
-            decision = {
-                "intent": "swap_select",
-                "source": "quote_reference",
-                "selected_quote": selected_quote_reference["arguments"]["selected_quote"],
-            }
         elif state.get("intent") in _VALID_INTENTS and not request.get("message"):
             decision = {"intent": state["intent"], "source": "graph_resume"}
         else:
@@ -4137,6 +4534,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             previous_response = _latest_read_response(state.get("conversation_history"))
             if previous_response is not None:
                 model_request["previous_read_response"] = previous_response
+            if preflight_followup is not None:
+                model_request["previous_preflight"] = preflight_followup
+            model_request["routing_hints"] = {
+                "explicit_transfer": explicit_transfer,
+                "asset_value_query": _looks_like_asset_value_query(message),
+                "active_task_followup_intent": followup_intent,
+                "history_followup_intent": history_followup_intent,
+                "resolved_reference": resolved_reference,
+                "selected_quote_reference": selected_quote_reference,
+                "historical_swap_status": (
+                    historical_swap.get("task_id")
+                    if historical_swap and _looks_like_swap_status_message(message)
+                    else None
+                ),
+            }
             if suggestion_data is not None:
                 model_request["suggestion_data"] = suggestion_data
             model_request["available_capabilities"] = {
@@ -4165,6 +4577,26 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "intent": "clarification",
                     "error": _error("SUPERVISOR_FAILED", str(exc), retryable=True),
                 }
+            if decision is not None:
+                try:
+                    # Legacy `ainvoke` models may return intent plus extracted
+                    # slots. Validate the routing field strictly while
+                    # preserving those slots for the existing intent node.
+                    validated_route = RouteDecision.model_validate(
+                        {"intent": decision.get("intent")}
+                    )
+                    decision = {
+                        **decision,
+                        "intent": validated_route.intent,
+                    }
+                except Exception:
+                    decision = {
+                        "intent": "clarification",
+                        "error": _error(
+                            "SUPERVISOR_OUTPUT_INVALID",
+                            "无法判断这次请求应该执行哪项钱包能力。",
+                        ),
+                    }
             if not decision or decision.get("intent") not in _VALID_INTENTS:
                 decision = {
                     "intent": "clarification",
@@ -4175,6 +4607,47 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             else:
                 decision = {**decision, "source": "model"}
+            # Deterministic parsers are a bounded fallback for an invalid or
+            # non-committal model answer. They never override a valid model
+            # route for a new business request.
+            decision_error = decision.get("error")
+            decision_error_code = (
+                decision_error.get("code")
+                if isinstance(decision_error, Mapping)
+                else None
+            )
+            if (
+                decision.get("intent") in {"clarification", "unsupported"}
+                and decision_error_code != "SUPERVISOR_OUTPUT_INVALID"
+            ):
+                fallback: dict[str, Any] | None = None
+                if explicit_transfer and not _looks_like_cancel_message(message):
+                    fallback = {"intent": "transfer", "source": "semantic_fallback"}
+                elif _looks_like_asset_value_query(message):
+                    fallback = {"intent": "price_query", "source": "semantic_fallback"}
+                elif historical_swap and _looks_like_swap_status_message(message):
+                    fallback = {
+                        "intent": "swap_status",
+                        "source": "operation_history",
+                        "operation_reference_task_id": historical_swap.get("task_id"),
+                    }
+                elif followup_intent in _VALID_INTENTS:
+                    fallback = {"intent": followup_intent, "source": "active_task"}
+                elif history_followup_intent in _VALID_INTENTS:
+                    fallback = {"intent": history_followup_intent, "source": "history_fallback"}
+                elif resolved_reference is not None:
+                    fallback = {
+                        "intent": resolved_reference["intent"],
+                        "source": "dialogue_reference_fallback",
+                    }
+                elif selected_quote_reference is not None:
+                    fallback = {
+                        "intent": "swap_select",
+                        "source": "quote_reference_fallback",
+                        "selected_quote": selected_quote_reference["arguments"]["selected_quote"],
+                    }
+                if fallback is not None:
+                    decision = fallback
         if (
             decision.get("intent") == "transaction_status"
             and state.get("provider_orders")
@@ -4204,6 +4677,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "read_only_complete": False,
             "read_only_pending": False,
         }
+        if decision.get("source") == "preflight_followup":
+            update["preflight_followup"] = decision.get("preflight_followup")
         has_native_read_tools = hasattr(runtime.model, "invoke_read_tools")
         has_structured_read_planner = hasattr(runtime.model, "plan_read")
         update["read_only_enabled"] = bool(
@@ -4878,6 +5353,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "pending_transaction": None,
                 "user_confirmation": None,
                 "response": {"kind": "cancelled", "message": f"已取消当前{kind}任务。"},
+            }
+        if isinstance(state.get("preflight_followup"), Mapping):
+            response = _preflight_balance_response(
+                state["preflight_followup"],
+                _response_language(message, state.get("conversation_history")),
+            )
+            return {
+                "intent": "clarification",
+                "route": "response",
+                "response": response,
+                "preflight_followup": None,
             }
         supervisor_source = (state.get("supervisor_output") or {}).get("source")
         if existing in valid and (

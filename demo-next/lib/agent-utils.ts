@@ -219,6 +219,7 @@ export type ConversationArtifacts = {
   wallet?: any;
   portfolio?: any;
   price?: any;
+  assetValue?: any;
   gas?: any;
   assets?: any;
   status?: any;
@@ -250,6 +251,7 @@ export function extractConversationArtifacts(state: any): ConversationArtifacts 
   if (kind === "wallet_query") artifacts.wallet = response.wallet || response;
   if (kind === "portfolio_query") artifacts.portfolio = response.portfolio || response;
   if (kind === "price_query") artifacts.price = response;
+  if (kind === "asset_value") artifacts.assetValue = response;
   if (kind === "gas_check") artifacts.gas = response;
   if (kind === "asset_discovery") artifacts.assets = response;
   if (kind === "swap_status" || kind === "transaction_status") artifacts.status = response;
@@ -365,6 +367,13 @@ export function formatResponseSummary(response: any): string {
     return prices.length
       ? `价格来源：${prices.map((item: any) => `${String(item.provider || "未知来源").toUpperCase()} ${item.asset?.symbol || ""} ${item.usd_price || "-"}`).join("；")}`
       : "暂时没有可用的价格数据。";
+  }
+  if (response.kind === "asset_value") {
+    if (response.message) return String(response.message);
+    const symbol = response.asset?.symbol || "资产";
+    return response.usd_value != null
+      ? `你的 ${symbol} 当前价值约为 $${response.usd_value}。`
+      : `我查到你的 ${symbol} 余额，但暂时无法计算美元价值。`;
   }
   return responseMessage(response);
 }

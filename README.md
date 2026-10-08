@@ -26,6 +26,16 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+之后可以使用仓库内的脚本重复部署（不会删除 PostgreSQL/Redis 数据卷）：
+
+```bash
+./scripts/redeploy.sh
+./scripts/redeploy.sh --no-cache
+./scripts/redeploy.sh --proxy http://host.docker.internal:7890
+```
+
+脚本会等待 API 的 `/health`、`/ready` 和 Demo 首页就绪；构建或健康检查失败时会输出最近的服务日志。
+
 远程服务器部署时，Demo 在用户浏览器中运行，因此 `NEXT_PUBLIC_AGENT_API_URL`
 必须填写浏览器可访问的 API 地址，不能填写 Compose 内部的 `wallet-agent:8000`：
 
@@ -87,21 +97,15 @@ docker compose down -v
 Docker 部署的 SSE 恢复和多实例配置见下面的
 [Multi-instance persistence and SSE recovery](#multi-instance-persistence-and-sse-recovery)。
 
-## Docker + real mobile-call demo
+## Next.js Demo
 
-Open [http://localhost:8000/demo/](http://localhost:8000/demo/) in a browser.
-The page calls the same REST/SSE endpoints that a mobile app uses: turn,
-stream, quote selection, approval, session, and broadcast. It never accepts or
-sends private keys. After the user explicitly selects a quote, the browser
-wallet signs and broadcasts each unsigned transaction locally; the demo sends
-only the returned chain-qualified transaction hash to the service.
+Open [http://localhost:3000](http://localhost:3000) in a browser after Docker
+starts. The Demo calls the API at `http://localhost:8000`, streams agent
+progress and model/tool traces, and keeps wallet interaction in the browser.
+The API no longer serves a legacy `/demo/` page.
 
-本地调试的完整步骤（包括浏览器 Network/Console、SSE、报价选择和
-approve/兑换交易流程）见 [docs/local-demo-debugging.md](docs/local-demo-debugging.md)。
-
-Demo/API 调用示例见 [docs/demo-api-guide.md](docs/demo-api-guide.md)。
-
-Demo 现在支持对话式兑换和 EIP-1193 浏览器钱包连接；钱包插件只提供公开地址和链信息，签名仍在浏览器钱包本地完成。详见 [docs/mobile-integration.md](docs/mobile-integration.md)。
+Demo/API 调用示例见 [docs/demo-api-guide.md](docs/demo-api-guide.md)，钱包集成说明见
+[docs/mobile-integration.md](docs/mobile-integration.md)。
 
 For a command-line check after startup:
 

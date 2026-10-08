@@ -153,6 +153,7 @@ class AgentState(TypedDict, total=False):
     forced_intent: NotRequired[str | None]
     transfer_request: NotRequired[dict[str, Any] | None]
     preflight: NotRequired[dict[str, Any] | None]
+    preflight_followup: NotRequired[dict[str, Any] | None]
     transaction_query: NotRequired[dict[str, Any] | None]
     transaction_status_snapshot: NotRequired[dict[str, Any] | None]
     portfolio_request: NotRequired[dict[str, Any] | None]

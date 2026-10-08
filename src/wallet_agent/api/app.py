@@ -9,7 +9,6 @@ import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import fields, is_dataclass
-from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
@@ -17,7 +16,6 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -238,6 +236,8 @@ def _conversation_artifacts(state: Mapping[str, Any]) -> dict[str, Any] | None:
         artifacts["portfolio"] = response.get("portfolio") or response
     if kind == "price_query":
         artifacts["price"] = response
+    if kind == "asset_value":
+        artifacts["asset_value"] = response
     if kind == "gas_check":
         artifacts["gas"] = response
     if kind == "asset_discovery":
@@ -296,6 +296,7 @@ def _assistant_response_content(response: Mapping[str, Any]) -> str:
         "wallet_query": "钱包余额查询完成。",
         "portfolio_query": "资产组合查询完成。",
         "price_query": "价格查询完成。",
+        "asset_value": "资产估值查询完成。",
         "gas_check": "Gas 检查完成。",
         "asset_discovery": "Token 资产查询完成。",
         "transaction_status": "交易状态查询完成。",
@@ -687,10 +688,6 @@ def create_app(
             if hasattr(registry, "get_adapter")
             else registry.get(chain)
         )
-
-    demo_dir = Path(__file__).resolve().parents[3] / "demo"
-    if demo_dir.is_dir():
-        app.mount("/demo", StaticFiles(directory=demo_dir, html=True), name="demo")
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:

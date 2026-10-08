@@ -625,6 +625,7 @@ export default function Home() {
       {artifacts.wallet && <section className="card" data-card-kind="wallet"><h3>钱包余额</h3><pre className="debug">{JSON.stringify(artifacts.wallet, null, 2)}</pre></section>}
       {artifacts.portfolio && <section className="card" data-card-kind="portfolio"><h3>资产组合</h3><pre className="debug">{JSON.stringify(artifacts.portfolio, null, 2)}</pre></section>}
       {artifacts.price && <section className="card" data-card-kind="price"><h3>价格与市场数据</h3><pre className="debug">{JSON.stringify(artifacts.price, null, 2)}</pre></section>}
+      {artifacts.assetValue && <section className="card" data-card-kind="asset-value"><h3>资产估值</h3><p>{responseMessage(artifacts.assetValue)}</p><pre className="debug">{JSON.stringify(artifacts.assetValue, null, 2)}</pre></section>}
       {artifacts.gas && <section className="card" data-card-kind="gas"><h3>Gas 检查</h3><pre className="debug">{JSON.stringify(artifacts.gas, null, 2)}</pre></section>}
       {artifacts.assets && <section className="card" data-card-kind="assets"><h3>Token 资产发现</h3><pre className="debug">{JSON.stringify(artifacts.assets, null, 2)}</pre></section>}
       {cardStatus && <section className="card" data-card-kind="status"><h3>订单状态</h3><p>{cardStatus.message || responseMessage(cardStatus) || cardStatus.status?.status || "处理中"}</p><pre className="debug">{JSON.stringify(cardStatus, null, 2)}</pre></section>}
