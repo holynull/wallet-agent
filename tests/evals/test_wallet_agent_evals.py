@@ -1,6 +1,7 @@
 import pytest
 
 from evals.wallet_agent_evals import (
+    _parse_args,
     evaluate_expectations,
     run_offline_evals,
     run_react_offline_evals,
@@ -79,3 +80,9 @@ async def test_react_offline_matrix_checks_route_scope_handoff_and_budget():
     assert all(item["tool_count"] >= 1 for item in report["cases"])
     assert all(item["lifecycle_boundary"] for item in report["cases"])
     assert all(item["latency_budget"] for item in report["cases"])
+
+
+def test_eval_cli_exposes_strict_react_matrix(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["wallet_agent_evals", "--react"])
+
+    assert _parse_args().react is True

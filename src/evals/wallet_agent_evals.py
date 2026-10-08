@@ -973,13 +973,21 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="use the configured language model; chain and swap backends remain simulated",
     )
+    parser.add_argument(
+        "--react",
+        action="store_true",
+        help="run the deterministic strict ReAct route/tool/scope matrix",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
     try:
-        report = asyncio.run(run_online_evals() if args.online else run_offline_evals())
+        if args.react:
+            report = asyncio.run(run_react_offline_evals())
+        else:
+            report = asyncio.run(run_online_evals() if args.online else run_offline_evals())
     except Exception as exc:
         print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
         return 2
