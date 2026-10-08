@@ -297,6 +297,58 @@ async def test_model_router_responds_with_facts_and_structured_contract():
 
 
 @pytest.mark.asyncio
+async def test_model_router_response_preserves_react_tool_transcript():
+    """Removing the transcript argument would hide tool observations from final generation."""
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    captured = {}
+
+    class ResponseModel:
+        async def ainvoke(self, value):
+            captured["value"] = value
+            return {"language": "zh", "message": "ETH 当前约 1800 美元。", "suggestions": []}
+
+    registry = ModelRegistry(
+        {"deepseek-chat": FakeModel()},
+        default_model_id="deepseek-chat",
+        responses={"deepseek-chat": ResponseModel()},
+    )
+    transcript = [
+        HumanMessage(content="ETH 现在多少钱"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"id": "price-1", "name": "price_lookup", "args": {"symbol": "ETH"}}
+            ],
+        ),
+        ToolMessage(
+            content='{"ok":true,"prices":[{"symbol":"ETH","usd_price":"1800"}]}',
+            tool_call_id="price-1",
+            name="price_lookup",
+        ),
+    ]
+
+    router = ModelRouter(registry)
+    await router.respond(
+        {"message": "ETH 现在多少钱"},
+        {"prices": [{"symbol": "ETH", "usd_price": "1800"}]},
+        messages=transcript,
+    )
+
+    values = captured["value"]
+    assert [type(item).__name__ for item in values[1:4]] == [
+        "HumanMessage",
+        "AIMessage",
+        "ToolMessage",
+    ]
+    assert values[2].tool_calls[0]["id"] == "price-1"
+    assert "request/facts" in values[-1].content
+    trace = router.consume_model_trace()
+    assert trace[0]["role"] == "response"
+    assert trace[0]["stage"] == "生成回复"
+
+
+@pytest.mark.asyncio
 async def test_model_router_uses_role_defaults_and_honors_explicit_override():
     calls = []
 

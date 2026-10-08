@@ -128,8 +128,10 @@ def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanM
 
 
 def _response_model_input(
-    request: Mapping[str, Any], facts: Mapping[str, Any]
-) -> list[HumanMessage]:
+    request: Mapping[str, Any],
+    facts: Mapping[str, Any],
+    messages: list[Any] | None = None,
+) -> list[Any]:
     payload = json.dumps(
         {"request": dict(request), "facts": dict(facts)}, ensure_ascii=False, default=str
     )
@@ -148,7 +150,21 @@ def _response_model_input(
         "绝不调用工具、不执行查询、签名、授权、广播或转账/兑换；不要生成交易数据、私钥或签名内容。"
         "仅返回符合结构化输出 schema 的 JSON。"
     )
-    return _instruction_messages(instructions, "request 和 facts JSON：", payload)
+    if not messages:
+        return _instruction_messages(instructions, "request 和 facts JSON：", payload)
+    transcript = list(messages)
+    if transcript and isinstance(transcript[0], SystemMessage):
+        transcript = transcript[1:]
+    return [
+        SystemMessage(content=instructions),
+        *transcript,
+        HumanMessage(
+            content=(
+                "请基于上面的原始问题、工具调用和 ToolMessage，以及下面经过服务端校验的 "
+                f"request/facts JSON 生成最终回复：\n{payload}"
+            )
+        ),
+    ]
 
 
 def _read_model_input(request: Mapping[str, Any]) -> list[HumanMessage]:
@@ -469,11 +485,14 @@ class ModelRouter:
         return result if isinstance(result, contract) else contract.model_validate(result)
 
     async def respond(
-        self, request: Mapping[str, Any], facts: Mapping[str, Any]
+        self,
+        request: Mapping[str, Any],
+        facts: Mapping[str, Any],
+        messages: list[Any] | None = None,
     ) -> AgentResponseDraft:
         model_id = str(request.get("model_id") or self.registry.response_model_id)
         model = self.registry.get_response_model(model_id)
-        model_request = _response_model_input(request, facts)
+        model_request = _response_model_input(request, facts, messages)
         result = await self._invoke(
             role="response", model_id=model_id, stage="生成回复",
             model=model, request=model_request,

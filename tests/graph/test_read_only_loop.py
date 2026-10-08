@@ -49,9 +49,257 @@ def test_route_stops_after_two_rounds():
     ) == "response"
 
 
+def test_react_message_reducer_appends_tool_transcript_in_order():
+    """The durable read transcript must preserve the model/tool exchange order."""
+    from langchain_core.messages import HumanMessage
+
+    from wallet_agent.graph.state import AgentState
+
+    first = [HumanMessage(content="ETH price")]
+    second = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"id": "call-1", "name": "price_lookup", "args": {"symbol": "ETH"}}
+            ],
+        ),
+        ToolMessage(
+            content='{"ok": true, "prices": [{"symbol": "ETH"}]}',
+            tool_call_id="call-1",
+            name="price_lookup",
+        ),
+    ]
+    state: AgentState = {"react_messages": [*first, *second]}
+
+    assert [type(message).__name__ for message in state["react_messages"]] == [
+        "HumanMessage",
+        "AIMessage",
+        "ToolMessage",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_response_receives_original_question_and_tool_messages():
+    """Final naturalization must receive the full ReAct transcript, not facts alone."""
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import TokenPrice
+    from wallet_agent.graph.build import build_graph
+    from wallet_agent.models.contracts import AgentResponseDraft
+
+    class PriceProvider:
+        async def get_prices(self, assets):
+            return [TokenPrice(asset=assets[0], usd_price=Decimal("1800"), provider="okx")]
+
+    class Model:
+        read_agent_enabled = True
+
+        def __init__(self):
+            self.read_calls = []
+            self.response_messages = None
+
+        async def classify(self, _request):
+            return {"intent": "price_query"}
+
+        async def extract(self, _kind, _request):
+            return {"symbol": "ETH", "chain": "ETH", "decimals": 18}
+
+        async def invoke_read_tools(self, messages, _tools):
+            self.read_calls.append(list(messages))
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-eth-price",
+                            "name": "price_lookup",
+                            "args": {"symbol": "ETH", "chain": "ETH"},
+                        }
+                    ],
+                )
+            return AIMessage(content="已取得 ETH 行情")
+
+        async def respond(self, _request, _facts, messages=None):
+            self.response_messages = list(messages or [])
+            return AgentResponseDraft(
+                language="zh", message="ETH 当前约 1800 美元。", suggestions=[]
+            )
+
+    model = Model()
+    result = await build_graph(model=model, price_provider=PriceProvider()).ainvoke(
+        {
+            "request": {"message": "ETH 现在多少钱"},
+            "conversation_history": [
+                {"role": "user", "content": "前面我们在看 Ethereum 行情"},
+                {"role": "assistant", "content": "可以，继续问我。"},
+            ],
+        },
+        config={"configurable": {"thread_id": "react-response-transcript"}},
+    )
+
+    assert result["response"]["message"] == "ETH 当前约 1800 美元。"
+    assert [type(message).__name__ for message in model.response_messages] == [
+        "SystemMessage",
+        "HumanMessage",
+        "AIMessage",
+        "ToolMessage",
+        "AIMessage",
+    ]
+    assert "ETH 现在多少钱" in str(model.response_messages[1].content)
+    assert "前面我们在看 Ethereum 行情" in str(model.read_calls[0][1].content)
+
+
+@pytest.mark.asyncio
+async def test_native_balance_query_uses_model_route_and_enforces_requested_symbol():
+    """A read-capable model chooses the tool, while the server preserves BNB-only scope."""
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+    from wallet_agent.graph.build import build_graph
+
+    class Wallet:
+        chain_index_by_name = {"BSC": "56"}
+        chain_name_by_index = {"56": "BSC"}
+
+        async def get_token_balances(self, _address, _indexes):
+            return [
+                TokenBalance(
+                    asset=Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18),
+                    amount=Decimal("0.5"),
+                    amount_raw="500000000000000000",
+                    usd_value=Decimal("150"),
+                ),
+                TokenBalance(
+                    asset=Asset(
+                        chain="BSC",
+                        chain_id=56,
+                        symbol="USDC",
+                        decimals=6,
+                        address="0x" + "2" * 40,
+                    ),
+                    amount=Decimal("10"),
+                    amount_raw="10000000",
+                    usd_value=Decimal("10"),
+                ),
+            ]
+
+    class Model:
+        read_agent_enabled = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def classify(self, _request):
+            return {"intent": "wallet_query"}
+
+        async def invoke_read_tools(self, messages, _tools):
+            self.calls += 1
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-bnb-balance",
+                            "name": "portfolio_snapshot",
+                            # Deliberately omit symbol: the server owns user scope enforcement.
+                            "args": {"address": "0x" + "1" * 40, "chain": "BSC"},
+                        }
+                    ],
+                )
+            return AIMessage(content="只需要 BNB")
+
+    model = Model()
+    result = await build_graph(model=model, wallet_provider=Wallet()).ainvoke(
+        {
+            "request": {
+                "message": "我的 BNB 余额",
+                "address": "0x" + "1" * 40,
+                "chain": "BSC",
+            },
+            "wallet_context": {"address": "0x" + "1" * 40, "chain": "BSC"},
+        },
+        config={"configurable": {"thread_id": "react-bnb-balance-route"}},
+    )
+
+    assert model.calls == 2
+    assert result["response"]["asset_scope"] == {"symbol": "BNB"}
+    assert [item["asset"]["symbol"] for item in result["response"]["assets"]] == ["BNB"]
+
+
+@pytest.mark.asyncio
+async def test_same_thread_starts_each_react_turn_with_a_fresh_transcript():
+    """A persisted prior ToolMessage must not satisfy a new request on the same thread."""
+    from decimal import Decimal
+
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from wallet_agent.domain.models import TokenPrice
+    from wallet_agent.graph.build import build_graph
+
+    class PriceProvider:
+        async def get_prices(self, assets):
+            return [TokenPrice(asset=assets[0], usd_price=Decimal("1800"), provider="okx")]
+
+    class Model:
+        read_agent_enabled = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def classify(self, _request):
+            return {"intent": "price_query"}
+
+        async def extract(self, _kind, request):
+            symbol = "BTC" if "BTC" in str(request) else "ETH"
+            return {"symbol": symbol, "chain": symbol, "decimals": 18}
+
+        async def invoke_read_tools(self, messages, _tools):
+            self.calls.append(list(messages))
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                message = str(messages[-1].content)
+                symbol = "BTC" if "BTC" in message else "ETH"
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": f"call-{symbol.lower()}",
+                            "name": "price_lookup",
+                            "args": {"symbol": symbol, "chain": symbol},
+                        }
+                    ],
+                )
+            return AIMessage(content="查询完成")
+
+    model = Model()
+    graph = build_graph(
+        model=model,
+        price_provider=PriceProvider(),
+        checkpointer=MemorySaver(),
+    )
+    config = {"configurable": {"thread_id": "react-thread-resume"}}
+
+    await graph.ainvoke({"request": {"message": "ETH 价格"}}, config=config)
+    await graph.ainvoke({"request": {"message": "BTC 价格"}}, config=config)
+
+    first_calls = [messages for messages in model.calls if not any(
+        isinstance(item, ToolMessage) for item in messages
+    )]
+    assert len(first_calls) == 2
+    assert "ETH 价格" in str(first_calls[0][-1].content)
+    assert "BTC 价格" in str(first_calls[1][-1].content)
+
+
 @pytest.mark.parametrize("intent", ["market_details", "price_history", "portfolio_query"])
 def test_extended_read_intents_use_the_native_read_only_route(intent):
     assert route_after_intent({"intent": intent, "read_only_enabled": True}) == "read_only"
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [("transfer", "transfer"), ("swap_quote", "swap_resolve")],
+)
+def test_write_intents_never_enter_read_react_tools(intent, expected):
+    assert route_after_intent({"intent": intent, "read_only_enabled": True}) == expected
 
 
 @pytest.mark.asyncio
@@ -422,6 +670,7 @@ async def test_repeated_native_tool_call_reuses_verified_fact_without_requerying
     )
 
     assert result["response"]["kind"] == "price_query"
+    assert result["response"]["prices"][0]["usd_price"] == "1800"
     assert provider.calls == 1
     assert len(result["read_tool_calls"]) == 2
     assert result["read_tool_calls"][0]["status"] == "completed"

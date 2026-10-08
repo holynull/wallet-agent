@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
+from langgraph.graph.message import add_messages
+
 Intent = Literal[
     "wallet_query",
     "swap_quote",
@@ -132,6 +134,8 @@ class AgentState(TypedDict, total=False):
     read_loop_count: NotRequired[int]
     read_tool_calls: NotRequired[list[dict[str, Any]]]
     read_messages: NotRequired[list[Any]]
+    react_messages: Annotated[list[Any], add_messages]
+    react_result: NotRequired[dict[str, Any] | None]
     read_native: NotRequired[bool]
     read_facts: NotRequired[dict[str, Any] | None]
     read_tool_call: NotRequired[dict[str, Any] | None]

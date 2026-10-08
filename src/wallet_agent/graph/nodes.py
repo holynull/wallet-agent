@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import re
 from collections.abc import Mapping
@@ -13,8 +14,9 @@ from decimal import ROUND_DOWN, Decimal
 from time import perf_counter
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
 from langgraph.config import get_stream_writer
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 
@@ -3555,7 +3557,22 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         response_validation = "deterministic"
         if callable(responder):
             try:
-                draft = _dump(await responder(request, facts)) or {}
+                parameters = inspect.signature(responder).parameters.values()
+                supports_messages = any(
+                    parameter.name == "messages"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
+                if supports_messages:
+                    draft = _dump(
+                        await responder(
+                            request,
+                            facts,
+                            messages=list(state.get("react_messages") or []),
+                        )
+                    ) or {}
+                else:
+                    draft = _dump(await responder(request, facts)) or {}
                 validated = validate_response_draft(draft, facts)
                 if isinstance(validated, Mapping) and str(validated.get("message") or "").strip():
                     language = str(validated.get("language") or facts["language_hint"])
@@ -3990,7 +4007,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "read_only_complete": True,
                 "read_only_pending": False,
             }
-        if intent in {"wallet_query", "portfolio_query"}:
+        native_invoker = getattr(runtime.model, "invoke_read_tools", None)
+        if intent in {"wallet_query", "portfolio_query"} and not callable(native_invoker):
             if "portfolio_snapshot" in (state.get("read_facts") or {}):
                 return {
                     "read_tool_call": None,
@@ -4017,14 +4035,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "read_only_complete": False,
                     "read_only_pending": True,
                 }
-        native_invoker = getattr(runtime.model, "invoke_read_tools", None)
         if callable(native_invoker):
-            messages = list(state.get("read_messages") or [])
+            existing_react_messages = list(state.get("react_messages") or [])
+            messages = existing_react_messages or list(state.get("read_messages") or [])
             if not messages:
                 context = {
                     "message": request.get("message"),
                     "intent": intent,
                     "wallet_context": state.get("wallet_context"),
+                    "conversation_history": _model_conversation_history(
+                        state.get("conversation_history")
+                    ),
+                    "dialogue": state.get("dialogue"),
                     "read_facts": state.get("read_facts") or {},
                     "task_plan": request.get("task_plan"),
                 }
@@ -4042,6 +4064,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         content=json.dumps(context, ensure_ascii=False, default=str)
                     ),
                 ]
+
+            def react_update(*new_messages: Any) -> list[Any]:
+                """Append only new messages, except when migrating a legacy checkpoint."""
+                if existing_react_messages:
+                    return [*new_messages]
+                return [*messages, *new_messages]
             try:
                 native_output = await native_invoker(messages, READ_ONLY_TOOL_SCHEMAS)
             except ValueError:
@@ -4072,7 +4100,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                                 )
                             ],
                         },
-                        "read_messages": [*messages, native_output],
+                        "react_messages": react_update(native_output),
                         "read_tool_calls": [
                             dict(item) for item in state.get("read_tool_calls") or []
                         ],
@@ -4092,7 +4120,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                                 )
                             ],
                         },
-                        "read_messages": [*messages, native_output],
+                        "react_messages": react_update(native_output),
                         "read_tool_call": None,
                         "read_only_complete": True,
                         "read_only_pending": False,
@@ -4131,14 +4159,23 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             }
                             for item, signature in zip(tool_calls, incoming_signatures, strict=True)
                         ]
-                        return {
-                            "read_messages": [*messages, native_output],
+                        reused_update: dict[str, Any] = {
+                            "react_messages": react_update(native_output),
                             "read_tool_calls": [*existing_calls, *reused_records],
                             "read_tool_call": None,
                             "read_only_complete": True,
                             "read_only_pending": False,
                             "read_native": True,
                         }
+                        if isinstance(state.get("react_result"), Mapping):
+                            reused_update["response"] = await naturalize_read_response(
+                                {
+                                    **state,
+                                    "react_messages": [*messages, native_output],
+                                },
+                                state["react_result"],
+                            )
+                        return reused_update
                     records = [
                         {
                             "call_id": str(item.get("id") or ""),
@@ -4150,20 +4187,26 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         for item, signature in zip(tool_calls, incoming_signatures, strict=True)
                     ]
                     return {
-                        "read_messages": [*messages, native_output],
+                        "react_messages": react_update(native_output),
                         "read_tool_call": {"native": True},
                         "read_tool_calls": [*existing_calls, *records],
                         "read_only_complete": False,
                         "read_only_pending": True,
                         "read_native": True,
                     }
-                return {
-                    "read_messages": [*messages, native_output],
+                completed: dict[str, Any] = {
+                    "react_messages": react_update(native_output),
                     "read_tool_call": None,
                     "read_only_complete": True,
                     "read_only_pending": False,
                     "read_native": True,
                 }
+                if isinstance(state.get("react_result"), Mapping):
+                    completed["response"] = await naturalize_read_response(
+                        {**state, "react_messages": [*messages, native_output]},
+                        state["react_result"],
+                    )
+                return completed
         call = await read_only_decision(runtime.model, request)
         if _looks_like_asset_value_query(str(request.get("message") or "")):
             context = state.get("wallet_context") or {}
@@ -4255,6 +4298,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         raw_call = state.get("read_tool_call") or {}
         name = str(raw_call.get("name") or "")
         arguments = raw_call.get("arguments") or {}
+        request_message = str((state.get("request") or {}).get("message") or "")
+        supported_chain_names = {
+            str(value).upper()
+            for value in (
+                set(getattr(runtime.wallet_provider, "chain_index_by_name", {}) or {})
+                | set(runtime.chains)
+            )
+        }
+        requested_balance_symbol = _requested_balance_symbol(
+            request_message, supported_chain_names
+        )
 
         async def price_lookup(args: dict[str, Any]) -> dict[str, Any]:
             """Read the current price for an asset."""
@@ -4562,7 +4616,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         ) -> dict[str, Any]:
             """Read wallet balances."""
             return await wallet_balance(
-                {"chain": chain, "address": address, "symbol": symbol}
+                {
+                    "chain": chain,
+                    "address": address,
+                    "symbol": symbol or requested_balance_symbol,
+                }
             )
 
         async def native_transaction_status(
@@ -4635,7 +4693,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         ) -> dict[str, Any]:
             """Read a wallet portfolio snapshot."""
             return await portfolio_snapshot(
-                {"address": address, "chain": chain, "symbol": symbol}
+                {
+                    "address": address,
+                    "chain": chain,
+                    "symbol": symbol or requested_balance_symbol,
+                }
             )
 
         native_tools = [
@@ -4654,7 +4716,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             native_tool.__name__ = tool_name
         if state.get("read_native"):
             count = int(state.get("read_loop_count") or 0) + 1
-            messages = list(state.get("read_messages") or [])
+            messages = list(state.get("react_messages") or [])
             calls = [dict(item) for item in state.get("read_tool_calls") or []]
             facts = dict(state.get("read_facts") or {})
             try:
@@ -4675,7 +4737,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
                 return {
                     "read_loop_count": count,
-                    "read_messages": messages,
+                    "react_messages": [],
                     "read_tool_calls": calls,
                     "read_facts": facts,
                     "read_tool_call": None,
@@ -4727,7 +4789,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             )
             return {
                 "read_loop_count": count,
-                "read_messages": [*messages, *tool_messages],
+                "react_messages": tool_messages,
                 "read_tool_calls": calls,
                 "read_facts": facts,
                 "read_tool_call": None,
@@ -4926,12 +4988,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             )
             return update
         final = int(state.get("read_loop_count") or 0) >= READ_ONLY_MAX_ROUNDS
-        update = {
-            "response": await naturalize_read_response(state, result),
-            "read_tool_call": None,
-            "read_only_complete": final,
-            "read_only_pending": not final,
-        }
+        if state.get("read_native") and not final:
+            update = {
+                "react_result": result,
+                "response": None,
+                "read_tool_call": None,
+                "read_only_complete": False,
+                "read_only_pending": True,
+            }
+        else:
+            update = {
+                "response": await naturalize_read_response(state, result),
+                "read_tool_call": None,
+                "read_only_complete": final,
+                "read_only_pending": not final,
+            }
         wallet_event(
             "read_only_observe",
             "success",
@@ -5161,6 +5232,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "read_loop_count": 0,
             "read_tool_calls": [],
             "read_messages": [],
+            "react_messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)],
+            "react_result": None,
             "read_native": False,
             "read_facts": {},
             "read_tool_call": None,
