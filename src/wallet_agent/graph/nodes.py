@@ -52,7 +52,7 @@ from wallet_agent.domain.normalization import (
     unambiguous_amount_with_unit,
 )
 from wallet_agent.models import RouteDecision
-from wallet_agent.observability import wallet_event
+from wallet_agent.observability import MetadataCache, RuntimeMetrics, wallet_event
 
 from .dialogue import resolve_quote_reference, resolve_read_reference
 from .facts import validate_response_draft
@@ -429,6 +429,11 @@ class GraphRuntime:
     max_poll_attempts: int = 3
     confirmation_ttl_seconds: int = 900
     provider_timeout_seconds: float = 15
+    max_react_steps: int = 8
+    react_tool_timeout_seconds: float = 20
+    require_react: bool = False
+    metadata_cache: MetadataCache | None = None
+    metrics: RuntimeMetrics | None = None
 
 
 _VALID_INTENTS = {
@@ -3835,6 +3840,27 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             if provider_name
             else runtime.providers
         )
+        cache = runtime.metadata_cache
+        cache_key = json.dumps(
+            {
+                "chain": query.chain,
+                "search": query.search,
+                "providers": sorted(str(name) for name in selected),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if cache is not None:
+            cached_assets = cache.get(cache_key)
+            if cached_assets is not None:
+                return {
+                    "ok": True,
+                    "query": query.model_dump(mode="json"),
+                    "assets": cached_assets,
+                    "providers": list(selected),
+                    "provider_errors": [],
+                    "cache_status": "hit",
+                }
         assets: list[Asset] = []
         provider_errors: list[dict[str, Any]] = []
         for name, provider in selected.items():
@@ -3859,12 +3885,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 str(asset.address or "").lower(),
             )
             merged[key] = asset
+        serialized_assets = [_dump(asset) for asset in merged.values()]
+        if cache is not None and not provider_errors:
+            cache.set(cache_key, serialized_assets)
         return {
             "ok": True,
             "query": query.model_dump(mode="json"),
-            "assets": [_dump(asset) for asset in merged.values()],
+            "assets": serialized_assets,
             "providers": list(selected),
             "provider_errors": provider_errors,
+            "cache_status": "miss" if cache is not None else None,
         }
 
     async def quote_lookup_tool(
@@ -3912,7 +3942,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
 
     async def dialogue_manager(state: dict[str, Any]) -> dict[str, Any]:
         """Project conversational context before capability routing."""
-        return {"dialogue": dialogue_snapshot(state)}
+        return {
+            "dialogue": dialogue_snapshot(state),
+            "graph_role": "lifecycle",
+            "route_mode": "lifecycle",
+            "route_reason": "explicit_lifecycle_input",
+        }
 
     async def read_only_agent(state: dict[str, Any]) -> dict[str, Any]:
         started = perf_counter()
@@ -8644,14 +8679,183 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         ),
     ]
 
+    react_tool_runner = ToolNode(
+        react_tools,
+        name="react_tools",
+        handle_tool_errors=False,
+    )
+
+    async def run_react_tools(state: dict[str, Any]) -> dict[str, Any]:
+        messages = list(state.get("messages") or [])
+        latest = messages[-1] if messages else None
+        calls = list(getattr(latest, "tool_calls", None) or [])
+        started = perf_counter()
+        status = "success"
+        error_code = None
+        try:
+            result = await asyncio.wait_for(
+                react_tool_runner.ainvoke(state),
+                timeout=runtime.react_tool_timeout_seconds,
+            )
+            tool_messages = list(result.get("messages") or [])
+            if not tool_messages:
+                raise ValueError("tool node returned no ToolMessage")
+        except TimeoutError:
+            status = "timeout"
+            error_code = "REACT_TOOL_TIMEOUT"
+            tool_messages = [
+                ToolMessage(
+                    content=json.dumps(
+                        {
+                            "ok": False,
+                            "code": error_code,
+                            "error": "工具查询超过时限，已停止本轮调用。",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    name=str(call.get("name") or "unknown_tool"),
+                    tool_call_id=str(call.get("id") or ""),
+                )
+                for call in calls
+            ]
+        except Exception:
+            status = "error"
+            error_code = "REACT_TOOL_FAILED"
+            # Avoid returning exception strings that may contain provider
+            # URLs, request payloads, or credentials to the model/transcript.
+            tool_messages = [
+                ToolMessage(
+                    content=json.dumps(
+                        {
+                            "ok": False,
+                            "code": error_code,
+                            "error": "工具执行失败，请基于此结果向用户说明暂时无法完成。",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    name=str(call.get("name") or "unknown_tool"),
+                    tool_call_id=str(call.get("id") or ""),
+                )
+                for call in calls
+            ]
+
+        def safe_tool_message(message: ToolMessage) -> ToolMessage:
+            """Keep tool observations JSON-safe without leaking provider errors."""
+            try:
+                payload = json.loads(str(message.content))
+            except (TypeError, ValueError):
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "ok": False,
+                            "code": "TOOL_OUTPUT_INVALID",
+                            "error": "工具返回了无法解析的结果。",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    name=str(getattr(message, "name", "") or "unknown_tool"),
+                    tool_call_id=str(getattr(message, "tool_call_id", "") or ""),
+                )
+            if not isinstance(payload, Mapping):
+                payload = {
+                    "ok": False,
+                    "code": "TOOL_OUTPUT_INVALID",
+                    "error": "工具返回了非 JSON 对象。",
+                }
+            else:
+                payload = dict(payload)
+                for error_key in ("errors", "provider_errors"):
+                    entries = payload.get(error_key)
+                    if not isinstance(entries, list):
+                        continue
+                    safe_entries = []
+                    for entry in entries:
+                        if isinstance(entry, Mapping):
+                            safe_entry = dict(entry)
+                            if "error" in safe_entry:
+                                safe_entry["error"] = "下游 Provider 返回了错误。"
+                            if "message" in safe_entry:
+                                safe_entry["message"] = "下游 Provider 返回了错误。"
+                            safe_entries.append(safe_entry)
+                        else:
+                            safe_entries.append({"code": "TOOL_PROVIDER_ERROR"})
+                    payload[error_key] = safe_entries
+                if payload.get("ok") is False:
+                    payload["error"] = "工具查询失败，请根据错误码向用户说明当前无法完成。"
+            return ToolMessage(
+                content=json.dumps(payload, ensure_ascii=False, default=str),
+                name=str(getattr(message, "name", "") or "unknown_tool"),
+                tool_call_id=str(getattr(message, "tool_call_id", "") or ""),
+            )
+
+        tool_messages = [safe_tool_message(item) for item in tool_messages]
+
+        elapsed_ms = round((perf_counter() - started) * 1000, 2)
+        timings = []
+        for call in calls:
+            call_id = str(call.get("id") or "")
+            tool_name = str(call.get("name") or "unknown_tool")
+            observation = next(
+                (
+                    item
+                    for item in tool_messages
+                    if str(getattr(item, "tool_call_id", "")) == call_id
+                ),
+                None,
+            )
+            observed_code = error_code
+            observed_status = status
+            cache_status = None
+            if status == "success" and observation is not None:
+                try:
+                    payload = json.loads(str(observation.content))
+                except (TypeError, ValueError):
+                    payload = {}
+                if isinstance(payload, Mapping) and payload.get("ok") is False:
+                    observed_status = "error"
+                    observed_code = str(payload.get("code") or "TOOL_FAILED")
+                if isinstance(payload, Mapping):
+                    cache_status = str(payload.get("cache_status") or "") or None
+            timings.append(
+                {
+                    "call_id": call_id,
+                    "tool": tool_name,
+                    "elapsed_ms": elapsed_ms,
+                    "status": observed_status,
+                    "error_code": observed_code,
+                    "cache_status": cache_status,
+                }
+            )
+            if runtime.metrics is not None:
+                runtime.metrics.record_tool(
+                    tool_name,
+                    elapsed_ms=elapsed_ms,
+                    status=observed_status,
+                    error_code=observed_code,
+                    cache_status=cache_status,
+                )
+        return {
+            "messages": tool_messages,
+            "react_tool_timings": [*list(state.get("react_tool_timings") or []), *timings],
+            "graph_role": "conversation",
+            "route_mode": "react",
+            "route_reason": "tool_result",
+        }
+
     def route_entry(state: dict[str, Any]) -> str:
         request = state.get("request") or {}
         # Forced inputs are the explicit HTTP lifecycle boundary. All ordinary
-        # messages go to the model; the capability check is only compatibility
-        # for legacy test doubles that cannot bind tools.
+        # messages go to the model. A production graph must fail loudly when
+        # the configured model cannot provide the ReAct contract.
         if state.get("forced_intent") or not request.get("message"):
             return "legacy"
-        return "react" if callable(getattr(runtime.model, "invoke_react", None)) else "legacy"
+        if callable(getattr(runtime.model, "invoke_react", None)):
+            return "react"
+        if runtime.require_react:
+            raise RuntimeError(
+                "configured model does not support the required ReAct contract"
+            )
+        return "legacy"
 
     async def react_entry(state: dict[str, Any]) -> dict[str, Any]:
         request = dict(state.get("request") or {})
@@ -8684,7 +8888,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *history_messages],
                 "react_steps": 0,
                 "react_tool_signatures": [],
+                "react_tool_timings": [],
                 "react_active": True,
+                "graph_role": "conversation",
+                "route_mode": "react",
+                "route_reason": "ordinary_natural_language",
                 # Keep the explicit quote-selection lifecycle contract
                 # present on ordinary ReAct turns as well.  ReAct can expose
                 # quote_candidates for the UI, but it must not implicitly
@@ -8699,7 +8907,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "messages": additions,
             "react_steps": 0,
             "react_tool_signatures": [],
+            "react_tool_timings": [],
             "react_active": True,
+            "graph_role": "conversation",
+            "route_mode": "react",
+            "route_reason": "ordinary_natural_language",
             # A conversational turn may offer fresh quote candidates, but
             # selection remains an explicit client/API action.
             "selected_quote": None,
@@ -8708,7 +8920,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
     async def react_agent(state: dict[str, Any]) -> dict[str, Any]:
         messages = list(state.get("messages") or [])
         step = int(state.get("react_steps") or 0) + 1
-        if step > 8:
+        if step > runtime.max_react_steps:
             return {
                 "messages": [
                     AIMessage(
@@ -8720,6 +8932,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 ],
                 "react_steps": step,
                 "react_active": False,
+                "graph_role": "conversation",
+                "route_mode": "react",
+                "route_reason": "react_step_limit",
             }
         request_model_id = str((state.get("request") or {}).get("model_id") or "") or None
         invoke_react = runtime.model.invoke_react
@@ -8752,6 +8967,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "react_steps": step,
             "react_tool_signatures": [*prior, *[item for item in signatures if item not in prior]],
             "react_active": bool(calls),
+            "graph_role": "conversation",
+            "route_mode": "react",
+            "route_reason": "tool_call" if calls else "model_answer",
         }
 
     async def finalize_response(state: dict[str, Any]) -> dict[str, Any]:
@@ -8786,6 +9004,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "kind": "react",
             "message": content,
             "react_results": react_results,
+            "react_tool_timings": list(state.get("react_tool_timings") or []),
+            "graph_role": "conversation",
+            "route_mode": state.get("route_mode") or "react",
+            "route_reason": state.get("route_reason") or "model_answer",
         }
         update: dict[str, Any] = {"response": response, "react_active": False}
         quote_result = next(

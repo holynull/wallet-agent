@@ -24,6 +24,7 @@ from wallet_agent.models import (
     TransactionStatusSlotPatch,
     TransferSlotPatch,
 )
+from wallet_agent.observability import MetadataCache, RuntimeMetrics
 from wallet_agent.okx import (
     OKX_CHAIN_INDEX_BY_NAME,
     OkxExplorerAdapter,
@@ -146,6 +147,11 @@ def build_application(settings: Settings | None = None) -> Any:
         raw_models=read_clients,
     )
     model = ModelRouter(model_registry)
+    metrics = RuntimeMetrics()
+    metadata_cache = MetadataCache(
+        max_entries=settings.metadata_cache_max_entries,
+        ttl_seconds=settings.metadata_cache_ttl_seconds,
+    )
     providers: dict[str, Any] = {}
     transports: list[Any] = []
     okx_client = None
@@ -226,6 +232,12 @@ def build_application(settings: Settings | None = None) -> Any:
         max_poll_attempts=settings.poll_max_attempts,
         confirmation_ttl_seconds=settings.confirmation_ttl_seconds,
         provider_timeout_seconds=settings.provider_timeout_seconds,
+        max_react_steps=settings.react_max_steps,
+        react_tool_timeout_seconds=settings.react_tool_timeout_seconds,
+        require_react=not settings.react_compatibility_mode,
+        split_graphs=not settings.react_compatibility_mode,
+        metadata_cache=metadata_cache,
+        metrics=metrics,
     )
     session_store = SqlSessionStore(settings.persistence_url)
     redis_client = None
@@ -258,6 +270,8 @@ def build_application(settings: Settings | None = None) -> Any:
         run_store=run_store,
         lock_manager=lock_manager,
         model_registry=model_registry,
+        metrics=metrics,
+        metadata_cache=metadata_cache,
         token_verifier=StaticTokenVerifier(settings.auth_tokens) if settings.auth_tokens else None,
         require_auth=settings.auth_required,
         chain_registry=chain_registry,
@@ -271,4 +285,12 @@ def build_application(settings: Settings | None = None) -> Any:
 try:  # Keep `uvicorn wallet_agent.main:app` import-safe without .env.
     app = build_application()
 except Exception:
-    app = create_app()
+    # Keep documentation/unit-test imports usable when no runtime settings
+    # exist, but never hide a production construction error once Settings can
+    # be loaded (for example, a strict ReAct capability failure).
+    try:
+        Settings()
+    except Exception:
+        app = create_app()
+    else:
+        raise

@@ -4,6 +4,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from wallet_agent.graph.read_only import READ_ONLY_TOOL_SCHEMAS
 from wallet_agent.models import ModelRegistry, ModelRouter
 from wallet_agent.models.contracts import AgentResponseDraft
+from wallet_agent.observability import RuntimeMetrics
 
 
 class FakeModel:
@@ -89,6 +90,25 @@ async def test_model_router_trace_includes_call_timing_and_stage():
     assert item["timestamp"].endswith("Z")
     assert isinstance(item["elapsed_ms"], int)
     assert item["elapsed_ms"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_model_router_records_runtime_metrics_for_each_model_call():
+    class TimedModel:
+        async def ainvoke(self, _value):
+            return {"intent": "clarification"}
+
+    router = ModelRouter(
+        ModelRegistry({"deepseek-flash": TimedModel()}, default_model_id="deepseek-flash")
+    )
+    metrics = RuntimeMetrics()
+    router.metrics = metrics
+
+    await router.classify({"message": "你好"})
+
+    snapshot = metrics.snapshot()
+    assert snapshot["model_calls"] == 1
+    assert snapshot["models"]["deepseek-flash"]["roles"]["classifier"] == 1
 
 
 @pytest.mark.asyncio

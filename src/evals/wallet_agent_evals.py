@@ -11,6 +11,8 @@ from decimal import Decimal
 from time import perf_counter
 from typing import Any
 
+from langchain_core.messages import AIMessage, ToolMessage
+
 from wallet_agent.domain.models import (
     Asset,
     AssetQuery,
@@ -52,6 +54,38 @@ class FixedOutputModel:
         index = min(self._index, len(self._outputs) - 1)
         self._index += 1
         return dict(self._outputs[index])
+
+
+class FixedReactModel:
+    """Deterministic native-tool model used by the offline ReAct matrix."""
+
+    def __init__(self, tool_name: str, arguments: Mapping[str, Any], answer: str) -> None:
+        self.tool_name = tool_name
+        self.arguments = dict(arguments)
+        self.answer = answer
+        self.calls = 0
+
+    async def invoke_react(self, messages: list[Any], _tools: list[Any]) -> AIMessage:
+        self.calls += 1
+        current_user_index = max(
+            (index for index, item in enumerate(messages) if getattr(item, "type", "") == "human"),
+            default=-1,
+        )
+        has_current_observation = any(
+            isinstance(item, ToolMessage) for item in messages[current_user_index + 1 :]
+        )
+        if not has_current_observation:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": f"eval-react-{self.calls}",
+                        "name": self.tool_name,
+                        "args": self.arguments,
+                    }
+                ],
+            )
+        return AIMessage(content=self.answer)
 
 
 class FakeChainAdapter:
@@ -755,6 +789,136 @@ async def run_offline_evals() -> dict[str, Any]:
         mode="offline",
         model_id="fixed-structured-output",
     )
+
+
+async def run_react_offline_evals() -> dict[str, Any]:
+    """Exercise the strict conversation graph with deterministic tool calls.
+
+    This matrix complements the legacy slot/lifecycle suite.  It deliberately
+    checks externally visible invariants (route, scope, handoff and budget),
+    never model reasoning text or live provider behavior.
+    """
+    cases = (
+        {
+            "id": "react_price_route",
+            "message": "ETH 的价格",
+            "tool": "price_lookup",
+            "args": {"chain": "ETH", "symbol": "ETH"},
+            "answer": "ETH 当前价格已查询。",
+            "answer_scope": "requested_asset",
+            "lifecycle_boundary": True,
+        },
+        {
+            "id": "react_all_nonzero_portfolio",
+            "message": "我的全部余额",
+            "tool": "portfolio_snapshot",
+            "args": {"address": WALLET_ADDRESS},
+            "answer": "已汇总全部非零资产。",
+            "answer_scope": "all_nonzero_assets",
+            "lifecycle_boundary": True,
+        },
+        {
+            "id": "react_quote_handoff",
+            "message": "在 Base 用 1 USDC 换 USDT",
+            "tool": "get_swap_quote",
+            "args": {
+                "source_symbol": "USDC",
+                "destination_symbol": "USDT",
+                "source_chain": "BASE",
+                "destination_chain": "BASE",
+                "input_amount": "1",
+            },
+            "answer": "报价已找到，请选择后继续。",
+            "answer_scope": "quote_candidates",
+            "lifecycle_boundary": True,
+        },
+        {
+            "id": "react_followup_context",
+            "message": "刚才的结果再说明一下",
+            "tool": "price_lookup",
+            "args": {"chain": "ETH", "symbol": "ETH"},
+            "answer": "我会基于本轮查询结果回答。",
+            "answer_scope": "current_turn_facts",
+            "lifecycle_boundary": True,
+        },
+    )
+    results: list[dict[str, Any]] = []
+    for case in cases:
+        chain = FakeChainAdapter()
+        swap_provider = FakeSwapProvider()
+        model = FixedReactModel(case["tool"], case["args"], case["answer"])
+        graph = build_graph(
+            model=model,
+            chains={"BASE": chain},
+            providers=[swap_provider],
+            wallet_provider=FakeOkxWalletProvider(chain),
+            price_provider=FakePriceProvider(),
+            split_graphs=True,
+            require_react=True,
+        )
+        started = perf_counter()
+        failures: list[str] = []
+        try:
+            state = await graph.ainvoke(
+                {
+                    "request": {"message": case["message"]},
+                    "wallet_context": {
+                        "address": WALLET_ADDRESS,
+                        "chain": "BASE",
+                        "chain_id": 8453,
+                    },
+                },
+                config={"configurable": {"thread_id": f"eval-react-{case['id']}"}},
+            )
+            if state.get("route_mode") != "react":
+                failures.append(f"route_mode: expected 'react', got {state.get('route_mode')!r}")
+            if state.get("graph_role") != "conversation":
+                failures.append(
+                    f"graph_role: expected 'conversation', got {state.get('graph_role')!r}"
+                )
+            timings = state.get("react_tool_timings") or []
+            if not timings:
+                failures.append("react_tool_timings: expected at least one tool call")
+            if case["tool"] == "get_swap_quote" and state.get("selected_quote") is not None:
+                failures.append("lifecycle_boundary: quote was implicitly selected")
+            if case["tool"] == "portfolio_snapshot":
+                payloads = [
+                    item.get("result")
+                    for item in state.get("response", {}).get("react_results", [])
+                    if item.get("tool") == "portfolio_snapshot"
+                ]
+                if not payloads or not payloads[-1].get("ok"):
+                    failures.append("answer_scope: portfolio observation was not successful")
+            if any(float(item.get("elapsed_ms") or 0) > 1_000 for item in timings):
+                failures.append("latency_budget: tool call exceeded 1000ms")
+        except Exception as exc:
+            state = {}
+            failures.append(f"execution: {type(exc).__name__}: {exc}")
+        results.append(
+            {
+                "id": case["id"],
+                "route": (state or {}).get("route_mode"),
+                "tool_count": len((state or {}).get("react_tool_timings") or []),
+                "answer_scope": case["answer_scope"],
+                "lifecycle_boundary": case["lifecycle_boundary"]
+                and (state or {}).get("selected_quote") is None,
+                "latency_budget": all(
+                    float(item.get("elapsed_ms") or 0) <= 1_000
+                    for item in (state or {}).get("react_tool_timings") or []
+                ),
+                "passed": not failures,
+                "failures": failures,
+                "duration_ms": round((perf_counter() - started) * 1000, 2),
+            }
+        )
+    passed = sum(bool(item["passed"]) for item in results)
+    return {
+        "mode": "offline-react",
+        "model": "fixed-native-tool-call",
+        "summary": {"total": len(results), "passed": passed, "pass_rate": passed / len(results)},
+        "cases": results,
+        "safety": {"signing": False, "broadcasting": False, "real_providers": False},
+    }
 
 
 async def run_online_evals() -> dict[str, Any]:

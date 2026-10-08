@@ -116,6 +116,57 @@ def test_react_response_persists_current_turn_tool_results_only():
     }
 
 
+def test_react_response_persists_route_and_tool_timing_metadata():
+    artifacts = _conversation_artifacts(
+        {
+            "response": {"kind": "react", "message": "已查询。"},
+            "graph_role": "conversation",
+            "route_mode": "react",
+            "route_reason": "model_answer",
+            "react_tool_timings": [
+                {
+                    "call_id": "price-1",
+                    "tool": "price_lookup",
+                    "elapsed_ms": 12.4,
+                    "status": "success",
+                    "error_code": None,
+                }
+            ],
+        }
+    )
+
+    assert artifacts["response"]["route"] == {
+        "graph_role": "conversation",
+        "route_mode": "react",
+        "route_reason": "model_answer",
+    }
+    assert artifacts["response"]["react_tool_timings"][0]["tool"] == "price_lookup"
+
+
+@pytest.mark.asyncio
+async def test_debug_metrics_endpoint_returns_safe_aggregates():
+    app, client = await client_for()
+    app.state.metrics = type(
+        "Metrics",
+        (),
+        {"snapshot": lambda _self: {"model_calls": 1, "tool_calls": 2}},
+    )()
+    app.state.metadata_cache = type(
+        "Cache",
+        (),
+        {"stats": lambda _self: {"hits": 1, "misses": 2}},
+    )()
+
+    async with client:
+        response = await client.get("/debug/metrics")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "metrics": {"model_calls": 1, "tool_calls": 2},
+        "metadata_cache": {"hits": 1, "misses": 2},
+    }
+
+
 def test_sse_state_does_not_duplicate_persisted_card_payloads():
     state = {
         "response": {"kind": "swap_quote", "quotes": []},

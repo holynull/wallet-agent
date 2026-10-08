@@ -22,7 +22,12 @@ def test_settings_load_non_secret_defaults(monkeypatch):
     assert settings.deepseek_reasoning_effort == "none"
     assert settings.read_agent_thinking_enabled is True
     assert settings.read_agent_reasoning_effort == "low"
+    assert settings.react_compatibility_mode is False
+    assert settings.react_max_steps == 8
+    assert settings.react_tool_timeout_seconds == 20
     assert settings.allowed_model_ids == ["deepseek-flash", "deepseek-v4-pro"]
+    assert settings.metadata_cache_ttl_seconds == 600
+    assert settings.metadata_cache_max_entries == 512
     assert settings.openai_base_url == "https://api.deepseek.com"
     assert settings.redis_url is None
     assert settings.redis_key_prefix == "wallet-agent"
@@ -30,6 +35,13 @@ def test_settings_load_non_secret_defaults(monkeypatch):
     assert settings.run_event_max_entries == 2_000
     assert settings.conversation_lock_lease_seconds == 120
     assert settings.conversation_lock_wait_seconds == 30
+
+
+def test_react_compatibility_mode_requires_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    settings = Settings(_env_file=None, react_compatibility_mode=True)
+
+    assert settings.react_compatibility_mode is True
 
 
 @pytest.mark.parametrize(
@@ -44,6 +56,10 @@ def test_settings_load_non_secret_defaults(monkeypatch):
         ("run_event_max_entries", 99),
         ("conversation_lock_lease_seconds", 1),
         ("conversation_lock_wait_seconds", 0),
+        ("react_max_steps", 0),
+        ("react_max_steps", 33),
+        ("react_tool_timeout_seconds", 0),
+        ("metadata_cache_max_entries", -1),
     ],
 )
 def test_settings_rejects_invalid_polling_and_timeout_values(monkeypatch, field, value):

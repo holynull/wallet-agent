@@ -218,6 +218,27 @@ test("restores generic ReAct tool results without guessing a business card kind"
   assert.equal(formatResponseSummary({ kind: "react", message: "ETH 当前价格约为 1800 美元。" }), "ETH 当前价格约为 1800 美元。");
 });
 
+test("restores ReAct route and tool timing metadata", () => {
+  const artifacts = extractConversationArtifacts({
+    response: { kind: "react", message: "已查询。" },
+    graph_role: "conversation",
+    route_mode: "react",
+    route_reason: "model_answer",
+    react_tool_timings: [
+      { call_id: "price-1", tool: "price_lookup", elapsed_ms: 12, status: "success" },
+    ],
+  });
+
+  assert.deepEqual(artifacts?.route, {
+    graph_role: "conversation",
+    route_mode: "react",
+    route_reason: "model_answer",
+  });
+  assert.deepEqual(artifacts?.reactToolTimings, [
+    { call_id: "price-1", tool: "price_lookup", elapsed_ms: 12, status: "success" },
+  ]);
+});
+
 test("restores latest legacy card without moving persisted cards", () => {
   const persisted = { response: { kind: "swap_quote", quotes: [{ provider_reference: "q1" }] }, quotes: [{ provider_reference: "q1" }] };
   const latest = { response: { kind: "swap_status", status: { status: "pending" } }, status: { kind: "swap_status", status: { status: "pending" } } };

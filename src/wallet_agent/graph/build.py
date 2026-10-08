@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import tools_condition
+from langgraph.types import Command
+
+from wallet_agent.observability import MetadataCache, RuntimeMetrics
 
 from .nodes import GraphRuntime, make_nodes
 from .routes import (
@@ -18,7 +22,56 @@ from .routes import (
 from .state import AgentState
 
 
-def build_graph(
+class GraphRouter:
+    """Stable graph facade routing chat and lifecycle inputs to separate graphs."""
+
+    graph_role = "router"
+
+    def __init__(self, conversation_graph: Any, lifecycle_graph: Any, model: Any) -> None:
+        self.conversation_graph = conversation_graph
+        self.lifecycle_graph = lifecycle_graph
+        self._model = model
+        self.graph_role = "router"
+
+    @staticmethod
+    def _is_lifecycle_input(value: Any) -> bool:
+        if isinstance(value, Command):
+            return True
+        if not isinstance(value, Mapping):
+            return True
+        if value.get("forced_intent"):
+            return True
+        request = value.get("request")
+        if not isinstance(request, Mapping) or not request.get("message"):
+            return True
+        return False
+
+    def _select(self, value: Any) -> Any:
+        return self.lifecycle_graph if self._is_lifecycle_input(value) else self.conversation_graph
+
+    async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        graph = self._select(input)
+        return await graph.ainvoke(input, config=config, **kwargs)
+
+    def astream(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        graph = self._select(input)
+        return graph.astream(input, config=config, **kwargs)
+
+    def get_state(self, config: Any, **kwargs: Any) -> Any:
+        return self.conversation_graph.get_state(config, **kwargs)
+
+    async def aget_state(self, config: Any, **kwargs: Any) -> Any:
+        return await self.conversation_graph.aget_state(config, **kwargs)
+
+    async def aupdate_state(self, config: Any, values: Any, **kwargs: Any) -> Any:
+        return await self.conversation_graph.aupdate_state(config, values, **kwargs)
+
+    @property
+    def checkpointer(self) -> Any:
+        return getattr(self.conversation_graph, "checkpointer", None)
+
+
+def _build_graph(
     *,
     model: Any,
     providers: Any = (),
@@ -31,6 +84,13 @@ def build_graph(
     max_poll_attempts: int = 3,
     confirmation_ttl_seconds: int = 900,
     provider_timeout_seconds: float = 15,
+    max_react_steps: int = 8,
+    react_tool_timeout_seconds: float = 20,
+    require_react: bool = False,
+    conversation_only: bool = False,
+    lifecycle_only: bool = False,
+    metadata_cache: MetadataCache | None = None,
+    metrics: RuntimeMetrics | None = None,
 ) -> Any:
     """Compile a graph with injectable model, providers, chain adapters, and checkpointer."""
     if isinstance(providers, dict):
@@ -62,26 +122,47 @@ def build_graph(
         max_poll_attempts=max(1, max_poll_attempts),
         confirmation_ttl_seconds=max(1, confirmation_ttl_seconds),
         provider_timeout_seconds=max(0.001, provider_timeout_seconds),
+        max_react_steps=max(1, max_react_steps),
+        react_tool_timeout_seconds=max(0.001, react_tool_timeout_seconds),
+        require_react=require_react,
+        metadata_cache=metadata_cache,
+        metrics=metrics,
     )
+    if metrics is not None and hasattr(model, "metrics"):
+        model.metrics = metrics
     n = make_nodes(runtime)
     builder = StateGraph(AgentState)
-    builder.add_node("react_entry", n["react_entry"])
-    builder.add_node("react_agent", n["react_agent"])
-    builder.add_node("react_tools", ToolNode(n["react_tools"], name="react_tools"))
-    builder.add_node("finalize_response", n["finalize_response"])
-    builder.add_conditional_edges(
-        START,
-        n["route_entry"],
-        {"react": "react_entry", "legacy": "dialogue_manager"},
-    )
-    builder.add_edge("react_entry", "react_agent")
-    builder.add_conditional_edges(
-        "react_agent",
-        tools_condition,
-        {"tools": "react_tools", "__end__": "finalize_response"},
-    )
-    builder.add_edge("react_tools", "react_agent")
-    builder.add_edge("finalize_response", END)
+    if not lifecycle_only:
+        builder.add_node("react_entry", n["react_entry"])
+        builder.add_node("react_agent", n["react_agent"])
+        builder.add_node("react_tools", n["run_react_tools"])
+        builder.add_node("finalize_response", n["finalize_response"])
+    if conversation_only:
+        builder.add_edge(START, "react_entry")
+    elif lifecycle_only:
+        builder.add_edge(START, "dialogue_manager")
+    else:
+        builder.add_conditional_edges(
+            START,
+            n["route_entry"],
+            {"react": "react_entry", "legacy": "dialogue_manager"},
+        )
+    if not lifecycle_only:
+        builder.add_edge("react_entry", "react_agent")
+        builder.add_conditional_edges(
+            "react_agent",
+            tools_condition,
+            {"tools": "react_tools", "__end__": "finalize_response"},
+        )
+        builder.add_edge("react_tools", "react_agent")
+        builder.add_edge("finalize_response", END)
+    if conversation_only:
+        compiled = builder.compile(checkpointer=checkpointer or MemorySaver())
+        setattr(compiled, "_model", model)
+        setattr(compiled, "graph_role", "conversation")
+        setattr(compiled, "metadata_cache", metadata_cache)
+        setattr(compiled, "metrics", metrics)
+        return compiled
     builder.add_node("dialogue_manager", n["dialogue_manager"])
     builder.add_node("supervisor", n["supervisor"])
     builder.add_node("intent", n["intent"])
@@ -188,8 +269,111 @@ def build_graph(
     builder.add_conditional_edges(
         "status_poll", route_after_status, {"status_poll": "status_poll", "response": "response"}
     )
-    compiled = builder.compile(checkpointer=checkpointer or MemorySaver())
+    compiled = builder.compile(
+        checkpointer=checkpointer if checkpointer is not None else MemorySaver()
+    )
     # Keep the router available to the API transport for non-checkpointed
     # observability metadata. The model trace itself is emitted as SSE data.
     setattr(compiled, "_model", model)
+    setattr(compiled, "graph_role", "lifecycle")
+    setattr(compiled, "metadata_cache", metadata_cache)
+    setattr(compiled, "metrics", metrics)
     return compiled
+
+
+def build_graph(
+    *,
+    model: Any,
+    providers: Any = (),
+    chains: Any = (),
+    wallet_provider: Any | None = None,
+    explorer_provider: Any | None = None,
+    execution_observer: Any | None = None,
+    price_provider: Any | None = None,
+    checkpointer: Any | None = None,
+    max_poll_attempts: int = 3,
+    confirmation_ttl_seconds: int = 900,
+    provider_timeout_seconds: float = 15,
+    max_react_steps: int = 8,
+    react_tool_timeout_seconds: float = 20,
+    require_react: bool = False,
+    split_graphs: bool = False,
+    conversation_only: bool = False,
+    metadata_cache: MetadataCache | None = None,
+    metadata_cache_ttl_seconds: float = 600,
+    metadata_cache_max_entries: int = 512,
+    metrics: RuntimeMetrics | None = None,
+) -> Any:
+    """Build the compatible graph or the production split graph router."""
+    if require_react and not callable(getattr(model, "invoke_react", None)):
+        raise RuntimeError("configured model does not support the required ReAct contract")
+    if require_react and getattr(model, "supports_react", True) is False:
+        raise RuntimeError("configured model cannot bind wallet tools for ReAct")
+    shared_cache = metadata_cache or MetadataCache(
+        max_entries=metadata_cache_max_entries,
+        ttl_seconds=metadata_cache_ttl_seconds,
+    )
+    shared_metrics = metrics or RuntimeMetrics()
+    if not split_graphs:
+        return _build_graph(
+            model=model,
+            providers=providers,
+            chains=chains,
+            wallet_provider=wallet_provider,
+            explorer_provider=explorer_provider,
+            execution_observer=execution_observer,
+            price_provider=price_provider,
+            checkpointer=checkpointer,
+            max_poll_attempts=max_poll_attempts,
+            confirmation_ttl_seconds=confirmation_ttl_seconds,
+            provider_timeout_seconds=provider_timeout_seconds,
+            max_react_steps=max_react_steps,
+            react_tool_timeout_seconds=react_tool_timeout_seconds,
+            require_react=require_react,
+            conversation_only=conversation_only,
+            metadata_cache=shared_cache,
+            metrics=shared_metrics,
+        )
+    shared_checkpointer = checkpointer if checkpointer is not None else MemorySaver()
+    conversation = _build_graph(
+        model=model,
+        providers=providers,
+        chains=chains,
+        wallet_provider=wallet_provider,
+        explorer_provider=explorer_provider,
+        execution_observer=execution_observer,
+        price_provider=price_provider,
+        checkpointer=shared_checkpointer,
+        max_poll_attempts=max_poll_attempts,
+        confirmation_ttl_seconds=confirmation_ttl_seconds,
+        provider_timeout_seconds=provider_timeout_seconds,
+        max_react_steps=max_react_steps,
+        react_tool_timeout_seconds=react_tool_timeout_seconds,
+        require_react=True,
+        conversation_only=True,
+        metadata_cache=shared_cache,
+        metrics=shared_metrics,
+    )
+    lifecycle = _build_graph(
+        model=model,
+        providers=providers,
+        chains=chains,
+        wallet_provider=wallet_provider,
+        explorer_provider=explorer_provider,
+        execution_observer=execution_observer,
+        price_provider=price_provider,
+        checkpointer=shared_checkpointer,
+        max_poll_attempts=max_poll_attempts,
+        confirmation_ttl_seconds=confirmation_ttl_seconds,
+        provider_timeout_seconds=provider_timeout_seconds,
+        max_react_steps=max_react_steps,
+        react_tool_timeout_seconds=react_tool_timeout_seconds,
+        require_react=False,
+        lifecycle_only=True,
+        metadata_cache=shared_cache,
+        metrics=shared_metrics,
+    )
+    router = GraphRouter(conversation, lifecycle, model)
+    router.metadata_cache = shared_cache
+    router.metrics = shared_metrics
+    return router

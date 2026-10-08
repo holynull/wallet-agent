@@ -384,3 +384,143 @@ async def test_unified_react_tool_loop_stops_after_bounded_unique_calls():
     assert result["react_steps"] == 9
     assert result["response"]["kind"] == "react"
     assert "有限次数" in result["response"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_unified_react_tool_timeout_returns_safe_tool_message_and_timing():
+    import asyncio
+
+    from wallet_agent.graph.build import build_graph
+
+    class SlowPrices:
+        async def get_prices(self, _assets):
+            await asyncio.sleep(0.1)
+            return []
+
+    class TimeoutModel(ReActModel):
+        async def invoke_react(self, messages, tools):
+            self.calls.append((list(messages), [tool.name for tool in tools]))
+            last_user = max(
+                (index for index, item in enumerate(messages) if isinstance(item, HumanMessage)),
+                default=-1,
+            )
+            if not any(isinstance(item, ToolMessage) for item in messages[last_user + 1 :]):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "slow-price-call",
+                            "name": "price_lookup",
+                            "args": {"chain": "ETH", "symbol": "ETH"},
+                        }
+                    ],
+                )
+            return AIMessage(content="资产目录查询超时，我暂时无法确认该资产。")
+
+    result = await build_graph(
+        model=TimeoutModel(),
+        price_provider=SlowPrices(),
+        react_tool_timeout_seconds=0.01,
+    ).ainvoke(
+        {"request": {"message": "查询 ETH 的价格"}},
+        config={"configurable": {"thread_id": "react-tool-timeout"}},
+    )
+
+    observations = [item for item in result["messages"] if isinstance(item, ToolMessage)]
+    assert len(observations) == 1
+    assert observations[0].tool_call_id == "slow-price-call"
+    assert '"code": "REACT_TOOL_TIMEOUT"' in observations[0].content
+    assert result["react_tool_timings"][0]["status"] == "timeout"
+    assert result["react_tool_timings"][0]["tool"] == "price_lookup"
+    assert result["response"]["react_tool_timings"] == result["react_tool_timings"]
+
+
+@pytest.mark.asyncio
+async def test_unified_react_caches_only_asset_metadata_and_records_hit_miss():
+    from wallet_agent.domain.models import Asset
+    from wallet_agent.graph.build import build_graph
+
+    class AssetProvider:
+        provider_name = "catalog"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def list_assets(self, _query):
+            self.calls += 1
+            return [Asset(chain="BASE", symbol="USDC", decimals=6, address="0x1")]
+
+    class AssetModel(ReActModel):
+        async def invoke_react(self, messages, tools):
+            self.calls.append((list(messages), [tool.name for tool in tools]))
+            last_user = max(
+                (index for index, item in enumerate(messages) if isinstance(item, HumanMessage)),
+                default=-1,
+            )
+            if not any(isinstance(item, ToolMessage) for item in messages[last_user + 1 :]):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": f"asset-{len(self.calls)}",
+                            "name": "asset_discovery",
+                            "args": {"chain": "BASE", "search": "USDC"},
+                        }
+                    ],
+                )
+            return AIMessage(content="找到 USDC。")
+
+    provider = AssetProvider()
+    graph = build_graph(model=AssetModel(), providers=[provider])
+    config = {"configurable": {"thread_id": "react-asset-cache"}}
+
+    first = await graph.ainvoke({"request": {"message": "查找 USDC"}}, config=config)
+    second = await graph.ainvoke({"request": {"message": "再查找 USDC"}}, config=config)
+
+    assert provider.calls == 1
+    assert first["react_tool_timings"][0]["cache_status"] == "miss"
+    assert second["react_tool_timings"][0]["cache_status"] == "hit"
+    assert graph.metrics.snapshot()["tools"]["asset_discovery"]["cache_hits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_unified_react_sanitizes_provider_exception_details_before_toolmessage():
+    from wallet_agent.graph.build import build_graph
+
+    class FailingAssetProvider:
+        provider_name = "catalog"
+
+        async def list_assets(self, _query):
+            raise RuntimeError("https://catalog.invalid?api_key=never-expose")
+
+    class ErrorModel(ReActModel):
+        async def invoke_react(self, messages, tools):
+            self.calls.append((list(messages), [tool.name for tool in tools]))
+            last_user = max(
+                (index for index, item in enumerate(messages) if isinstance(item, HumanMessage)),
+                default=-1,
+            )
+            if not any(isinstance(item, ToolMessage) for item in messages[last_user + 1 :]):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "asset-error",
+                            "name": "asset_discovery",
+                            "args": {"chain": "BASE", "search": "USDC"},
+                        }
+                    ],
+                )
+            return AIMessage(content="我暂时无法查询这个 Token。")
+
+    result = await build_graph(
+        model=ErrorModel(), providers=[FailingAssetProvider()]
+    ).ainvoke(
+        {"request": {"message": "查找 USDC"}},
+        config={"configurable": {"thread_id": "react-safe-error"}},
+    )
+
+    tool_messages = [item for item in result["messages"] if isinstance(item, ToolMessage)]
+    assert tool_messages
+    assert "never-expose" not in tool_messages[0].content
+    assert "never-expose" not in str(result["response"]["react_results"])

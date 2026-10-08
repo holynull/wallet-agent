@@ -127,7 +127,21 @@ async def test_model_trace_is_emitted_in_sse_and_final_state():
 
         async def aget_state(self, _config):
             class Snapshot:
-                values = {"response": {"kind": "clarification", "message": "你好"}}
+                values = {
+                    "response": {"kind": "react", "message": "已查询。"},
+                    "graph_role": "conversation",
+                    "route_mode": "react",
+                    "route_reason": "model_answer",
+                    "react_tool_timings": [
+                        {
+                            "call_id": "price-1",
+                            "tool": "price_lookup",
+                            "elapsed_ms": 12,
+                            "status": "success",
+                            "error_code": None,
+                        }
+                    ],
+                }
                 tasks = ()
                 next = ()
 
@@ -144,6 +158,8 @@ async def test_model_trace_is_emitted_in_sse_and_final_state():
     assert '"model_id": "deepseek-chat"' in stream.text
     assert '"stage": "\\u8bf7\\u6c42\\u8bc6\\u522b"' in stream.text
     assert '"elapsed_ms": 12' in stream.text
+    assert '"route_mode": "react"' in stream.text
+    assert '"tool": "price_lookup"' in stream.text
 
 
 class UnavailableRunStore(InMemoryRunStore):

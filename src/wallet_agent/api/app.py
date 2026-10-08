@@ -199,6 +199,18 @@ def _conversation_artifacts(state: Mapping[str, Any]) -> dict[str, Any] | None:
     response = _jsonable(raw_response)
     kind = response.get("kind")
     stage = response.get("stage") or (state.get("authorization_stage") if not kind else None)
+    route_metadata = {
+        key: _jsonable(state.get(key))
+        for key in ("graph_role", "route_mode", "route_reason")
+        if state.get(key) is not None
+    }
+    has_route_metadata = bool(route_metadata)
+    if route_metadata and not response.get("route"):
+        response["route"] = route_metadata
+    tool_timings = state.get("react_tool_timings")
+    has_tool_timings = isinstance(tool_timings, list) and bool(tool_timings)
+    if has_tool_timings and not response.get("react_tool_timings"):
+        response["react_tool_timings"] = _jsonable(tool_timings)
     artifacts: dict[str, Any] = {"response": response}
     model_trace = state.get("model_trace")
     if isinstance(model_trace, list) and model_trace:
@@ -272,7 +284,7 @@ def _conversation_artifacts(state: Mapping[str, Any]) -> dict[str, Any] | None:
     ):
         artifacts["read_only"] = read_only_fields
 
-    return artifacts if len(artifacts) > 1 else None
+    return artifacts if len(artifacts) > 1 or has_route_metadata or has_tool_timings else None
 
 
 def _assistant_response_content(response: Mapping[str, Any]) -> str:
@@ -618,6 +630,8 @@ def create_app(
     token_verifier: TokenVerifier | None = None,
     require_auth: bool = False,
     model_registry: Any = None,
+    metrics: Any = None,
+    metadata_cache: Any = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -675,6 +689,8 @@ def create_app(
     app.state.require_auth = require_auth
     app.state.model_registry = model_registry
     app.state.model_router = getattr(graph, "_model", None)
+    app.state.metrics = metrics or getattr(graph, "metrics", None)
+    app.state.metadata_cache = metadata_cache or getattr(graph, "metadata_cache", None)
     app.state.transports: list[Any] = []
 
     def graph_lock(thread_id: str) -> Any:
@@ -748,6 +764,28 @@ def create_app(
                 },
             ) from exc
         return {"status": "ready"}
+
+    @app.get("/debug/metrics")
+    async def debug_metrics(request: Request) -> dict[str, Any]:
+        """Return bounded process-local timings; no prompts or credentials."""
+        await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id="debug",
+        )
+        metrics_snapshot = (
+            app.state.metrics.snapshot()
+            if app.state.metrics is not None and hasattr(app.state.metrics, "snapshot")
+            else {"model_calls": 0, "tool_calls": 0, "models": {}, "tools": {}}
+        )
+        cache_stats = (
+            app.state.metadata_cache.stats()
+            if app.state.metadata_cache is not None
+            and hasattr(app.state.metadata_cache, "stats")
+            else None
+        )
+        return {"metrics": metrics_snapshot, "metadata_cache": cache_stats}
 
     @app.get("/v1/agent/conversations")
     async def list_conversations(

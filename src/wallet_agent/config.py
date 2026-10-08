@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     deepseek_reasoning_effort: str = "none"
     read_agent_thinking_enabled: bool = True
     read_agent_reasoning_effort: str = "low"
+    react_compatibility_mode: bool = False
+    react_max_steps: int = Field(default=8, ge=1, le=32)
+    react_tool_timeout_seconds: float = Field(default=20, gt=0, le=300)
     openai_base_url: str | None = "https://api.deepseek.com"
     allowed_model_ids: list[str] = Field(
         default_factory=lambda: ["deepseek-flash", "deepseek-v4-pro"]
@@ -60,6 +63,8 @@ class Settings(BaseSettings):
     okx_cache_ttl_seconds: int = Field(default=60, ge=0)
     okx_exclude_risk_tokens: bool = True
     asset_cache_ttl_seconds: int = Field(default=600, ge=0)
+    metadata_cache_ttl_seconds: int = Field(default=600, ge=0)
+    metadata_cache_max_entries: int = Field(default=512, ge=0, le=100_000)
 
     persistence_url: str = "sqlite+aiosqlite:///./wallet_agent.db"
     redis_url: str | None = None

@@ -293,8 +293,18 @@ class ModelRouter:
     def __init__(self, registry: ModelRegistry) -> None:
         self.registry = registry
         self.read_agent_enabled = registry.read_agent_enabled
+        self.metrics: Any = None
         self._model_trace: list[dict[str, Any]] = []
         self._model_call_index = 0
+
+    @property
+    def supports_react(self) -> bool:
+        """Whether the configured default raw model exposes native tool binding."""
+        try:
+            model = self.registry.get_raw(self.registry.default_model_id)
+        except ValueError:
+            return False
+        return callable(getattr(model, "bind_tools", None))
 
     def _record_model(
         self,
@@ -376,21 +386,36 @@ class ModelRouter:
     ) -> Any:
         started = perf_counter()
         result: Any = None
+        status = "success"
+        error_code: str | None = None
         try:
             if hasattr(model, "ainvoke"):
                 result = await model.ainvoke(request)
             else:
                 result = model.invoke(request)
             return result
+        except Exception:
+            status = "error"
+            error_code = "MODEL_INVOCATION_FAILED"
+            raise
         finally:
+            elapsed_ms = max(0, round((perf_counter() - started) * 1000))
             self._record_model(
                 role,
                 model_id,
-                elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
+                elapsed_ms=elapsed_ms,
                 stage=stage,
                 **self._response_usage(result),
                 **details,
             )
+            if self.metrics is not None:
+                self.metrics.record_model(
+                    model_id,
+                    role=role,
+                    elapsed_ms=elapsed_ms,
+                    status=status,
+                    error_code=error_code,
+                )
 
     def consume_model_trace(self) -> list[dict[str, Any]]:
         trace = list(self._model_trace)

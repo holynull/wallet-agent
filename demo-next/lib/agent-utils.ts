@@ -208,6 +208,8 @@ export function responseMessage(response: any): string {
 
 export type ConversationArtifacts = {
   response: any;
+  route?: { graph_role?: string; route_mode?: string; route_reason?: string };
+  reactToolTimings?: Array<Record<string, any>>;
   model_trace?: ModelTraceEntry[];
   quotes?: any[];
   confirmation?: any;
@@ -235,6 +237,24 @@ export function extractConversationArtifacts(state: any): ConversationArtifacts 
   const kind = response.kind;
   const stage = response.stage || (!kind ? state.authorization_stage : undefined);
   const artifacts: ConversationArtifacts = { response };
+  const routeValue = state.route || response.route;
+  if (routeValue && typeof routeValue === "object") {
+    artifacts.route = {
+      graph_role: routeValue.graph_role,
+      route_mode: routeValue.route_mode,
+      route_reason: routeValue.route_reason,
+    };
+  } else if (state.route_mode || response.route_mode) {
+    artifacts.route = {
+      graph_role: state.graph_role,
+      route_mode: state.route_mode || response.route_mode,
+      route_reason: state.route_reason || response.route_reason,
+    };
+  }
+  const reactToolTimings = state.react_tool_timings || response.react_tool_timings;
+  if (Array.isArray(reactToolTimings) && reactToolTimings.length) {
+    artifacts.reactToolTimings = reactToolTimings.map((item: any) => ({ ...item }));
+  }
   const modelTrace = state.model_trace || state.artifacts?.model_trace;
   if (Array.isArray(modelTrace) && modelTrace.length) artifacts.model_trace = modelTrace;
 

@@ -1,6 +1,10 @@
 import pytest
 
-from evals.wallet_agent_evals import evaluate_expectations, run_offline_evals
+from evals.wallet_agent_evals import (
+    evaluate_expectations,
+    run_offline_evals,
+    run_react_offline_evals,
+)
 
 
 @pytest.mark.asyncio
@@ -64,3 +68,14 @@ def test_expectation_scoring_reports_wrong_state_and_unsafe_side_effects():
         "response.kind: expected 'transfer_prepare', got 'error'",
         "broadcast_calls: expected 0, got 1",
     ]
+
+
+@pytest.mark.asyncio
+async def test_react_offline_matrix_checks_route_scope_handoff_and_budget():
+    report = await run_react_offline_evals()
+
+    assert report["summary"] == {"total": 4, "passed": 4, "pass_rate": 1.0}
+    assert all(item["route"] == "react" for item in report["cases"])
+    assert all(item["tool_count"] >= 1 for item in report["cases"])
+    assert all(item["lifecycle_boundary"] for item in report["cases"])
+    assert all(item["latency_budget"] for item in report["cases"])
