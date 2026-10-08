@@ -224,6 +224,7 @@ export type ConversationArtifacts = {
   assets?: any;
   status?: any;
   broadcast_hash?: string;
+  reactResults?: Array<{ tool?: string; result?: any }>;
   readOnly?: ReadOnlyTrace;
 };
 
@@ -255,6 +256,21 @@ export function extractConversationArtifacts(state: any): ConversationArtifacts 
   if (kind === "gas_check") artifacts.gas = response;
   if (kind === "asset_discovery") artifacts.assets = response;
   if (kind === "swap_status" || kind === "transaction_status") artifacts.status = response;
+  if (kind === "react" && Array.isArray(response.react_results) && response.react_results.length) {
+    artifacts.reactResults = response.react_results;
+    const quoteResult = [...response.react_results].reverse().find((item: any) =>
+      item?.tool === "get_swap_quote" && item?.result?.ok === true && Array.isArray(item.result.quotes),
+    );
+    if (quoteResult?.result.quotes.length) artifacts.quotes = quoteResult.result.quotes;
+    const transferResult = [...response.react_results].reverse().find((item: any) =>
+      item?.tool === "prepare_transfer" && item?.result?.ok === true && item?.result?.pending_transaction,
+    );
+    if (transferResult) {
+      artifacts.preflight = transferResult.result.preflight;
+      artifacts.pending_transaction = transferResult.result.pending_transaction;
+      artifacts.pending_kind = "transfer";
+    }
+  }
   if (kind === "error" && (response.preflight || state.preflight)) artifacts.preflight = response.preflight || state.preflight;
   if (state.broadcast_tx_hash || response.tx_hash) artifacts.broadcast_hash = state.broadcast_tx_hash || response.tx_hash;
   const readOnly = extractReadOnlyTrace(state.read_only || state);

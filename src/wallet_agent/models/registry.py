@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from .contracts import (
     AgentResponseDraft,
@@ -444,6 +444,46 @@ class ModelRouter:
                 if isinstance(item, Mapping) and item.get("id")
             ]
         return result
+
+    async def invoke_react(
+        self,
+        messages: list[Any],
+        tools: list[Any],
+        model_id: str | None = None,
+    ) -> AIMessage:
+        """Invoke the single conversational model bound to all wallet tools."""
+        selected = str(model_id or self.registry.default_model_id)
+        raw_model = self.registry.get_raw(selected)
+        binder = getattr(raw_model, "bind_tools", None)
+        if not callable(binder):
+            raise ValueError(f"react model does not support tool calls: {selected}")
+        try:
+            bound = binder(tools, tool_choice="auto", parallel_tool_calls=True)
+        except TypeError:
+            bound = binder(tools)
+        result = await self._invoke(
+            role="react_agent",
+            model_id=selected,
+            stage="ReAct 工具决策",
+            model=bound,
+            request=messages,
+            tool_count=str(len(tools)),
+        )
+        calls = getattr(result, "tool_calls", None) or []
+        if self._model_trace:
+            self._model_trace[-1]["tool_call_ids"] = [
+                str(item.get("id"))
+                for item in calls
+                if isinstance(item, Mapping) and item.get("id")
+            ]
+        if isinstance(result, AIMessage):
+            return result
+        if isinstance(result, Mapping):
+            return AIMessage(
+                content=str(result.get("content") or result.get("message") or ""),
+                tool_calls=list(result.get("tool_calls") or []),
+            )
+        return AIMessage(content=str(result or ""))
 
     async def classify(self, request: Mapping[str, Any]) -> RouteDecision:
         model_id = str(request.get("model_id") or self.registry.classifier_model_id)

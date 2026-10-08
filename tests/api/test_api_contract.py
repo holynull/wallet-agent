@@ -87,6 +87,35 @@ def test_assistant_history_entry_persists_read_only_trace():
     }
 
 
+def test_react_response_persists_current_turn_tool_results_only():
+    artifacts = _conversation_artifacts(
+        {
+            "response": {
+                "kind": "react",
+                "message": "ETH 当前价格约为 1800 美元。",
+                "react_results": [
+                    {"tool": "price_lookup", "result": {"ok": True, "usd_price": "1800"}},
+                ],
+            },
+            "model_trace": [{"role": "react_agent", "model_id": "deepseek-chat"}],
+        }
+    )
+
+    assert artifacts == {
+        "response": {
+            "kind": "react",
+            "message": "ETH 当前价格约为 1800 美元。",
+            "react_results": [
+                {"tool": "price_lookup", "result": {"ok": True, "usd_price": "1800"}},
+            ],
+        },
+        "model_trace": [{"role": "react_agent", "model_id": "deepseek-chat"}],
+        "react_results": [
+            {"tool": "price_lookup", "result": {"ok": True, "usd_price": "1800"}},
+        ],
+    }
+
+
 def test_sse_state_does_not_duplicate_persisted_card_payloads():
     state = {
         "response": {"kind": "swap_quote", "quotes": []},

@@ -1,5 +1,5 @@
-import pytest
 import httpx
+import pytest
 
 from wallet_agent.api import create_app
 

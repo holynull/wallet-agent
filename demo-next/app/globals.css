@@ -53,6 +53,10 @@ main { width: min(1180px, 100%); min-height: 100dvh; margin: 0 auto; background:
 .card pre { max-height: 220px; margin: 8px 0; padding: 10px; overflow: auto; border-radius: 8px; background: #0a0f15; color: #c9d5e5; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .quote { display: grid; gap: 6px; margin-top: 8px; padding: 10px; border: 1px solid #3b4b63; border-radius: 9px; background: #121a24; }
 .quote span { color: #afbdcf; font-size: 12px; }
+.react-results-list { display: grid; gap: 8px; margin: 0; padding-left: 20px; color: #bdc8d7; font-size: 12px; }
+.react-results-list li::marker { color: #57c58c; }
+.react-results-list strong { color: #dce7f3; font-weight: 600; }
+.react-results-list .debug { max-height: 150px; margin: 6px 0 0; }
 .card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .system .bubble { width: 100%; max-width: 100%; padding: 4px 8px; color: #7f90a5; background: transparent; font-size: 11px; text-align: center; }
 .inline-suggestions { width: min(100%, 520px); padding: 10px 12px; border: 1px solid #2e4564; border-radius: 8px; background: #101d2c; }.inline-suggestions > span { display: block; margin-bottom: 7px; color: #8fa7c1; font-size: 11px; }.inline-suggestions .card-actions { margin-top: 0; }

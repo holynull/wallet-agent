@@ -130,6 +130,46 @@ async def test_native_model_trace_normalizes_provider_usage_and_finish_reason():
     assert item["cached_tokens"] == 80
 
 
+@pytest.mark.asyncio
+async def test_model_router_invokes_unified_react_model_and_records_role():
+    class BoundModel:
+        async def ainvoke(self, messages):
+            assert messages[0].content == "hello"
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "name": "wallet_balance",
+                        "args": {"chain": "BSC"},
+                    }
+                ],
+            )
+
+    class RawModel:
+        def bind_tools(self, tools, **kwargs):
+            assert [tool.name for tool in tools] == ["wallet_balance"]
+            assert kwargs["tool_choice"] == "auto"
+            return BoundModel()
+
+    router = ModelRouter(
+        ModelRegistry(
+            {"deepseek-chat": FakeModel()},
+            default_model_id="deepseek-chat",
+            raw_models={"deepseek-chat": RawModel()},
+        )
+    )
+    result = await router.invoke_react(
+        [HumanMessage(content="hello")],
+        [type("Tool", (), {"name": "wallet_balance"})()],
+    )
+
+    assert result.tool_calls[0]["name"] == "wallet_balance"
+    trace = router.consume_model_trace()
+    assert trace[0]["role"] == "react_agent"
+    assert trace[0]["stage"] == "ReAct 工具决策"
+
+
 def test_registry_has_default_and_allows_whitelisted_temporary_selection():
     default = FakeModel()
     reasoner = FakeModel()

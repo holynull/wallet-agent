@@ -204,6 +204,13 @@ def _conversation_artifacts(state: Mapping[str, Any]) -> dict[str, Any] | None:
     if isinstance(model_trace, list) and model_trace:
         artifacts["model_trace"] = _jsonable(model_trace)
 
+    # ReAct responses already contain the current turn's validated tool
+    # observations. Preserve them as a generic artifact so the UI can restore
+    # the exact tool trace without guessing a legacy business-card kind.
+    react_results = response.get("react_results")
+    if isinstance(react_results, list) and react_results:
+        artifacts["react_results"] = _jsonable(react_results)
+
     if kind == "swap_quote":
         artifacts["quotes"] = response.get("quotes") or _jsonable(
             state.get("quote_candidates") or []

@@ -197,6 +197,27 @@ test("extracts only cards belonging to the current response", () => {
   }), null);
 });
 
+test("restores generic ReAct tool results without guessing a business card kind", () => {
+  const artifacts = extractConversationArtifacts({
+    response: {
+      kind: "react",
+      message: "ETH 当前价格约为 1800 美元。",
+      react_results: [
+        { tool: "price_lookup", result: { ok: true, usd_price: "1800" } },
+        { tool: "get_swap_quote", result: { ok: true, quotes: [{ provider_reference: "q1" }] } },
+      ],
+    },
+    model_trace: [{ role: "react_agent", model_id: "deepseek-chat" }],
+  });
+
+  assert.deepEqual(artifacts?.reactResults, [
+    { tool: "price_lookup", result: { ok: true, usd_price: "1800" } },
+    { tool: "get_swap_quote", result: { ok: true, quotes: [{ provider_reference: "q1" }] } },
+  ]);
+  assert.deepEqual(artifacts?.quotes, [{ provider_reference: "q1" }]);
+  assert.equal(formatResponseSummary({ kind: "react", message: "ETH 当前价格约为 1800 美元。" }), "ETH 当前价格约为 1800 美元。");
+});
+
 test("restores latest legacy card without moving persisted cards", () => {
   const persisted = { response: { kind: "swap_quote", quotes: [{ provider_reference: "q1" }] }, quotes: [{ provider_reference: "q1" }] };
   const latest = { response: { kind: "swap_status", status: { status: "pending" } }, status: { kind: "swap_status", status: { status: "pending" } } };

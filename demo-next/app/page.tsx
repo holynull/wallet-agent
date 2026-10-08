@@ -601,6 +601,7 @@ export default function Home() {
     const cardPendingKind = artifacts.pending_kind || "swap";
     const cardTokenCandidates = artifacts.token_candidates || [];
     const cardStatus = artifacts.status;
+    const reactResults = artifacts.reactResults || [];
     const readOnlyTimeline = artifacts.readOnly
       ? buildReadOnlyTimeline(artifacts.model_trace || [], artifacts.readOnly.toolCalls)
       : [];
@@ -629,6 +630,7 @@ export default function Home() {
       {artifacts.gas && <section className="card" data-card-kind="gas"><h3>Gas 检查</h3><pre className="debug">{JSON.stringify(artifacts.gas, null, 2)}</pre></section>}
       {artifacts.assets && <section className="card" data-card-kind="assets"><h3>Token 资产发现</h3><pre className="debug">{JSON.stringify(artifacts.assets, null, 2)}</pre></section>}
       {cardStatus && <section className="card" data-card-kind="status"><h3>订单状态</h3><p>{cardStatus.message || responseMessage(cardStatus) || cardStatus.status?.status || "处理中"}</p><pre className="debug">{JSON.stringify(cardStatus, null, 2)}</pre></section>}
+      {reactResults.length > 0 && <section className="card" data-card-kind="react-results"><div className="progress-heading"><h3>本轮工具结果</h3><span>{reactResults.length} 项</span></div><ol className="react-results-list">{reactResults.map((item, index) => <li key={`${item.tool || "tool"}-${index}`}><strong>{item.tool || "工具"}</strong><pre className="debug">{JSON.stringify(sanitizeDebug(item.result), null, 2)}</pre></li>)}</ol></section>}
       {artifacts.model_trace?.length ? <section className="model-trace" data-testid="model-trace"><span>本轮模型</span><div>{artifacts.model_trace.map((item, index) => <code key={item.call_id || `${item.timestamp}-${item.role}-${index}`}>{formatModelTraceEntry({ ...item, stage: item.task_kind ? `${item.stage || item.role}:${item.task_kind}` : item.stage || item.role })}</code>)}</div></section> : null}
       {readOnlyTimeline.length > 0 && <section className="model-trace-panel" data-testid="tool-timeline"><div className="progress-heading"><h3>模型调用过程</h3><span>{readOnlyTimeline.filter((item) => item.kind === "tool").length} 个工具调用</span></div><ol className="timeline-list">{readOnlyTimeline.map((item) => <li className={`timeline-item ${item.kind}`} key={item.key}><i /><div><strong>{timelineTitle(item)}</strong><span>{timelineMeta(item)}</span>{item.kind === "tool" && item.args && <details><summary>查看参数</summary><pre className="debug">{JSON.stringify(sanitizeDebug(item.args), null, 2)}</pre></details>}{item.error && <p className="timeline-error">{item.error.message || item.error.code || String(item.error)}</p>}</div></li>)}</ol></section>}
     </>;

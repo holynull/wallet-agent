@@ -6,6 +6,7 @@ from typing import Any
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
 
 from .nodes import GraphRuntime, make_nodes
 from .routes import (
@@ -64,6 +65,23 @@ def build_graph(
     )
     n = make_nodes(runtime)
     builder = StateGraph(AgentState)
+    builder.add_node("react_entry", n["react_entry"])
+    builder.add_node("react_agent", n["react_agent"])
+    builder.add_node("react_tools", ToolNode(n["react_tools"], name="react_tools"))
+    builder.add_node("finalize_response", n["finalize_response"])
+    builder.add_conditional_edges(
+        START,
+        n["route_entry"],
+        {"react": "react_entry", "legacy": "dialogue_manager"},
+    )
+    builder.add_edge("react_entry", "react_agent")
+    builder.add_conditional_edges(
+        "react_agent",
+        tools_condition,
+        {"tools": "react_tools", "__end__": "finalize_response"},
+    )
+    builder.add_edge("react_tools", "react_agent")
+    builder.add_edge("finalize_response", END)
     builder.add_node("dialogue_manager", n["dialogue_manager"])
     builder.add_node("supervisor", n["supervisor"])
     builder.add_node("intent", n["intent"])
@@ -97,7 +115,6 @@ def build_graph(
     builder.add_node("read_only_agent", n["read_only_agent"])
     builder.add_node("read_only_tool", n["read_only_tool"])
     builder.add_node("read_only_observe", n["read_only_observe"])
-    builder.add_edge(START, "dialogue_manager")
     builder.add_edge("dialogue_manager", "supervisor")
     builder.add_edge("supervisor", "intent")
     builder.add_conditional_edges(

@@ -12,12 +12,19 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from time import perf_counter
-from typing import Any
+from typing import Annotated, Any
 
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.tools import StructuredTool
 from langgraph.config import get_stream_writer
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import InjectedState, ToolNode
 from langgraph.types import interrupt
 
 from wallet_agent.chains._common import receipt_success
@@ -8300,5 +8307,522 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             }
         return {"response": {"kind": state.get("intent", "clarification")}}
+
+    async def _react_read_observation(
+        name: str, arguments: dict[str, Any], state: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Reuse the validated read implementation behind a ReAct tool call."""
+        read_state = {
+            **state,
+            "read_native": False,
+            "read_tool_call": {"name": name, "arguments": arguments},
+            "read_facts": {},
+            "read_tool_calls": [],
+            "read_loop_count": 0,
+        }
+        update = await read_only_tool(read_state)
+        facts = update.get("read_facts") or {}
+        value = facts.get(name)
+        if isinstance(value, Mapping):
+            return dict(value)
+        return {
+            "ok": False,
+            "code": "READ_TOOL_FAILED",
+            "error": "只读工具没有返回 JSON 对象。",
+        }
+
+    async def react_wallet_balance(
+        chain: str | None = None,
+        address: str | None = None,
+        symbol: str | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        return await _react_read_observation(
+            "wallet_balance",
+            {"chain": chain, "address": address, "symbol": symbol},
+            state,
+        )
+
+    async def react_portfolio_snapshot(
+        address: str | None = None,
+        chain: str | None = None,
+        symbol: str | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        return await _react_read_observation(
+            "portfolio_snapshot",
+            {"address": address, "chain": chain, "symbol": symbol},
+            state,
+        )
+
+    async def react_price_lookup(
+        symbol: str,
+        chain: str | None = None,
+        token_address: str | None = None,
+        decimals: int | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        return await _react_read_observation(
+            "price_lookup",
+            {
+                "symbol": symbol,
+                "chain": chain,
+                "token_address": token_address,
+                "decimals": decimals,
+            },
+            state,
+        )
+
+    async def react_market_details(
+        symbol: str,
+        chain: str | None = None,
+        token_address: str | None = None,
+        decimals: int | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        return await _react_read_observation(
+            "market_details",
+            {
+                "symbol": symbol,
+                "chain": chain,
+                "token_address": token_address,
+                "decimals": decimals,
+            },
+            state,
+        )
+
+    async def react_price_history(
+        symbol: str,
+        chain: str | None = None,
+        token_address: str | None = None,
+        decimals: int | None = None,
+        period: str | None = None,
+        limit: int | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        return await _react_read_observation(
+            "price_history",
+            {
+                "symbol": symbol,
+                "chain": chain,
+                "token_address": token_address,
+                "decimals": decimals,
+                "period": period,
+                "limit": limit,
+            },
+            state,
+        )
+
+    async def react_asset_discovery(
+        chain: str | None = None,
+        search: str | None = None,
+        provider_name: str | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        return await _react_read_observation(
+            "asset_discovery",
+            {"chain": chain, "search": search, "provider_name": provider_name},
+            state,
+        )
+
+    async def react_gas_estimate(
+        chain: str | None = None,
+        address: str | None = None,
+        to: str | None = None,
+        data: str | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        return await _react_read_observation(
+            "gas_estimate",
+            {"chain": chain, "address": address, "to": to, "data": data},
+            state,
+        )
+
+    async def react_transaction_status(
+        tx_hash: str,
+        chain: str | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        return await _react_read_observation(
+            "transaction_status", {"tx_hash": tx_hash, "chain": chain}, state
+        )
+
+    async def react_get_swap_quote(
+        source_symbol: str | None = None,
+        destination_symbol: str | None = None,
+        input_amount: str | None = None,
+        output_amount: str | None = None,
+        amount_mode: str | None = None,
+        source_chain: str | None = None,
+        destination_chain: str | None = None,
+        source_token_address: str | None = None,
+        destination_token_address: str | None = None,
+        slippage_bps: int | None = None,
+        provider_name: str | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        """Resolve human asset names and request one or all provider quotes."""
+        current = state
+        context = current.get("wallet_context") or {}
+        task_slots = (current.get("active_task") or {}).get("slots") or {}
+        values = {
+            **dict(task_slots),
+            "source_symbol": source_symbol,
+            "destination_symbol": destination_symbol,
+            "input_amount": input_amount,
+            "output_amount": output_amount,
+            "amount_mode": amount_mode,
+            "source_chain": source_chain,
+            "destination_chain": destination_chain,
+            "source_token_address": source_token_address,
+            "destination_token_address": destination_token_address,
+            "slippage_bps": slippage_bps,
+        }
+        draft = {key: value for key, value in values.items() if value not in (None, "")}
+        draft.setdefault("source_chain", context.get("chain"))
+        draft.setdefault("destination_chain", draft.get("source_chain"))
+        draft.setdefault("sender_address", context.get("address"))
+        draft.setdefault("recipient_address", context.get("address"))
+        resolved, candidates, errors = await _resolve_swap_assets(draft, runtime.providers)
+        if candidates:
+            return {"ok": False, "code": "ASSET_AMBIGUOUS", "candidates": candidates}
+        if errors:
+            return {"ok": False, "code": "ASSET_RESOLUTION_FAILED", "errors": errors}
+        request_model, missing = _swap_draft_request(resolved, context)
+        if request_model is None:
+            return {
+                "ok": False,
+                "code": "SWAP_PARAMETERS_REQUIRED",
+                "missing_fields": missing,
+                "message": "请补充兑换所需的资产、网络和数量。",
+            }
+        raw_request = request_model.model_dump(mode="json")
+        if amount_mode == "exact_out" and output_amount is not None:
+            raw_request.update(
+                {"amount_mode": "exact_out", "output_amount": str(output_amount)}
+            )
+        providers = [str(provider_name)] if provider_name else list(runtime.providers)
+        if not providers:
+            return {
+                "ok": False,
+                "code": "PROVIDER_UNAVAILABLE",
+                "error": "没有可用的兑换 Provider。",
+            }
+        quotes: list[dict[str, Any]] = []
+        provider_errors: list[dict[str, Any]] = []
+        for name in providers:
+            result = await quote_tool_call(
+                {"provider_name": name, "swap_request": raw_request}
+            )
+            quotes.extend(result.get("quote_candidates") or [])
+            provider_errors.extend(result.get("errors") or [])
+        return {
+            "ok": bool(quotes),
+            "quotes": quotes,
+            "provider_errors": provider_errors,
+            "request": _dump(raw_request),
+            "code": None if quotes else "NO_VALID_QUOTES",
+        }
+
+    async def react_prepare_transfer(
+        chain: str | None = None,
+        symbol: str | None = None,
+        amount: str | None = None,
+        recipient: str | None = None,
+        token_address: str | None = None,
+        decimals: int | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        current = state
+        context = current.get("wallet_context") or {}
+        draft = {
+            "chain": chain or context.get("chain"),
+            "symbol": symbol,
+            "amount": amount,
+            "recipient": recipient,
+            "token_address": token_address,
+            "decimals": decimals,
+            "sender": context.get("address"),
+        }
+        resolved = await _resolve_transfer_asset(
+            draft, runtime.providers, context, runtime.wallet_provider
+        )
+        request_model, missing = _transfer_draft_request(resolved, context)
+        if request_model is None:
+            return {
+                "ok": False,
+                "code": "TRANSFER_PARAMETERS_REQUIRED",
+                "missing_fields": missing,
+                "message": "请补充转账网络、资产、数量和收款地址。",
+            }
+        result = await transfer(
+            {
+                **current,
+                "request": {"message": ""},
+                "transfer_request": request_model.model_dump(mode="json"),
+            }
+        )
+        return {"ok": result.get("response", {}).get("kind") == "transfer_prepare", **result}
+
+    async def react_query_swap_status(
+        tx_hash: str,
+        chain: str | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        return await transaction_status_tool(
+            str(chain or state.get("wallet_context", {}).get("chain") or ""),
+            tx_hash,
+            state.get("broadcast_status"),
+        )
+
+    react_tools = [
+        StructuredTool.from_function(
+            coroutine=react_wallet_balance,
+            name="wallet_balance",
+            description="查询钱包余额；用户指定资产时只返回该资产。网络和地址可由上下文提供。",
+        ),
+        StructuredTool.from_function(
+            coroutine=react_portfolio_snapshot,
+            name="portfolio_snapshot",
+            description="查询一个网络或全部支持网络中美元价值非零的钱包资产。",
+        ),
+        StructuredTool.from_function(
+            coroutine=react_price_lookup,
+            name="price_lookup",
+            description="查询资产当前美元价格，优先使用网络和 symbol，服务端解析合约与精度。",
+        ),
+        StructuredTool.from_function(
+            coroutine=react_market_details,
+            name="market_details",
+            description="查询资产行情详情。",
+        ),
+        StructuredTool.from_function(
+            coroutine=react_price_history,
+            name="price_history",
+            description="查询资产历史价格。",
+        ),
+        StructuredTool.from_function(
+            coroutine=react_asset_discovery,
+            name="asset_discovery",
+            description="按网络和 symbol 搜索资产元数据。",
+        ),
+        StructuredTool.from_function(
+            coroutine=react_gas_estimate,
+            name="gas_estimate",
+            description="估算交易网络手续费。",
+        ),
+        StructuredTool.from_function(
+            coroutine=react_transaction_status,
+            name="transaction_status",
+            description="查询链上交易状态。",
+        ),
+        StructuredTool.from_function(
+            coroutine=react_get_swap_quote,
+            name="get_swap_quote",
+            description="根据来源/目标资产和数量获取兑换报价；自动发现合约和 decimals。",
+        ),
+        StructuredTool.from_function(
+            coroutine=react_prepare_transfer,
+            name="prepare_transfer",
+            description="准备未签名转账交易；自动发现 Token 合约和 decimals。",
+        ),
+        StructuredTool.from_function(
+            coroutine=react_query_swap_status,
+            name="query_swap_status",
+            description="查询兑换或交易的当前状态。",
+        ),
+    ]
+
+    def route_entry(state: dict[str, Any]) -> str:
+        request = state.get("request") or {}
+        # Forced inputs are the explicit HTTP lifecycle boundary. All ordinary
+        # messages go to the model; the capability check is only compatibility
+        # for legacy test doubles that cannot bind tools.
+        if state.get("forced_intent") or not request.get("message"):
+            return "legacy"
+        return "react" if callable(getattr(runtime.model, "invoke_react", None)) else "legacy"
+
+    async def react_entry(state: dict[str, Any]) -> dict[str, Any]:
+        request = dict(state.get("request") or {})
+        current = str(request.get("message") or state.get("message") or "")
+        existing = list(state.get("messages") or [])
+        system = SystemMessage(
+            content=(
+                "你是多链数字货币钱包助手。根据完整对话和 ToolMessage 自主完成任务，"
+                "需要事实时调用工具，可连续调用多个工具；不要索要工具可以发现的"
+                "合约地址或 decimals。询问资产持仓价值时必须查询余额和价格并计算；"
+                "指定资产只回答该资产，询问全部余额时返回所有美元价值非零资产。"
+                "短追问要结合历史理解；工具失败时说明真实原因并提出最小澄清；不要编造事实或描述内部推理。"
+            )
+        )
+        if not existing or not any(isinstance(item, SystemMessage) for item in existing):
+            history_messages: list[Any] = [system]
+            for item in _model_conversation_history(state.get("conversation_history")):
+                role = str(item.get("role") or "")
+                content = str(item.get("content") or "")
+                if role == "user":
+                    history_messages.append(HumanMessage(content=content))
+                elif role == "assistant":
+                    history_messages.append(AIMessage(content=content))
+            if not any(
+                isinstance(item, HumanMessage) and str(item.content) == current
+                for item in history_messages
+            ):
+                history_messages.append(HumanMessage(content=current))
+            return {
+                "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *history_messages],
+                "react_steps": 0,
+                "react_tool_signatures": [],
+                "react_active": True,
+                # Keep the explicit quote-selection lifecycle contract
+                # present on ordinary ReAct turns as well.  ReAct can expose
+                # quote_candidates for the UI, but it must not implicitly
+                # select a quote or enter the confirmation flow.
+                "selected_quote": None,
+            }
+        last = existing[-1] if existing else None
+        additions: list[Any] = []
+        if not isinstance(last, HumanMessage) or str(last.content) != current:
+            additions.append(HumanMessage(content=current))
+        return {
+            "messages": additions,
+            "react_steps": 0,
+            "react_tool_signatures": [],
+            "react_active": True,
+            # A conversational turn may offer fresh quote candidates, but
+            # selection remains an explicit client/API action.
+            "selected_quote": None,
+        }
+
+    async def react_agent(state: dict[str, Any]) -> dict[str, Any]:
+        messages = list(state.get("messages") or [])
+        step = int(state.get("react_steps") or 0) + 1
+        if step > 8:
+            return {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "我已完成有限次数的查询，但仍无法可靠完成这次请求，"
+                            "请补充具体资产或网络。"
+                        )
+                    )
+                ],
+                "react_steps": step,
+                "react_active": False,
+            }
+        request_model_id = str((state.get("request") or {}).get("model_id") or "") or None
+        invoke_react = runtime.model.invoke_react
+        parameters = inspect.signature(invoke_react).parameters.values()
+        accepts_model_id = any(
+            parameter.name == "model_id"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if accepts_model_id:
+            result = await invoke_react(messages, react_tools, model_id=request_model_id)
+        else:
+            result = await invoke_react(messages, react_tools)
+        calls = list(getattr(result, "tool_calls", None) or [])
+        prior = list(state.get("react_tool_signatures") or [])
+        signatures = [
+            read_tool_signature(str(call.get("name") or ""), call.get("args") or {})
+            for call in calls
+        ]
+        if calls and signatures and all(signature in prior for signature in signatures):
+            result = AIMessage(
+                content=(
+                    "我已经查询过相同的数据，但没有获得新的信息。"
+                    "请补充或更换网络/资产后再试。"
+                )
+            )
+            calls = []
+        return {
+            "messages": [result],
+            "react_steps": step,
+            "react_tool_signatures": [*prior, *[item for item in signatures if item not in prior]],
+            "react_active": bool(calls),
+        }
+
+    async def finalize_response(state: dict[str, Any]) -> dict[str, Any]:
+        messages = list(state.get("messages") or [])
+        last = messages[-1] if messages else None
+        content = str(getattr(last, "content", "") or "").strip()
+        if not content:
+            content = "我暂时无法生成有效回复，请换一种方式描述你的需求。"
+        tool_payloads: list[tuple[str, dict[str, Any]]] = []
+        current_user_index = max(
+            (
+                index
+                for index, message in enumerate(messages)
+                if isinstance(message, HumanMessage)
+            ),
+            default=-1,
+        )
+        turn_messages = messages[current_user_index + 1 :] if current_user_index >= 0 else messages
+        for message in turn_messages:
+            if not isinstance(message, ToolMessage):
+                continue
+            try:
+                payload = json.loads(str(message.content))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, Mapping):
+                tool_payloads.append((str(message.name or ""), dict(payload)))
+        react_results = [
+            {"tool": name, "result": payload} for name, payload in tool_payloads
+        ]
+        response: dict[str, Any] = {
+            "kind": "react",
+            "message": content,
+            "react_results": react_results,
+        }
+        update: dict[str, Any] = {"response": response, "react_active": False}
+        quote_result = next(
+            (
+                payload
+                for name, payload in reversed(tool_payloads)
+                if name == "get_swap_quote"
+                and payload.get("ok")
+                and isinstance(payload.get("quotes"), list)
+                and payload["quotes"]
+            ),
+            None,
+        )
+        if quote_result is not None:
+            # These are tool observations, not a code-inferred intent. Project
+            # them only so the existing explicit quote-selection endpoint can
+            # continue the user-approved lifecycle.
+            update["quote_candidates"] = [
+                {"__clear__": True},
+                *[dict(item) for item in quote_result["quotes"] if isinstance(item, Mapping)],
+            ]
+            if isinstance(quote_result.get("request"), Mapping):
+                update["swap_request"] = dict(quote_result["request"])
+        transfer_result = next(
+            (
+                payload
+                for name, payload in reversed(tool_payloads)
+                if name == "prepare_transfer"
+                and payload.get("ok")
+                and isinstance(payload.get("pending_transaction"), Mapping)
+            ),
+            None,
+        )
+        if transfer_result is not None:
+            update["pending_transaction"] = dict(transfer_result["pending_transaction"])
+            if isinstance(transfer_result.get("preflight"), Mapping):
+                update["preflight"] = dict(transfer_result["preflight"])
+        return update
 
     return locals()
