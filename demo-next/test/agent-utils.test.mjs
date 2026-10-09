@@ -1,11 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 test("App context isolates address families and deduplicates BTC addresses", () => {
-  assert.deepEqual(buildWalletAppContext({ ...DEFAULT_APP_WALLET, networks: ["ETH", "BASE", "BTC", "TRON"], btcAddresses: "btc-a\nbtc-b btc-a" }, "0xevm"), {
+  assert.deepEqual(buildWalletAppContext({ ...DEFAULT_APP_WALLET, networks: ["ETH", "BASE", "BTC", "TRON"], btcAddresses: "btc-a\nbtc-b btc-a", tronAddress: "tron-a" }, "0xevm"), {
     supported_networks: ["ETH", "BASE", "BTC", "TRON"],
-    wallet_accounts: [{ chain: "ETH", address: "0xevm" }, { chain: "BASE", address: "0xevm" }, { chain: "BTC", address: "btc-a" }, { chain: "BTC", address: "btc-b" }],
+    wallet_accounts: [{ chain: "ETH", address: "0xevm" }, { chain: "BASE", address: "0xevm" }, { chain: "BTC", address: "btc-a" }, { chain: "BTC", address: "btc-b" }, { chain: "TRON", address: "tron-a" }],
   });
   assert.deepEqual(buildWalletAppContext({ ...DEFAULT_APP_WALLET, networks: [] }, "0xevm"), { supported_networks: [], wallet_accounts: [] });
+});
+
+test("default demo wallet carries the three BTC addresses", () => {
+  const btc = buildWalletAppContext(DEFAULT_APP_WALLET, "").wallet_accounts.filter((item) => item.chain === "BTC");
+  assert.deepEqual(btc, [
+    { chain: "BTC", address: "bc1qdqahz8x62rsyfmlkv0m5e5rc234zr7vyl690d5" },
+    { chain: "BTC", address: "bc1p47u7v2k5cpfqt0gxftkat3ade7ucs588g8lr0znzr9le06taty6q6x9gut" },
+    { chain: "BTC", address: "3FGALr2UNebKnBTErhePUk3CuzmDd9FJux" },
+  ]);
+});
+
+test("default demo wallet carries the TRON address", () => {
+  const tron = buildWalletAppContext(DEFAULT_APP_WALLET, "").wallet_accounts.filter((item) => item.chain === "TRON");
+  assert.deepEqual(tron, [{ chain: "TRON", address: "TNwXHkvCwj3nayWPbFbxD7rBPncBsyBS27" }]);
 });
 
 test("nonzero dust remains visible and portfolio cards restore with chat history", () => {

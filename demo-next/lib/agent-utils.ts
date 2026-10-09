@@ -243,7 +243,10 @@ export type ConversationArtifacts = {
 
 export const APP_NETWORKS = ["ETH", "BSC", "BASE", "POLYGON", "ARBITRUM", "OPTIMISM", "BTC", "TRON", "SOLANA"];
 export type AppWalletConfig = { networks: string[]; evmAddress: string; btcAddresses: string; tronAddress: string; solanaAddress: string };
-export const DEFAULT_APP_WALLET: AppWalletConfig = { networks: [...APP_NETWORKS], evmAddress: "", btcAddresses: "", tronAddress: "", solanaAddress: "" };
+// Default SegWit / Taproot / nested SegWit BTC addresses plus a TRON address,
+// used to exercise the multi-chain balance query in the demo. Public
+// addresses only; the wallet extension does not expose BTC or TRON accounts.
+export const DEFAULT_APP_WALLET: AppWalletConfig = { networks: [...APP_NETWORKS], evmAddress: "", btcAddresses: ["bc1qdqahz8x62rsyfmlkv0m5e5rc234zr7vyl690d5", "bc1p47u7v2k5cpfqt0gxftkat3ade7ucs588g8lr0znzr9le06taty6q6x9gut", "3FGALr2UNebKnBTErhePUk3CuzmDd9FJux"].join("\n"), tronAddress: "TNwXHkvCwj3nayWPbFbxD7rBPncBsyBS27", solanaAddress: "" };
 
 export function buildWalletAppContext(config: AppWalletConfig, connectedAddress = "") {
   const supported_networks = [...new Set(config.networks.filter((chain) => APP_NETWORKS.includes(chain)))];
