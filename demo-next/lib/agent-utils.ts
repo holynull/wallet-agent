@@ -241,6 +241,30 @@ export type ConversationArtifacts = {
   readOnly?: ReadOnlyTrace;
 };
 
+export const APP_NETWORKS = ["ETH", "BSC", "BASE", "POLYGON", "ARBITRUM", "OPTIMISM", "BTC", "TRON", "SOLANA"];
+export type AppWalletConfig = { networks: string[]; evmAddress: string; btcAddresses: string; tronAddress: string; solanaAddress: string };
+export const DEFAULT_APP_WALLET: AppWalletConfig = { networks: [...APP_NETWORKS], evmAddress: "", btcAddresses: "", tronAddress: "", solanaAddress: "" };
+
+export function buildWalletAppContext(config: AppWalletConfig, connectedAddress = "") {
+  const supported_networks = [...new Set(config.networks.filter((chain) => APP_NETWORKS.includes(chain)))];
+  const wallet_accounts: Array<{ chain: string; address: string }> = [];
+  for (const chain of supported_networks) {
+    const addresses = chain === "BTC" ? config.btcAddresses.split(/[\s,;]+/) : [
+      chain === "TRON" ? config.tronAddress : chain === "SOLANA" ? config.solanaAddress : config.evmAddress.trim() || connectedAddress,
+    ];
+    for (const address of new Set(addresses.map((item) => item.trim()).filter(Boolean))) wallet_accounts.push({ chain, address });
+  }
+  return { supported_networks, wallet_accounts };
+}
+
+export function formatBalanceUsd(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "价格未知";
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "价格未知";
+  if (amount > 0 && amount < 0.01) return "<0.01";
+  return amount.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 export function extractConversationArtifacts(state: any): ConversationArtifacts | null {
   if (!state || typeof state !== "object") return null;
   const response = state.response?.response || state.response || (state.kind ? state : null);
@@ -282,6 +306,7 @@ export function extractConversationArtifacts(state: any): ConversationArtifacts 
   }
   if (kind === "wallet_query") artifacts.wallet = response.wallet || response;
   if (kind === "portfolio_query") artifacts.portfolio = response.portfolio || response;
+  if (response.portfolio) artifacts.portfolio = response.portfolio;
   if (kind === "price_query") artifacts.price = response;
   if (kind === "asset_value") artifacts.assetValue = response;
   if (kind === "gas_check") artifacts.gas = response;
@@ -289,6 +314,8 @@ export function extractConversationArtifacts(state: any): ConversationArtifacts 
   if (kind === "swap_status" || kind === "transaction_status") artifacts.status = response;
   if (kind === "react" && Array.isArray(response.react_results) && response.react_results.length) {
     artifacts.reactResults = response.react_results;
+    const portfolioResult = [...response.react_results].reverse().find((item: any) => item?.result?.portfolio);
+    if (!artifacts.portfolio && portfolioResult) artifacts.portfolio = portfolioResult.result.portfolio;
     const quoteResults = response.react_results.filter((item: any) =>
       item?.tool === "get_swap_quote" && item?.result?.ok === true && Array.isArray(item.result.quotes),
     );

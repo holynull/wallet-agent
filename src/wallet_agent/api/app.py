@@ -84,6 +84,12 @@ _BROADCAST_PROVIDER_VISIBLE: frozenset[BroadcastStatus] = frozenset(
 )
 
 
+class WalletAccount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    chain: str = Field(min_length=1, max_length=32)
+    address: str = Field(min_length=1, max_length=128)
+
+
 class TurnRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -93,6 +99,8 @@ class TurnRequest(BaseModel):
     message: str
     address: str | None = None
     chain: str | None = None
+    supported_networks: list[str] | None = Field(default=None, max_length=50)
+    wallet_accounts: list[WalletAccount] | None = Field(default=None, max_length=100)
     metadata: dict[str, Any] = Field(default_factory=dict)
     model_id: str | None = None
 
@@ -253,6 +261,8 @@ def _conversation_artifacts(state: Mapping[str, Any]) -> dict[str, Any] | None:
         artifacts["wallet"] = response.get("wallet") or response
     if kind == "portfolio_query":
         artifacts["portfolio"] = response.get("portfolio") or response
+    if isinstance(response.get("portfolio"), Mapping):
+        artifacts["portfolio"] = response["portfolio"]
     if kind == "price_query":
         artifacts["price"] = response
     if kind == "asset_value":
@@ -1532,6 +1542,12 @@ def create_app(
             wallet_context["address"] = payload.address
         if payload.chain:
             wallet_context["chain"] = payload.chain
+        if payload.supported_networks is not None:
+            wallet_context["supported_networks"] = payload.supported_networks
+        if payload.wallet_accounts is not None:
+            wallet_context["wallet_accounts"] = [
+                item.model_dump(mode="json") for item in payload.wallet_accounts
+            ]
         metadata_chain_id = payload.metadata.get("wallet_chain_id")
         if metadata_chain_id is not None:
             wallet_context["chain_id"] = metadata_chain_id

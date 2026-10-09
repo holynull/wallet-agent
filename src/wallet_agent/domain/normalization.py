@@ -5,6 +5,10 @@ from __future__ import annotations
 import re
 
 _CHAIN_ALIASES = {
+    "BITCOIN": "BTC",
+    "MATIC": "POLYGON",
+    "ARB": "ARBITRUM",
+    "OP": "OPTIMISM",
     "ETH": "ETH",
     "ETHEREUM": "ETH",
     "ETHEREUMMAINNET": "ETH",

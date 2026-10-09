@@ -1,6 +1,8 @@
 "use client";
 
 import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
+import { APP_NETWORKS, AppWalletConfig, DEFAULT_APP_WALLET, buildWalletAppContext } from "../lib/agent-utils";
+import { PortfolioCard } from "./portfolio-card";
 import { apiErrorMessage, buildReadOnlyTimeline, classifyAgentTest, ConversationArtifacts, extractConversationArtifacts, extractReadOnlyTrace, formatModelTraceEntry, formatProcessingDuration, formatResponseSummary, latestProgressText, mergeModelTrace, parseSseFrame, parseSseFrames, providerPriority as getProviderPriority, ReadOnlyTrace, responseMessage, restoreConversationMessages, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
 
 type Message = { id?: string; role: "user" | "assistant" | "system"; content: string; fullContent?: string; typing?: boolean; suggestions?: any[]; artifacts?: ConversationArtifacts; responseKey?: string };
@@ -188,6 +190,19 @@ export default function Home() {
   const cancellingRef = useRef(false);
   const [debug, setDebug] = useState<string[]>([]);
   const [wallet, setWallet] = useState<{ provider: Provider; address: string; chainId: string; chain: string } | null>(null);
+  const [appWallet, setAppWallet] = useState<AppWalletConfig>(DEFAULT_APP_WALLET);
+  const [appWalletReady, setAppWalletReady] = useState(false);
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("wallet-agent-app-context") || "null");
+      if (saved && Array.isArray(saved.networks) && ["evmAddress", "btcAddresses", "tronAddress", "solanaAddress"].every((key) => typeof saved[key] === "string")) setAppWallet(saved);
+    } catch { /* Ignore corrupt local preferences. */ }
+    setAppWalletReady(true);
+  }, []);
+  useEffect(() => {
+    if (appWalletReady) localStorage.setItem("wallet-agent-app-context", JSON.stringify(appWallet));
+  }, [appWallet, appWalletReady]);
+  const appContext = buildWalletAppContext(appWallet, wallet?.address);
   const [walletProviders, setWalletProviders] = useState<Array<{ info?: any; provider: Provider; source?: string }>>([]);
   const walletProvidersRef = useRef<Array<{ info?: any; provider: Provider; source?: string }>>([]);
   const [quotes, setQuotes] = useState<Quote[]>([]);
@@ -436,6 +451,7 @@ export default function Home() {
         user_id: "browser-demo", conversation_id: `agent-test-${Date.now()}-${spec.id}`,
         message: spec.message, address: spec.requiresWallet ? address : undefined,
         chain: spec.requiresWallet ? chain : undefined, metadata,
+        ...appContext,
       };
       try {
         const turn = await requestApi("/v1/agent/turn", { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(request) });
@@ -458,7 +474,7 @@ export default function Home() {
     setBackendDuration(null);
     setBackendStage("正在处理请求");
     const requestStartedAt = performance.now();
-    const body = await requestApi("/v1/agent/turn", { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", conversation_id: conversationId ?? undefined, session_id: sessionId ?? undefined, message: text, address: wallet?.address, chain: wallet?.chain, metadata: { ...(wallet ? { wallet_chain_id: wallet.chainId } : {}), ...extraMetadata } }), signal: abortRef.current?.signal });
+    const body = await requestApi("/v1/agent/turn", { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", conversation_id: conversationId ?? undefined, session_id: sessionId ?? undefined, message: text, address: wallet?.address || appWallet.evmAddress.trim() || undefined, chain: wallet?.chain, ...appContext, metadata: { ...(wallet ? { wallet_chain_id: wallet.chainId } : {}), ...extraMetadata } }), signal: abortRef.current?.signal });
     setConversationId(body.conversation_id); setSessionId(body.session_id ?? sessionId); log("API POST /v1/agent/turn", body); await readStream(body.run_id, true, requestStartedAt);
     if (display) setMessages((current) => [...current, { role: "system", content: "联调检查完成。" }]);
   }
@@ -765,8 +781,8 @@ export default function Home() {
       {cardApproval && <section className="card" data-card-kind="approval"><h3>需要 Approve 授权</h3><p>请确认授权额度，浏览器钱包会在本地弹窗签名。</p><pre className="debug">{JSON.stringify(cardApproval, null, 2)}</pre>{interactive && <button disabled={Boolean(actionLoading) || busy} onClick={() => void approveSwap()}>{actionLoading === "approve" ? <><i className="loading-spinner" />处理中…</> : "钱包签名并广播 Approve"}</button>}</section>}
       {cardTransaction && <section className="card" data-card-kind="transaction"><h3>{cardPendingKind === "transfer" ? "转账交易已准备好" : "兑换交易已准备好"}</h3><p>{cardPendingKind === "transfer" ? "请确认收款地址和金额，钱包会在当前转账链本地签名并广播。" : "请在钱包中确认未签名交易。"}</p><pre className="debug">{JSON.stringify(cardTransaction, null, 2)}</pre>{interactive && <div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void broadcastPendingTransaction()}>{actionLoading === "broadcast" ? <><i className="loading-spinner" />处理中…</> : `钱包签名并广播${cardPendingKind === "transfer" ? "转账" : " Swap"}`}</button>{cardPendingKind === "transfer" && broadcastHash && <button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void queryPendingTransaction()}>{actionLoading === "transaction-status" ? <><i className="loading-spinner" />处理中…</> : "查询交易状态"}</button>}</div>}</section>}
       {cardTokenCandidates.length > 0 && <section className="card" data-card-kind="tokens"><h3>请选择 Token</h3><div className="card-actions">{cardTokenCandidates.map((item, index) => interactive ? <button className="secondary" key={`${item.address}-${index}`} onClick={() => void chooseToken(item)}>{index + 1}. {item.symbol} · {item.chain} · {String(item.address).slice(0, 8)}…</button> : <span key={`${item.address}-${index}`}>{index + 1}. {item.symbol} · {item.chain}</span>)}</div></section>}
-      {artifacts.wallet && <section className="card" data-card-kind="wallet"><h3>钱包余额</h3><pre className="debug">{JSON.stringify(artifacts.wallet, null, 2)}</pre></section>}
-      {artifacts.portfolio && <section className="card" data-card-kind="portfolio"><h3>资产组合</h3><pre className="debug">{JSON.stringify(artifacts.portfolio, null, 2)}</pre></section>}
+      {artifacts.wallet && !artifacts.portfolio && <section className="card" data-card-kind="wallet"><h3>钱包余额</h3><pre className="debug">{JSON.stringify(artifacts.wallet, null, 2)}</pre></section>}
+      {artifacts.portfolio && <PortfolioCard portfolio={artifacts.portfolio} />}
       {artifacts.price && <section className="card" data-card-kind="price"><h3>价格与市场数据</h3><pre className="debug">{JSON.stringify(artifacts.price, null, 2)}</pre></section>}
       {artifacts.assetValue && <section className="card" data-card-kind="asset-value"><h3>资产估值</h3><p>{responseMessage(artifacts.assetValue)}</p><pre className="debug">{JSON.stringify(artifacts.assetValue, null, 2)}</pre></section>}
       {artifacts.gas && <section className="card" data-card-kind="gas"><h3>Gas 检查</h3><pre className="debug">{JSON.stringify(artifacts.gas, null, 2)}</pre></section>}
@@ -782,6 +798,7 @@ export default function Home() {
     <header className="app-header"><div className="brand"><span className="brand-mark">W</span><div><h1>Wallet Agent</h1><p>智能钱包操作台 · 安全地查询、报价与准备交易</p></div></div><div className="wallet-bar"><span className={`wallet-status ${wallet ? "connected" : ""}`}><i />{wallet ? `${wallet.chain} · ${wallet.address.slice(0, 6)}…${wallet.address.slice(-4)}` : "未连接钱包"}</span><input className="token" type="password" placeholder="Bearer token（可选）" value={token} onChange={(event) => setToken(event.target.value)} /><button onClick={() => void connectWallet()}>{wallet ? "重新连接" : "连接钱包"}</button><button className="secondary" onClick={() => void refreshSession()}>刷新</button><button className="secondary" onClick={() => { setHistoryOpen(!historyOpen); if (!historyOpen) void loadHistory(); }}>历史</button></div></header>
     <div className="workspace">
       <section className="main-column">
+        <details className="panel app-wallet-config" data-testid="app-wallet-config"><summary>模拟钱包 App · {appContext.supported_networks.length} 个网络 · {appContext.wallet_accounts.length} 个账户</summary><fieldset disabled={busy || Boolean(actionLoading)}><legend>App 支持的网络</legend><div className="network-options">{APP_NETWORKS.map((chain) => <label key={chain}><input type="checkbox" checked={appWallet.networks.includes(chain)} onChange={(event) => setAppWallet((config) => ({ ...config, networks: event.target.checked ? [...config.networks, chain] : config.networks.filter((item) => item !== chain) }))} />{chain}</label>)}</div><div className="account-inputs"><label>EVM 公共地址（六条 EVM 网络共享）<input aria-label="EVM 公共地址" value={appWallet.evmAddress} placeholder={wallet?.address || "0x…，留空使用已连接钱包"} onChange={(event) => setAppWallet((config) => ({ ...config, evmAddress: event.target.value }))} /></label><label>BTC 公共地址（可多行，包含收款和找零地址）<textarea aria-label="BTC 公共地址" value={appWallet.btcAddresses} placeholder="bc1… / 1… / 3…，每行一个" onChange={(event) => setAppWallet((config) => ({ ...config, btcAddresses: event.target.value }))} /></label><label>TRON 公共地址<input aria-label="TRON 公共地址" value={appWallet.tronAddress} placeholder="T…" onChange={(event) => setAppWallet((config) => ({ ...config, tronAddress: event.target.value }))} /></label><label>Solana 公共地址<input aria-label="Solana 公共地址" value={appWallet.solanaAddress} onChange={(event) => setAppWallet((config) => ({ ...config, solanaAddress: event.target.value }))} /></label></div><p className="muted">余额查询使用以上网络和公共地址；未提供地址的网络会显示“未提供地址”。BTC 仅统计所填地址，不能据此推断整个 HD 钱包余额。配置保存在此浏览器。</p></fieldset></details>
         {historyOpen && <section className="panel"><div className="toolbar"><button className="secondary" onClick={() => void loadHistory()}>重新加载</button><button className="secondary" onClick={startNew}>新建对话</button></div><div className="list">{conversations.length === 0 ? <p className="muted">暂无已保存的对话。</p> : conversations.map((item) => <div key={item.conversation_id} className="conversation"><button onClick={() => void loadConversation(item.conversation_id)}><strong>{item.summary}</strong><span>{new Date(item.updated_at).toLocaleString()} · {item.status}</span></button><button className="danger delete" onClick={() => void removeConversation(item.conversation_id)}>删除</button></div>)}</div></section>}
         <section className="action-strip"><span>工具</span><button className="secondary" onClick={() => void runDebugSmoke()}>联调检查</button><button className="secondary" onClick={() => void runAgentTests()}>测试全部 Agent 功能</button></section>
         <div ref={messagesRef} id="messages">

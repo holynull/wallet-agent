@@ -57,7 +57,49 @@ curl -sS -X POST http://localhost:8000/v1/agent/turn \
 }
 ```
 
-### 读取 SSE
+### 钱包 App 的多链余额上下文（包含 BTC）
+
+App 每次调用 `/v1/agent/turn` 时，应提供完整的 `supported_networks` 和 `wallet_accounts`。
+`chain` / `address` 仍表示当前签名钱包；余额查询的默认范围来自 App 配置，不受当前签名网络限制。
+
+```json
+{
+  "user_id": "demo-user",
+  "message": "我的全部余额",
+  "chain": "ETH",
+  "address": "0x1111111111111111111111111111111111111111",
+  "supported_networks": ["ETH", "BSC", "BASE", "POLYGON", "ARBITRUM", "OPTIMISM", "BTC", "TRON", "SOLANA"],
+  "wallet_accounts": [
+    {"chain": "ETH", "address": "0x1111111111111111111111111111111111111111"},
+    {"chain": "BASE", "address": "0x1111111111111111111111111111111111111111"},
+    {"chain": "BTC", "address": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"},
+    {"chain": "BTC", "address": "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"}
+  ]
+}
+```
+
+这些是格式示例公共地址。EVM 地址即使相同，也应为每个 App 支持的网络显式添加账户记录；每个网络允许多个账户。
+BTC 支持主网 Base58Check、SegWit 和 Taproot 地址，OKX chainIndex 为 `0`，精度为 8。
+BTC 钱包需由 App 提供全部相关收款和找零地址；单个地址或少量地址的余额不能代表整个 HD 钱包。
+当前能力是地址余额查询，不包含 BTC 签名或广播。仅发送公共地址，不能发送助记词、私钥或 xprv。
+
+两个字段分别最多支持 50 个网络和 100 条账户记录，重复的网络/地址不会重复计算。
+缺省字段兼容旧客户端：单个 EVM 地址默认查询服务支持的 EVM 网络；不跨地址家族推断账户。
+显式 `[]` 会清空相应配置，防止历史账户被继续使用；App 应始终同时发送两个完整字段。
+明确询问某条网络只查该网络，仅问某个币种则对所有配置网络按币种过滤，意图由 LLM 根据上下文解释。
+
+工具数据与最终回复的 `response.portfolio` 包含：
+
+- `assets`：完整资产明细，已知美元价值大于零的资产全部保留；价格未知的正余额也保留并标注。
+- `total_usd_value`：同一份返回明细中已知美元价值的合计，不混用 Provider 另一接口的总值。
+- `complete`：网络和账户是否全部查询成功；`valuation_complete` 表示所有明细是否都有价格。
+- `network_status`：逐链的 `success`、`partial`、`failed`、`missing_address`、`invalid_address` 或 `unsupported`，以及逐账户结果。
+
+逐链/逐地址有界并发、超时隔离，部分失败仍返回其他地址余额。未查询、缺失地址与查询失败都不能视为零余额。
+Demo 顶部“模拟钱包 App”可配置上述网络和地址，配置保存在浏览器；余额卡片紧跟回复并随历史恢复。
+极小非零美元价值显示 `<0.01`，没有截断明细行。
+
+### 读取 SSE 事件
 
 ```bash
 curl -N http://localhost:8000/v1/agent/stream/<run-id>

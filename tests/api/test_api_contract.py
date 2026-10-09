@@ -636,6 +636,57 @@ async def test_turn_forwards_public_wallet_context_and_reuses_session_id():
 
 
 @pytest.mark.asyncio
+async def test_app_networks_and_accounts_are_forwarded_and_explicit_empty_clears_scope():
+    class Graph:
+        inputs = []
+
+        async def astream(self, value, *, config, stream_mode):
+            self.inputs.append(value)
+            yield {"response": {"kind": "react", "message": "余额"}}
+
+        def get_state(self, _config):
+            class Snapshot:
+                values = {"response": {"kind": "react", "message": "余额"}}
+                tasks = ()
+                next = ()
+            return Snapshot()
+
+    graph = Graph()
+    app, client = await client_for(graph=graph)
+    accounts = [{"chain": "BTC", "address": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"}]
+    async with client:
+        first = await client.post("/v1/agent/turn", json={"user_id": "alice", "message": "全部余额",
+            "supported_networks": ["ETH", "BTC"], "wallet_accounts": accounts})
+        assert first.status_code == 200
+        await app.state.runs[first.json()["run_id"]]["task"]
+        second = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "message": "余额",
+                "conversation_id": first.json()["conversation_id"],
+                "supported_networks": [],
+                "wallet_accounts": [],
+            },
+        )
+        assert second.status_code == 200
+        await app.state.runs[second.json()["run_id"]]["task"]
+        invalid = await client.post(
+            "/v1/agent/turn",
+            json={
+                "message": "余额",
+                "wallet_accounts": [{"chain": "BTC", "address": "a", "private_key": "secret"}],
+            },
+        )
+        assert invalid.status_code == 422
+    assert graph.inputs[0]["wallet_context"] == {
+        "supported_networks": ["ETH", "BTC"],
+        "wallet_accounts": accounts,
+    }
+    assert graph.inputs[1]["wallet_context"] == {"supported_networks": [], "wallet_accounts": []}
+
+
+@pytest.mark.asyncio
 async def test_automatic_swap_prepare_continuation_preserves_active_task():
     class QuoteGraph:
         def __init__(self):

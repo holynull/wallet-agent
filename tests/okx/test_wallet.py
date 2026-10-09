@@ -10,6 +10,43 @@ ADDRESS = "0x" + "1" * 40
 TO = "0x" + "2" * 40
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "chain,symbol,index,amount,raw",
+    [
+        ("POLYGON", "POL", "137", "64.059133743331460466", "64059133743331460466"),
+        ("BTC", "BTC", "0", "0.00000123", "123"),
+    ],
+)
+async def test_native_pol_and_btc_balances_resolve_precision_without_metadata(
+    chain, symbol, index, amount, raw
+):
+    client = FakeClient(
+        {
+            "/api/v6/dex/balance/all-token-balances-by-address": {
+                "code": "0",
+                "data": [
+                    {
+                        "tokenAssets": [
+                            {
+                                "chainIndex": index,
+                                "symbol": symbol,
+                                "balance": amount,
+                                "rawBalance": raw,
+                                "tokenContractAddress": "",
+                                "tokenPrice": "1",
+                            }
+                        ]
+                    }
+                ],
+            }
+        }
+    )
+    balances = await OkxWalletAdapter(client, {chain: index}).get_token_balances(ADDRESS, [index])
+    assert balances[0].amount_raw == raw
+    assert balances[0].amount == Decimal(amount)
+
+
 class FakeClient:
     def __init__(self, responses=None, error=None):
         self.responses = responses or {}
@@ -21,6 +58,73 @@ class FakeClient:
         if self.error:
             raise self.error
         return self.responses[path]
+
+
+@pytest.mark.asyncio
+async def test_partial_snapshot_keeps_valid_tokens_and_strict_api_still_rejects_bad_record():
+    client = FakeClient(
+        {
+            "/api/v6/dex/balance/all-token-balances-by-address": {
+                "code": "0",
+                "data": [
+                    {
+                        "tokenAssets": [
+                            {
+                                "chainIndex": "137",
+                                "symbol": "POL",
+                                "balance": "1",
+                                "rawBalance": "1000000000000000000",
+                                "tokenPrice": "1",
+                            },
+                            {
+                                "chainIndex": "137",
+                                "symbol": "BROKEN",
+                                "tokenContractAddress": "0x" + "2" * 40,
+                                "decimals": "6",
+                                "balance": "1",
+                                "rawBalance": "abc",
+                            },
+                        ]
+                    }
+                ],
+            }
+        }
+    )
+    adapter = OkxWalletAdapter(client, {"POLYGON": "137"})
+    snapshot = await adapter.get_balance_snapshot(ADDRESS, ["137"])
+    assert len(snapshot["balances"]) == 1
+    assert snapshot["errors"] == [
+        {"chain": "POLYGON", "symbol": "BROKEN", "code": "OKX_MALFORMED_RESPONSE"}
+    ]
+    with pytest.raises(OkxWalletError):
+        await adapter.get_token_balances(ADDRESS, ["137"])
+
+
+@pytest.mark.asyncio
+async def test_btc_human_balance_without_raw_balance_uses_exact_satoshis():
+    client = FakeClient(
+        {
+            "/api/v6/dex/balance/all-token-balances-by-address": {
+                "code": "0",
+                "data": [
+                    {
+                        "tokenAssets": [
+                            {
+                                "chainIndex": "0",
+                                "symbol": "BTC",
+                                "balance": "0.00000123",
+                                "rawBalance": "",
+                                "tokenPrice": "60000",
+                            }
+                        ]
+                    }
+                ],
+            }
+        }
+    )
+    balances = await OkxWalletAdapter(client, {"BTC": "0"}).get_token_balances(ADDRESS, ["0"])
+    assert balances[0].amount_raw == "123"
+    assert balances[0].usd_value == Decimal("0.0738")
 
 
 @pytest.mark.asyncio
@@ -337,9 +441,7 @@ async def test_specific_balances_posts_selected_assets_in_batches():
         }
     )
     adapter = OkxWalletAdapter(client, {"ETH": "1"})
-    asset = Asset(
-        chain="ETH", symbol="USDC", decimals=6, address="0x" + "a" * 40
-    )
+    asset = Asset(chain="ETH", symbol="USDC", decimals=6, address="0x" + "a" * 40)
 
     balances = await adapter.get_specific_balances(ADDRESS, [asset])
 

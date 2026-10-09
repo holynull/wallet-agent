@@ -1,5 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+test("App context isolates address families and deduplicates BTC addresses", () => {
+  assert.deepEqual(buildWalletAppContext({ ...DEFAULT_APP_WALLET, networks: ["ETH", "BASE", "BTC", "TRON"], btcAddresses: "btc-a\nbtc-b btc-a" }, "0xevm"), {
+    supported_networks: ["ETH", "BASE", "BTC", "TRON"],
+    wallet_accounts: [{ chain: "ETH", address: "0xevm" }, { chain: "BASE", address: "0xevm" }, { chain: "BTC", address: "btc-a" }, { chain: "BTC", address: "btc-b" }],
+  });
+  assert.deepEqual(buildWalletAppContext({ ...DEFAULT_APP_WALLET, networks: [] }, "0xevm"), { supported_networks: [], wallet_accounts: [] });
+});
+
+test("nonzero dust remains visible and portfolio cards restore with chat history", () => {
+  assert.equal(formatBalanceUsd("0.0000001"), "<0.01");
+  assert.equal(formatBalanceUsd(null), "价格未知");
+  const portfolio = { assets: [{ asset: { chain: "BTC", symbol: "BTC" }, amount: "0.001" }], complete: false };
+  const response = { kind: "react", message: "部分余额", portfolio };
+  const artifacts = extractConversationArtifacts({ response });
+  const history = restoreConversationMessages([{ role: "assistant", content: "部分余额", artifacts }]);
+  assert.deepEqual(history[0].artifacts.portfolio, portfolio);
+});
 import {
   classifyAgentTest,
   apiErrorMessage,
@@ -18,6 +35,9 @@ import {
   restoreConversationMessages,
   sanitizeDebug,
   transactionChainId,
+  buildWalletAppContext,
+  DEFAULT_APP_WALLET,
+  formatBalanceUsd,
 } from "../lib/agent-utils.ts";
 
 test("maps confirmation API errors to distinct user-facing messages", () => {
@@ -212,7 +232,7 @@ test("restores generic ReAct tool results without guessing a business card kind"
       message: "ETH 当前价格约为 1800 美元。",
       react_results: [
         { tool: "price_lookup", result: { ok: true, usd_price: "1800" } },
-        { tool: "get_swap_quote", result: { ok: true, quotes: [{ provider_reference: "q1" }] } },
+        { tool: "get_swap_quote", result: { ok: true, quotes: [{ provider_reference: "q1", input_amount: "1", expected_output: "2" }] } },
       ],
     },
     model_trace: [{ role: "react_agent", model_id: "deepseek-chat" }],
@@ -220,9 +240,9 @@ test("restores generic ReAct tool results without guessing a business card kind"
 
   assert.deepEqual(artifacts?.reactResults, [
     { tool: "price_lookup", result: { ok: true, usd_price: "1800" } },
-    { tool: "get_swap_quote", result: { ok: true, quotes: [{ provider_reference: "q1" }] } },
+    { tool: "get_swap_quote", result: { ok: true, quotes: [{ provider_reference: "q1", input_amount: "1", expected_output: "2" }] } },
   ]);
-  assert.deepEqual(artifacts?.quotes, [{ provider_reference: "q1" }]);
+  assert.deepEqual(artifacts?.quotes, [{ provider_reference: "q1", input_amount: "1", expected_output: "2" }]);
   assert.equal(formatResponseSummary({ kind: "react", message: "ETH 当前价格约为 1800 美元。" }), "ETH 当前价格约为 1800 美元。");
 });
 

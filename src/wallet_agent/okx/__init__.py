@@ -6,6 +6,7 @@ from .explorer import OkxExplorerAdapter, OkxExplorerError
 from .wallet import OkxWalletAdapter, OkxWalletError
 
 OKX_CHAIN_INDEX_BY_NAME = {
+    "BTC": "0",
     "ETH": "1",
     "BSC": "56",
     "POLYGON": "137",
