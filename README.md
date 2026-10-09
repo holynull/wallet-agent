@@ -104,7 +104,8 @@ starts. The Demo calls the API at `http://localhost:8000`, streams agent
 progress and model/tool traces, and keeps wallet interaction in the browser.
 The API no longer serves a legacy `/demo/` page.
 
-Demo/API 调用示例见 [docs/demo-api-guide.md](docs/demo-api-guide.md)，钱包集成说明见
+Demo/API 调用示例见 [docs/demo-api-guide.md](docs/demo-api-guide.md)，App 端接入指南见
+[docs/app-integration.md](docs/app-integration.md)，钱包集成说明见
 [docs/mobile-integration.md](docs/mobile-integration.md)。
 
 For a command-line check after startup:
