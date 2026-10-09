@@ -165,3 +165,32 @@ async def test_split_router_resumes_lifecycle_interrupt_after_rebuild():
 
     assert resumed["pending_transaction"]["to"] == "0xrouter"
     assert provider.prepare_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_router_reads_lifecycle_checkpoint_when_confirmation_is_pending():
+    from types import SimpleNamespace
+
+    from wallet_agent.graph.build import GraphRouter
+
+    class StateGraph:
+        def __init__(self, state):
+            self.state = state
+
+        async def aget_state(self, _config):
+            return self.state
+
+        def get_state(self, _config):
+            return self.state
+
+    conversation_state = SimpleNamespace(next=(), tasks=(), values={"graph_role": "conversation"})
+    lifecycle_state = SimpleNamespace(
+        next=("confirmation_wait",),
+        tasks=(SimpleNamespace(interrupts=(SimpleNamespace(value={"kind": "confirmation_required"}),)),),
+        values={"confirmation_state": {"status": "requested"}, "graph_role": "lifecycle"},
+    )
+    router = GraphRouter(StateGraph(conversation_state), StateGraph(lifecycle_state), model=None)
+
+    state = await router.aget_state({"configurable": {"thread_id": "pending-confirmation"}})
+
+    assert state is lifecycle_state

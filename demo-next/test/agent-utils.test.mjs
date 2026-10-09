@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   classifyAgentTest,
+  apiErrorMessage,
   buildReadOnlyTimeline,
   extractConversationArtifacts,
   extractReadOnlyTrace,
@@ -18,6 +19,13 @@ import {
   sanitizeDebug,
   transactionChainId,
 } from "../lib/agent-utils.ts";
+
+test("maps confirmation API errors to distinct user-facing messages", () => {
+  assert.equal(apiErrorMessage({ detail: { code: "CONFIRMATION_EXPIRED", message: "expired" } }), "这份兑换报价已过期，请重新获取报价。");
+  assert.equal(apiErrorMessage({ detail: { code: "CONFIRMATION_NOT_PENDING", message: "changed" } }), "当前兑换确认状态已变化，正在刷新状态，请稍后重试。");
+  assert.equal(apiErrorMessage({ detail: { code: "CONFIRMATION_RESUME_NOOP", message: "noop" } }), "确认请求没有推进，兑换状态可能已更新，请刷新后重试。");
+  assert.equal(apiErrorMessage({ detail: { code: "OTHER", message: "其他错误" } }), "其他错误");
+});
 
 test("formats processing duration for an active request", () => {
   assert.equal(formatProcessingDuration(0), "0 ms");

@@ -49,6 +49,33 @@ class GraphRouter:
     def _select(self, value: Any) -> Any:
         return self.lifecycle_graph if self._is_lifecycle_input(value) else self.conversation_graph
 
+    @staticmethod
+    def _has_pending_lifecycle_work(state: Any) -> bool:
+        """Identify a lifecycle checkpoint that must own the next resume.
+
+        Split graphs share a checkpointer, but LangGraph keeps each compiled
+        graph's pending tasks in its own checkpoint namespace.  Reading only
+        the conversation graph can therefore hide a confirmation interrupt
+        that is waiting in the lifecycle graph.
+        """
+        if not state:
+            return False
+        if tuple(getattr(state, "next", ()) or ()):
+            return True
+        return any(
+            bool(getattr(task, "interrupts", ()))
+            for task in (getattr(state, "tasks", ()) or ())
+        )
+
+    async def _state_graph(self, config: Any) -> Any:
+        conversation_state = await self.conversation_graph.aget_state(config)
+        lifecycle_state = await self.lifecycle_graph.aget_state(config)
+        return (
+            self.lifecycle_graph
+            if self._has_pending_lifecycle_work(lifecycle_state)
+            else self.conversation_graph
+        )
+
     async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
         graph = self._select(input)
         return await graph.ainvoke(input, config=config, **kwargs)
@@ -58,13 +85,22 @@ class GraphRouter:
         return graph.astream(input, config=config, **kwargs)
 
     def get_state(self, config: Any, **kwargs: Any) -> Any:
-        return self.conversation_graph.get_state(config, **kwargs)
+        conversation_state = self.conversation_graph.get_state(config, **kwargs)
+        lifecycle_state = self.lifecycle_graph.get_state(config, **kwargs)
+        if self._has_pending_lifecycle_work(lifecycle_state):
+            return lifecycle_state
+        return conversation_state
 
     async def aget_state(self, config: Any, **kwargs: Any) -> Any:
-        return await self.conversation_graph.aget_state(config, **kwargs)
+        conversation_state = await self.conversation_graph.aget_state(config, **kwargs)
+        lifecycle_state = await self.lifecycle_graph.aget_state(config, **kwargs)
+        if self._has_pending_lifecycle_work(lifecycle_state):
+            return lifecycle_state
+        return conversation_state
 
     async def aupdate_state(self, config: Any, values: Any, **kwargs: Any) -> Any:
-        return await self.conversation_graph.aupdate_state(config, values, **kwargs)
+        graph = await self._state_graph(config)
+        return await graph.aupdate_state(config, values, **kwargs)
 
     @property
     def checkpointer(self) -> Any:

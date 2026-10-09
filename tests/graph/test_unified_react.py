@@ -357,6 +357,155 @@ async def test_unified_react_keeps_swap_quotes_available_to_explicit_lifecycle_u
 
 
 @pytest.mark.asyncio
+async def test_react_swap_rejects_invalid_amount_mode_instead_of_treating_output_as_input():
+    from wallet_agent.graph.build import build_graph
+
+    class Model:
+        async def invoke_react(self, messages, tools):
+            if not any(isinstance(item, ToolMessage) for item in messages):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "invalid-mode",
+                            "name": "get_swap_quote",
+                            "args": {
+                                "source_symbol": "BNB",
+                                "destination_symbol": "ETH",
+                                "source_chain": "BSC",
+                                "destination_chain": "ETH",
+                                "output_amount": "0.004",
+                                "amount_mode": "output",
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(content="参数模式无效，请重新确认目标数量。")
+
+    result = await build_graph(model=Model()).ainvoke(
+        {"request": {"message": "bnb 兑换 10u 的 ETH"}},
+        config={"configurable": {"thread_id": "react-invalid-amount-mode"}},
+    )
+
+    tool_messages = [item for item in result["messages"] if isinstance(item, ToolMessage)]
+    assert tool_messages
+    assert '"code": "INVALID_AMOUNT_MODE"' in tool_messages[0].content
+    assert not result.get("quote_candidates")
+
+
+@pytest.mark.asyncio
+async def test_react_step_limit_keeps_latest_valid_quote_and_natural_language_answer():
+    from wallet_agent.graph.build import build_graph
+
+    source = Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18)
+    destination = Asset(chain="ETH", chain_id=1, symbol="ETH", decimals=18)
+    valid_quote = {
+        "provider": "bridgers",
+        "source_asset": source.model_dump(mode="json"),
+        "destination_asset": destination.model_dump(mode="json"),
+        "input_amount": "0.013548",
+        "input_amount_raw": "13548000000000000",
+        "expected_output": "0.003851",
+        "expected_output_raw": "3851000000000000",
+        "provider_reference": "valid-quote",
+    }
+
+    class Model:
+        async def invoke_react(self, messages, tools):
+            tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
+            if not tool_messages:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "valid-call",
+                            "name": "get_swap_quote",
+                            "args": {
+                                "source_symbol": "BNB",
+                                "destination_symbol": "ETH",
+                                "source_chain": "BSC",
+                                "destination_chain": "ETH",
+                                "input_amount": "0.013548",
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": f"repeat-{len(tool_messages)}",
+                        "name": "asset_discovery",
+                        "args": {"chain": "BSC", "search": f"OTHER-{len(tool_messages)}"},
+                    }
+                ],
+            )
+
+    class Provider:
+        provider_name = "bridgers"
+
+        async def list_assets(self, query):
+            if query.search == "BNB":
+                return [source]
+            return [destination] if query.chain == "ETH" else []
+
+        async def quote(self, request):
+            return NormalizedQuote.model_validate(valid_quote)
+
+    result = await build_graph(model=Model(), providers=[Provider()], max_react_steps=2).ainvoke(
+        {
+            "request": {"message": "bnb 兑换 10u 的 ETH"},
+            "wallet_context": {"address": WALLET, "chain": "BSC"},
+        },
+        config={"configurable": {"thread_id": "react-limit-preserves-quote"}},
+    )
+
+    assert result["response"]["route_reason"] == "react_step_limit_with_result"
+    assert "有限次数" not in result["response"]["message"]
+    assert result["quote_candidates"][0]["provider_reference"] == "valid-quote"
+
+
+def test_react_quote_projection_ignores_zero_output_quote():
+    from wallet_agent.graph.nodes import _best_react_quote_result
+
+    result = _best_react_quote_result(
+        [
+            (
+                "get_swap_quote",
+                {
+                    "ok": True,
+                    "quotes": [
+                        {
+                            "provider": "bridgers",
+                            "provider_reference": "zero",
+                            "input_amount": "1",
+                            "expected_output": "0",
+                        }
+                    ],
+                },
+            ),
+            (
+                "get_swap_quote",
+                {
+                    "ok": True,
+                    "quotes": [
+                        {
+                            "provider": "omnibridge",
+                            "provider_reference": "valid",
+                            "input_amount": "0.013548",
+                            "expected_output": "0.0039",
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+
+    assert result is not None
+    assert [item["provider_reference"] for item in result["quotes"]] == ["valid"]
+
+
+@pytest.mark.asyncio
 async def test_unified_react_tool_loop_stops_after_bounded_unique_calls():
     from wallet_agent.graph.build import build_graph
 

@@ -1,7 +1,7 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
-import { buildReadOnlyTimeline, classifyAgentTest, ConversationArtifacts, extractConversationArtifacts, extractReadOnlyTrace, formatModelTraceEntry, formatProcessingDuration, formatResponseSummary, latestProgressText, mergeModelTrace, parseSseFrame, parseSseFrames, providerPriority as getProviderPriority, ReadOnlyTrace, responseMessage, restoreConversationMessages, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
+import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
+import { apiErrorMessage, buildReadOnlyTimeline, classifyAgentTest, ConversationArtifacts, extractConversationArtifacts, extractReadOnlyTrace, formatModelTraceEntry, formatProcessingDuration, formatResponseSummary, latestProgressText, mergeModelTrace, parseSseFrame, parseSseFrames, providerPriority as getProviderPriority, ReadOnlyTrace, responseMessage, restoreConversationMessages, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
 
 type Message = { id?: string; role: "user" | "assistant" | "system"; content: string; fullContent?: string; typing?: boolean; suggestions?: any[]; artifacts?: ConversationArtifacts; responseKey?: string };
 type ProgressEntry = { text: string; elapsed?: number; model?: ModelTraceEntry };
@@ -27,6 +27,116 @@ type WalletShape = { address: string; chain: string };
 
 const API_BASE = process.env.NEXT_PUBLIC_AGENT_API_URL ?? "http://localhost:8000";
 const walletShape = {} as WalletShape;
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const result: ReactNode[] = [];
+  const pattern = /(\[[^\]]+\]\((https?:\/\/[^\s)]+)\)|`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_)/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+  const appendText = (value: string) => {
+    value.split("\n").forEach((line, index) => {
+      if (index > 0) result.push(<br key={`br-${key++}`} />);
+      if (line) result.push(line);
+    });
+  };
+  while ((match = pattern.exec(text)) !== null) {
+    appendText(text.slice(cursor, match.index));
+    const token = match[0];
+    if (token.startsWith("[")) {
+      const link = token.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+      if (link) result.push(<a key={`link-${key++}`} href={link[2]} target="_blank" rel="noreferrer">{link[1]}</a>);
+    } else if (token.startsWith("`")) {
+      result.push(<code key={`code-${key++}`}>{token.slice(1, -1)}</code>);
+    } else if (token.startsWith("**") || token.startsWith("__")) {
+      result.push(<strong key={`strong-${key++}`}>{token.slice(2, -2)}</strong>);
+    } else {
+      result.push(<em key={`em-${key++}`}>{token.slice(1, -1)}</em>);
+    }
+    cursor = match.index + token.length;
+  }
+  appendText(text.slice(cursor));
+  return result;
+}
+
+function markdownCells(line: string): string[] {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+function isMarkdownTableSeparator(line: string): boolean {
+  const cells = markdownCells(line);
+  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function renderMarkdown(content: string): JSX.Element {
+  const lines = String(content || "").replace(/\r\n?/g, "\n").split("\n");
+  const blocks: ReactNode[] = [];
+  let index = 0;
+  let key = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (/^\s*```/.test(line)) {
+      const language = line.trim().slice(3).trim();
+      const code: string[] = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```/.test(lines[index])) code.push(lines[index++]);
+      if (index < lines.length) index += 1;
+      blocks.push(<pre className="markdown-code" key={`code-block-${key++}`}><code data-language={language || undefined}>{code.join("\n")}</code></pre>);
+      continue;
+    }
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+    const heading = line.match(/^\s*(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      const Heading = `h${heading[1].length}` as keyof JSX.IntrinsicElements;
+      blocks.push(<Heading key={`heading-${key++}`}>{renderInlineMarkdown(heading[2])}</Heading>);
+      index += 1;
+      continue;
+    }
+    if (index + 1 < lines.length && line.includes("|") && isMarkdownTableSeparator(lines[index + 1])) {
+      const headers = markdownCells(line);
+      const rows: string[][] = [];
+      index += 2;
+      while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
+        rows.push(markdownCells(lines[index++]));
+      }
+      blocks.push(<div className="markdown-table-wrap" key={`table-${key++}`}><table><thead><tr>{headers.map((cell, cellIndex) => <th key={`th-${cellIndex}`}>{renderInlineMarkdown(cell)}</th>)}</tr></thead><tbody>{rows.map((row, rowIndex) => <tr key={`tr-${rowIndex}`}>{headers.map((_header, cellIndex) => <td key={`td-${rowIndex}-${cellIndex}`}>{renderInlineMarkdown(row[cellIndex] || "")}</td>)}</tr>)}</tbody></table></div>);
+      continue;
+    }
+    const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
+    if (unordered) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = lines[index].match(/^\s*[-*+]\s+(.+)$/);
+        if (!item) break;
+        items.push(item[1]);
+        index += 1;
+      }
+      blocks.push(<ul key={`ul-${key++}`}>{items.map((item, itemIndex) => <li key={`li-${itemIndex}`}>{renderInlineMarkdown(item)}</li>)}</ul>);
+      continue;
+    }
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (ordered) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = lines[index].match(/^\s*\d+[.)]\s+(.+)$/);
+        if (!item) break;
+        items.push(item[1]);
+        index += 1;
+      }
+      blocks.push(<ol key={`ol-${key++}`}>{items.map((item, itemIndex) => <li key={`li-${itemIndex}`}>{renderInlineMarkdown(item)}</li>)}</ol>);
+      continue;
+    }
+    const paragraph: string[] = [line];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !/^\s*(#{1,6})\s+/.test(lines[index]) && !/^\s*```/.test(lines[index]) && !/^\s*[-*+]\s+/.test(lines[index]) && !/^\s*\d+[.)]\s+/.test(lines[index])) paragraph.push(lines[index++]);
+    blocks.push(<p key={`p-${key++}`}>{renderInlineMarkdown(paragraph.join("\n"))}</p>);
+  }
+  return <div className="markdown">{blocks}</div>;
+}
+
 function agentSwapMetadata(address: string) {
   return { swap_request: {
     source_asset: { chain: "BASE", chain_id: 8453, symbol: "USDC", decimals: 6, address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" },
@@ -54,7 +164,11 @@ const AGENT_TESTS: AgentTest[] = [
 async function requestApi(path: string, options?: RequestInit) {
   const response = await fetch(`${API_BASE}${path}`, options);
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(JSON.stringify(body));
+  if (!response.ok) {
+    const error = new Error(apiErrorMessage(body));
+    (error as Error & { apiBody?: unknown }).apiBody = body;
+    throw error;
+  }
   return body;
 }
 
@@ -177,13 +291,22 @@ export default function Home() {
     setMessages((current) => [...current, {
       id,
       role: "assistant",
-      content: content.slice(0, 1),
+      content,
       fullContent: content,
       typing: content.length > 1,
       suggestions,
       artifacts: artifacts || undefined,
       responseKey,
     }]);
+  }
+  function confirmationKey(value: any) {
+    return value?.payload_hash || value?.provider_reference || value?.quote?.provider_reference || [value?.task_id, value?.task_revision, value?.summary?.provider_reference].filter(Boolean).join(":") || JSON.stringify({
+      provider: value?.summary?.provider,
+      input_amount: value?.summary?.input_amount,
+      source: value?.summary?.source_asset?.symbol,
+      destination: value?.summary?.destination_asset?.symbol,
+      expected_output: value?.summary?.expected_output,
+    });
   }
   function startNew() { clearConversationState(); setAgentTests({}); setDebug([]); setMessages([{ role: "assistant", content: "你好，我可以帮你查询余额、比较兑换报价，并准备未签名交易。告诉我你想做什么。" }]); }
   function chainName(id: string) { return ({ "0x1": "ETH", "0x38": "BSC", "0x89": "POLYGON", "0xa": "OPTIMISM", "0x2105": "BASE", "0xa4b1": "ARBITRUM" } as Record<string, string>)[id.toLowerCase()] ?? `EVM(${id})`; }
@@ -430,7 +553,20 @@ export default function Home() {
   async function confirmSwap(approved: boolean) {
     if (!sessionId) return;
     await runCardAction(approved ? "confirm" : "cancel-confirmation", approved ? "正在确认兑换" : "正在取消兑换", async () => {
-      try { const body = await requestApi(`/v1/swap/${sessionId}/confirm`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", approved }) }); applyState(body); }
+      try {
+        const body = await requestApi(`/v1/swap/${sessionId}/confirm`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ user_id: "browser-demo", approved }) });
+        log("CONFIRM RESPONSE", body);
+        applyState(body);
+        const response = body?.response?.response || body?.response || body;
+        const kind = response?.kind || body?.stage || body?.status;
+        if (kind === "approval_required" || body?.stage === "approval_required") {
+          setMessages((current) => [...current, { role: "system", content: "兑换已确认，需要先完成 Token Approve 授权。" }]);
+        } else if (kind === "swap_prepare" || body?.pending_transaction) {
+          setMessages((current) => [...current, { role: "system", content: "兑换已确认，交易已准备好，请在钱包中签名。" }]);
+        } else if (response?.message) {
+          setMessages((current) => [...current, { role: "system", content: String(response.message) }]);
+        }
+      }
       catch (error) { setMessages((current) => [...current, { role: "assistant", content: `${approved ? "确认" : "取消"}兑换失败：${error instanceof Error ? error.message : String(error)}` }]); }
     });
   }
@@ -592,7 +728,13 @@ export default function Home() {
     return () => window.clearInterval(timer);
   }, [processing]);
   const lastAssistantIndex = messages.map((item) => item.role).lastIndexOf("assistant");
-  function renderConversationCards(artifacts: ConversationArtifacts, interactive: boolean) {
+  const activeConfirmationKey = confirmation?.status === "requested" ? confirmationKey(confirmation) : null;
+  const confirmationIndexes = new Map<string, number>();
+  messages.forEach((messageItem, messageIndex) => {
+    const candidate = messageItem.role === "assistant" ? messageItem.artifacts?.confirmation : null;
+    if (candidate?.status === "requested") confirmationIndexes.set(confirmationKey(candidate), messageIndex);
+  });
+  function renderConversationCards(artifacts: ConversationArtifacts, interactive: boolean, showConfirmation = true) {
     const cardQuotes = artifacts.quotes || [];
     const cardConfirmation = artifacts.confirmation;
     const cardPreflight = artifacts.preflight;
@@ -618,7 +760,7 @@ export default function Home() {
     };
     return <>
       {cardQuotes.length > 0 && <section className="card" data-card-kind="quotes"><h3>报价列表</h3>{cardQuotes.map((quote: Quote) => <div className="quote" key={quote.provider_reference}><strong>{quote.provider} · {quote.provider_reference}</strong><span>{quote.input_amount} {quote.source_asset?.symbol} → {quote.expected_output} {quote.destination_asset?.symbol}</span>{interactive && <button className="secondary" disabled={!quote.provider_reference || Boolean(actionLoading) || busy} onClick={() => void selectQuote(quote.provider_reference!)}>{actionLoading === `quote:${quote.provider_reference}` ? <><i className="loading-spinner" />处理中…</> : selectedQuote === quote.provider_reference ? "已选择" : "选择此报价"}</button>}</div>)}</section>}
-      {cardConfirmation?.status === "requested" && <section className="card" data-card-kind="confirmation"><h3>请确认兑换</h3><p>{cardConfirmation.summary?.input_amount} {cardConfirmation.summary?.source_asset?.symbol} → {cardConfirmation.summary?.expected_output} {cardConfirmation.summary?.destination_asset?.symbol}{cardConfirmation.summary?.provider ? `\nProvider：${cardConfirmation.summary.provider}` : ""}{cardConfirmation.expires_at ? `\n有效期至：${cardConfirmation.expires_at}` : ""}</p>{interactive && <div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void confirmSwap(true)}>{actionLoading === "confirm" ? <><i className="loading-spinner" />处理中…</> : "确认兑换"}</button><button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void confirmSwap(false)}>{actionLoading === "cancel-confirmation" ? <><i className="loading-spinner" />处理中…</> : "取消"}</button></div>}</section>}
+      {showConfirmation && cardConfirmation?.status === "requested" && <section className="card" data-card-kind="confirmation" data-confirmation-key={confirmationKey(cardConfirmation)}><h3>请确认兑换</h3><p>{cardConfirmation.summary?.input_amount} {cardConfirmation.summary?.source_asset?.symbol} → {cardConfirmation.summary?.expected_output} {cardConfirmation.summary?.destination_asset?.symbol}{cardConfirmation.summary?.provider ? `\nProvider：${cardConfirmation.summary.provider}` : ""}{cardConfirmation.expires_at ? `\n有效期至：${cardConfirmation.expires_at}` : ""}</p>{interactive && <div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void confirmSwap(true)}>{actionLoading === "confirm" ? <><i className="loading-spinner" />处理中…</> : "确认兑换"}</button><button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void confirmSwap(false)}>{actionLoading === "cancel-confirmation" ? <><i className="loading-spinner" />处理中…</> : "取消"}</button></div>}</section>}
       {cardPreflight && <section className="card" data-card-kind="preflight"><h3>{cardPreflight.ok ? "交易预检查通过" : "交易预检查未通过"}</h3><p>{cardPreflight.gas_sources ? `Gas 来源：${Object.entries(cardPreflight.gas_sources).map(([name, used]) => `${name}=${used === null || used === undefined ? "未返回" : used === "unavailable" ? "不可用" : used === "failed" ? "失败" : "成功"}`).join("、")}\n` : ""}{cardPreflight.simulation?.success === false ? `模拟警告：${cardPreflight.simulation.error || cardPreflight.simulation.failure_reason || cardPreflight.simulation.fail_reason || "simulation failed"}\n` : ""}{(cardPreflight.checks || []).map((item: any) => `${item.status === "passed" ? "✓" : item.status === "warning" ? "!" : "×"} ${item.message}`).join("\n")}</p></section>}
       {cardApproval && <section className="card" data-card-kind="approval"><h3>需要 Approve 授权</h3><p>请确认授权额度，浏览器钱包会在本地弹窗签名。</p><pre className="debug">{JSON.stringify(cardApproval, null, 2)}</pre>{interactive && <button disabled={Boolean(actionLoading) || busy} onClick={() => void approveSwap()}>{actionLoading === "approve" ? <><i className="loading-spinner" />处理中…</> : "钱包签名并广播 Approve"}</button>}</section>}
       {cardTransaction && <section className="card" data-card-kind="transaction"><h3>{cardPendingKind === "transfer" ? "转账交易已准备好" : "兑换交易已准备好"}</h3><p>{cardPendingKind === "transfer" ? "请确认收款地址和金额，钱包会在当前转账链本地签名并广播。" : "请在钱包中确认未签名交易。"}</p><pre className="debug">{JSON.stringify(cardTransaction, null, 2)}</pre>{interactive && <div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void broadcastPendingTransaction()}>{actionLoading === "broadcast" ? <><i className="loading-spinner" />处理中…</> : `钱包签名并广播${cardPendingKind === "transfer" ? "转账" : " Swap"}`}</button>{cardPendingKind === "transfer" && broadcastHash && <button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void queryPendingTransaction()}>{actionLoading === "transaction-status" ? <><i className="loading-spinner" />处理中…</> : "查询交易状态"}</button>}</div>}</section>}
@@ -643,7 +785,12 @@ export default function Home() {
         {historyOpen && <section className="panel"><div className="toolbar"><button className="secondary" onClick={() => void loadHistory()}>重新加载</button><button className="secondary" onClick={startNew}>新建对话</button></div><div className="list">{conversations.length === 0 ? <p className="muted">暂无已保存的对话。</p> : conversations.map((item) => <div key={item.conversation_id} className="conversation"><button onClick={() => void loadConversation(item.conversation_id)}><strong>{item.summary}</strong><span>{new Date(item.updated_at).toLocaleString()} · {item.status}</span></button><button className="danger delete" onClick={() => void removeConversation(item.conversation_id)}>删除</button></div>)}</div></section>}
         <section className="action-strip"><span>工具</span><button className="secondary" onClick={() => void runDebugSmoke()}>联调检查</button><button className="secondary" onClick={() => void runAgentTests()}>测试全部 Agent 功能</button></section>
         <div ref={messagesRef} id="messages">
-      {messages.map((item, index) => <div className="message-group" key={item.id || `${index}-${item.content}`}><div className={`message ${item.role}`}><div className="message-stack">{item.role !== "system" && <div className="bubble">{item.content}</div>}{item.suggestions?.length ? <div className="inline-suggestions"><span>建议操作</span><div className="card-actions">{item.suggestions.map((suggestion, suggestionIndex) => <button className="secondary" disabled={busy || Boolean(actionLoading)} key={`${suggestion.label || suggestion.message}-${suggestionIndex}`} onClick={() => void chooseSuggestion(suggestion.message || suggestion.label || "", suggestion.data)}>{busy || actionLoading ? <><i className="loading-spinner" />处理中…</> : suggestion.label || suggestion.message}</button>)}</div></div> : null}{item.role === "assistant" && item.artifacts && renderConversationCards(item.artifacts, index === lastAssistantIndex)}</div></div></div>)}
+      {messages.map((item, index) => {
+        const itemConfirmation = item.role === "assistant" ? item.artifacts?.confirmation : null;
+        const itemConfirmationKey = itemConfirmation?.status === "requested" ? confirmationKey(itemConfirmation) : null;
+        const showConfirmation = Boolean(itemConfirmationKey && activeConfirmationKey && itemConfirmationKey === activeConfirmationKey && confirmationIndexes.get(itemConfirmationKey) === index);
+        return <div className="message-group" key={item.id || `${index}-${item.content}`}><div className={`message ${item.role}`}><div className="message-stack">{item.role !== "system" && <div className="bubble">{renderMarkdown(item.content)}</div>}{item.suggestions?.length ? <div className="inline-suggestions"><span>建议操作</span><div className="card-actions">{item.suggestions.map((suggestion, suggestionIndex) => <button className="secondary" disabled={busy || Boolean(actionLoading)} key={`${suggestion.label || suggestion.message}-${suggestionIndex}`} onClick={() => void chooseSuggestion(suggestion.message || suggestion.label || "", suggestion.data)}>{busy || actionLoading ? <><i className="loading-spinner" />处理中…</> : suggestion.label || suggestion.message}</button>)}</div></div> : null}{item.role === "assistant" && item.artifacts && renderConversationCards(item.artifacts, index === lastAssistantIndex, showConfirmation)}</div></div></div>;
+      })}
         </div>
         <form className="composer" onSubmit={send}><div className="composer-row"><textarea onKeyDown={handleComposerKeyDown} value={message} onChange={(event) => setMessage(event.target.value)} placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled={busy || Boolean(actionLoading)} /><button disabled={busy || Boolean(actionLoading)}>{busy ? <><i className="loading-spinner" />处理中…</> : "发送"}</button></div><div className="toolbar"><span className="muted">{processing ? `${processing.label} · ${formatProcessingDuration(processingElapsed)}` : "就绪"}</span>{busy && <button type="button" className="secondary" onClick={cancelRequest}>取消请求</button>}{!busy && !actionLoading && lastMessage && <button type="button" className="secondary" onClick={() => void retryLastMessage()}>重试</button>}</div><div className="meta"><span>conversation: {conversationId ?? "新会话"}</span><span>session: {sessionId ?? "未创建"}</span></div></form>
       </section>

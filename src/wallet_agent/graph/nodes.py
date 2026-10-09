@@ -753,6 +753,56 @@ def latest_public_result(history: Any) -> dict[str, Any] | None:
     return None
 
 
+def _quote_is_usable(quote: Mapping[str, Any]) -> bool:
+    """Reject provider placeholders that are technically successful but unusable."""
+    try:
+        return (
+            Decimal(str(quote.get("input_amount"))) > 0
+            and Decimal(str(quote.get("expected_output"))) > 0
+            and bool(quote.get("provider_reference"))
+        )
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+
+
+def _best_react_quote_result(
+    tool_payloads: list[tuple[str, dict[str, Any]]]
+) -> dict[str, Any] | None:
+    """Select the latest valid request result without allowing zero-output probes to win."""
+    candidates: list[dict[str, Any]] = []
+    for name, payload in tool_payloads:
+        if name != "get_swap_quote" or not payload.get("ok"):
+            continue
+        quotes = [
+            dict(item)
+            for item in (payload.get("quotes") or [])
+            if isinstance(item, Mapping) and _quote_is_usable(item)
+        ]
+        if quotes:
+            candidates.append({**payload, "quotes": quotes})
+    return candidates[-1] if candidates else None
+
+
+def _valid_react_quotes(messages: list[Any]) -> list[dict[str, Any]]:
+    """Extract valid quote observations from the current ReAct transcript."""
+    result: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, ToolMessage) or str(message.name or "") != "get_swap_quote":
+            continue
+        try:
+            payload = json.loads(str(message.content))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, Mapping) or not payload.get("ok"):
+            continue
+        result.extend(
+            dict(item)
+            for item in (payload.get("quotes") or [])
+            if isinstance(item, Mapping) and _quote_is_usable(item)
+        )
+    return result
+
+
 def _model_conversation_history(history: Any, *, limit: int = 12) -> list[dict[str, Any]]:
     """Keep model context bounded while the full history remains checkpointed for the UI."""
     items = [item for item in (history or []) if isinstance(item, Mapping)]
@@ -3928,11 +3978,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 quote = await provider.quote(request_model)
             return {"ok": True, "quote": _dump(quote)}
         except Exception as exc:
+            retryable = bool(getattr(exc, "retryable", False))
+            category = getattr(exc, "category", None)
+            provider_code = getattr(exc, "code", None)
             return {
                 "ok": False,
                 "code": "PROVIDER_QUOTE_FAILED",
                 "error": str(exc),
                 "provider": str(provider_name),
+                "provider_code": str(provider_code) if provider_code else None,
+                "retryable": retryable,
+                "category": category,
             }
 
     transaction_tool_node = ToolNode([transaction_status_tool], name="transaction_tools")
@@ -5861,6 +5917,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "error": str(result["messages"][-1].content),
             }
         if not payload.get("ok"):
+            provider_error = {
+                "provider": str(name),
+                "code": payload.get("code", "TOOL_FAILED"),
+                "message": payload.get("error", "报价查询失败。"),
+                "retryable": payload.get("retryable", False),
+                "category": payload.get("category"),
+            }
             _emit_progress(
                 "quote_provider",
                 "failed",
@@ -5873,9 +5936,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "quote_candidates": [],
                 "errors": [
                     _error(
-                        payload.get("code", "TOOL_FAILED"),
-                        payload.get("error", "报价查询失败。"),
-                        details={"provider": name},
+                        "PROVIDER_QUOTE_FAILED",
+                        f"{name} 报价失败：{payload.get('error', '报价查询失败。')}",
+                        retryable=bool(payload.get("retryable")),
+                        details=provider_error,
                     )
                 ],
             }
@@ -7078,7 +7142,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "response": {
                     "kind": "error",
                     "errors": invalid_quotes
-                    or [_error("NO_VALID_QUOTES", "暂时没有可用的有效兑换报价。", retryable=True)],
+                    or [_error(
+                        "NO_VALID_QUOTES",
+                        "暂时没有可用的有效兑换报价。",
+                        retryable=True,
+                        details={"reason": "all_providers_returned_no_quote"},
+                    )],
                 },
             }
         previous_selected = _dump(state.get("selected_quote"))
@@ -8506,6 +8575,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         state: Annotated[dict[str, Any], InjectedState],
     ) -> dict[str, Any]:
         """Resolve human asset names and request one or all provider quotes."""
+        if amount_mode not in (None, "exact_in", "exact_out"):
+            return {
+                "ok": False,
+                "code": "INVALID_AMOUNT_MODE",
+                "error": "amount_mode 只能是 exact_in 或 exact_out。",
+            }
+        # A natural-language request such as “BNB 换 10u 的 ETH” does not
+        # identify the destination network. Never silently turn it into a
+        # same-chain token swap; that can produce provider errors or quote a
+        # different asset than the user intended.
         current = state
         context = current.get("wallet_context") or {}
         task_slots = (current.get("active_task") or {}).get("slots") or {}
@@ -8522,9 +8601,32 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "destination_token_address": destination_token_address,
             "slippage_bps": slippage_bps,
         }
+        # Preserve the user's fiat-target semantics when the model calls the
+        # tool directly. The lifecycle path performs this conversion later,
+        # but ReAct must not reinterpret “10u” as an input token amount.
+        if output_amount in (None, "") and input_amount in (None, ""):
+            message = str((current.get("request") or {}).get("message") or "")
+            fiat_hint = mentioned_fiat_value(message)
+            if fiat_hint is not None:
+                values["target_value_amount"] = fiat_hint[0]
+                values["target_value_currency"] = fiat_hint[1]
+                values["amount_mode"] = "exact_out"
         draft = {key: value for key, value in values.items() if value not in (None, "")}
+        if draft.get("target_value_amount") and not draft.get("destination_chain"):
+            return {
+                "ok": False,
+                "code": "DESTINATION_CHAIN_REQUIRED",
+                "missing_fields": ["destination_chain"],
+                "message": "请先确认目标资产所在的网络，才能按 10 USD 计算到账数量。",
+            }
         draft.setdefault("source_chain", context.get("chain"))
-        draft.setdefault("destination_chain", draft.get("source_chain"))
+        if not draft.get("destination_chain"):
+            return {
+                "ok": False,
+                "code": "DESTINATION_CHAIN_REQUIRED",
+                "missing_fields": ["destination_chain"],
+                "message": "请先确认目标资产所在的网络（例如以太坊主网或 BSC）。",
+            }
         draft.setdefault("sender_address", context.get("address"))
         draft.setdefault("recipient_address", context.get("address"))
         resolved, candidates, errors = await _resolve_swap_assets(draft, runtime.providers)
@@ -8558,7 +8660,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             result = await quote_tool_call(
                 {"provider_name": name, "swap_request": raw_request}
             )
-            quotes.extend(result.get("quote_candidates") or [])
+            quotes.extend(
+                item
+                for item in (result.get("quote_candidates") or [])
+                if isinstance(item, Mapping) and _quote_is_usable(item)
+            )
             provider_errors.extend(result.get("errors") or [])
         return {
             "ok": bool(quotes),
@@ -8921,6 +9027,24 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         messages = list(state.get("messages") or [])
         step = int(state.get("react_steps") or 0) + 1
         if step > runtime.max_react_steps:
+            previous = list(state.get("react_messages") or state.get("messages") or [])
+            valid_quotes = _valid_react_quotes(previous)
+            if valid_quotes:
+                return {
+                    "messages": [
+                        AIMessage(
+                            content=(
+                                "我已找到可用的兑换报价，请查看下方报价并选择一个继续。"
+                            )
+                        )
+                    ],
+                    "react_steps": step,
+                    "react_active": False,
+                    "react_step_limit_with_result": True,
+                    "graph_role": "conversation",
+                    "route_mode": "react",
+                    "route_reason": "react_step_limit_with_result",
+                }
             return {
                 "messages": [
                     AIMessage(
@@ -9010,17 +9134,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "route_reason": state.get("route_reason") or "model_answer",
         }
         update: dict[str, Any] = {"response": response, "react_active": False}
-        quote_result = next(
-            (
-                payload
-                for name, payload in reversed(tool_payloads)
-                if name == "get_swap_quote"
-                and payload.get("ok")
-                and isinstance(payload.get("quotes"), list)
-                and payload["quotes"]
-            ),
-            None,
-        )
+        quote_result = _best_react_quote_result(tool_payloads)
         if quote_result is not None:
             # These are tool observations, not a code-inferred intent. Project
             # them only so the existing explicit quote-selection endpoint can

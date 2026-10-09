@@ -22,6 +22,7 @@ from wallet_agent.domain.models import (
 from wallet_agent.graph.build import build_graph
 from wallet_agent.persistence import InMemorySessionStore, SwapSessionRecord
 from wallet_agent.providers.http import ProviderResponseError
+from wallet_agent.api.app import _interrupt_values
 
 
 class Model:
@@ -86,6 +87,26 @@ class StatusModel(Model):
         if value.get("message") == "怎么样了？":
             return {"intent": "swap_status"}
         return await super().ainvoke(value)
+
+
+def test_interrupt_values_infers_confirmation_from_checkpoint_values_when_task_interrupts_are_empty():
+    snapshot = SimpleNamespace(
+        next=("confirmation_wait",),
+        tasks=(),
+        values={"confirmation_state": {"status": "requested"}},
+    )
+
+    assert _interrupt_values(snapshot) == [{"kind": "confirmation_required"}]
+
+
+def test_interrupt_values_infers_approval_from_checkpoint_stage_when_task_interrupts_are_empty():
+    snapshot = SimpleNamespace(
+        next=("swap_allowance",),
+        tasks=(),
+        values={"authorization_stage": "approval_required"},
+    )
+
+    assert _interrupt_values(snapshot) == [{"kind": "approval_required"}]
 
 
 def authorization_quote(reference: str) -> NormalizedQuote:
@@ -173,6 +194,55 @@ async def test_select_quote_requires_confirmation_before_allowance_and_prepare()
     assert confirmed.json()["approval_transaction"]["data"].startswith("0x095ea7b3")
     assert adapter.allowance_calls == 1
     assert provider.prepare_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_split_graph_confirm_resumes_lifecycle_confirmation_checkpoint():
+    """The API must read the lifecycle graph before resuming confirmation."""
+    quote = authorization_quote("ref-split-confirm").model_copy(
+        update={"allowance_requirement": None}
+    )
+    adapter = Adapter()
+    provider = Provider()
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-split-confirm",
+            user_id="alice",
+            thread_id="t-split-confirm",
+            quote_candidates=[quote],
+        )
+    )
+    graph = build_graph(
+        model=Model(),
+        providers=[provider],
+        chains={"BASE": adapter},
+        split_graphs=True,
+    )
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        execution_observer=ExecutionObserver(ChainAdapterRegistry({"BASE": adapter})),
+        store=store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        selected = await client.post(
+            "/v1/swap/s-split-confirm/select-quote",
+            json={"user_id": "alice", "provider_reference": quote.provider_reference},
+        )
+        confirmed = await client.post(
+            "/v1/swap/s-split-confirm/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+
+    assert selected.status_code == 200
+    assert selected.json()["status"] == "awaiting_confirmation"
+    assert confirmed.status_code == 200
+    assert confirmed.json()["stage"] == "swap_ready"
+    assert provider.prepare_calls == 1
 
 
 @pytest.mark.asyncio

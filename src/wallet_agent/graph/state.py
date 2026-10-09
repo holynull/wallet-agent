@@ -195,6 +195,7 @@ class AgentState(TypedDict, total=False):
     graph_role: NotRequired[str]
     route_mode: NotRequired[str]
     route_reason: NotRequired[str]
+    react_step_limit_with_result: NotRequired[bool]
     react_tool_timings: NotRequired[list[dict[str, Any]]]
     conversation_history: Annotated[list[dict[str, Any]], _merge_conversation_history]
     route: NotRequired[str | None]

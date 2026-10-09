@@ -552,12 +552,32 @@ def _looks_like_swap(message: str) -> bool:
 
 
 def _interrupt_values(snapshot: Any) -> list[Any]:
-    if not getattr(snapshot, "next", ()):
-        return []
+    next_nodes = tuple(getattr(snapshot, "next", ()) or ())
     values: list[Any] = []
     for task in getattr(snapshot, "tasks", ()):
         for interruption in getattr(task, "interrupts", ()):
             values.append(getattr(interruption, "value", interruption))
+    if values or not next_nodes:
+        return values
+
+    # LangGraph checkpoint implementations can expose a pending node through
+    # ``snapshot.next`` while leaving ``task.interrupts`` empty.  Only infer
+    # an interrupt when the node and persisted state agree; treating every
+    # pending node as resumable would allow a confirmation action to mutate a
+    # status poll or another unrelated graph task.
+    state = getattr(snapshot, "values", None) or {}
+    if not isinstance(state, Mapping):
+        return values
+    if "confirmation_wait" in next_nodes:
+        confirmation = state.get("confirmation_state")
+        if isinstance(confirmation, Mapping) and confirmation.get("status") == "requested":
+            return [{"kind": "confirmation_required"}]
+    if "swap_allowance" in next_nodes:
+        authorization_stage = state.get("authorization_stage")
+        response = state.get("response")
+        response_stage = response.get("stage") if isinstance(response, Mapping) else None
+        if authorization_stage == "approval_required" or response_stage == "approval_required":
+            return [{"kind": "approval_required"}]
     return values
 
 
@@ -1353,6 +1373,11 @@ def create_app(
                             session_status = "failed"
                     elif response_kind == "swap_quote" and not result.get("selected_quote"):
                         session_status = "quoted"
+                    elif response_kind == "react" and result.get("quote_candidates"):
+                        # Ordinary ReAct turns may produce lifecycle-safe quote
+                        # candidates. Project them as quoted so the client can
+                        # render selection without pretending a quote was selected.
+                        session_status = "quoted"
                     elif response_kind == "clarification":
                         active_task = result.get("active_task") or {}
                         task_stage = result.get("task_stage") or active_task.get("stage")
@@ -1715,6 +1740,22 @@ def create_app(
             return _jsonable(await session_store.update(session_id, status="confirmed"))
         config = {"configurable": {"thread_id": session.thread_id}}
         async with graph_lock(session.thread_id):
+            snapshot_before = (
+                await graph.aget_state(config)
+                if hasattr(graph, "aget_state")
+                else graph.get_state(config)
+            )
+            interrupt_values = _interrupt_values(snapshot_before)
+            interrupt_kinds = {_interrupt_kind(value) for value in interrupt_values}
+            if interrupt_kinds != {"confirmation_required"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "CONFIRMATION_NOT_PENDING",
+                        "message": "当前兑换确认状态已变化，请刷新后再试。",
+                        "details": {"interrupt_kinds": sorted(kind or "unknown" for kind in interrupt_kinds)},
+                    },
+                )
             result = await graph.ainvoke(
                 Command(resume={"approved": True}),
                 config=config,
@@ -1724,6 +1765,16 @@ def create_app(
                 snapshot = await graph.aget_state(config)
             else:
                 snapshot = graph.get_state(config)
+            values = getattr(snapshot, "values", None) or {}
+            confirmation_state = values.get("confirmation_state") or result.get("confirmation_state")
+            if isinstance(confirmation_state, Mapping) and confirmation_state.get("status") == "requested":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "CONFIRMATION_RESUME_NOOP",
+                        "message": "确认请求没有推进，请刷新兑换状态后重试。",
+                    },
+                )
             if _has_approval_interrupt(snapshot):
                 updated = await project_session(
                     session_id, result, status="approval_required"

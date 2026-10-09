@@ -21,6 +21,17 @@ export function formatProcessingDuration(milliseconds: number): string {
   return `${(milliseconds / 1000).toFixed(1)} s`;
 }
 
+export function apiErrorMessage(body: any, fallback = "请求失败，请稍后重试。"): string {
+  const detail = body?.detail && typeof body.detail === "object" ? body.detail : body;
+  const code = detail?.code;
+  const messages: Record<string, string> = {
+    CONFIRMATION_EXPIRED: "这份兑换报价已过期，请重新获取报价。",
+    CONFIRMATION_NOT_PENDING: "当前兑换确认状态已变化，正在刷新状态，请稍后重试。",
+    CONFIRMATION_RESUME_NOOP: "确认请求没有推进，兑换状态可能已更新，请刷新后重试。",
+  };
+  return messages[code] || detail?.message || body?.message || fallback;
+}
+
 export function latestProgressText(entries: Array<{ text?: string }>, fallback: string): string {
   return (entries.length ? entries[entries.length - 1]?.text : undefined) || fallback;
 }
@@ -278,10 +289,19 @@ export function extractConversationArtifacts(state: any): ConversationArtifacts 
   if (kind === "swap_status" || kind === "transaction_status") artifacts.status = response;
   if (kind === "react" && Array.isArray(response.react_results) && response.react_results.length) {
     artifacts.reactResults = response.react_results;
-    const quoteResult = [...response.react_results].reverse().find((item: any) =>
+    const quoteResults = response.react_results.filter((item: any) =>
       item?.tool === "get_swap_quote" && item?.result?.ok === true && Array.isArray(item.result.quotes),
     );
-    if (quoteResult?.result.quotes.length) artifacts.quotes = quoteResult.result.quotes;
+    const usableQuotes = quoteResults.flatMap((item: any) => item.result.quotes).filter((quote: any) => {
+      const input = Number(quote?.input_amount);
+      const output = Number(quote?.expected_output);
+      return Boolean(quote?.provider_reference) && Number.isFinite(input) && input > 0 && Number.isFinite(output) && output > 0;
+    });
+    if (usableQuotes.length) {
+      const unique = new Map<string, any>();
+      usableQuotes.forEach((quote: any) => unique.set(String(quote.provider_reference), quote));
+      artifacts.quotes = [...unique.values()];
+    }
     const transferResult = [...response.react_results].reverse().find((item: any) =>
       item?.tool === "prepare_transfer" && item?.result?.ok === true && item?.result?.pending_transaction,
     );
