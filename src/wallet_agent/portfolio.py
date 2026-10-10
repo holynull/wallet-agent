@@ -3,82 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import re
 from decimal import Decimal, localcontext
 from time import monotonic
 from typing import Any
 
-from wallet_agent.chains.solana import _base58_bytes
-from wallet_agent.chains.tron import _valid_tron
+from wallet_agent.domain.addresses import (
+    EVM_NETWORKS,
+    is_valid_address,
+    valid_bitcoin_address,
+)
 from wallet_agent.domain.normalization import canonical_chain, canonical_symbol
 from wallet_agent.okx import OKX_CHAIN_INDEX_BY_NAME
 
-EVM_NETWORKS = ("ETH", "BSC", "BASE", "POLYGON", "ARBITRUM", "OPTIMISM")
-
-
-def valid_btc_address(address: str) -> bool:
-    """Bitcoin mainnet Base58Check and BIP173/BIP350 witness addresses."""
-    try:
-        if address.startswith(("1", "3")):
-            raw = _base58_bytes(address)
-            return (
-                len(raw) == 25
-                and raw[0] in (0, 5)
-                and hashlib.sha256(hashlib.sha256(raw[:-4]).digest()).digest()[:4] == raw[-4:]
-            )
-        if address != address.lower() and address != address.upper():
-            return False
-        value = address.lower()
-        if not value.startswith("bc1") or len(value) > 90:
-            return False
-        alphabet = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-        data = [alphabet.index(char) for char in value[3:]]
-        if len(data) < 7 or data[0] > 16:
-            return False
-        checksum = 1
-        for part in [3, 3, 0, 2, 3, *data]:  # HRP expansion of 'bc'
-            high = checksum >> 25
-            checksum = ((checksum & 0x1FFFFFF) << 5) ^ part
-            for index, generator in enumerate(
-                (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
-            ):
-                if (high >> index) & 1:
-                    checksum ^= generator
-        if checksum != (1 if data[0] == 0 else 0x2BC830A3):
-            return False
-        bits = 0
-        accumulator = 0
-        program: list[int] = []
-        for part in data[1:-6]:
-            accumulator = (accumulator << 5) | part
-            bits += 5
-            if bits >= 8:
-                bits -= 8
-                program.append((accumulator >> bits) & 255)
-        return (
-            bits < 5
-            and not ((accumulator << (8 - bits)) & 255)
-            and 2 <= len(program) <= 40
-            and (data[0] != 0 or len(program) in (20, 32))
-        )
-    except (ValueError, IndexError):
-        return False
-
-
-def valid_address(chain: str, address: str) -> bool:
-    if chain in EVM_NETWORKS:
-        return bool(re.fullmatch(r"0x[0-9a-fA-F]{40}", address))
-    if chain == "BTC":
-        return valid_btc_address(address)
-    if chain == "TRON":
-        return _valid_tron(address)
-    if chain == "SOLANA":
-        try:
-            return len(_base58_bytes(address)) == 32
-        except ValueError:
-            return False
-    return False
+valid_btc_address = valid_bitcoin_address
+valid_address = is_valid_address
 
 
 async def query_portfolio(

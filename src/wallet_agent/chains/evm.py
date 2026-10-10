@@ -33,6 +33,9 @@ _ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 
 class EVMChainAdapter:
+    #: Account/calldata transaction shape (to + data + value).
+    transaction_model = "evm"
+
     def __init__(
         self,
         transport: Any = None,

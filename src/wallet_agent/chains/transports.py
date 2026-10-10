@@ -56,7 +56,6 @@ class FailoverJsonRpcTransport:
     async def aclose(self) -> None:
         await self.client.aclose()
 
-
 class FailoverHttpTransport:
     """Failover GET transport for REST-style chain APIs such as TRON."""
 
@@ -67,7 +66,7 @@ class FailoverHttpTransport:
         self.client = httpx.AsyncClient(timeout=timeout_seconds)
         self._cursor = 0
 
-    async def get(self, path: str, **kwargs: Any) -> Any:
+    async def get(self, path: str, *, text: bool = False, **kwargs: Any) -> Any:
         last_error: Exception | None = None
         for offset in range(len(self.urls)):
             index = (self._cursor + offset) % len(self.urls)
@@ -75,10 +74,23 @@ class FailoverHttpTransport:
                 response = await self.client.get(f"{self.urls[index]}{path}", **kwargs)
                 response.raise_for_status()
                 self._cursor = index
-                return response.json()
+                return response.text if text else response.json()
             except (httpx.HTTPError, ValueError) as exc:
                 last_error = exc
         raise RpcEndpointError(f"all HTTP endpoints failed: {last_error}") from last_error
 
     async def aclose(self) -> None:
         await self.client.aclose()
+
+    async def post(self, path: str, **kwargs: Any) -> Any:
+        last_error: Exception | None = None
+        for offset in range(len(self.urls)):
+            index = (self._cursor + offset) % len(self.urls)
+            try:
+                response = await self.client.post(f"{self.urls[index]}{path}", **kwargs)
+                response.raise_for_status()
+                self._cursor = index
+                return response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                last_error = exc
+        raise RpcEndpointError(f"all HTTP endpoints failed: {last_error}") from last_error

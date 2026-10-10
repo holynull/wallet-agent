@@ -5,6 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+from wallet_agent.domain.addresses import base58_decode, valid_solana_address
 from wallet_agent.domain.chains import Capability, CapabilitySnapshot
 from wallet_agent.domain.models import (
     Asset,
@@ -16,18 +17,13 @@ from wallet_agent.domain.models import (
 
 from ._common import quantity, rpc_call, token_balance
 
-_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
-
-def _base58_bytes(value: str) -> bytes:
-    n = 0
-    for char in value:
-        n = n * 58 + _ALPHABET.index(char)
-    raw = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
-    return b"\0" * (len(value) - len(value.lstrip("1"))) + raw
+_base58_bytes = base58_decode
 
 
 class SolanaChainAdapter:
+    #: Account model: transactions are built from instructions, not calldata.
+    transaction_model = "account"
+
     def __init__(
         self,
         transport: Any = None,
@@ -52,10 +48,7 @@ class SolanaChainAdapter:
         return CapabilitySnapshot(chain=self.chain, available=frozenset(Capability))
 
     async def validate_address(self, address: str) -> bool:
-        try:
-            return len(_base58_bytes(address.strip())) == 32
-        except (ValueError, IndexError):
-            return False
+        return valid_solana_address(address)
 
     async def get_native_balance(self, address: str) -> TokenBalance:
         result = await rpc_call(self.transport, "getBalance", [address])

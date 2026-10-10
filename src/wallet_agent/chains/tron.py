@@ -1,10 +1,11 @@
-"""TRON HTTP API read-only adapter."""
+"""TRON HTTP API adapter: reads, unsigned transfers, and TRC-20 approvals."""
 
 from __future__ import annotations
 
-import hashlib
+from collections.abc import Mapping
 from typing import Any
 
+from wallet_agent.domain.addresses import valid_tron_address, validate_address
 from wallet_agent.domain.chains import Capability, CapabilitySnapshot
 from wallet_agent.domain.models import (
     Asset,
@@ -12,31 +13,30 @@ from wallet_agent.domain.models import (
     TokenBalance,
     TransactionRecord,
     TransactionStatus,
+    UnsignedTransaction,
 )
 
-from ._common import http_call, quantity, token_balance
+from ._common import (
+    build_erc20_calldata,
+    encode_evm_uint256_word,
+    encode_tron_address_word,
+    http_call,
+    normalize_raw_integer,
+    quantity,
+    token_balance,
+)
 
-_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
-
-def _base58_decode(value: str) -> bytes:
-    number = 0
-    for char in value:
-        number = number * 58 + _ALPHABET.index(char)
-    return number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b"\0"
-
-
-def _valid_tron(address: str) -> bool:
-    try:
-        raw = _base58_decode(address)
-        if len(raw) != 25 or raw[0] != 0x41:
-            return False
-        return hashlib.sha256(hashlib.sha256(raw[:-4]).digest()).digest()[:4] == raw[-4:]
-    except (ValueError, IndexError):
-        return False
+_valid_tron = valid_tron_address
+_DEFAULT_FEE_LIMIT = 100_000_000  # 100 TRX ceiling for smart-contract calls.
+_APPROVE_SELECTOR = "095ea7b3"
+_TRANSFER_SELECTOR = "a9059cbb"
+_ALLOWANCE_SELECTOR = "dd62ed3e"
 
 
 class TronChainAdapter:
+    #: Account model: calldata lives in a protobuf payload returned by the node.
+    transaction_model = "account"
+
     def __init__(
         self,
         transport: Any = None,
@@ -48,6 +48,7 @@ class TronChainAdapter:
         native_symbol: str = "TRX",
         native_decimals: int = 6,
         token_assets: list[Asset] | None = None,
+        fee_limit: int = _DEFAULT_FEE_LIMIT,
     ) -> None:
         self.transport = transport or http_transport or http
         if self.transport is None:
@@ -57,13 +58,14 @@ class TronChainAdapter:
             chain=self.chain, chain_id=chain_id, symbol=native_symbol, decimals=native_decimals
         )
         self.token_assets = token_assets or []
+        self.fee_limit = int(fee_limit)
 
     @property
     def capabilities(self) -> CapabilitySnapshot:
         return CapabilitySnapshot(chain=self.chain, available=frozenset(Capability))
 
     async def validate_address(self, address: str) -> bool:
-        return _valid_tron(address.strip())
+        return valid_tron_address(address)
 
     async def get_native_balance(self, address: str) -> TokenBalance:
         data = await http_call(self.transport, "get", f"/v1/accounts/{address}")
@@ -132,6 +134,163 @@ class TronChainAdapter:
         if contract in {"FAILED", "REVERT"}:
             return TransactionStatus.FAILED
         return TransactionStatus.PENDING
+
+    def _token_contract_address(self, token: Asset) -> str:
+        if not token.address:
+            raise ValueError("TRC-20 contract address is required")
+        return validate_address(self.chain, token.address)
+
+    @staticmethod
+    def _calldata(selector: str, *words: str) -> str:
+        return build_erc20_calldata(selector, *words).removeprefix("0x")
+
+    def _unsigned_from_payload(
+        self,
+        payload: Any,
+        *,
+        action: str,
+        owner: str,
+        to: str,
+        amount_raw: str,
+        extra: Mapping[str, str] | None = None,
+    ) -> UnsignedTransaction:
+        """Wrap a node-built TRON transaction; ``raw_data_hex`` is what gets signed."""
+        if isinstance(payload, Mapping) and isinstance(payload.get("transaction"), Mapping):
+            payload = payload["transaction"]
+        if not isinstance(payload, Mapping) or not payload.get("raw_data_hex"):
+            raise ValueError("TRON node did not return an unsigned transaction")
+        tx_id = str(payload.get("txID") or "")
+        display = {
+            "action": action,
+            "from": owner,
+            "to": to,
+            "amount_raw": amount_raw,
+            "tx_id": tx_id,
+        }
+        display.update(extra or {})
+        return UnsignedTransaction(
+            chain=self.chain,
+            chain_id=self.chain_id,
+            to=to,
+            data=str(payload["raw_data_hex"]),
+            value=amount_raw,
+            provider_reference=tx_id or None,
+            display=display,
+        )
+
+    async def _trigger_smart_contract(
+        self, *, owner: str, contract: str, calldata: str, call_value: str = "0"
+    ) -> Any:
+        return await http_call(
+            self.transport,
+            "post",
+            "/wallet/triggersmartcontract",
+            json={
+                "owner_address": owner,
+                "contract_address": contract,
+                "data": calldata,
+                "call_value": int(call_value),
+                "fee_limit": self.fee_limit,
+                "visible": True,
+            },
+        )
+
+    async def build_native_transfer(
+        self, *, from_address: str, to_address: str, amount_raw: str
+    ) -> UnsignedTransaction:
+        owner = validate_address(self.chain, from_address)
+        recipient = validate_address(self.chain, to_address)
+        amount = normalize_raw_integer(amount_raw)
+        payload = await http_call(
+            self.transport,
+            "post",
+            "/wallet/createtransaction",
+            json={
+                "owner_address": owner,
+                "to_address": recipient,
+                "amount": int(amount),
+                "visible": True,
+            },
+        )
+        return self._unsigned_from_payload(
+            payload, action="native_transfer", owner=owner, to=recipient, amount_raw=amount
+        )
+
+    async def build_erc20_transfer(
+        self, *, token: Asset, from_address: str, to_address: str, amount_raw: str
+    ) -> UnsignedTransaction:
+        contract = self._token_contract_address(token)
+        owner = validate_address(self.chain, from_address)
+        recipient = validate_address(self.chain, to_address)
+        amount = normalize_raw_integer(amount_raw)
+        payload = await self._trigger_smart_contract(
+            owner=owner,
+            contract=contract,
+            calldata=self._calldata(
+                _TRANSFER_SELECTOR,
+                encode_tron_address_word(recipient),
+                encode_evm_uint256_word(amount),
+            ),
+        )
+        return self._unsigned_from_payload(
+            payload,
+            action="trc20_transfer",
+            owner=owner,
+            to=recipient,
+            amount_raw=amount,
+            extra={"token": token.symbol, "contract": contract},
+        )
+
+    async def build_erc20_approve(
+        self, *, token: Asset, owner: str, spender: str, amount_raw: str
+    ) -> UnsignedTransaction:
+        contract = self._token_contract_address(token)
+        owner_address = validate_address(self.chain, owner)
+        spender_address = validate_address(self.chain, spender)
+        amount = normalize_raw_integer(amount_raw)
+        payload = await self._trigger_smart_contract(
+            owner=owner_address,
+            contract=contract,
+            calldata=self._calldata(
+                _APPROVE_SELECTOR,
+                encode_tron_address_word(spender_address),
+                encode_evm_uint256_word(amount),
+            ),
+        )
+        return self._unsigned_from_payload(
+            payload,
+            action="trc20_approve",
+            owner=owner_address,
+            to=contract,
+            amount_raw=amount,
+            extra={"token": token.symbol, "spender": spender_address},
+        )
+
+    async def get_allowance(self, token: Asset, owner: str, spender: str) -> str:
+        contract = self._token_contract_address(token)
+        owner_address = validate_address(self.chain, owner)
+        payload = await http_call(
+            self.transport,
+            "post",
+            "/wallet/triggerconstantcontract",
+            json={
+                "owner_address": owner_address,
+                "contract_address": contract,
+                "data": self._calldata(
+                    _ALLOWANCE_SELECTOR,
+                    encode_tron_address_word(owner_address),
+                    encode_tron_address_word(spender),
+                ),
+                "visible": True,
+            },
+        )
+        results = payload.get("constant_result") if isinstance(payload, Mapping) else None
+        if not results:
+            return "0"
+        try:
+            return str(int(str(results[0] or "0"), 16))
+        except (TypeError, ValueError):
+            return "0"
 
     def _record(self, item: dict[str, Any]) -> TransactionRecord:
         contract = ((item.get("ret") or [{}])[0] or {}).get("contractRet", "")

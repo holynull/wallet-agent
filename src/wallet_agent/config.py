@@ -48,7 +48,7 @@ class Settings(BaseSettings):
 
     provider_timeout_seconds: float = Field(default=15, gt=0)
     http_timeout_seconds: float = Field(default=15, gt=0)
-    allowed_chains: list[str] = Field(default_factory=lambda: ["EVM", "TRON", "SOLANA"])
+    allowed_chains: list[str] = Field(default_factory=lambda: ["EVM", "BTC", "TRON", "SOLANA"])
     rpc_urls: dict[str, str | list[str]] = Field(default_factory=dict)
     rpc_timeout_seconds: float = Field(default=10, gt=0)
     rpc_max_attempts: int = Field(default=2, ge=1, le=5)

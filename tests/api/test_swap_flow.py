@@ -751,7 +751,7 @@ async def test_omnibridge_deposit_order_becomes_wallet_transaction_and_registers
     assert provider.registered_reference == "order-omni"
 
 
-def test_omnibridge_native_deposit_order_becomes_native_wallet_transaction():
+async def test_omnibridge_native_deposit_order_becomes_native_wallet_transaction():
     source = Asset(chain="ETH", chain_id=1, symbol="ETH", decimals=18)
     destination = Asset(
         chain="ETH", chain_id=1, symbol="USDT", decimals=6, address="0x" + "2" * 40
@@ -770,7 +770,7 @@ def test_omnibridge_native_deposit_order_becomes_native_wallet_transaction():
                 display={"from": from_address},
             )
 
-    transaction = _deposit_order_to_transaction(
+    transaction = await _deposit_order_to_transaction(
         DepositOrder(
             provider="omnibridge",
             provider_order_id="order-native",

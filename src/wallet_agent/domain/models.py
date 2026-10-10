@@ -8,6 +8,8 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
+from .addresses import validate_address
+
 ProviderName = Literal["bridgers", "omnibridge", "okx"]
 OrderState = Literal[
     "pending",
@@ -185,14 +187,24 @@ class SwapQuoteRequest(DomainModel):
 
 
 class TransferRequest(DomainModel):
-    """A user-authorized native or ERC-20 transfer request."""
+    """A user-authorized native or token transfer request.
+
+    Addresses are validated with the rules of ``chain``: EVM hex accounts,
+    Bitcoin Base58Check/bech32, TRON Base58Check, Solana Base58 pubkeys.
+    """
 
     chain: str
-    sender: EVMAddress
-    recipient: EVMAddress
+    sender: str
+    recipient: str
     amount: Decimal = Field(gt=0)
     amount_raw: RawInteger
     token: Asset | None = None
+
+    @model_validator(mode="after")
+    def validate_chain_addresses(self) -> "TransferRequest":
+        validate_address(self.chain, self.sender)
+        validate_address(self.chain, self.recipient)
+        return self
 
 
 class AllowanceRequirement(DomainModel):

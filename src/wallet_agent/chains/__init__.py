@@ -1,5 +1,6 @@
 """Read-only blockchain adapters."""
 
+from .btc import BitcoinAdapter, BitcoinChainAdapter, BTCAdapter
 from .evm import EVMAdapter, EVMChain, EVMChainAdapter
 from .execution_observer import ExecutionObserver
 from .registry import ChainAdapterRegistry, ChainRegistry, build_default_registry
@@ -9,6 +10,9 @@ from .transports import FailoverHttpTransport, FailoverJsonRpcTransport
 from .tron import TronAdapter, TronChain, TronChainAdapter
 
 __all__ = [
+    "BTCAdapter",
+    "BitcoinAdapter",
+    "BitcoinChainAdapter",
     "ChainAdapterRegistry",
     "ChainRegistry",
     "EVMAdapter",

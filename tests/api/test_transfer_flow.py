@@ -161,3 +161,72 @@ async def test_transfer_broadcast_persists_failed_receipt_for_status_queries():
     assert persisted is not None
     assert persisted.broadcast_tx_hash == tx_hash
     assert persisted.broadcast_status == "failed"
+
+
+BTC_SENDER = "bc1qdqahz8x62rsyfmlkv0m5e5rc234zr7vyl690d5"
+BTC_RECIPIENT = "bc1p47u7v2k5cpfqt0gxftkat3ade7ucs588g8lr0znzr9le06taty6q6x9gut"
+
+
+class EsploraFake:
+    async def get(self, path, **_kwargs):
+        if path.endswith("/utxo"):
+            return [{"txid": "aa" * 32, "vout": 0, "value": 200_000, "status": {}}]
+        if path.endswith("/fee-estimates"):
+            return {"6": 3.0}
+        if "/address/" in path:
+            return {"chain_stats": {"funded_txo_sum": 200_000, "spent_txo_sum": 0}}
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_bitcoin_transfer_prepare_returns_a_psbt():
+    import base64
+
+    from wallet_agent.chains.btc import PSBT_MAGIC, BitcoinChainAdapter
+
+    adapter = BitcoinChainAdapter(EsploraFake())
+    graph = build_graph(model=Model(), chains={"BTC": adapter})
+    store = InMemorySessionStore()
+    await store.save(SwapSessionRecord(session_id="btc-1", user_id="alice", thread_id="btc-t"))
+    app = create_app(graph=graph, chain_registry=Registry(adapter), store=store)
+    payload = {
+        "user_id": "alice",
+        "chain": "BTC",
+        "sender": BTC_SENDER,
+        "recipient": BTC_RECIPIENT,
+        "amount": "0.0012",
+        "amount_raw": "120000",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/v1/transfer/btc-1/prepare", json=payload)
+
+    assert response.status_code == 200
+    transaction = response.json()["pending_transaction"]
+    assert transaction["chain"] == "BTC"
+    assert transaction["to"] == BTC_RECIPIENT
+    assert transaction["value"] == "120000"
+    assert base64.b64decode(transaction["data"]).startswith(PSBT_MAGIC)
+    assert transaction["display"]["action"] == "native_transfer"
+    assert transaction["display"]["fee_raw"] == "459"
+
+
+def test_assistant_content_explains_bitcoin_psbt_signing():
+    from wallet_agent.api.app import _assistant_response_content
+
+    psbt = {"chain": "BTC", "data": "cHNidP8", "display": {"format": "psbt"}}
+
+    assert _assistant_response_content(
+        {"kind": "transfer_prepare", "pending_transaction": psbt}
+    ) == "Bitcoin 转账交易已准备好，请把 PSBT 导入比特币钱包签名并广播。"
+    assert _assistant_response_content({"kind": "swap_prepare", "transaction": psbt}) == (
+        "Bitcoin 兑换交易已准备好，请把 PSBT 导入比特币钱包签名并广播。"
+    )
+    # EVM and unknown payloads keep the original wording.
+    assert _assistant_response_content({"kind": "transfer_prepare"}) == (
+        "转账交易已准备好，请在钱包中确认并广播。"
+    )
+    assert _assistant_response_content(
+        {"kind": "transfer_prepare", "pending_transaction": {"chain": "BASE", "data": "0x"}}
+    ) == "转账交易已准备好，请在钱包中确认并广播。"

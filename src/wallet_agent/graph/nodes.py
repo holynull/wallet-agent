@@ -7,7 +7,7 @@ import hashlib
 import inspect
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
@@ -28,6 +28,8 @@ from langgraph.prebuilt import InjectedState, ToolNode
 from langgraph.types import interrupt
 
 from wallet_agent.chains._common import receipt_success
+from wallet_agent.domain.addresses import is_valid_address
+from wallet_agent.domain.chains import native_decimals
 from wallet_agent.domain.models import (
     AgentError,
     ApprovalTransaction,
@@ -611,11 +613,12 @@ def _apply_fee_estimate(transaction: Any, fee: Mapping[str, Any] | None) -> Any:
     return transaction.model_copy(update=updates) if updates else transaction
 
 
-def _deposit_order_to_transaction(
+async def _deposit_order_to_transaction(
     order: Any,
     *,
     adapter: Any,
     sender: str,
+    from_addresses: Sequence[str] | None = None,
 ) -> UnsignedTransaction | Any:
     """Turn a provider deposit order into the source-chain wallet transaction."""
     if not isinstance(order, DepositOrder):
@@ -628,11 +631,13 @@ def _deposit_order_to_transaction(
             raise ValueError(
                 f"{order.source_asset.chain} adapter cannot build an ERC-20 deposit transaction"
             )
-        transaction = builder(
-            token=order.source_asset,
-            from_address=sender,
-            to_address=order.deposit_address,
-            amount_raw=order.input_amount_raw,
+        transaction = await _resolve(
+            builder(
+                token=order.source_asset,
+                from_address=sender,
+                to_address=order.deposit_address,
+                amount_raw=order.input_amount_raw,
+            )
         )
     else:
         builder = getattr(adapter, "build_native_transfer", None)
@@ -640,26 +645,111 @@ def _deposit_order_to_transaction(
             raise ValueError(
                 f"{order.source_asset.chain} adapter cannot build a native deposit transaction"
             )
-        transaction = builder(
-            from_address=sender,
-            to_address=order.deposit_address,
-            amount_raw=order.input_amount_raw,
+        native_kwargs: dict[str, Any] = {}
+        if from_addresses:
+            native_kwargs["from_addresses"] = list(from_addresses)
+        transaction = await _resolve(
+            builder(
+                from_address=sender,
+                to_address=order.deposit_address,
+                amount_raw=order.input_amount_raw,
+                **native_kwargs,
+            )
         )
+    # Merge (not replace) so adapter-specific fields such as the Bitcoin PSBT
+    # or fee breakdown survive alongside the provider deposit metadata.
+    display = {
+        **dict(getattr(transaction, "display", {}) or {}),
+        "action": "provider_deposit",
+        "provider": order.provider,
+        "deposit_address": order.deposit_address,
+        "input_amount": str(order.input_amount),
+        "input_amount_raw": order.input_amount_raw,
+        "provider_order_id": order.provider_order_id,
+    }
     return transaction.model_copy(
         update={
             "provider": order.provider,
             "provider_reference": order.provider_reference,
             "expires_at": order.expires_at,
-            "display": {
-                "action": "provider_deposit",
-                "provider": order.provider,
-                "deposit_address": order.deposit_address,
-                "input_amount": str(order.input_amount),
-                "input_amount_raw": order.input_amount_raw,
-                "provider_order_id": order.provider_order_id,
-            },
+            "display": display,
         }
     )
+
+
+def _is_utxo_adapter(adapter: Any) -> bool:
+    """Bitcoin-style chains sign locally built UTXO transactions, not calldata."""
+    return getattr(adapter, "transaction_model", None) == "utxo"
+
+
+def _utxo_deposit_order(quote: Any, prepared: Any) -> DepositOrder | None:
+    """Reinterpret an EVM-shaped provider payload as a UTXO deposit transfer.
+
+    Bitcoin swap providers return only the deposit address (in ``txData.to``);
+    there is no calldata to sign. The wallet must instead pay that address with a
+    locally built native (PSBT) transfer, which mirrors a deposit order.
+    """
+    if isinstance(prepared, DepositOrder):
+        return prepared
+    if not isinstance(prepared, UnsignedTransaction):
+        return None
+    display = dict(getattr(prepared, "display", {}) or {})
+    if display.get("action") in {"native_transfer", "provider_deposit"}:
+        # Already a source-chain-ready transaction built by the chain adapter.
+        return None
+    deposit_address = str(
+        display.get("deposit_address")
+        or display.get("depositAddress")
+        or getattr(prepared, "to", "")
+        or ""
+    ).strip()
+    if not deposit_address:
+        return None
+    return DepositOrder(
+        provider=getattr(prepared, "provider", None) or quote.provider,
+        provider_order_id=quote.provider_reference,
+        deposit_address=deposit_address,
+        source_asset=quote.source_asset,
+        destination_asset=quote.destination_asset,
+        input_amount=quote.input_amount,
+        input_amount_raw=quote.input_amount_raw,
+        expires_at=getattr(prepared, "expires_at", None) or quote.expires_at,
+        provider_reference=quote.provider_reference,
+    )
+
+
+async def _resolve_swap_transaction(
+    prepared: Any,
+    *,
+    quote: Any,
+    adapter: Any,
+    sender: str,
+    chain: str,
+    wallet_context: Mapping[str, Any] | None = None,
+) -> Any:
+    """Normalize a provider's prepared output into a source-chain transaction.
+
+    EVM and account-model chains sign the provider's calldata directly. UTXO
+    chains (Bitcoin) cannot, so a provider deposit payload is rebuilt as a
+    native transfer paying the deposit address.
+    """
+    if _is_utxo_adapter(adapter):
+        sources = _utxo_source_addresses(wallet_context, chain, sender)
+        if sources and not is_valid_address(str(chain or ""), sender):
+            # A UTXO swap is signed by the App's own account for the chain, not
+            # by the browser-connected account of another chain family.
+            sender = sources[0]
+        order = _utxo_deposit_order(quote, prepared)
+        if order is None:
+            return prepared
+        return await _deposit_order_to_transaction(
+            order, adapter=adapter, sender=sender, from_addresses=sources
+        )
+    if isinstance(prepared, DepositOrder):
+        if adapter is None:
+            raise ValueError(f"Chain adapter unavailable for {chain} deposit")
+        return await _deposit_order_to_transaction(prepared, adapter=adapter, sender=sender)
+    return prepared
 
 
 def _quote(value: Any) -> NormalizedQuote:
@@ -722,6 +812,11 @@ def _error(
     return AgentError(
         code=code, message=message, retryable=retryable, details=details or {}
     ).model_dump(mode="json")
+
+
+async def _resolve(value: Any) -> Any:
+    """Chain adapters may build transactions synchronously or over HTTP."""
+    return await value if inspect.isawaitable(value) else value
 
 
 def _parse_model_output(value: Any) -> dict[str, Any] | None:
@@ -2050,6 +2145,8 @@ def _native_symbol(chain: str, wallet_context: dict[str, Any] | None) -> str | N
     if context_symbol:
         return str(context_symbol).upper()
     return {
+        "BTC": "BTC",
+        "BITCOIN": "BTC",
         "EVM": "ETH",
         "ETH": "ETH",
         "BASE": "ETH",
@@ -2067,6 +2164,7 @@ def _native_symbol(chain: str, wallet_context: dict[str, Any] | None) -> str | N
 
 
 _NATIVE_ASSET_DECIMALS = {
+    "BTC": 8,
     "ETH": 18,
     "BASE": 18,
     "ARBITRUM": 18,
@@ -2320,21 +2418,85 @@ async def _resolve_transfer_asset(
     return resolved
 
 
+def _declared_accounts(wallet_context: Mapping[str, Any] | None, chain: str) -> list[str]:
+    """Every address the App declared for ``chain``, in publish order.
+
+    Falls back to the single connected account only when the App published no
+    account for that chain, so an EVM account is never reused on another family.
+    """
+    context = wallet_context or {}
+    canonical = canonical_chain(str(chain or ""))
+    accounts = context.get("wallet_accounts")
+    addresses: list[str] = []
+    if isinstance(accounts, list):
+        for item in accounts:
+            if not isinstance(item, Mapping):
+                continue
+            if canonical_chain(str(item.get("chain") or "")) != canonical:
+                continue
+            address = str(item.get("address") or "").strip()
+            if address and address not in addresses and is_valid_address(canonical, address):
+                addresses.append(address)
+    if addresses:
+        return addresses
+    legacy = str(context.get("address") or "").strip()
+    if legacy and is_valid_address(canonical, legacy):
+        return [legacy]
+    return []
+
+
+def _chain_sender(wallet_context: Mapping[str, Any] | None, chain: str) -> str | None:
+    """Resolve the transfer sender for a chain from the App's account list."""
+    accounts = _declared_accounts(wallet_context, chain)
+    return accounts[0] if accounts else None
+
+
+def _utxo_source_addresses(
+    wallet_context: Mapping[str, Any] | None, chain: str, primary: str | None = None
+) -> list[str]:
+    """Every spendable address of a UTXO chain, with the primary sender first."""
+    canonical = canonical_chain(str(chain or ""))
+    ordered: list[str] = []
+    for candidate in (primary, *_declared_accounts(wallet_context, canonical)):
+        address = str(candidate or "").strip()
+        if address and address not in ordered and is_valid_address(canonical, address):
+            ordered.append(address)
+    return ordered
+
+
 def _transfer_draft_request(
     draft: dict[str, Any], wallet_context: dict[str, Any] | None
 ) -> tuple[TransferRequest | None, list[str]]:
     context = wallet_context or {}
     normalized = dict(draft)
     normalized.setdefault("chain", normalized.get("transfer_chain") or context.get("chain"))
-    normalized.setdefault("sender", normalized.get("transfer_sender") or context.get("address"))
+    symbol = normalized.get("symbol") or normalized.get("transfer_symbol")
+    token_address = normalized.get("token_address") or normalized.get("transfer_token_address")
+    inferred_chain = _unique_native_chain(str(symbol or ""), token_address)
+    if inferred_chain and canonical_chain(str(normalized.get("chain") or "")) != inferred_chain:
+        # A uniquely identifiable native asset (BTC/BNB/TRX/SOL/MATIC) pins its
+        # chain, mirroring the swap slot reconciliation for the same symbols.
+        normalized["chain"] = inferred_chain
+        normalized["transfer_chain"] = inferred_chain
+    chain = str(normalized.get("chain") or "")
+    sender = next(
+        (
+            str(candidate).strip()
+            for candidate in (normalized.get("sender"), normalized.get("transfer_sender"))
+            if candidate and is_valid_address(chain, str(candidate))
+        ),
+        None,
+    )
+    # An explicit sender from another chain family (the connected EVM account is
+    # the common case) must never be reused here, even when a caller passed it;
+    # fall back to the per-chain account list instead.
+    normalized["sender"] = sender or _chain_sender(context, chain)
     normalized.setdefault("recipient", normalized.get("transfer_recipient"))
     normalized.setdefault("amount", normalized.get("transfer_amount"))
     normalized.setdefault("amount_raw", normalized.get("transfer_amount_raw"))
     normalized.setdefault("symbol", normalized.get("transfer_symbol"))
     normalized.setdefault("token_address", normalized.get("transfer_token_address"))
     normalized.setdefault("decimals", normalized.get("transfer_decimals"))
-    if not normalized.get("sender"):
-        normalized["sender"] = normalized.get("transfer_sender")
     if normalized.get("chain") and normalized.get("transfer_chain") is None:
         normalized["transfer_chain"] = normalized["chain"]
 
@@ -2363,7 +2525,9 @@ def _transfer_draft_request(
     if not normalized.get("amount_raw"):
         try:
             amount = Decimal(str(normalized["amount"]))
-            amount_decimals = 18 if is_native else int(decimals)
+            amount_decimals = (
+                native_decimals(str(normalized["chain"])) if is_native else int(decimals)
+            )
             raw = amount * (Decimal(10) ** amount_decimals)
             if raw != raw.to_integral_value():
                 raise ValueError("transfer amount has more precision than token decimals")
@@ -2423,6 +2587,7 @@ async def _transaction_preflight(
             item["details"] = details
         checks.append(item)
 
+    connected = str(context.get("address") or "")
     if not sender:
         add(
             "wallet_account",
@@ -2430,13 +2595,27 @@ async def _transaction_preflight(
             "缺少发送方上下文，无法核对当前钱包账户。",
             code="CHECK_UNAVAILABLE",
         )
-    elif context.get("address") and str(context["address"]).lower() != sender.lower():
+    elif connected and connected.lower() == sender.lower():
+        add("wallet_account", "passed", "发送方与当前钱包账户一致。")
+    elif connected and not is_valid_address(chain, connected):
+        # The connected browser account is not even a valid address on this
+        # chain family, so it can never sign here; Bitcoin/TRON/Solana app
+        # accounts sign outside the browser (e.g. a PSBT handed to a Bitcoin
+        # signer) and a mismatch is expected rather than an error.
+        add(
+            "wallet_account",
+            "warning",
+            f"当前连接的账户不属于 {chain} 网络；该笔交易由 App 声明的 {chain} 账户签名。",
+            code="WALLET_ACCOUNT_EXTERNAL_SIGNER",
+            details={"wallet_address": connected, "sender": sender},
+        )
+    elif connected:
         add(
             "wallet_account",
             "failed",
             "当前连接的钱包账户与交易发送方不一致。",
             code="WALLET_ACCOUNT_MISMATCH",
-            details={"wallet_address": context["address"], "sender": sender},
+            details={"wallet_address": connected, "sender": sender},
         )
     else:
         add("wallet_account", "passed", "发送方与当前钱包账户一致。")
@@ -2507,18 +2686,36 @@ async def _transaction_preflight(
     else:
         add("network_fee", "warning", "当前链适配器不支持手续费估算。", code="CHECK_UNAVAILABLE")
 
+    # A UTXO builder already selected its inputs, so its fee is exact; use it
+    # instead of the generic one-input estimate for the balance check and card.
+    if _is_utxo_adapter(adapter) and fee is not None:
+        selected_fee = str(dict(getattr(transaction, "display", None) or {}).get("fee_raw") or "")
+        if selected_fee.isdigit():
+            fee = fee.model_copy(
+                update={
+                    "amount_raw": selected_fee,
+                    "amount": Decimal(selected_fee) / (Decimal(10) ** fee.asset.decimals),
+                }
+            )
+
     gas_sources: dict[str, Any] = {
         "rpc": _fee_dump(fee).get("gas_limit") if fee is not None else None,
         "okx": None,
         "simulation": None,
     }
-    if wallet_provider is not None:
+    # Bitcoin/UTXO transactions carry a PSBT rather than EVM calldata, so OKX's
+    # gas-limit and simulation endpoints do not apply and are reported as such.
+    evm_style = getattr(adapter, "transaction_model", "evm") != "utxo"
+    simulation = None
+    if not evm_style:
+        gas_sources["okx"] = "unsupported"
+        gas_sources["simulation"] = "unsupported"
+    elif wallet_provider is not None:
         if not hasattr(wallet_provider, "estimate_gas_limit"):
             gas_sources["okx"] = "unavailable"
         if not hasattr(wallet_provider, "simulate_transaction"):
             gas_sources["simulation"] = "unavailable"
-    simulation = None
-    if wallet_provider is not None:
+    if wallet_provider is not None and evm_style:
         tx_context = TransactionContext(
             chain=chain,
             from_address=sender,
@@ -2592,7 +2789,23 @@ async def _transaction_preflight(
     native_balance = None
     if hasattr(adapter, "get_native_balance"):
         try:
-            native_balance = await adapter.get_native_balance(sender)
+            # UTXO chains spend the pooled UTXOs of every address the App
+            # declared, so the balance check has to pool those addresses too.
+            balance_addresses = [sender]
+            if _is_utxo_adapter(adapter):
+                pooled = _utxo_source_addresses(context, chain, sender)
+                if len(pooled) > 1:
+                    balance_addresses = pooled
+            total_raw = 0
+            for address in balance_addresses:
+                balance = await adapter.get_native_balance(address)
+                total_raw += int(balance.amount_raw)
+                if native_balance is None:
+                    native_balance = balance
+            if native_balance is not None and total_raw != int(native_balance.amount_raw):
+                native_balance = native_balance.model_copy(
+                    update={"amount_raw": str(total_raw)}
+                )
         except Exception as exc:
             add(
                 "native_balance",
@@ -7159,16 +7372,50 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             }
         try:
+            builder = "build_native_transfer" if req.token is None else "build_erc20_transfer"
+            if adapter is None or not hasattr(adapter, builder):
+                return {
+                    "response": {
+                        "kind": "error",
+                        "errors": [
+                            _error(
+                                "CHAIN_CAPABILITY_UNAVAILABLE",
+                                f"{req.chain} 暂不支持构造转账交易。",
+                                details={
+                                    "chain": req.chain,
+                                    "capability": builder,
+                                    "kind": "token" if req.token else "native",
+                                },
+                            )
+                        ],
+                    }
+                }
             if req.token is None:
-                tx = adapter.build_native_transfer(
-                    from_address=req.sender, to_address=req.recipient, amount_raw=req.amount_raw
+                native_kwargs: dict[str, Any] = {}
+                if _is_utxo_adapter(adapter):
+                    sources = _utxo_source_addresses(
+                        state.get("wallet_context"), req.chain, req.sender
+                    )
+                    if len(sources) > 1:
+                        # Pool every address the App declared for the chain so a
+                        # transfer is not capped at one address's UTXO balance.
+                        native_kwargs["from_addresses"] = sources
+                tx = await _resolve(
+                    adapter.build_native_transfer(
+                        from_address=req.sender,
+                        to_address=req.recipient,
+                        amount_raw=req.amount_raw,
+                        **native_kwargs,
+                    )
                 )
             else:
-                tx = adapter.build_erc20_transfer(
-                    token=req.token,
-                    from_address=req.sender,
-                    to_address=req.recipient,
-                    amount_raw=req.amount_raw,
+                tx = await _resolve(
+                    adapter.build_erc20_transfer(
+                        token=req.token,
+                        from_address=req.sender,
+                        to_address=req.recipient,
+                        amount_raw=req.amount_raw,
+                    )
                 )
             preflight = await _transaction_preflight(
                 adapter=adapter,
@@ -7288,14 +7535,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             source_asset = request.get("source_asset") or selected.get("source_asset") or {}
             source_chain = str(source_asset.get("chain") or getattr(prepared, "chain", ""))
             adapter = execution_adapter(source_chain)
-            if isinstance(prepared, DepositOrder):
-                if adapter is None:
-                    raise ValueError(f"Chain adapter unavailable for {source_chain} deposit")
-                prepared = _deposit_order_to_transaction(
-                    prepared,
-                    adapter=adapter,
-                    sender=str(request.get("sender_address") or ""),
-                )
+            prepared = await _resolve_swap_transaction(
+                prepared,
+                quote=quote,
+                adapter=adapter,
+                sender=str(request.get("sender_address") or ""),
+                chain=source_chain,
+                wallet_context=state.get("wallet_context"),
+            )
             if isinstance(prepared, UnsignedTransaction) and adapter is not None:
                 preflight = await _transaction_preflight(
                     adapter=adapter,
@@ -7359,11 +7606,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         approval_tx_hash = state.get("approval_tx_hash")
         approval_transaction = state.get("approval_transaction")
         if int(allowance_raw) < required and not approval_tx_hash:
-            approval = adapter.build_erc20_approve(
-                token=requirement.token,
-                owner=requirement.owner,
-                spender=requirement.spender,
-                amount_raw=requirement.required_amount_raw,
+            approval = await _resolve(
+                adapter.build_erc20_approve(
+                    token=requirement.token,
+                    owner=requirement.owner,
+                    spender=requirement.spender,
+                    amount_raw=requirement.required_amount_raw,
+                )
             )
             approval_model = ApprovalTransaction(
                 chain=requirement.token.chain,
@@ -7444,14 +7693,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         source_asset = request.get("source_asset") or selected.get("source_asset") or {}
         source_chain = str(source_asset.get("chain") or getattr(prepared, "chain", ""))
         adapter = execution_adapter(source_chain)
-        if isinstance(prepared, DepositOrder):
-            if adapter is None:
-                raise ValueError(f"Chain adapter unavailable for {source_chain} deposit")
-            prepared = _deposit_order_to_transaction(
-                prepared,
-                adapter=adapter,
-                sender=str(request.get("sender_address") or requirement.owner),
-            )
+        prepared = await _resolve_swap_transaction(
+            prepared,
+            quote=quote,
+            adapter=adapter,
+            sender=str(request.get("sender_address") or requirement.owner),
+            chain=source_chain,
+            wallet_context=state.get("wallet_context"),
+        )
         if isinstance(prepared, UnsignedTransaction) and adapter is not None:
             preflight = await _transaction_preflight(
                 adapter=adapter,
@@ -7972,21 +8221,22 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     _error("PROVIDER_UNAVAILABLE", f"Provider {provider_name} is unavailable.")
                 ]
             }
+        quote = _quote(selected)
         try:
-            prepared = await provider.prepare(_quote(selected))
+            prepared = await provider.prepare(quote)
             preflight = None
             request = state.get("swap_request") or {}
             source_asset = request.get("source_asset") or selected.get("source_asset") or {}
             source_chain = str(source_asset.get("chain") or selected.get("chain") or "")
             adapter = execution_adapter(source_chain)
-            if isinstance(prepared, DepositOrder):
-                if adapter is None:
-                    raise ValueError(f"Chain adapter unavailable for {source_chain} deposit")
-                prepared = _deposit_order_to_transaction(
-                    prepared,
-                    adapter=adapter,
-                    sender=str(request.get("sender_address") or ""),
-                )
+            prepared = await _resolve_swap_transaction(
+                prepared,
+                quote=quote,
+                adapter=adapter,
+                sender=str(request.get("sender_address") or ""),
+                chain=source_chain,
+                wallet_context=state.get("wallet_context"),
+            )
             if isinstance(prepared, dict) and {"to", "data"}.issubset(prepared):
                 prepared_transaction = UnsignedTransaction.model_validate(prepared)
             elif hasattr(prepared, "to") and hasattr(prepared, "data"):

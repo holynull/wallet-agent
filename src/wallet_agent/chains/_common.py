@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
+from wallet_agent.domain.addresses import base58check_payload
 from wallet_agent.domain.models import Asset, TokenBalance
 
 _ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -100,6 +101,14 @@ def validate_evm_address(address: str) -> str:
 
 def encode_evm_address_word(address: str) -> str:
     return validate_evm_address(address).removeprefix("0x").lower().rjust(64, "0")
+
+
+def encode_tron_address_word(address: str) -> str:
+    """ABI-encode a TRON Base58Check account as a 32-byte word (0x41 prefix stripped)."""
+    payload = base58check_payload(address.strip(), version=0x41)
+    if payload is None:
+        raise ValueError(f"invalid TRON address: {address}")
+    return payload[1:].hex().rjust(64, "0")
 
 
 def encode_evm_uint256_word(value: Any) -> str:

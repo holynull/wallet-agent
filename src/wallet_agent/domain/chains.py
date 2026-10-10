@@ -7,6 +7,21 @@ from pydantic import Field
 
 from .errors import ChainCapabilityUnavailable
 from .models import DomainModel
+from .normalization import canonical_chain
+
+_NATIVE_DECIMALS = {
+    "BTC": 8,
+    "TRON": 6,
+    "TRX": 6,
+    "SOLANA": 9,
+    "SOL": 9,
+}
+
+
+def native_decimals(chain: str) -> int:
+    """Decimals of a chain's native asset, defaulting to the EVM 18."""
+    normalized = canonical_chain(chain)
+    return _NATIVE_DECIMALS.get(normalized, 18)
 
 
 class Capability(str, Enum):

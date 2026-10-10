@@ -297,6 +297,16 @@ def _conversation_artifacts(state: Mapping[str, Any]) -> dict[str, Any] | None:
     return artifacts if len(artifacts) > 1 or has_route_metadata or has_tool_timings else None
 
 
+def _is_bitcoin_psbt_transaction(value: Any) -> bool:
+    """Bitcoin transfers arrive as PSBTs rather than signable EVM calldata."""
+    if not isinstance(value, Mapping):
+        return False
+    display = value.get("display")
+    if isinstance(display, Mapping) and str(display.get("format", "")).lower() == "psbt":
+        return True
+    return str(value.get("chain", "")).upper() in {"BTC", "BITCOIN"}
+
+
 def _assistant_response_content(response: Mapping[str, Any]) -> str:
     if response.get("message"):
         return str(response["message"])
@@ -316,6 +326,12 @@ def _assistant_response_content(response: Mapping[str, Any]) -> str:
         if failed:
             message += f"另有 {', '.join(dict.fromkeys(failed))} 报价失败，已跳过。"
         return message
+    pending = response.get("pending_transaction") or response.get("transaction")
+    if _is_bitcoin_psbt_transaction(pending) and (
+        kind in {"transfer_prepare", "swap_prepare"} or stage == "swap_ready"
+    ):
+        target = "转账" if kind == "transfer_prepare" else "兑换"
+        return f"Bitcoin {target}交易已准备好，请把 PSBT 导入比特币钱包签名并广播。"
     messages = {
         "unsupported": "抱歉，我目前只能处理钱包余额、资产、价格、转账和兑换相关请求。",
         "confirmation_required": "请确认是否继续这笔兑换。",

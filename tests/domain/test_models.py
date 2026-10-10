@@ -215,6 +215,42 @@ def test_transfer_request_rejects_non_evm_sender_address():
         )
 
 
+def test_transfer_request_accepts_tron_and_bitcoin_addresses():
+    tron = TransferRequest(
+        chain="TRON",
+        sender="TNwXHkvCwj3nayWPbFbxD7rBPncBsyBS27",
+        recipient="TNwXHkvCwj3nayWPbFbxD7rBPncBsyBS27",
+        amount="1",
+        amount_raw="1000000",
+        token=None,
+    )
+    assert tron.sender == "TNwXHkvCwj3nayWPbFbxD7rBPncBsyBS27"
+
+    bitcoin = TransferRequest(
+        chain="BTC",
+        sender="bc1qdqahz8x62rsyfmlkv0m5e5rc234zr7vyl690d5",
+        recipient="3FGALr2UNebKnBTErhePUk3CuzmDd9FJux",
+        amount="0.001",
+        amount_raw="100000",
+        token=None,
+    )
+    assert bitcoin.amount_raw == "100000"
+
+
+def test_transfer_request_rejects_a_tron_address_on_an_evm_chain():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        TransferRequest(
+            chain="BASE",
+            sender="TNwXHkvCwj3nayWPbFbxD7rBPncBsyBS27",
+            recipient="0x" + "2" * 40,
+            amount="1",
+            amount_raw="1000000",
+            token=None,
+        )
+
+
 def test_allowance_requirement_is_serializable_in_normalized_quote():
     requirement = AllowanceRequirement(
         token=Asset(chain="BASE", symbol="USDC", decimals=6, address="0x" + "3" * 40),
