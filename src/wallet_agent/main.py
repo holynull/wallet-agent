@@ -43,8 +43,13 @@ from wallet_agent.providers import BridgersProvider, HttpJsonTransport, OmniBrid
 IntentOutput = RouteDecision
 
 
-def build_application(settings: Settings | None = None) -> Any:
-    settings = settings or Settings()
+def build_graph_dependencies(settings: Settings) -> dict[str, Any]:
+    """Assemble everything the graph needs, and nothing the HTTP app owns.
+
+    LangGraph Server hosts the graph directly, so the server entry point must not
+    build the session store, the checkpointer or Redis: those are application
+    concerns the platform replaces.
+    """
     try:
         from langchain_openai import ChatOpenAI
     except ImportError as exc:  # pragma: no cover - dependency is locked in production
@@ -219,18 +224,34 @@ def build_application(settings: Settings | None = None) -> Any:
         rpc_max_attempts=settings.rpc_max_attempts,
     )
     execution_observer = ExecutionObserver(chain_registry)
-    checkpoint_handle = initialize_checkpointer(settings.persistence_url)
-    graph = build_graph(
-        model=model,
-        providers=providers,
-        chains=dict(chain_registry.items()),
-        wallet_provider=wallet_provider,
-        explorer_provider=explorer_provider,
-        execution_observer=execution_observer,
-        price_provider=price_provider,
-        checkpointer=(
-            False if settings.use_platform_checkpointer else checkpoint_handle.checkpointer
-        ),
+
+    return {
+        "model": model,
+        "model_registry": model_registry,
+        "providers": providers,
+        "transports": transports,
+        "wallet_provider": wallet_provider,
+        "explorer_provider": explorer_provider,
+        "price_provider": price_provider,
+        "chain_registry": chain_registry,
+        "execution_observer": execution_observer,
+        "metadata_cache": metadata_cache,
+        "metrics": metrics,
+        "okx_client": okx_client,
+    }
+
+
+def build_runtime_graph(settings: Settings, *, checkpointer: Any) -> Any:
+    """Build the graph from settings. Callers decide who owns persistence."""
+    dependencies = build_graph_dependencies(settings)
+    return build_graph(
+        model=dependencies["model"],
+        providers=dependencies["providers"],
+        chains=dict(dependencies["chain_registry"].items()),
+        wallet_provider=dependencies["wallet_provider"],
+        explorer_provider=dependencies["explorer_provider"],
+        execution_observer=dependencies["execution_observer"],
+        price_provider=dependencies["price_provider"],
         max_poll_attempts=settings.poll_max_attempts,
         confirmation_ttl_seconds=settings.confirmation_ttl_seconds,
         provider_timeout_seconds=settings.provider_timeout_seconds,
@@ -238,9 +259,28 @@ def build_application(settings: Settings | None = None) -> Any:
         react_tool_timeout_seconds=settings.react_tool_timeout_seconds,
         require_react=not settings.react_compatibility_mode,
         split_graphs=not settings.react_compatibility_mode,
-        metadata_cache=metadata_cache,
-        metrics=metrics,
+        metadata_cache=dependencies["metadata_cache"],
+        metrics=dependencies["metrics"],
+        checkpointer=checkpointer,
     )
+
+
+def build_application(settings: Settings | None = None) -> Any:
+    settings = settings or Settings()
+    dependencies = build_graph_dependencies(settings)
+    model_registry = dependencies["model_registry"]
+    providers = dependencies["providers"]
+    transports = dependencies["transports"]
+    wallet_provider = dependencies["wallet_provider"]
+    explorer_provider = dependencies["explorer_provider"]
+    price_provider = dependencies["price_provider"]
+    chain_registry = dependencies["chain_registry"]
+    execution_observer = dependencies["execution_observer"]
+    metadata_cache = dependencies["metadata_cache"]
+    metrics = dependencies["metrics"]
+    okx_client = dependencies["okx_client"]
+    checkpoint_handle = initialize_checkpointer(settings.persistence_url)
+    graph = build_runtime_graph(settings, checkpointer=checkpoint_handle.checkpointer)
     session_store = SqlSessionStore(settings.persistence_url)
     redis_client = None
     run_store = None

@@ -1,24 +1,37 @@
-"""Entry point for hosting this graph on LangGraph Server (spike).
+"""Entry point for hosting this graph on LangGraph Server.
 
-`langgraph.json` points here. The server owns persistence, so the factory must
-NOT hand the graph a checkpointer of its own -- a compiled-in checkpointer
-shadows the platform one and breaks thread management. Wiring `checkpointer=`
-through `build_graph(..., checkpointer=False)` is the seam this spike verifies.
+`langgraph.json` points here. The server owns persistence and the HTTP
+transport, so this assembles **only** the graph's dependencies: building the
+whole FastAPI application would also create the session store, the checkpointer
+and Redis, and a compiled-in checkpointer would shadow the platform's.
+
+The factory is async on purpose. `Settings()` resolves its env file through
+`os.getcwd()`, and the server rejects synchronous blocking calls inside a run,
+so construction is handed to a worker thread.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 _GRAPH: Any = None
+_LOCK = asyncio.Lock()
 
 
-def graph(config: Any = None) -> Any:  # noqa: ARG001 - server passes the run config
-    """Build once per process and hand the same compiled graph to the server."""
+def _build() -> Any:
+    from wallet_agent.config import Settings
+    from wallet_agent.main import build_runtime_graph
+
+    # checkpointer=False: the platform injects its own per run.
+    return build_runtime_graph(Settings(_env_file=None), checkpointer=False)
+
+
+async def graph(config: Any = None) -> Any:  # noqa: ARG001 - server passes the run config
+    """Build once per process, off the event loop, and reuse it."""
     global _GRAPH
     if _GRAPH is None:
-        from wallet_agent.main import build_application
-
-        application = build_application()
-        _GRAPH = application.state.graph
+        async with _LOCK:
+            if _GRAPH is None:
+                _GRAPH = await asyncio.to_thread(_build)
     return _GRAPH
