@@ -29,19 +29,6 @@ class LazyAsyncSqliteSaver:
         current_version = 0 if current is None else int(str(current).split(".")[0])
         return f"{current_version + 1:032}.{random.random():016}"
 
-    async def _open(self) -> tuple[Any, Any]:
-        """Open the saver; drivers with a different connection shape override this."""
-        import importlib
-
-        saver_class = getattr(importlib.import_module(self._module), self._class_name)
-        context = saver_class.from_conn_string(self.dsn)
-        saver = await context.__aenter__()
-        await saver.setup()
-        return context, saver
-
-    async def _close(self, context: Any) -> None:
-        await context.__aexit__(None, None, None)
-
     async def _get(self) -> Any:
         if self._saver is None:
             import aiosqlite
@@ -144,6 +131,19 @@ class LazyAsyncPostgresSaver:
     def get_next_version(self, current: str | None, _channel: Any = None) -> str:
         current_version = 0 if current is None else int(str(current).split(".")[0])
         return f"{current_version + 1:032}.{random.random():016}"
+
+    async def _open(self) -> tuple[Any, Any]:
+        """Open the saver; drivers with a different connection shape override this."""
+        import importlib
+
+        saver_class = getattr(importlib.import_module(self._module), self._class_name)
+        context = saver_class.from_conn_string(self.dsn)
+        saver = await context.__aenter__()
+        await saver.setup()
+        return context, saver
+
+    async def _close(self, context: Any) -> None:
+        await context.__aexit__(None, None, None)
 
     async def _get(self) -> Any:
         if self._saver is not None:
