@@ -276,7 +276,56 @@ POST /v1/swap/{session_id}/broadcast
 
 7. 查询订单状态：`GET /v1/swap/{session_id}?user_id=app-user-42`。
 
-### 5.4 取消与失效
+### 5.4 Bitcoin（PSBT）
+
+Bitcoin 没有 `data` calldata，也没有 chain_id；服务端返回的是**未签名交易的 PSBT**，
+由 App 交给比特币签名器（本地或硬件钱包）签名后再广播。
+
+- 转账与兑换都走同一条 `pending_transaction` 结构：
+
+```json
+{
+  "chain": "BTC",
+  "to": "bc1p...（收款方或 Provider 充值地址）",
+  "value": "120000",
+  "data": "<base64 PSBT>",
+  "display": {
+    "action": "native_transfer | provider_deposit",
+    "format": "psbt",
+    "from": "bc1q...（找零回填的主地址）",
+    "from_addresses": "bc1q...,bc1p...,3FGA...（App 声明的全部 BTC 地址）",
+    "amount_raw": "120000",
+    "fee_raw": "459",
+    "change_raw": "79541",
+    "unsigned_tx_hex": "0200000001...",
+    "deposit_address": "bc1p...（仅兑换）",
+    "provider_order_id": "...（仅兑换）"
+  }
+}
+```
+
+- 判定方式：`chain === "BTC"` 且 `display.format === "psbt"`；此时 `data` 是 base64
+  PSBT，**不要**按十六进制 calldata 解析。`value` 是聪（satoshi）为单位的整数。
+- **UTXO 聚合**：服务端会把 App 为该钱包声明的**所有** BTC 地址（收款地址与找零地址）
+  的 UTXO 合并挑选，因此单笔转账不再受某一个地址余额限制；找零回到主地址
+  （`display.from`）。`display.from_addresses` 是参与挑选的地址清单（逗号分隔），
+  `display.input_count` 是实际花费的 UTXO 数。App 需要提供**完整**的地址列表，
+  否则大额转账仍可能报 `insufficient Bitcoin balance`。
+- 广播：用 PSBT 签名得到完整交易后向比特币网络广播（例如 Esplora
+  `POST /api/tx`），再把交易哈希回传：
+
+```http
+POST /v1/transfer/{session_id}/broadcast
+{"user_id":"app-user-42","chain":"BTC","tx_hash":"<64 hex>"}
+```
+
+- 兑换：`display.deposit_address` 是 Provider 的充值地址，`to` 与之一致；签名广播后同样用
+  `/v1/swap/{session_id}/broadcast` 回传哈希，再按 Provider 订单轮询状态。
+- 服务端只在本地根据 UTXO 组装 PSBT（含手续费与找零），**不持有私钥、不签名、不广播**。
+- 浏览器插件若暂时没有 BTC 签名 API，可先把 PSBT（`data`）或 `display.unsigned_tx_hex`
+  导出给外部钱包完成签名。
+
+### 5.5 取消与失效
 
 - 取消当前兑换：`POST /v1/swap/{session_id}/cancel`（`{"user_id":"..."}`）。
 - `confirmation` 有 `requested_at` / `expires_at`；超时后服务端返回 `CONFIRMATION_EXPIRED`，需重新发起。
@@ -286,7 +335,7 @@ POST /v1/swap/{session_id}/broadcast
 
 ## 6. 签名与广播（App 职责）
 
-- 未签名交易包含 `chain`、`chain_id`、`to`、`data`、`value`。
+- 未签名交易包含 `chain`、`chain_id`、`to`、`data`、`value`；Bitcoin（`display.format == "psbt"`）的 `data` 是 base64 PSBT，`chain_id` 为空。
 - 签名前必须向用户展示资产、数量、收款方 / spender，并做一次明确确认。
 - `pending_transaction` 的 `chain` / `chain_id` 必须与钱包当前网络一致，否则先切网。
 - 服务端**不会**替 App 签名、选 Provider 或自动广播。

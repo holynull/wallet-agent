@@ -13,6 +13,7 @@ in wallet-agent requests or checkpoints.
 | Optimism | `https://mainnet.optimism.io` | Optimism public endpoint |
 | Polygon | `https://polygon-rpc.com` | Polygon community endpoint |
 | BNB Smart Chain | `https://bsc-dataseed.binance.org` | Binance public endpoint |
+| Bitcoin | `https://blockstream.info` | Esplora REST API (`/api`) |
 | TRON | `https://api.trongrid.io` | REST API; may be rate-limited |
 | Solana | `https://api.mainnet-beta.solana.com` | Solana public JSON-RPC |
 
