@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "wallet_agent": "./src/wallet_agent/graph/server_app.py:graph"
+  },
+  "env": ".env"
+}
