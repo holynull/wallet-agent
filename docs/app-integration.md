@@ -198,6 +198,13 @@ const response = current?.response?.response || current?.response || current;
 | `swap_status` / `transaction_status` | `status` | 链上状态 |
 | `unsupported` / `error` | `message`、`errors[]` | 兜底展示 |
 | `react` | `react_results[]` | ReAct 工具调用结果，按 tool 名自行投影 |
+| `react` + `receive_address` | `react_results[]` | 收款地址卡：`groups` / `supported_chains` / `message` |
+| `react` + `transaction_history` | `react_results[]` | 交易记录卡：`items` / `total` / `summary` / `filter` / `partial_errors` |
+| 任意 `kind` | `client_action` | App 需要弹出的界面（通讯录 / 扫码 / 金额键盘） |
+| `clarification` | `suggestions[].type` / `value` | 快捷回复的类型与回填值 |
+
+ReAct 响应（`kind: "react"`）里，业务卡片统一从 `react_results[]` 按 `tool` 名取；
+`suggestions`（快捷回复）和 `client_action`（客户端动作）是**响应级字段**，不在 `react_results` 里。
 
 恢复历史时需要同样的投影逻辑：`GET /v1/agent/conversations/{id}` 返回 `latest_artifacts`，
 字段与上表一一对应（`quotes` / `confirmation` / `approval` / `pending_transaction` / `pending_kind` /
@@ -333,6 +340,87 @@ POST /v1/transfer/{session_id}/broadcast
   **旧报价、旧确认、旧未签名交易一律作废**，必须重新走一轮。
 - 广播失败后不要伪造成功状态；只提交真实哈希。
 
+### 5.6 对话卡片字段契约
+
+下面每个字段都是 App 渲染对应卡片需要的全部输入。服务端只给数据，不生成 UI。
+
+**快捷回复** `response.suggestions[]`（`kind == "clarification"`）
+
+| 字段 | 说明 |
+| --- | --- |
+| `label` | 胶囊文案 |
+| `message` | 点击后作为用户消息回传的内容 |
+| `type` | `chain` / `symbol` / `amount` / `address` / `token` / `action` |
+| `value` | 回填值；`action` 类型时是动作名（见下） |
+| `data` | 槽位数据，建议随下一轮请求原样放进 `metadata.suggestion_data` |
+
+- `type: "action"` 的胶囊是**动作**不是槽位值，不要当参数提交。
+- `type: "amount"` 的 `value` 可能是 `25%` 这种比例，需要 App 用当前余额换算出具体数量再提交。
+
+**客户端动作** `response.client_action`
+
+```json
+{"type": "open_contacts", "reason": "用户要给朋友转账", "slots": {"chain": "BTC"}}
+```
+
+- `type` 取 `open_contacts` / `scan_qr` / `open_amount_keypad`，App 收到后弹出自己的界面。
+- 用户选完，把结果作为**下一轮** `turn` 的输入回传（地址文本，或 `metadata.suggestion_data`）。
+- 服务端只会下发白名单内的动作；工具遇到其它取值返回 `CLIENT_ACTION_UNSUPPORTED`，不会误导 App 弹窗。
+
+**收款地址卡** `react_results` 中 `tool == "receive_address"` 的 `result`
+
+| 字段 | 说明 |
+| --- | --- |
+| `groups[]` | `{group, label, address, addresses[], chains[]}`；所有 EVM 网络合并为一组，BTC/TRON 各自成组 |
+| `supported_chains[]` | 全部可用链，用于「支持的链」卡片 |
+| `message` | 可直接展示的话术，与设计稿一致 |
+
+二维码由 App 用 `groups[].address` 自行生成；`addresses[]` 多于一个时（BTC 收款+找零地址）要在卡片上说明。
+
+**交易记录卡** `react_results` 中 `tool == "transaction_history"` 的 `result`
+
+| 字段 | 说明 |
+| --- | --- |
+| `items[]` | `chain`、`tx_hash`、`status`、`direction`、`symbol`、`decimals`、`amount_raw`、`raw_only`、`counterparty`、`occurred_at`、`failure_reason` |
+| `total` / `fetched` | 本页条数 / 本轮实际抓到的总条数（`fetched` 用于「拉取到 N 笔中的最近 M 笔」） |
+| `summary` | 形如「7 笔转出、3 笔入账」，按抓到的全部记录统计 |
+| `filter` | 回显本次的 `chain` / `direction` |
+| `partial_errors[]` | 本轮没能读取的链，形如 `BSC:timeout` |
+
+- `direction`：`send` / `receive` / `swap` / `unknown`；符号（`+` / `-`）由 App 决定。
+- `raw_only: true` 表示来源**没有给出小数位**，`amount_raw` 是代币最小单位，**不要做除法换算**，原样标注即可。
+- `partial_errors` 非空**不能渲染成「没有交易」**，要在卡片上写清楚哪条链本轮没读到。
+- 「只看支出」= 下一轮传 `direction: "send"`。
+
+**资产卡** `portfolio`（`kind == "portfolio_query"` 或 `react_results` 中的 `portfolio_snapshot`）
+
+- `assets[]`：`asset`（含 `symbol`/`chain`）、`amount`、`amount_raw`、`usd_value`、`unit_price`、`addresses[]`。`unit_price` 可能为 `null`（价格未知）。
+- `total_usd_value`、`has_assets`（为 `false` 时渲染 `$ 0.00` +「暂无资产数据」）、`complete`、`valuation_complete`、`network_status[]`。
+- 查询不完整时（`complete == false`）必须保留「未查询 ≠ 余额为零」的说明。
+
+**风险提示** `preflight.risk`
+
+```json
+{"level": "warning", "code": "SELF_TRANSFER", "message": "..."}
+```
+
+- `level: "danger"` 时 `preflight.ok == false`，交易被阻断，App 不要给出签名入口。
+- `level: "warning"` 不阻断，展示后允许继续。
+- 同样的信息也在 `preflight.checks[]` 里（`name == "address_risk"`）。
+
+**交易状态** `transaction_status`
+
+- `status`（`pending` / `confirmed` / `failed` / `dropped` / `unknown`）、`chain`、`tx_hash`、`message`。
+- `failure_reason`：失败原因；`reason_unavailable: true` 表示**来源没有提供原因**，此时按「无法获知原因」表述，不要编造。
+
+**从交易详情页进入对话**：把当前交易放进 `metadata.transaction_query`：
+
+```json
+{"transaction_query": {"chain": "ETH", "tx_hash": "0x..."}}
+```
+
+这样「解释失败原因？」「为什么还没到账？」这类默认问题不需要用户重复粘贴哈希，服务端会直接查这笔。
+
 ## 6. 签名与广播（App 职责）
 
 - 未签名交易包含 `chain`、`chain_id`、`to`、`data`、`value`；Bitcoin（`display.format == "psbt"`）的 `data` 是 base64 PSBT，`chain_id` 为空。
@@ -382,6 +470,10 @@ SSE 的 `error` 事件正文同样是 `code` + `message`。
 - 卡片渲染与历史恢复共用同一套投影函数，避免两处逻辑漂移。
 - 未签名交易只在 App 侧签名，提交的永远只是哈希。
 - 余额、价格、Gas 的未知值一律显示为「未知 / 不可用」，不能当成 0。
+- `partial_errors` 非空的查询结果要标注「部分链未读取」，不能当成「没有数据」。
+- `raw_only: true` 的交易记录金额不要做小数位换算。
+- `client_action` 必须由 App 处理（弹通讯录/扫码/键盘），不要当普通文本塞回模型。
+- 从交易详情页进入时带上 `metadata.transaction_query`，默认问题才能落到具体那笔交易。
 
 ## 10. 自测
 
@@ -414,3 +506,69 @@ curl -N 'http://<server-ip>:8000/v1/agent/stream/<run-id>?last_event_id=<event-i
 - 兑换走完 报价 → 选择 → （Approve）→ 广播 → 状态 全流程。
 - 杀进程/断网后重连：不重复发 turn、不重复广播，状态能恢复到正确阶段。
 - 未签名交易的网络与钱包当前网络不一致时，签名入口被正确拦截。
+
+## 11. 联调与调试方案
+
+目标：App 和服务器之间出问题时，**一眼看出是输入没带、路由走错、还是外部数据源慢/失败**，
+而不是靠猜和反复重试。
+
+### 11.1 App 调试面板建议展示的内容
+
+服务端已经在响应里给了这些字段，App 调试模式直接平铺即可（Demo 的「后端调试数据」面板就是这套）：
+
+| 字段 | 用途 |
+| --- | --- |
+| `run_id` / `conversation_id` / `session_id` | 和服务器日志、checkpoint、会话记录对齐 |
+| `response.route` | `graph_role` / `route_mode` / `route_reason`：判断这轮走了 ReAct 还是确定性链路 |
+| `react_results[]` | 每个工具的原始返回，按 `tool` 折叠 |
+| `react_tool_timings[]` | 每个工具的耗时、`status`、`error_code`、`cache_status` |
+| `model_trace[]` | 用了哪个模型、耗时、token 数 |
+| `preflight.checks[]` / `preflight.risk` | 预检查逐项结果与风险等级 |
+| `client_action` / `suggestions` | 需要 App 侧响应的动作与快捷回复 |
+| 原始 SSE 帧 | 归一化投影会吃掉字段，调试时保留一份原文 |
+
+建议再加一个「显示原始响应」开关，直接看未投影的 `state.response`——卡片渲染有问题时，
+这一步能立刻区分「服务端没给」还是「App 投影丢了」。
+
+### 11.2 服务端已有的调试入口
+
+- `GET /debug/metrics`：进程内的模型/工具调用计数与缓存命中统计，用于判断「是模型慢还是工具慢」。
+- `GET /v1/agent/conversations/{id}`：拿到完整的 `messages`、`latest_artifacts`、`model_trace`，
+  可复现某一轮的卡片快照，不必回放 SSE。
+- 每轮 SSE 都带 `run_id`，断线后可用 `Last-Event-ID` 续传，不要重新发一轮。
+
+### 11.3 一键诊断包（建议 App 实现）
+
+在调试面板加一个「复制诊断信息」按钮，内容包含：
+
+1. 本轮 `request`（**去除 token / 助记词 / 私钥**）
+2. `run_id`、`conversation_id`、`session_id`
+3. `response.route` + `response.kind` + `message`
+4. `react_tool_timings[]`（含 `error_code`）
+5. `partial_errors`（如果有）
+6. 原始 SSE 尾部若干帧
+
+安全边界：服务端本身不持有私钥/助记词/签名结果，诊断包里也不应该出现它们；
+`user_id` 用测试账号，Bearer token 不要写进诊断包。
+
+### 11.4 失败自查表
+
+| 现象 | 先看什么 |
+| --- | --- |
+| 卡片没有数据 | `partial_errors` 是否非空（外部链慢/失败）；`react_tool_timings` 里该工具的 `error_code` |
+| 一直反问地址/金额 | 请求是否带了 `wallet_accounts`、`supported_networks`；`suggestions` 是否被 App 丢弃 |
+| 金额数字明显不对 | 记录里 `raw_only` 是否为 `true`（没有小数位，不能换算） |
+| 「无法确定交易状态」 | 是否传了 `metadata.transaction_query`；哈希与链是否匹配 |
+| 交易准备不出来 | `preflight.checks[]` 里哪一项 `failed`（`address_risk` 的 `danger` 会直接阻断） |
+| 回答和上一轮对不上 | 补参数时是否复用了同一个 `conversation_id` / `session_id` |
+
+### 11.5 联调顺序建议
+
+1. **上下文与 SSE**：先用只会返回 `clarification` 的输入（不触发任何链上请求），
+   验证 `wallet_accounts` 透传、`conversation_id` 复用、断线续传。
+2. **只读**：资产、价格、交易记录各跑一轮，确认 `partial_errors`、`raw_only` 等诚实字段被正确展示。
+3. **待签名交易**：转账/兑换到 `pending_transaction`，确认预检查与风险提示，**不广播**。
+4. **回执**：用一条已上链的哈希验证 `transaction_status` 与 `failure_reason`。
+5. **客户端动作**：验证通讯录/扫码/键盘的回填闭环。
+
+每步都用同一个测试账号，方便用 `GET /v1/agent/conversations` 回看整条链路。
