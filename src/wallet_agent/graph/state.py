@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from langgraph.graph.message import add_messages
@@ -111,8 +112,28 @@ def _merge_conversation_history(
     existing: list[dict[str, Any]] | None,
     incoming: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
-    """Append public user/assistant turns while preserving checkpoint history."""
-    return [*(existing or []), *(incoming or [])]
+    """Merge public user/assistant turns while preserving checkpoint history.
+
+    Mirrors ``add_messages``: entries are appended, and an entry that repeats an
+    existing ``id`` replaces it in place. That makes re-persisting the same turn
+    idempotent instead of appending a duplicate transcript row.
+    """
+    merged = [dict(item) for item in (existing or [])]
+    index_by_id = {
+        str(item["id"]): position
+        for position, item in enumerate(merged)
+        if isinstance(item, dict) and item.get("id")
+    }
+    for item in incoming or []:
+        entry = dict(item) if isinstance(item, Mapping) else item
+        entry_id = str(entry["id"]) if isinstance(entry, dict) and entry.get("id") else None
+        if entry_id is not None and entry_id in index_by_id:
+            merged[index_by_id[entry_id]] = entry
+            continue
+        merged.append(entry)
+        if entry_id is not None:
+            index_by_id[entry_id] = len(merged) - 1
+    return merged
 
 
 class AgentState(TypedDict, total=False):

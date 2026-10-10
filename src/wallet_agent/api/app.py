@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import uuid
@@ -403,7 +404,9 @@ def _assistant_response_content(response: Mapping[str, Any]) -> str:
     return messages.get(str(kind)) or stage_messages.get(str(stage)) or "请求已处理完成。"
 
 
-def _assistant_history_entry(state: Mapping[str, Any]) -> dict[str, Any] | None:
+def _assistant_history_entry(
+    state: Mapping[str, Any], *, turn_id: str | None = None
+) -> dict[str, Any] | None:
     response = state.get("response") or {}
     if not isinstance(response, Mapping) or not response:
         return None
@@ -411,6 +414,20 @@ def _assistant_history_entry(state: Mapping[str, Any]) -> dict[str, Any] | None:
         "role": "assistant",
         "content": _assistant_response_content(response),
     }
+    if turn_id:
+        # One run can persist several distinct responses (a quote, then the
+        # confirmation it triggered), so the id needs a content fingerprint:
+        # re-persisting the same response stays idempotent, a different one is
+        # kept as its own transcript row.
+        fingerprint = hashlib.sha1(
+            json.dumps(
+                {key: entry.get(key) for key in ("content", "artifacts", "suggestions")},
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:12]
+        entry["id"] = f"assistant:{turn_id}:{fingerprint}"
     artifacts = _conversation_artifacts(state)
     if artifacts:
         entry["artifacts"] = artifacts
@@ -964,11 +981,11 @@ def create_app(
         return {"conversation": _jsonable(_conversation_summary(updated))}
 
     async def persist_assistant_history(
-        conversation_id: str, state: Mapping[str, Any]
+        conversation_id: str, state: Mapping[str, Any], *, run_id: str | None = None
     ) -> None:
         """Persist response text and its immutable UI-card snapshot as one chat item."""
         graph = app.state.graph
-        history_entry = _assistant_history_entry(state)
+        history_entry = _assistant_history_entry(state, turn_id=run_id)
         if history_entry is None or graph is None or not hasattr(graph, "aupdate_state"):
             return
         config = {"configurable": {"thread_id": conversation_id}}
@@ -1395,7 +1412,7 @@ def create_app(
                     # The quote and its cards are a completed user-facing step.
                     # Preserve it before the automatic confirmation execution
                     # replaces ``response`` in the same checkpoint.
-                    await persist_assistant_history(thread_id, result)
+                    await persist_assistant_history(thread_id, result, run_id=run_id)
                     result = await execute(
                         {
                             "request": result.get("request"),
@@ -1412,7 +1429,7 @@ def create_app(
                     )
                 snapshot = await get_snapshot()
                 result = snapshot.values
-                await persist_assistant_history(thread_id, result)
+                await persist_assistant_history(thread_id, result, run_id=run_id)
                 snapshot = await get_snapshot()
                 result = snapshot.values
                 interrupted = bool(getattr(snapshot, "tasks", ())) and bool(
