@@ -76,15 +76,32 @@ LangChain 的条款，**必须向官方确认**；上生产前还应用 `langcha
 
 **对我们最实际的一点**：现在这套自建 FastAPI **完全没有这个依赖**——没有授权条款、没有 air-gapped 上报。
 
-## 五、附：MySQL
+## 五、附：MySQL（已实现并验证）
 
-LangGraph 官方 checkpointer 只有 `InMemorySaver` / `SqliteSaver` / `AsyncSqliteSaver` /
-`PostgresSaver` / `AsyncPostgresSaver`，**没有 MySQL**。
+官方 checkpointer 仍然只有 `InMemorySaver` / `SqliteSaver` / `AsyncSqliteSaver` /
+`PostgresSaver` / `AsyncPostgresSaver`，**没有 MySQL**；但社区有实现，我们已接入并实测通过：
 
-- 我们**自己的会话索引**是 SQLAlchemy 写的，可以换 MySQL（改 URL + 建表）；
-- LangGraph 的 checkpoint 要 MySQL 就得自己实现 `BaseCheckpointSaver`
-  （`get_tuple` / `list` / `put` / `put_writes` / `delete_thread` 及异步变体），本质是 fork 上游包；
-- **自托管平台只吃 Postgres**，所以"LangGraph Server + MySQL"这条组合走不通。
+- 包：`langgraph-checkpoint-mysql`（第三方，作者 tjni，仓库 `github.com/tjni/langgraph-checkpoint-mysql`），
+  异步类 `AIOMySQLSaver`，其说明写明"尽量模仿 postgres 版以跟官方保持同步"；
+- 接入方式：`create_checkpointer()` 把 `mysql://` / `mysql+aiomysql://` / `mysql+pymysql://`
+  统一归一为 `mysql+aiomysql://`，复用与 Postgres 相同的惰性打开逻辑（`LazyAsyncMySQLSaver`）；
+- 会话索引：`SqlSessionStore` 只加了一条方言映射（`mysql://` → `mysql+aiomysql://`），
+  表结构由 SQLAlchemy `create_all` 建，无需改 DDL；
+- **必须安装 `cryptography`**：MySQL 8 默认 `caching_sha2_password`，aiomysql 缺了它会认证失败，
+  而报错是" misleading 的 `Lost connection to MySQL server during query`"。
+
+实测（本地 MySQL 8 容器）：
+
+```
+checkpointer class: AIOMySQLSaver
+checkpoint round-trip: OK            # setup + aput + aget_tuple
+session rows: [('转给朋友', True), ('查一下余额', False)]
+title search: ['转给朋友']            # 标题搜索 + pinned 都在 MySQL 上工作
+```
+
+**取舍**：这条依赖是第三方的（非 LangChain 官方），需要 pin 版本并关注上游；
+另外**平台自托管只吃 Postgres**，所以选 MySQL 等于放弃 LangGraph Server 这条路
+（本文档其余部分的迁移评估因此只在"改用 Postgres"的前提下成立）。
 
 ## 六、建议
 

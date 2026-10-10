@@ -184,6 +184,10 @@ def _async_database_url(url: str) -> str:
         return f"postgresql+psycopg://{url[len('postgresql://') :]}"
     if url.startswith("sqlite://") and not url.startswith("sqlite+aiosqlite://"):
         return f"sqlite+aiosqlite://{url[len('sqlite://') :]}"
+    if url.startswith("mysql://"):
+        return f"mysql+aiomysql://{url[len('mysql://') :]}"
+    if url.startswith("mysql+pymysql://"):
+        return f"mysql+aiomysql://{url[len('mysql+pymysql://') :]}"
     return url
 
 

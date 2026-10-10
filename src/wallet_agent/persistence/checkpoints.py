@@ -81,6 +81,22 @@ class LazyAsyncSqliteSaver:
             self._saver = None
 
 
+def _mysql_dsn(url: str) -> str:
+    """Normalize MySQL URLs for both the saver and SQLAlchemy.
+
+    The checkpoint saver and our session store both speak SQLAlchemy URLs, and
+    the async path needs an async driver, so a bare ``mysql://`` (or the sync
+    pymysql driver) is rewritten to aiomysql.
+    """
+    if url.startswith("mysql://"):
+        return f"mysql+aiomysql://{url[len('mysql://') :]}"
+    if url.startswith("mysql+pymysql://"):
+        return f"mysql+aiomysql://{url[len('mysql+pymysql://') :]}"
+    if url.startswith("mysql+aiomysql://"):
+        return url
+    raise ValueError(f"unsupported MySQL persistence URL: {url}")
+
+
 def _postgres_dsn(url: str) -> str:
     """Normalize SQLAlchemy-style PostgreSQL URLs for psycopg."""
     if url.startswith("postgres://"):
@@ -93,13 +109,24 @@ def _postgres_dsn(url: str) -> str:
 
 
 class LazyAsyncPostgresSaver:
-    """Keep the official PostgreSQL saver open for the application lifetime."""
+    """Keep an official SQL saver open for the application lifetime.
+
+    ``_module`` / ``_class_name`` / ``_normalize`` are overridden by the MySQL
+    subclass, so the two drivers share one lifecycle implementation.
+    """
+
+    _module = "langgraph.checkpoint.postgres.aio"
+    _class_name = "AsyncPostgresSaver"
 
     def __init__(self, dsn: str) -> None:
-        self.dsn = _postgres_dsn(dsn)
+        self.dsn = self._normalize(dsn)
         self._context: Any = None
         self._saver: Any = None
         self._open_lock: Any = None
+
+    @staticmethod
+    def _normalize(url: str) -> str:
+        return _postgres_dsn(url)
 
     def get_next_version(self, current: str | None, _channel: Any = None) -> str:
         current_version = 0 if current is None else int(str(current).split(".")[0])
@@ -114,9 +141,12 @@ class LazyAsyncPostgresSaver:
             self._open_lock = asyncio.Lock()
         async with self._open_lock:
             if self._saver is None:
-                from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+                import importlib
 
-                self._context = AsyncPostgresSaver.from_conn_string(self.dsn)
+                saver_class = getattr(
+                    importlib.import_module(self._module), self._class_name
+                )
+                self._context = saver_class.from_conn_string(self.dsn)
                 self._saver = await self._context.__aenter__()
                 await self._saver.setup()
         return self._saver
@@ -176,10 +206,23 @@ class CheckpointerHandle:
         await self.checkpointer.aclose()
 
 
+class LazyAsyncMySQLSaver(LazyAsyncPostgresSaver):
+    """MySQL saver (community package, mirrors the official Postgres one)."""
+
+    _module = "langgraph.checkpoint.mysql.aio"
+    _class_name = "AIOMySQLSaver"
+
+    @staticmethod
+    def _normalize(url: str) -> str:
+        return _mysql_dsn(url)
+
+
 def create_checkpointer(persistence_url: str) -> CheckpointerHandle:
     """Create a durable checkpointer for the configured persistence URL."""
     if persistence_url.startswith(("sqlite://", "sqlite+aiosqlite://")):
         return CheckpointerHandle(LazyAsyncSqliteSaver(_sqlite_path(persistence_url)))
     if persistence_url.startswith(("postgres://", "postgresql://", "postgresql+")):
         return CheckpointerHandle(LazyAsyncPostgresSaver(persistence_url))
+    if persistence_url.startswith(("mysql://", "mysql+")):
+        return CheckpointerHandle(LazyAsyncMySQLSaver(persistence_url))
     raise ValueError(f"unsupported persistence URL: {persistence_url}")

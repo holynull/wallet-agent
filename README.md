@@ -159,6 +159,11 @@ CONVERSATION_LOCK_WAIT_SECONDS=30
 ```
 
 PostgreSQL owns LangGraph checkpoints and the app-facing session projection.
+MySQL is supported too: `PERSISTENCE_URL=mysql://user:pass@host:3306/db` (the driver
+is rewritten to `mysql+aiomysql`). Checkpoints use the community
+`langgraph-checkpoint-mysql` package; `cryptography` must stay installed for MySQL
+8's default `caching_sha2_password` auth -- without it the failure surfaces as a
+misleading "Lost connection to MySQL server during query".
 Redis Streams owns the cross-instance run-event log, while a renewable Redis
 lease serializes turns for the same `conversation_id`. Every SSE frame includes
 an `id`. Reconnect to the same `run_id` with `Last-Event-ID` or
