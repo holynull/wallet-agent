@@ -241,8 +241,15 @@ def build_graph_dependencies(settings: Settings) -> dict[str, Any]:
     }
 
 
-def build_runtime_graph(settings: Settings, *, checkpointer: Any) -> Any:
-    """Build the graph from settings. Callers decide who owns persistence."""
+def build_runtime_graph(
+    settings: Settings, *, checkpointer: Any, split_graphs: bool | None = None
+) -> Any:
+    """Build the graph from settings.
+
+    Callers decide who owns persistence, and may override the split-graph mode:
+    LangGraph Server expects a CompiledGraph, while the split mode returns the
+    router that selects between the conversation and lifecycle graphs.
+    """
     dependencies = build_graph_dependencies(settings)
     return build_graph(
         model=dependencies["model"],
@@ -258,7 +265,9 @@ def build_runtime_graph(settings: Settings, *, checkpointer: Any) -> Any:
         max_react_steps=settings.react_max_steps,
         react_tool_timeout_seconds=settings.react_tool_timeout_seconds,
         require_react=not settings.react_compatibility_mode,
-        split_graphs=not settings.react_compatibility_mode,
+        split_graphs=(
+            not settings.react_compatibility_mode if split_graphs is None else split_graphs
+        ),
         metadata_cache=dependencies["metadata_cache"],
         metrics=dependencies["metrics"],
         checkpointer=checkpointer,

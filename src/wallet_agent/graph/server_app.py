@@ -24,7 +24,11 @@ def _build() -> Any:
     from wallet_agent.main import build_runtime_graph
 
     # checkpointer=False: the platform injects its own per run.
-    return build_runtime_graph(Settings(_env_file=None), checkpointer=False)
+    # split_graphs=False: the platform validates a CompiledGraph, and the split
+    # mode returns our router object instead.
+    return build_runtime_graph(
+        Settings(_env_file=None), checkpointer=False, split_graphs=False
+    )
 
 
 async def graph(config: Any = None) -> Any:  # noqa: ARG001 - server passes the run config
