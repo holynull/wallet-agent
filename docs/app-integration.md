@@ -15,6 +15,7 @@ Demo 中的对照实现：
 - 事件 → UI 卡片投影：`demo-next/app/page.tsx:610`、`demo-next/lib/agent-utils.ts:268`
 - 钱包上下文构造：`demo-next/lib/agent-utils.ts:248`
 - 交易动作（选择报价 / 确认 / Approve / 广播 / 查询）：`demo-next/app/page.tsx:562`
+- 历史管理（翻页 / 搜索 / 改名 / 置顶）：`demo-next/app/page.tsx:263`、`demo-next/lib/agent-utils.ts:613`
 
 ## 1. 安全边界
 
@@ -507,7 +508,38 @@ POST /v1/transfer/{session_id}/broadcast
 `latest_artifacts`、`model_trace`、`session_id`。App 冷启动时应据此恢复消息列表和当前卡片，
 而不是依赖 SSE 重放。投影规则与 §4.3 完全一致，**两处必须共用同一份实现**。
 
-### 7.3 已知限制与注意事项
+### 7.3 参考实现（Demo）
+
+历史面板是照着这套契约写的，App 可以直接对照 `demo-next/app/page.tsx:861`。三个纯函数
+（`demo-next/lib/agent-utils.ts:613`）就是客户端要做的那点事，也有单测覆盖：
+
+```ts
+// 1) 拼查询串：空搜索不要发 q，空 cursor 不要发 cursor
+buildHistoryPath({ userId, query, cursor, limit: 20 })
+// → /v1/agent/conversations?user_id=u1&limit=20&q=流水&cursor=2026-10-10T06:15:51Z
+
+// 2) 追加一页：按 conversation_id 去重，返回下一页游标
+const { conversations, nextCursor } = mergeHistoryPage(existing, page);
+
+// 3) 本地排序：置顶优先，其余按 updated_at 倒序（服务端顺序用于翻页，不要改动它）
+setRows(sortHistoryRows(conversations));
+```
+
+调用约定：
+
+| 动作 | 请求 | 说明 |
+| --- | --- | --- |
+| 首次打开 / 重新加载 | `buildHistoryPath({userId, query})` | 不传 `cursor`，`next_cursor` 置空重来 |
+| 加载更多 | `buildHistoryPath({userId, query, cursor: nextCursor})` | 用当前 `next_cursor`，结果**追加**而不是替换 |
+| 搜索 | 同上但带 `query` | 搜索和翻页可叠加：搜索后翻页要一直带着同一个 `q` |
+| 改名 | `PATCH {"title"}` | 成功后可直接用返回的 `conversation` 覆盖该行 |
+| 置顶 | `PATCH {"pinned"}` | 只改本地顺序，**不要重排服务端页** |
+| 删除 | `DELETE` | 需二次确认：服务端是物理删除 |
+
+**三个容易踩的点**：① 追加页时不去重会出现重复行；② 把服务端返回的页重新排序会破坏游标语义；
+③ 置顶当成分页条件会导致刷新后置顶项消失（服务端不按 `pinned` 排序）。
+
+### 7.4 已知限制与注意事项
 
 - **归属**：`user_id`（或 Bearer token）决定归属；用别人的 `conversation_id` 返回 **404**
   而不是 403，这是刻意的——不要据此判断"会话是否存在"。
@@ -546,6 +578,8 @@ SSE 的 `error` 事件正文同样是 `code` + `message`。
 - 每次 `turn` 独立维护进度时间线，不要把上一轮的进度混进来。
 - SSE 必须处理终态与重连，`HTTP 200` 不能当作成功判据。
 - 卡片渲染与历史恢复共用同一套投影函数，避免两处逻辑漂移。
+- 历史列表：翻页只用 `next_cursor`、结果按 `conversation_id` 去重后追加；不要重排服务端返回的页。
+- 历史列表：`pinned` 只影响本地展示顺序；搜索与翻页要带上同一个 `q`。
 - 未签名交易只在 App 侧签名，提交的永远只是哈希。
 - 余额、价格、Gas 的未知值一律显示为「未知 / 不可用」，不能当成 0。
 - `partial_errors` 非空的查询结果要标注「部分链未读取」，不能当成「没有数据」。
