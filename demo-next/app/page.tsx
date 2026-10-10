@@ -3,7 +3,7 @@
 import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { APP_NETWORKS, AppWalletConfig, DEFAULT_APP_WALLET, buildWalletAppContext } from "../lib/agent-utils";
 import { PortfolioCard } from "./portfolio-card";
-import { apiErrorMessage, buildReadOnlyTimeline, classifyAgentTest, ConversationArtifacts, extractConversationArtifacts, extractReadOnlyTrace, formatModelTraceEntry, formatProcessingDuration, formatResponseSummary, latestProgressText, mergeModelTrace, parseSseFrame, parseSseFrames, providerPriority as getProviderPriority, ReadOnlyTrace, responseMessage, restoreConversationMessages, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
+import { apiErrorMessage, bitcoinSigningFields, buildReadOnlyTimeline, classifyAgentTest, ConversationArtifacts, extractConversationArtifacts, extractReadOnlyTrace, formatModelTraceEntry, formatProcessingDuration, formatResponseSummary, isBitcoinSigningTransaction, latestProgressText, mergeModelTrace, parseSseFrame, parseSseFrames, providerPriority as getProviderPriority, ReadOnlyTrace, responseMessage, restoreConversationMessages, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
 
 type Message = { id?: string; role: "user" | "assistant" | "system"; content: string; fullContent?: string; typing?: boolean; suggestions?: any[]; artifacts?: ConversationArtifacts; responseKey?: string };
 type ProgressEntry = { text: string; elapsed?: number; model?: ModelTraceEntry };
@@ -146,6 +146,28 @@ function agentSwapMetadata(address: string) {
     input_amount: "10", input_amount_raw: "10000000", sender_address: address, recipient_address: address,
   } };
 }
+function BitcoinSigningCard({ transaction, kind }: { transaction: any; kind: string }) {
+  const [copied, setCopied] = useState("");
+  const fields = bitcoinSigningFields(transaction);
+  const copy = (label: string, value: string) => {
+    const done = () => { setCopied(label); window.setTimeout(() => setCopied((current) => (current === label ? "" : current)), 1500); };
+    navigator.clipboard?.writeText(value).then(done).catch(() => setCopied(""));
+  };
+  const explanation = "浏览器钱包插件暂不支持 BTC 签名。请把下面的 PSBT 或未签名交易导入比特币钱包完成签名和广播，再把交易哈希回填给 Agent。";
+  return <section className="card" data-card-kind="bitcoin-signing">
+    <h3>{kind === "transfer" ? "Bitcoin 转账待签名数据" : "Bitcoin 兑换待签名数据"}</h3>
+    <p>{explanation}</p>
+    <table className="signing-table"><tbody>
+      {fields.map((field) => <tr key={field.label}>
+        <th>{field.label}</th>
+        <td>{field.copy
+          ? <div className="signing-value"><code className="signing-code">{field.value}</code><button type="button" className="secondary" onClick={() => copy(field.label, field.value)}>{copied === field.label ? "已复制" : "复制"}</button></div>
+          : <span>{field.value}</span>}</td>
+      </tr>)}
+    </tbody></table>
+  </section>;
+}
+
 const AGENT_TESTS: AgentTest[] = [
   { id: "clarification", name: "问候与澄清", intent: "clarification", message: "你好", expectedKinds: ["clarification"] },
   { id: "unsupported", name: "不支持的请求", intent: "unsupported", message: "测试不支持的功能分支", expectedKinds: ["unsupported"] },
@@ -777,9 +799,9 @@ export default function Home() {
     return <>
       {cardQuotes.length > 0 && <section className="card" data-card-kind="quotes"><h3>报价列表</h3>{cardQuotes.map((quote: Quote) => <div className="quote" key={quote.provider_reference}><strong>{quote.provider} · {quote.provider_reference}</strong><span>{quote.input_amount} {quote.source_asset?.symbol} → {quote.expected_output} {quote.destination_asset?.symbol}</span>{interactive && <button className="secondary" disabled={!quote.provider_reference || Boolean(actionLoading) || busy} onClick={() => void selectQuote(quote.provider_reference!)}>{actionLoading === `quote:${quote.provider_reference}` ? <><i className="loading-spinner" />处理中…</> : selectedQuote === quote.provider_reference ? "已选择" : "选择此报价"}</button>}</div>)}</section>}
       {showConfirmation && cardConfirmation?.status === "requested" && <section className="card" data-card-kind="confirmation" data-confirmation-key={confirmationKey(cardConfirmation)}><h3>请确认兑换</h3><p>{cardConfirmation.summary?.input_amount} {cardConfirmation.summary?.source_asset?.symbol} → {cardConfirmation.summary?.expected_output} {cardConfirmation.summary?.destination_asset?.symbol}{cardConfirmation.summary?.provider ? `\nProvider：${cardConfirmation.summary.provider}` : ""}{cardConfirmation.expires_at ? `\n有效期至：${cardConfirmation.expires_at}` : ""}</p>{interactive && <div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void confirmSwap(true)}>{actionLoading === "confirm" ? <><i className="loading-spinner" />处理中…</> : "确认兑换"}</button><button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void confirmSwap(false)}>{actionLoading === "cancel-confirmation" ? <><i className="loading-spinner" />处理中…</> : "取消"}</button></div>}</section>}
-      {cardPreflight && <section className="card" data-card-kind="preflight"><h3>{cardPreflight.ok ? "交易预检查通过" : "交易预检查未通过"}</h3><p>{cardPreflight.gas_sources ? `Gas 来源：${Object.entries(cardPreflight.gas_sources).map(([name, used]) => `${name}=${used === null || used === undefined ? "未返回" : used === "unavailable" ? "不可用" : used === "failed" ? "失败" : "成功"}`).join("、")}\n` : ""}{cardPreflight.simulation?.success === false ? `模拟警告：${cardPreflight.simulation.error || cardPreflight.simulation.failure_reason || cardPreflight.simulation.fail_reason || "simulation failed"}\n` : ""}{(cardPreflight.checks || []).map((item: any) => `${item.status === "passed" ? "✓" : item.status === "warning" ? "!" : "×"} ${item.message}`).join("\n")}</p></section>}
+      {cardPreflight && <section className="card" data-card-kind="preflight"><h3>{cardPreflight.ok ? "交易预检查通过" : "交易预检查未通过"}</h3><p>{cardPreflight.gas_sources ? `Gas 来源：${Object.entries(cardPreflight.gas_sources).map(([name, used]) => `${name}=${used === null || used === undefined ? "未返回" : used === "unavailable" ? "不可用" : used === "unsupported" ? "不适用" : used === "failed" ? "失败" : "成功"}`).join("、")}\n` : ""}{cardPreflight.simulation?.success === false ? `模拟警告：${cardPreflight.simulation.error || cardPreflight.simulation.failure_reason || cardPreflight.simulation.fail_reason || "simulation failed"}\n` : ""}{(cardPreflight.checks || []).map((item: any) => `${item.status === "passed" ? "✓" : item.status === "warning" ? "!" : "×"} ${item.message}`).join("\n")}</p></section>}
       {cardApproval && <section className="card" data-card-kind="approval"><h3>需要 Approve 授权</h3><p>请确认授权额度，浏览器钱包会在本地弹窗签名。</p><pre className="debug">{JSON.stringify(cardApproval, null, 2)}</pre>{interactive && <button disabled={Boolean(actionLoading) || busy} onClick={() => void approveSwap()}>{actionLoading === "approve" ? <><i className="loading-spinner" />处理中…</> : "钱包签名并广播 Approve"}</button>}</section>}
-      {cardTransaction && <section className="card" data-card-kind="transaction"><h3>{cardPendingKind === "transfer" ? "转账交易已准备好" : "兑换交易已准备好"}</h3><p>{cardPendingKind === "transfer" ? "请确认收款地址和金额，钱包会在当前转账链本地签名并广播。" : "请在钱包中确认未签名交易。"}</p><pre className="debug">{JSON.stringify(cardTransaction, null, 2)}</pre>{interactive && <div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void broadcastPendingTransaction()}>{actionLoading === "broadcast" ? <><i className="loading-spinner" />处理中…</> : `钱包签名并广播${cardPendingKind === "transfer" ? "转账" : " Swap"}`}</button>{cardPendingKind === "transfer" && broadcastHash && <button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void queryPendingTransaction()}>{actionLoading === "transaction-status" ? <><i className="loading-spinner" />处理中…</> : "查询交易状态"}</button>}</div>}</section>}
+      {cardTransaction && (isBitcoinSigningTransaction(cardTransaction) ? <BitcoinSigningCard transaction={cardTransaction} kind={cardPendingKind} /> : <section className="card" data-card-kind="transaction"><h3>{cardPendingKind === "transfer" ? "转账交易已准备好" : "兑换交易已准备好"}</h3><p>{cardPendingKind === "transfer" ? "请确认收款地址和金额，钱包会在当前转账链本地签名并广播。" : "请在钱包中确认未签名交易。"}</p><pre className="debug">{JSON.stringify(cardTransaction, null, 2)}</pre>{interactive && <div className="card-actions"><button disabled={Boolean(actionLoading) || busy} onClick={() => void broadcastPendingTransaction()}>{actionLoading === "broadcast" ? <><i className="loading-spinner" />处理中…</> : `钱包签名并广播${cardPendingKind === "transfer" ? "转账" : " Swap"}`}</button>{cardPendingKind === "transfer" && broadcastHash && <button className="secondary" disabled={Boolean(actionLoading) || busy} onClick={() => void queryPendingTransaction()}>{actionLoading === "transaction-status" ? <><i className="loading-spinner" />处理中…</> : "查询交易状态"}</button>}</div>}</section>)}
       {cardTokenCandidates.length > 0 && <section className="card" data-card-kind="tokens"><h3>请选择 Token</h3><div className="card-actions">{cardTokenCandidates.map((item, index) => interactive ? <button className="secondary" key={`${item.address}-${index}`} onClick={() => void chooseToken(item)}>{index + 1}. {item.symbol} · {item.chain} · {String(item.address).slice(0, 8)}…</button> : <span key={`${item.address}-${index}`}>{index + 1}. {item.symbol} · {item.chain}</span>)}</div></section>}
       {artifacts.wallet && !artifacts.portfolio && <section className="card" data-card-kind="wallet"><h3>钱包余额</h3><pre className="debug">{JSON.stringify(artifacts.wallet, null, 2)}</pre></section>}
       {artifacts.portfolio && <PortfolioCard portfolio={artifacts.portfolio} />}

@@ -213,6 +213,14 @@ export function responseMessage(response: any): string {
     transfer_prepare: "转账交易已准备好，请在钱包中确认并广播。",
     swap_ready: "兑换交易已准备好，请在钱包中确认并广播。",
   };
+  const prepareKind = response.kind === "transfer_prepare"
+    ? "transfer"
+    : response.kind === "swap_prepare" || response.stage === "swap_ready" ? "swap" : null;
+  if (prepareKind && isBitcoinSigningTransaction(response.pending_transaction || response.transaction)) {
+    return prepareKind === "transfer"
+      ? "Bitcoin 转账交易已准备好，请把 PSBT 导入比特币钱包签名并广播。"
+      : "Bitcoin 兑换交易已准备好，请把 PSBT 导入比特币钱包签名并广播。";
+  }
   const status = response.provider_status || response.confirmation_status || response.stage || (typeof response.status === "object" ? response.status?.status || response.status?.state : response.status);
   return messages[status] || messages[response.kind] || (status ? `交易状态：${status}` : "");
 }
@@ -394,6 +402,53 @@ export function transactionChainId(transaction: any): number | string | undefine
   if (transaction?.chain_id != null) return transaction.chain_id;
   const chain = String(transaction?.chain || "").toUpperCase();
   return chainIds[chain];
+}
+
+export function isBitcoinSigningTransaction(transaction: any): boolean {
+  if (!transaction || typeof transaction !== "object") return false;
+  const chain = String(transaction.chain || "").toUpperCase();
+  const format = String(transaction?.display?.format || "").toLowerCase();
+  return chain === "BTC" || chain === "BITCOIN" || format === "psbt";
+}
+
+export function formatSigningDecimal(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "";
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return String(value);
+  return String(Math.round(amount * 1000) / 1000);
+}
+
+export function satsToBtc(value: unknown): string {
+  const sats = Number(value);
+  if (!Number.isFinite(sats)) return "";
+  return (sats / 1e8).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+export type SigningField = { label: string; value: string; copy?: boolean };
+
+/** Human-readable Bitcoin signing payload: everything the app must show before signing. */
+export function bitcoinSigningFields(transaction: any): SigningField[] {
+  const display = transaction?.display || {};
+  const fields: SigningField[] = [];
+  const push = (label: string, value: unknown, copy = false) => {
+    const text = value === null || value === undefined ? "" : String(value);
+    if (!text) return;
+    fields.push({ label, value: text, copy });
+  };
+  push("操作", display.action === "provider_deposit" ? "兑换充值（转入 Provider 充值地址）" : "BTC 转账");
+  push("网络", "Bitcoin (BTC)");
+  push("目标地址", display.deposit_address || transaction?.to);
+  push("金额 (sats)", transaction?.value);
+  push("金额 (BTC)", satsToBtc(transaction?.value));
+  push("手续费 (sats)", display.fee_raw);
+  push("费率 (sat/vB)", formatSigningDecimal(display.fee_rate_sat_vb));
+  push("找零 (sats)", display.change_raw);
+  push("输入数量", display.input_count);
+  push("Provider", transaction?.provider);
+  push("订单号", display.provider_order_id);
+  push("PSBT (base64)", transaction?.data, true);
+  push("未签名交易 (hex)", display.unsigned_tx_hex, true);
+  return fields;
 }
 
 function providerText(entry: any): string {

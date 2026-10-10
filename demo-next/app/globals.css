@@ -72,6 +72,7 @@ main { width: min(1180px, 100%); min-height: 100dvh; margin: 0 auto; background:
 .react-results-list strong { color: #dce7f3; font-weight: 600; }
 .react-results-list .debug { max-height: 150px; margin: 6px 0 0; }
 .card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.signing-table { width: 100%; margin: 9px 0 0; border-collapse: collapse; font-size: 11px; }.signing-table th { width: 118px; padding: 7px 8px 7px 0; border-top: 1px solid #202d3e; color: #7f90a5; font-weight: 500; text-align: left; vertical-align: top; }.signing-table td { padding: 7px 0; border-top: 1px solid #202d3e; color: #d7e0eb; overflow-wrap: anywhere; }.signing-value { display: grid; gap: 6px; }.signing-value .secondary { justify-self: start; }.signing-code { display: block; max-height: 96px; padding: 7px 8px; overflow: auto; border-radius: 6px; background: #0a0f15; color: #c9d5e5; font-size: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .system .bubble { width: 100%; max-width: 100%; padding: 4px 8px; color: #7f90a5; background: transparent; font-size: 11px; text-align: center; }
 .inline-suggestions { width: min(100%, 520px); padding: 10px 12px; border: 1px solid #2e4564; border-radius: 8px; background: #101d2c; }.inline-suggestions > span { display: block; margin-bottom: 7px; color: #8fa7c1; font-size: 11px; }.inline-suggestions .card-actions { margin-top: 0; }
 .card:has(h3:first-child) { box-shadow: inset 3px 0 0 #385fae; }

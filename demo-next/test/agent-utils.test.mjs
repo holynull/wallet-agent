@@ -52,6 +52,10 @@ import {
   buildWalletAppContext,
   DEFAULT_APP_WALLET,
   formatBalanceUsd,
+  isBitcoinSigningTransaction,
+  bitcoinSigningFields,
+  formatSigningDecimal,
+  satsToBtc,
 } from "../lib/agent-utils.ts";
 
 test("maps confirmation API errors to distinct user-facing messages", () => {
@@ -375,4 +379,82 @@ test("classifies agent results by expected response and dependency errors", () =
   assert.equal(classifyAgentTest({ expectedKinds: ["price_query"] }, [
     { state: { response: { kind: "error", errors: [{ code: "OKX_CAPABILITY_UNAVAILABLE" }] } } },
   ]).status, "blocked");
+});
+
+test("Bitcoin signing payload is detected by chain or PSBT format", () => {
+  assert.equal(isBitcoinSigningTransaction({ chain: "BTC", to: "bc1p", data: "psbt" }), true);
+  assert.equal(isBitcoinSigningTransaction({ chain: "bitcoin", display: {} }), true);
+  assert.equal(isBitcoinSigningTransaction({ chain: "ETH", display: { format: "psbt" } }), true);
+  assert.equal(isBitcoinSigningTransaction({ chain: "BASE", display: { format: "calldata" } }), false);
+  assert.equal(isBitcoinSigningTransaction(null), false);
+});
+
+test("sats convert to a trimmed BTC amount", () => {
+  assert.equal(satsToBtc("120000"), "0.0012");
+  assert.equal(satsToBtc(100000000), "1");
+  assert.equal(satsToBtc(1), "0.00000001");
+  assert.equal(satsToBtc("nope"), "");
+});
+
+test("bitcoin signing fields expose the data an app must show before signing", () => {
+  const transaction = {
+    chain: "BTC",
+    to: "bc1p47u...",
+    value: "120000",
+    data: "cHNidP8B...",
+    provider: "bridgers",
+    display: {
+      action: "provider_deposit",
+      format: "psbt",
+      deposit_address: "bc1p47u...",
+      fee_raw: "459",
+      fee_rate_sat_vb: "3.0",
+      change_raw: "79541",
+      input_count: "1",
+      provider_order_id: "order-btc",
+      unsigned_tx_hex: "0200000001aa",
+    },
+  };
+  const fields = bitcoinSigningFields(transaction);
+  const byLabel = Object.fromEntries(fields.map((field) => [field.label, field]));
+  assert.equal(byLabel["目标地址"].value, "bc1p47u...");
+  assert.equal(byLabel["金额 (sats)"].value, "120000");
+  assert.equal(byLabel["金额 (BTC)"].value, "0.0012");
+  assert.equal(byLabel["手续费 (sats)"].value, "459");
+  assert.equal(byLabel["找零 (sats)"].value, "79541");
+  assert.equal(byLabel["订单号"].value, "order-btc");
+  assert.equal(byLabel["PSBT (base64)"].value, "cHNidP8B...");
+  assert.equal(byLabel["PSBT (base64)"].copy, true);
+  assert.equal(byLabel["未签名交易 (hex)"].copy, true);
+  assert.equal(byLabel["操作"].value, "兑换充值（转入 Provider 充值地址）");
+});
+
+test("bitcoin signing fields omit empty optional values and label plain transfers", () => {
+  const fields = bitcoinSigningFields({ chain: "BTC", to: "bc1q", value: "5000", data: "psbt" });
+  assert.equal(fields.find((field) => field.label === "操作").value, "BTC 转账");
+  assert.equal(fields.some((field) => field.label === "手续费 (sats)"), false);
+  assert.equal(fields.some((field) => field.label === "订单号"), false);
+});
+
+test("Bitcoin prepare responses get PSBT-specific wording", () => {
+  const btc = { chain: "BTC", data: "cHNidP8", display: { format: "psbt" } };
+  assert.equal(
+    responseMessage({ kind: "transfer_prepare", pending_transaction: btc }),
+    "Bitcoin 转账交易已准备好，请把 PSBT 导入比特币钱包签名并广播。",
+  );
+  assert.equal(
+    responseMessage({ kind: "swap_prepare", transaction: btc }),
+    "Bitcoin 兑换交易已准备好，请把 PSBT 导入比特币钱包签名并广播。",
+  );
+  assert.equal(responseMessage({ kind: "transfer_prepare", pending_transaction: { chain: "BASE" } }), "转账交易已准备好，请在钱包中确认并广播。");
+  assert.equal(responseMessage({ kind: "swap_status", pending_transaction: btc }), "");
+});
+
+test("signing decimals are trimmed for display", () => {
+  assert.equal(formatSigningDecimal("0.6970000000000001"), "0.697");
+  assert.equal(formatSigningDecimal(3), "3");
+  assert.equal(formatSigningDecimal(""), "");
+  assert.equal(formatSigningDecimal(undefined), "");
+  const fields = bitcoinSigningFields({ chain: "BTC", to: "bc1q", value: "5000", data: "psbt", display: { fee_rate_sat_vb: "0.6970000000000001" } });
+  assert.equal(fields.find((field) => field.label === "费率 (sat/vB)").value, "0.697");
 });
