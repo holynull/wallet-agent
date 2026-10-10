@@ -348,18 +348,19 @@ POST /v1/transfer/{session_id}/broadcast
 下面每个字段都是 App 渲染对应卡片需要的全部输入。服务端只给数据，不生成 UI。
 
 设计稿对照（视觉参数以 Figma 为准，这里只给跳转锚点；节点 ID 会随设计文件重新导出而变，
-失效时到 [figma-ai-assistant-alignment.md](figma-ai-assistant-alignment.md) 找最新对照）：
+失效时到 [figma-ai-assistant-alignment.md](figma-ai-assistant-alignment.md) 找最新对照。
+节点编号就是可点链接，点开直接定位到 Figma 里那一屏）：
 
 | 卡片 | Figma 节点 |
 | --- | --- |
-| 空态 + 快捷胶囊行 | `33715:148396` |
-| 用户消息气泡 | `33715:146536` |
-| 交易记录卡 | `33715:146539`（屏 `33715:146533`） |
-| 收款地址卡 / 支持链卡 | `33715:146203` / 收款地址屏内 |
+| 空态 + 快捷胶囊行 | [`33715:148396`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33715-148396) |
+| 用户消息气泡 | [`33715:146536`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33715-146536) |
+| 交易记录卡 | [`33715:146539`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33715-146539)（屏 [`33715:146533`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33715-146533)） |
+| 收款地址卡 / 支持链卡 | [`33715:146203`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33715-146203) / 收款地址屏内 |
 | 多链资产总览卡 | 见对齐文档第四节（节点待补） |
-| 转账：地址输入 / 金额输入 | `33692:37951` / `33692:37984` |
-| 转账：链选择 / 风险提示 | `33692:48836` / `33692:48838` |
-| 交易状态页（App 页，非对话卡） | 分区 `33617:39513` |
+| 转账：地址输入 / 金额输入 | [`33692:37951`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33692-37951) / [`33692:37984`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33692-37984) |
+| 转账：链选择 / 风险提示 | [`33692:48836`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33692-48836) / [`33692:48838`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33692-48838) |
+| 交易状态页（App 页，非对话卡） | 分区 [`33617:39513`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33617-39513) |
 
 文件：`Cat Wallet v1.6.0`，fileKey `2N2sTwtjY3OznWq8m9zpmR`，画布 `32786:19122`（v1.6.9 AI 助手）。
 
