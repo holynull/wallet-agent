@@ -6,7 +6,11 @@ services:
     env_file:
       - .env
     environment:
-      PERSISTENCE_URL: postgresql://wallet_agent:wallet_agent@postgres:5432/wallet_agent
+      # Bundled default; a deployment overrides this from its own .env, which
+      # Compose interpolates here. A separate variable name keeps the local
+      # .env (sqlite, for ./scripts/start_local.sh) from silently changing what
+      # the Compose stack uses.
+      PERSISTENCE_URL: ${DEPLOY_PERSISTENCE_URL:-postgresql://wallet_agent:wallet_agent@postgres:5432/wallet_agent}
       REDIS_URL: redis://redis:6379/0
       LANGGRAPH_STRICT_MSGPACK: "true"
     depends_on:

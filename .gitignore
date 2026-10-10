@@ -15,3 +15,5 @@ artifacts/
 *.db
 *.db-shm
 *.db-wal
+# Per-deployment compose overrides (credentials live here, not in the repo)
+docker-compose.override.yml
