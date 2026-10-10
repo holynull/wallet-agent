@@ -39,7 +39,10 @@ import {
   extractReadOnlyTrace,
   formatResponseSummary,
   formatProcessingDuration,
+  buildHistoryPath,
   clientActionLabel,
+  mergeHistoryPage,
+  sortHistoryRows,
   formatTokenAmount,
   historyAmountSign,
   historyDirectionLabel,
@@ -605,4 +608,49 @@ test("signing decimals are trimmed for display", () => {
   assert.equal(formatSigningDecimal(undefined), "");
   const fields = bitcoinSigningFields({ chain: "BTC", to: "bc1q", value: "5000", data: "psbt", display: { fee_rate_sat_vb: "0.6970000000000001" } });
   assert.equal(fields.find((field) => field.label === "费率 (sat/vB)").value, "0.697");
+});
+
+
+test("history list path carries user, search and cursor", () => {
+  assert.equal(buildHistoryPath({ userId: "u1" }), "/v1/agent/conversations?user_id=u1");
+  assert.equal(
+    buildHistoryPath({ userId: "u1", limit: 20 }),
+    "/v1/agent/conversations?user_id=u1&limit=20",
+  );
+  const path = buildHistoryPath({ userId: "u1", query: " 流水 ", cursor: "2026-10-10T06:15:51Z", limit: 20 });
+  const params = new URLSearchParams(path.split("?")[1]);
+  assert.equal(params.get("user_id"), "u1");
+  assert.equal(params.get("q"), "流水");
+  assert.equal(params.get("cursor"), "2026-10-10T06:15:51Z");
+  assert.equal(params.get("limit"), "20");
+  // An empty search must not be sent at all.
+  assert.equal(new URLSearchParams(buildHistoryPath({ userId: "u1", query: "   " }).split("?")[1]).has("q"), false);
+});
+
+test("history pages append without duplicating rows", () => {
+  const first = mergeHistoryPage([], {
+    conversations: [{ conversation_id: "a" }, { conversation_id: "b" }],
+    next_cursor: "cursor-1",
+  });
+  assert.deepEqual(first.conversations.map((item) => item.conversation_id), ["a", "b"]);
+  assert.equal(first.nextCursor, "cursor-1");
+
+  const second = mergeHistoryPage(first.conversations, {
+    conversations: [{ conversation_id: "b" }, { conversation_id: "c" }],
+    next_cursor: null,
+  });
+  assert.deepEqual(second.conversations.map((item) => item.conversation_id), ["a", "b", "c"]);
+  assert.equal(second.nextCursor, null);
+});
+
+test("pinned rows float to the top of the local ordering", () => {
+  const rows = [
+    { conversation_id: "old", updated_at: "2026-10-01T00:00:00Z", pinned: false },
+    { conversation_id: "new", updated_at: "2026-10-10T00:00:00Z", pinned: false },
+    { conversation_id: "pinned-old", updated_at: "2026-09-01T00:00:00Z", pinned: true },
+  ];
+  assert.deepEqual(
+    sortHistoryRows(rows).map((item) => item.conversation_id),
+    ["pinned-old", "new", "old"],
+  );
 });

@@ -603,6 +603,51 @@ function collectCodes(value: any, result = new Set<string>()): Set<string> {
   return result;
 }
 
+// --- conversation history -------------------------------------------------
+// The three shapes below are the whole client-side contract for §7 of
+// app-integration.md: build the list URL, append a page, then decide the
+// display order (the server keeps updated_at ordering so paging stays stable).
+
+export type HistoryPage = { conversations?: any[]; next_cursor?: string | null };
+
+export function buildHistoryPath(options: {
+  userId: string;
+  query?: string;
+  cursor?: string | null;
+  limit?: number;
+}): string {
+  const params = new URLSearchParams({ user_id: options.userId });
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.query?.trim()) params.set("q", options.query.trim());
+  if (options.cursor) params.set("cursor", options.cursor);
+  return `/v1/agent/conversations?${params.toString()}`;
+}
+
+export function mergeHistoryPage(
+  existing: any[],
+  page: HistoryPage,
+): { conversations: any[]; nextCursor: string | null } {
+  const seen = new Set((existing || []).map((item) => item?.conversation_id));
+  const merged = [...(existing || [])];
+  for (const item of page?.conversations || []) {
+    if (!item?.conversation_id || seen.has(item.conversation_id)) continue;
+    seen.add(item.conversation_id);
+    merged.push(item);
+  }
+  return { conversations: merged, nextCursor: page?.next_cursor ?? null };
+}
+
+// Pinned rows float to the top locally; the server deliberately does not sort
+// by `pinned` because that would make cursor paging unstable.
+export function sortHistoryRows(rows: any[]): any[] {
+  return [...(rows || [])].sort((left, right) => {
+    if (Boolean(left?.pinned) !== Boolean(right?.pinned)) return left?.pinned ? -1 : 1;
+    const rightTime = Date.parse(right?.updated_at);
+    const leftTime = Date.parse(left?.updated_at);
+    return (Number.isFinite(rightTime) ? rightTime : 0) - (Number.isFinite(leftTime) ? leftTime : 0);
+  });
+}
+
 export function classifyAgentTest(spec: any, events: any[], error?: unknown) {
   const states = events.map((item) => item?.state).filter((item) => item && typeof item === "object");
   const codes = [...collectCodes([error, events])];

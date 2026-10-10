@@ -3,7 +3,8 @@
 import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { APP_NETWORKS, AppWalletConfig, DEFAULT_APP_WALLET, buildWalletAppContext } from "../lib/agent-utils";
 import { PortfolioCard } from "./portfolio-card";
-import { apiErrorMessage, bitcoinSigningFields, buildReadOnlyTimeline, classifyAgentTest, ConversationArtifacts, extractConversationArtifacts, extractReadOnlyTrace, formatModelTraceEntry, formatProcessingDuration, formatResponseSummary, clientActionLabel, formatTokenAmount, historyAmountSign, historyDirectionLabel, isBitcoinSigningTransaction, latestProgressText, mergeModelTrace, parseSseFrame, parseSseFrames, providerPriority as getProviderPriority, ReadOnlyTrace, responseMessage, restoreConversationMessages, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
+import { apiErrorMessage, bitcoinSigningFields, buildReadOnlyTimeline, classifyAgentTest, ConversationArtifacts, extractConversationArtifacts, extractReadOnlyTrace, formatModelTraceEntry, formatProcessingDuration, formatResponseSummary, buildHistoryPath, clientActionLabel, formatTokenAmount, historyAmountSign,
+  historyDirectionLabel, mergeHistoryPage, sortHistoryRows, isBitcoinSigningTransaction, latestProgressText, mergeModelTrace, parseSseFrame, parseSseFrames, providerPriority as getProviderPriority, ReadOnlyTrace, responseMessage, restoreConversationMessages, sanitizeDebug, transactionChainId } from "../lib/agent-utils";
 
 type Message = { id?: string; role: "user" | "assistant" | "system"; content: string; fullContent?: string; typing?: boolean; suggestions?: any[]; artifacts?: ConversationArtifacts; responseKey?: string };
 type ProgressEntry = { text: string; elapsed?: number; model?: ModelTraceEntry };
@@ -199,6 +200,8 @@ async function requestApi(path: string, options?: RequestInit) {
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([{ role: "assistant", content: "你好，我可以帮你查询余额、比较兑换报价，并准备未签名交易。告诉我你想做什么。" }]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [historyQuery, setHistoryQuery] = useState("");
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [message, setMessage] = useState("");
@@ -257,19 +260,43 @@ export default function Home() {
     setDebug((current) => [...current, `[${new Date().toISOString()}] ${label}\n${JSON.stringify(sanitizeDebug(value), null, 2)}`].slice(-100));
   }
   const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
-  async function loadHistory() {
+  async function loadHistory(options?: { append?: boolean; query?: string }) {
+    const query = options?.query ?? historyQuery;
+    const cursor = options?.append ? nextCursor : null;
     try {
-      const body = await requestApi("/v1/agent/conversations?user_id=browser-demo", { headers });
-      const history = Array.isArray(body.conversations) ? body.conversations : [];
-      history.sort((left: Conversation, right: Conversation) => {
-        const rightTime = Date.parse(right.updated_at);
-        const leftTime = Date.parse(left.updated_at);
-        return (Number.isFinite(rightTime) ? rightTime : 0) - (Number.isFinite(leftTime) ? leftTime : 0);
-      });
-      setConversations(history);
-      log("CONVERSATIONS", { ...body, conversations: history });
+      const path = buildHistoryPath({ userId: "browser-demo", query, cursor, limit: 20 });
+      const body = await requestApi(path, { headers });
+      const { conversations: merged, nextCursor: next } = mergeHistoryPage(
+        options?.append ? conversations : [],
+        body,
+      );
+      setConversations(sortHistoryRows(merged));
+      setNextCursor(next);
+      log("CONVERSATIONS", { path, next_cursor: next, rows: merged.length });
     }
     catch (error) { setMessages((current) => [...current, { role: "assistant", content: `读取历史失败：${error instanceof Error ? error.message : String(error)}` }]); }
+  }
+  async function patchConversation(id: string, changes: Record<string, unknown>) {
+    const path = `/v1/agent/conversations/${encodeURIComponent(id)}?user_id=browser-demo`;
+    const body = await requestApi(path, { method: "PATCH", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(changes) });
+    log("CONVERSATION PATCH", { path, changes, conversation: body?.conversation });
+    return body?.conversation;
+  }
+  async function renameConversation(item: Conversation) {
+    const next = window.prompt("重命名这条对话", item.title || item.summary || "");
+    if (!next || !next.trim()) return;
+    try {
+      const updated = await patchConversation(item.conversation_id, { title: next.trim() });
+      setConversations((current) => current.map((row) => row.conversation_id === item.conversation_id ? { ...row, ...(updated || {}), title: updated?.title ?? next.trim() } : row));
+    }
+    catch (error) { setMessages((current) => [...current, { role: "assistant", content: `重命名失败：${error instanceof Error ? error.message : String(error)}` }]); }
+  }
+  async function togglePinned(item: Conversation) {
+    try {
+      const updated = await patchConversation(item.conversation_id, { pinned: !item.pinned });
+      setConversations((current) => sortHistoryRows(current.map((row) => row.conversation_id === item.conversation_id ? { ...row, ...(updated || {}), pinned: updated?.pinned ?? !row.pinned } : row)));
+    }
+    catch (error) { setMessages((current) => [...current, { role: "assistant", content: `置顶失败：${error instanceof Error ? error.message : String(error)}` }]); }
   }
   async function loadConversation(id: string) {
     try {
@@ -831,7 +858,22 @@ export default function Home() {
     <div className="workspace">
       <section className="main-column">
         <details className="panel app-wallet-config" data-testid="app-wallet-config"><summary>模拟钱包 App · {appContext.supported_networks.length} 个网络 · {appContext.wallet_accounts.length} 个账户</summary><fieldset disabled={busy || Boolean(actionLoading)}><legend>App 支持的网络</legend><div className="network-options">{APP_NETWORKS.map((chain) => <label key={chain}><input type="checkbox" checked={appWallet.networks.includes(chain)} onChange={(event) => setAppWallet((config) => ({ ...config, networks: event.target.checked ? [...config.networks, chain] : config.networks.filter((item) => item !== chain) }))} />{chain}</label>)}</div><div className="account-inputs"><label>EVM 公共地址（六条 EVM 网络共享）<input aria-label="EVM 公共地址" value={appWallet.evmAddress} placeholder={wallet?.address || "0x…，留空使用已连接钱包"} onChange={(event) => setAppWallet((config) => ({ ...config, evmAddress: event.target.value }))} /></label><label>BTC 公共地址（可多行，包含收款和找零地址）<textarea aria-label="BTC 公共地址" value={appWallet.btcAddresses} placeholder="bc1… / 1… / 3…，每行一个" onChange={(event) => setAppWallet((config) => ({ ...config, btcAddresses: event.target.value }))} /></label><label>TRON 公共地址<input aria-label="TRON 公共地址" value={appWallet.tronAddress} placeholder="T…" onChange={(event) => setAppWallet((config) => ({ ...config, tronAddress: event.target.value }))} /></label><label>Solana 公共地址<input aria-label="Solana 公共地址" value={appWallet.solanaAddress} onChange={(event) => setAppWallet((config) => ({ ...config, solanaAddress: event.target.value }))} /></label></div><p className="muted">余额查询使用以上网络和公共地址；未提供地址的网络会显示“未提供地址”。BTC 仅统计所填地址，不能据此推断整个 HD 钱包余额。配置保存在此浏览器。</p></fieldset></details>
-        {historyOpen && <section className="panel"><div className="toolbar"><button className="secondary" onClick={() => void loadHistory()}>重新加载</button><button className="secondary" onClick={startNew}>新建对话</button></div><div className="list">{conversations.length === 0 ? <p className="muted">暂无已保存的对话。</p> : conversations.map((item) => <div key={item.conversation_id} className="conversation"><button onClick={() => void loadConversation(item.conversation_id)}><strong>{(item.title || item.summary)}</strong><span>{new Date(item.updated_at).toLocaleString()} · {item.status}</span></button><button className="danger delete" onClick={() => void removeConversation(item.conversation_id)}>删除</button></div>)}</div></section>}
+        {historyOpen && <section className="panel" data-testid="history-panel">
+          <div className="toolbar">
+            <input aria-label="搜索对话" placeholder="搜索对话标题" value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} />
+            <button className="secondary" onClick={() => void loadHistory({ query: historyQuery })}>搜索</button>
+            <button className="secondary" onClick={() => { setHistoryQuery(""); void loadHistory({ query: "" }); }}>重新加载</button>
+            <button className="secondary" onClick={startNew}>新建对话</button>
+          </div>
+          <p className="muted">共 {conversations.length} 条{nextCursor ? "（还有更早的）" : ""} · 置顶在本地排序，服务端仍按更新时间翻页</p>
+          <div className="list">{conversations.length === 0 ? <p className="muted">暂无已保存的对话。</p> : conversations.map((item) => <div key={item.conversation_id} className="conversation" data-pinned={Boolean(item.pinned)}>
+            <button onClick={() => void loadConversation(item.conversation_id)}><strong>{item.pinned ? "📌 " : ""}{(item.title || item.summary)}</strong><span>{new Date(item.updated_at).toLocaleString()} · {item.status}</span></button>
+            <button className="secondary" onClick={() => void renameConversation(item)}>重命名</button>
+            <button className="secondary" onClick={() => void togglePinned(item)}>{item.pinned ? "取消置顶" : "置顶"}</button>
+            <button className="danger delete" onClick={() => void removeConversation(item.conversation_id)}>删除</button>
+          </div>)}</div>
+          {nextCursor && <div className="toolbar"><button className="secondary" onClick={() => void loadHistory({ append: true, query: historyQuery })}>加载更多</button></div>}
+        </section>}
         <section className="action-strip"><span>工具</span><button className="secondary" onClick={() => void runDebugSmoke()}>联调检查</button><button className="secondary" onClick={() => void runAgentTests()}>测试全部 Agent 功能</button></section>
         <div ref={messagesRef} id="messages">
       {messages.map((item, index) => {
