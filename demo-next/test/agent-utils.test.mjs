@@ -39,6 +39,10 @@ import {
   extractReadOnlyTrace,
   formatResponseSummary,
   formatProcessingDuration,
+  clientActionLabel,
+  formatTokenAmount,
+  historyAmountSign,
+  historyDirectionLabel,
   formatModelTraceEntry,
   latestProgressText,
   mergeModelTrace,
@@ -262,6 +266,150 @@ test("restores generic ReAct tool results without guessing a business card kind"
   ]);
   assert.deepEqual(artifacts?.quotes, [{ provider_reference: "q1", input_amount: "1", expected_output: "2" }]);
   assert.equal(formatResponseSummary({ kind: "react", message: "ETH 当前价格约为 1800 美元。" }), "ETH 当前价格约为 1800 美元。");
+});
+
+test("projects the receive-address card from a successful ReAct tool result", () => {
+  const artifacts = extractConversationArtifacts({
+    response: {
+      kind: "react",
+      message: "你的收款地址：0x3f84… 👆",
+      react_results: [
+        {
+          tool: "receive_address",
+          result: {
+            ok: true,
+            kind: "receive_address",
+            address: "0x3f84",
+            groups: [{ group: "EVM", address: "0x3f84", chains: ["ETH", "BSC"] }],
+            supported_chains: ["ETH", "BSC", "BTC"],
+          },
+        },
+      ],
+    },
+  });
+
+  assert.equal(artifacts?.receive?.address, "0x3f84");
+  assert.deepEqual(artifacts?.receive?.supported_chains, ["ETH", "BSC", "BTC"]);
+});
+
+test("ignores an unsuccessful receive-address result", () => {
+  const artifacts = extractConversationArtifacts({
+    response: {
+      kind: "react",
+      message: "App 还没有提供任何公共地址。",
+      react_results: [
+        { tool: "receive_address", result: { ok: false, code: "RECEIVE_ADDRESS_UNAVAILABLE" } },
+      ],
+    },
+  });
+
+  assert.equal(artifacts?.receive, undefined);
+});
+
+test("formats raw history amounts with token decimals", () => {
+  assert.equal(formatTokenAmount("120300000000000000", 18, "BNB"), "0.1203 BNB");
+  assert.equal(formatTokenAmount("42020000", 8, "BTC"), "0.4202 BTC");
+  assert.equal(formatTokenAmount("1000000000000000000", 18, "ETH"), "1 ETH");
+  assert.equal(formatTokenAmount("", 18, "ETH"), "ETH");
+  assert.equal(formatTokenAmount("120300000000000000", null, "BNB"), "120300000000000000 BNB");
+});
+
+test("labels history rows with direction and sign", () => {
+  assert.equal(historyDirectionLabel("receive"), "接收来自");
+  assert.equal(historyDirectionLabel("send"), "发送至");
+  assert.equal(historyDirectionLabel("swap"), "兑换");
+  assert.equal(historyDirectionLabel(undefined), "交易");
+  assert.equal(historyAmountSign("receive"), "+");
+  assert.equal(historyAmountSign("send"), "-");
+  assert.equal(historyAmountSign("swap"), "");
+});
+
+test("projects the transaction-history card from a successful ReAct tool result", () => {
+  const history = {
+    ok: true,
+    kind: "transaction_history",
+    title: "最近交易记录",
+    total: 1,
+    summary: "1 笔转出",
+    items: [
+      {
+        chain: "BSC",
+        tx_hash: "0xaa",
+        status: "confirmed",
+        direction: "send",
+        symbol: "BNB",
+        decimals: 18,
+        amount_raw: "120300000000000000",
+        counterparty: "0x6356beba8025334f1b7250fa06fcb1e47ff46ed1",
+      },
+    ],
+  };
+  const artifacts = extractConversationArtifacts({
+    response: { kind: "react", message: "最近 1 笔记录拉出来了 👆", react_results: [{ tool: "transaction_history", result: history }] },
+  });
+
+  assert.deepEqual(artifacts?.history, history);
+});
+
+test("ignores an unsuccessful transaction-history result", () => {
+  const artifacts = extractConversationArtifacts({
+    response: {
+      kind: "react",
+      message: "无法查询。",
+      react_results: [{ tool: "transaction_history", result: { ok: false, code: "HISTORY_ADDRESS_UNAVAILABLE" } }],
+    },
+  });
+
+  assert.equal(artifacts?.history, undefined);
+});
+
+test("quick-reply chips survive a reload with their type and value", () => {
+  const suggestions = [
+    { label: "使用当前钱包地址", message: "使用当前连接钱包地址作为收款地址。", type: "address", value: "0x3f84", data: { intent: "transfer", recipient: "0x3f84" } },
+    { label: "转给联系人", message: "我想从联系人里选一个收款地址。", type: "action", value: "pick_contact", data: { intent: "transfer" } },
+  ];
+  const artifacts = extractConversationArtifacts({
+    response: { kind: "clarification", message: "收款地址是？", missing_fields: ["transfer_recipient"], suggestions },
+  });
+
+  assert.deepEqual(artifacts?.suggestions, suggestions);
+
+  const restored = restoreConversationMessages([
+    { role: "assistant", content: "收款地址是？", artifacts },
+  ]);
+  assert.equal(restored[0].suggestions.length, 2);
+  assert.equal(restored[0].suggestions[0].type, "address");
+  assert.equal(restored[0].suggestions[1].value, "pick_contact");
+});
+
+test("a clarification without suggestions restores an empty chip row", () => {
+  const artifacts = extractConversationArtifacts({
+    response: { kind: "clarification", message: "请补充金额。", missing_fields: ["input_amount"] },
+  });
+
+  assert.equal(artifacts?.suggestions, undefined);
+  const restored = restoreConversationMessages([{ role: "assistant", content: "请补充金额。", artifacts }]);
+  assert.ok(!restored[0].suggestions || restored[0].suggestions.length === 0);
+});
+
+test("projects the client action the agent asked the App to open", () => {
+  const client_action = { type: "open_contacts", reason: "transfer_recipient", slots: { chain: "BTC" } };
+  const artifacts = extractConversationArtifacts({
+    response: { kind: "react", message: "请从通讯录里选一个联系人 👇", client_action },
+  });
+
+  assert.deepEqual(artifacts?.clientAction, client_action);
+  assert.equal(clientActionLabel("open_contacts"), "打开通讯录，选择一个转账联系人");
+  assert.equal(clientActionLabel("scan_qr"), "打开扫一扫，读取收款码");
+  assert.equal(clientActionLabel(undefined), "需要 App 弹出自己的界面");
+});
+
+test("a plain react answer carries no client action", () => {
+  const artifacts = extractConversationArtifacts({
+    response: { kind: "react", message: "你的余额是 1 ETH。" },
+  });
+
+  assert.equal(artifacts?.clientAction, undefined);
 });
 
 test("restores ReAct route and tool timing metadata", () => {

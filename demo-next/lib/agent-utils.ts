@@ -239,6 +239,10 @@ export type ConversationArtifacts = {
   token_candidates?: any[];
   wallet?: any;
   portfolio?: any;
+  receive?: any;
+  history?: any;
+  suggestions?: any[];
+  clientAction?: any;
   price?: any;
   assetValue?: any;
   gas?: any;
@@ -266,6 +270,40 @@ export function buildWalletAppContext(config: AppWalletConfig, connectedAddress 
     for (const address of new Set(addresses.map((item) => item.trim()).filter(Boolean))) wallet_accounts.push({ chain, address });
   }
   return { supported_networks, wallet_accounts };
+}
+
+// Render a raw integer amount with its token decimals, e.g. 120300000000000000 -> 0.1203.
+export function formatTokenAmount(amountRaw: unknown, decimals: unknown, symbol: unknown): string {
+  const raw = String(amountRaw ?? "").trim();
+  const name = String(symbol ?? "").trim();
+  const scale = Number(decimals);
+  if (!/^\d+$/.test(raw) || !Number.isFinite(scale) || scale < 0) return `${raw} ${name}`.trim();
+  const digits = raw.padStart(scale + 1, "0");
+  const whole = digits.slice(0, digits.length - scale);
+  const fraction = scale > 0 ? digits.slice(digits.length - scale).replace(/0+$/, "") : "";
+  const value = fraction ? `${whole}.${fraction}` : whole;
+  return `${value} ${name}`.trim();
+}
+
+// The App owns these surfaces; the agent only asks for them.
+export function clientActionLabel(type: unknown): string {
+  if (type === "open_contacts") return "打开通讯录，选择一个转账联系人";
+  if (type === "scan_qr") return "打开扫一扫，读取收款码";
+  if (type === "open_amount_keypad") return "打开金额键盘，输入转账金额";
+  return "需要 App 弹出自己的界面";
+}
+
+export function historyDirectionLabel(direction: unknown): string {
+  if (direction === "receive") return "接收来自";
+  if (direction === "swap") return "兑换";
+  if (direction === "send") return "发送至";
+  return "交易";
+}
+
+export function historyAmountSign(direction: unknown): string {
+  if (direction === "receive") return "+";
+  if (direction === "send") return "-";
+  return "";
 }
 
 export function formatBalanceUsd(value: unknown): string {
@@ -343,11 +381,25 @@ export function extractConversationArtifacts(state: any): ConversationArtifacts 
     const transferResult = [...response.react_results].reverse().find((item: any) =>
       item?.tool === "prepare_transfer" && item?.result?.ok === true && item?.result?.pending_transaction,
     );
+    const receiveResult = [...response.react_results].reverse().find((item: any) =>
+      item?.tool === "receive_address" && item?.result?.ok === true,
+    );
+    if (receiveResult) artifacts.receive = receiveResult.result;
+    const historyResult = [...response.react_results].reverse().find((item: any) =>
+      item?.tool === "transaction_history" && item?.result?.ok === true,
+    );
+    if (historyResult) artifacts.history = historyResult.result;
     if (transferResult) {
       artifacts.preflight = transferResult.result.preflight;
       artifacts.pending_transaction = transferResult.result.pending_transaction;
       artifacts.pending_kind = "transfer";
     }
+  }
+  if (Array.isArray(response.suggestions) && response.suggestions.length) {
+    artifacts.suggestions = response.suggestions;
+  }
+  if (response.client_action && typeof response.client_action === "object") {
+    artifacts.clientAction = response.client_action;
   }
   if (kind === "error" && (response.preflight || state.preflight)) artifacts.preflight = response.preflight || state.preflight;
   if (state.broadcast_tx_hash || response.tx_hash) artifacts.broadcast_hash = state.broadcast_tx_hash || response.tx_hash;
@@ -382,7 +434,11 @@ export function restoreConversationMessages(messages: any[], latestArtifacts?: C
   const restored = Array.isArray(messages) ? messages.map((item) => {
     if (!item?.artifacts) return { ...item };
     const artifacts = extractConversationArtifacts({ ...item.artifacts, response: item.artifacts.response });
-    return artifacts ? { ...item, artifacts } : Object.fromEntries(Object.entries(item).filter(([key]) => key !== "artifacts"));
+    if (!artifacts) {
+      return Object.fromEntries(Object.entries(item).filter(([key]) => key !== "artifacts"));
+    }
+    // Keep the quick-reply chips usable after a reload, not just live.
+    return { ...item, artifacts, suggestions: item.suggestions?.length ? item.suggestions : artifacts.suggestions || [] };
   }) : [];
   if (!latestArtifacts) return restored;
   for (let index = restored.length - 1; index >= 0; index -= 1) {
