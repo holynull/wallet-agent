@@ -194,3 +194,17 @@ async def test_router_reads_lifecycle_checkpoint_when_confirmation_is_pending():
     state = await router.aget_state({"configurable": {"thread_id": "pending-confirmation"}})
 
     assert state is lifecycle_state
+
+
+def test_checkpointer_false_compiles_without_persistence():
+    """The LangGraph Server seam: no compiled-in checkpointer to shadow the platform's."""
+    from wallet_agent.graph.build import build_graph
+
+    class Model:
+        async def ainvoke(self, _value):
+            return {"intent": "clarification"}
+
+    assert build_graph(model=Model(), checkpointer=False).checkpointer is None
+    assert build_graph(model=Model(), split_graphs=True, checkpointer=False).checkpointer is None
+    # The local default is unchanged.
+    assert build_graph(model=Model()).checkpointer is not None

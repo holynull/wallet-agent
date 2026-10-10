@@ -107,6 +107,18 @@ class GraphRouter:
         return getattr(self.conversation_graph, "checkpointer", None)
 
 
+def _resolve_checkpointer(checkpointer: Any) -> Any:
+    """Pick the checkpointer to compile with.
+
+    ``checkpointer=False`` is the platform seam: LangGraph Server injects its own
+    checkpointer per run, and a compiled-in one shadows it, so the graph must be
+    built without one. ``None`` keeps the local default.
+    """
+    if checkpointer is False:
+        return None
+    return checkpointer if checkpointer is not None else MemorySaver()
+
+
 def _build_graph(
     *,
     model: Any,
@@ -116,6 +128,8 @@ def _build_graph(
     explorer_provider: Any | None = None,
     execution_observer: Any | None = None,
     price_provider: Any | None = None,
+    # None -> an in-process MemorySaver (local default); False -> compile with
+    # no checkpointer so LangGraph Server can inject its own.
     checkpointer: Any | None = None,
     max_poll_attempts: int = 3,
     confirmation_ttl_seconds: int = 900,
@@ -193,7 +207,7 @@ def _build_graph(
         builder.add_edge("react_tools", "react_agent")
         builder.add_edge("finalize_response", END)
     if conversation_only:
-        compiled = builder.compile(checkpointer=checkpointer or MemorySaver())
+        compiled = builder.compile(checkpointer=checkpointer)
         setattr(compiled, "_model", model)
         setattr(compiled, "graph_role", "conversation")
         setattr(compiled, "metadata_cache", metadata_cache)
@@ -305,9 +319,7 @@ def _build_graph(
     builder.add_conditional_edges(
         "status_poll", route_after_status, {"status_poll": "status_poll", "response": "response"}
     )
-    compiled = builder.compile(
-        checkpointer=checkpointer if checkpointer is not None else MemorySaver()
-    )
+    compiled = builder.compile(checkpointer=checkpointer)
     # Keep the router available to the API transport for non-checkpointed
     # observability metadata. The model trace itself is emitted as SSE data.
     setattr(compiled, "_model", model)
@@ -341,6 +353,7 @@ def build_graph(
     metrics: RuntimeMetrics | None = None,
 ) -> Any:
     """Build the compatible graph or the production split graph router."""
+    checkpointer = _resolve_checkpointer(checkpointer)
     if require_react and not callable(getattr(model, "invoke_react", None)):
         raise RuntimeError("configured model does not support the required ReAct contract")
     if require_react and getattr(model, "supports_react", True) is False:
@@ -370,7 +383,7 @@ def build_graph(
             metadata_cache=shared_cache,
             metrics=shared_metrics,
         )
-    shared_checkpointer = checkpointer if checkpointer is not None else MemorySaver()
+    shared_checkpointer = checkpointer
     conversation = _build_graph(
         model=model,
         providers=providers,

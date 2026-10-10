@@ -228,7 +228,9 @@ def build_application(settings: Settings | None = None) -> Any:
         explorer_provider=explorer_provider,
         execution_observer=execution_observer,
         price_provider=price_provider,
-        checkpointer=checkpoint_handle.checkpointer,
+        checkpointer=(
+            False if settings.use_platform_checkpointer else checkpoint_handle.checkpointer
+        ),
         max_poll_attempts=settings.poll_max_attempts,
         confirmation_ttl_seconds=settings.confirmation_ttl_seconds,
         provider_timeout_seconds=settings.provider_timeout_seconds,
