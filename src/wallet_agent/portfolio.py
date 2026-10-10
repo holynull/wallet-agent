@@ -167,10 +167,9 @@ async def query_portfolio(
                 if symbol and canonical_symbol(asset.symbol) != symbol:
                     continue
                 usd = balance.usd_value
-                if usd is None:
-                    price = price_map.get((chain, canonical_symbol(asset.symbol), asset.address))
-                    if price is not None:
-                        usd = balance.amount * price
+                price = price_map.get((chain, canonical_symbol(asset.symbol), asset.address))
+                if usd is None and price is not None:
+                    usd = balance.amount * price
                 if balance.amount <= 0 or (usd is not None and usd <= 0):
                     continue
                 identity = (
@@ -185,8 +184,12 @@ async def query_portfolio(
                         "amount_raw": 0,
                         "usd_value": Decimal(0),
                         "addresses": [],
+                    # The design's asset row shows the unit price under the name.
+                    "unit_price": price,
                     }
                 row = rows[identity]
+                if row["unit_price"] is None:
+                    row["unit_price"] = price
                 row["amount"] += balance.amount
                 row["amount_raw"] += int(balance.amount_raw)
                 row["usd_value"] = (
@@ -202,7 +205,14 @@ async def query_portfolio(
             (item["usd_value"] for item in assets if item["usd_value"] is not None), Decimal(0)
         )
         for item in assets:
-            for field in ("amount", "amount_raw", "usd_value"):
+            if item["unit_price"] is None and item["usd_value"] is not None and item["amount"]:
+                # The provider often hands back the total value directly, so
+                # derive the unit price from it instead of a second price call.
+                item["unit_price"] = (item["usd_value"] / item["amount"]).quantize(
+                    Decimal("0.01")
+                )
+        for item in assets:
+            for field in ("amount", "amount_raw", "usd_value", "unit_price"):
                 if item[field] is not None:
                     item[field] = (
                         format(item[field], "f")
@@ -239,6 +249,8 @@ async def query_portfolio(
             "chains": chains,
             "scope": {"requested": "specified" if explicit else "all", "resolved_chains": chains},
             "asset_scope": {"symbol": symbol} if symbol else None,
+            # Drives the design's "暂无资产数据" empty state.
+            "has_assets": bool(assets),
             "network_status": statuses,
             "complete": complete,
             "valuation_complete": all(item["usd_value"] is not None for item in assets),
