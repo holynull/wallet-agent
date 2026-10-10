@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -101,7 +102,7 @@ class OkxExplorerAdapter:
                     "OKX_MALFORMED_RESPONSE", "OKX transaction history is malformed"
                 )
             transactions = [
-                self._record(row, history_kind="full")
+                self._record(row, history_kind="full", self_address=address)
                 for row in rows
                 if isinstance(row, dict)
             ]
@@ -243,6 +244,7 @@ class OkxExplorerAdapter:
         *,
         history_kind: str,
         fallback_tx_hash: str | None = None,
+        self_address: str | None = None,
     ) -> TransactionRecord:
         chain_index = self._optional_string(item.get("chainIndex", item.get("chainIndexId")))
         chain = self.chain_name_by_index.get(chain_index or "", chain_index or "UNKNOWN")
@@ -255,19 +257,39 @@ class OkxExplorerAdapter:
         status = self._status(item.get("txStatus", item.get("status")))
         timestamp = self._timestamp(item.get("txTime", item.get("timestamp")))
         block_number = self._number(item.get("blockHeight", item.get("blockNumber")))
+        symbol = self._optional_string(
+            item.get("symbol", item.get("tokenSymbol", item.get("assetSymbol")))
+        )
+        decimals = self._number(item.get("decimals", item.get("tokenDecimals")))
+        failure_reason = self._optional_string(
+            item.get(
+                "failReason",
+                item.get("failureReason", item.get("errorMsg", item.get("errMsg"))),
+            )
+        )
+        from_address, to_address = self._sides(
+            item.get("from", item.get("fromAddress")),
+            item.get("to", item.get("toAddress")),
+            self_address,
+        )
         return TransactionRecord(
             chain=chain,
             chain_id=chain_index,
             tx_hash=tx_hash,
             status=status,
-            from_address=item.get("from", item.get("fromAddress")),
-            to_address=item.get("to", item.get("toAddress")),
+            from_address=from_address,
+            to_address=to_address,
             value=self._optional_string(item.get("amount", item.get("value"))),
             block_number=block_number,
             confirmed_at=timestamp if status is TransactionStatus.CONFIRMED else None,
             source="okx",
             history_kind=history_kind,  # type: ignore[arg-type]
             method_id=item.get("methodId", item.get("methodID")),
+            direction=self._direction(item.get("txType", item.get("type"))),
+            symbol=symbol,
+            decimals=int(decimals) if decimals is not None else None,
+            occurred_at=timestamp,
+            failure_reason=failure_reason,
         )
 
     @staticmethod
@@ -280,6 +302,57 @@ class OkxExplorerAdapter:
         if text in {"3", "fail", "failed", "failure", "reverted", "error"}:
             return TransactionStatus.FAILED
         return TransactionStatus.UNKNOWN
+
+    @staticmethod
+    def _address_list(value: Any) -> list[str]:
+        """OKX sends an address list of {address, amount} objects, or a plain string."""
+        if isinstance(value, str):
+            return [value] if value else []
+        if isinstance(value, Mapping):
+            address = value.get("address")
+            return [str(address)] if address else []
+        if isinstance(value, (list, tuple)):
+            addresses: list[str] = []
+            for entry in value:
+                address = entry.get("address") if isinstance(entry, Mapping) else entry
+                if address:
+                    addresses.append(str(address))
+            return addresses
+        return []
+
+    @classmethod
+    def _sides(
+        cls, raw_from: Any, raw_to: Any, self_address: str | None
+    ) -> tuple[str | None, str | None]:
+        """Pick the sender/receiver, preferring this wallet's own address.
+
+        Keeping our own address on the matching side is what lets the history
+        card derive send/receive without trusting a provider type code.
+        """
+        senders = cls._address_list(raw_from)
+        receivers = cls._address_list(raw_to)
+        target = str(self_address or "").strip().lower()
+        sender = next((item for item in senders if item.lower() == target), None)
+        receiver = next((item for item in receivers if item.lower() == target), None)
+        if sender is None:
+            sender = next((item for item in senders if item.lower() != target), None)
+        if receiver is None:
+            receiver = next((item for item in receivers if item.lower() != target), None)
+        sender = sender or (senders[0] if senders else None)
+        receiver = receiver or (receivers[0] if receivers else None)
+        return sender, receiver
+
+    @staticmethod
+    def _direction(value: Any) -> str | None:
+        """Only trust explicit provider words; numeric codes are ambiguous."""
+        text = str(value).strip().lower()
+        if text in {"send", "out", "outgoing"}:
+            return "send"
+        if text in {"receive", "in", "incoming"}:
+            return "receive"
+        if text in {"swap", "exchange", "trade"}:
+            return "swap"
+        return None
 
     @staticmethod
     def _timestamp(value: Any) -> datetime | None:

@@ -68,6 +68,81 @@ async def test_history_maps_okx_transaction_list_and_cursor():
 
 
 @pytest.mark.asyncio
+async def test_history_accepts_okx_address_lists_and_keeps_our_own_side():
+    """OKX sends from/to as [{address, amount}]; a 500 here used to hide all EVM history."""
+    other = "0x" + "2" * 40
+    client = FakeClient(
+        {
+            "/api/v6/dex/post-transaction/transactions-by-address": {
+                "code": "0",
+                "data": [
+                    {
+                        "transactionList": [
+                            {
+                                "chainIndex": "1",
+                                "txHash": TX_HASH,
+                                "txStatus": "success",
+                                "from": [{"address": other, "amount": ""}],
+                                "to": [{"address": ADDRESS, "amount": ""}],
+                                "amount": "2000000",
+                                "symbol": "ETHG",
+                                "txTime": "1791248687000",
+                            },
+                            {
+                                "chainIndex": "1",
+                                "txHash": "0x" + "b" * 64,
+                                "txStatus": "success",
+                                "from": [{"address": ADDRESS, "amount": ""}],
+                                "to": [
+                                    {"address": other, "amount": ""},
+                                    {"address": "0x" + "3" * 40, "amount": ""},
+                                ],
+                                "amount": "1000",
+                                "symbol": "ETH",
+                                "txTime": "1791248687001",
+                            },
+                        ]
+                    }
+                ],
+            }
+        }
+    )
+    adapter = OkxExplorerAdapter(client, {"ETH": "1"})
+
+    page = await adapter.get_transaction_history(ADDRESS, "ETH", limit=5)
+
+    incoming, outgoing = page.transactions
+    # Our own address stays on the side it appears on, which is what the
+    # history card uses to tell send from receive.
+    assert incoming.from_address == other
+    assert incoming.to_address == ADDRESS
+    assert incoming.symbol == "ETHG"
+    assert incoming.occurred_at == datetime.fromtimestamp(1791248687, tz=timezone.utc)
+    assert outgoing.from_address == ADDRESS
+    assert outgoing.to_address == other
+
+
+def test_record_keeps_a_provider_failure_reason():
+    from wallet_agent.domain.models import TransactionStatus
+
+    adapter = OkxExplorerAdapter(FakeClient({}), {"ETH": "1"})
+
+    failed = adapter._record(
+        {"chainIndex": "1", "txHash": TX_HASH, "txStatus": "fail", "failReason": "out of gas"},
+        history_kind="full",
+    )
+    assert failed.status is TransactionStatus.FAILED
+    assert failed.failure_reason == "out of gas"
+
+    # No reason in the payload must stay None instead of being invented.
+    silent = adapter._record(
+        {"chainIndex": "1", "txHash": TX_HASH, "txStatus": "fail"}, history_kind="full"
+    )
+    assert silent.failure_reason is None
+
+
+
+@pytest.mark.asyncio
 async def test_history_treats_null_transactions_as_empty_page():
     client = FakeClient(
         {
