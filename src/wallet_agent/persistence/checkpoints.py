@@ -29,6 +29,19 @@ class LazyAsyncSqliteSaver:
         current_version = 0 if current is None else int(str(current).split(".")[0])
         return f"{current_version + 1:032}.{random.random():016}"
 
+    async def _open(self) -> tuple[Any, Any]:
+        """Open the saver; drivers with a different connection shape override this."""
+        import importlib
+
+        saver_class = getattr(importlib.import_module(self._module), self._class_name)
+        context = saver_class.from_conn_string(self.dsn)
+        saver = await context.__aenter__()
+        await saver.setup()
+        return context, saver
+
+    async def _close(self, context: Any) -> None:
+        await context.__aexit__(None, None, None)
+
     async def _get(self) -> Any:
         if self._saver is None:
             import aiosqlite
@@ -141,14 +154,7 @@ class LazyAsyncPostgresSaver:
             self._open_lock = asyncio.Lock()
         async with self._open_lock:
             if self._saver is None:
-                import importlib
-
-                saver_class = getattr(
-                    importlib.import_module(self._module), self._class_name
-                )
-                self._context = saver_class.from_conn_string(self.dsn)
-                self._saver = await self._context.__aenter__()
-                await self._saver.setup()
+                self._context, self._saver = await self._open()
         return self._saver
 
     async def aget_tuple(self, config: dict[str, Any]) -> Any:
@@ -188,7 +194,7 @@ class LazyAsyncPostgresSaver:
 
     async def aclose(self) -> None:
         if self._context is not None:
-            await self._context.__aexit__(None, None, None)
+            await self._close(self._context)
             self._context = None
             self._saver = None
 
@@ -207,7 +213,13 @@ class CheckpointerHandle:
 
 
 class LazyAsyncMySQLSaver(LazyAsyncPostgresSaver):
-    """MySQL saver (community package, mirrors the official Postgres one)."""
+    """MySQL saver (community package, mirrors the official Postgres one).
+
+    ``AIOMySQLSaver.from_conn_string`` parses the URL with ``urlparse`` and hands
+    the *still percent-encoded* password to aiomysql, so a password containing
+    reserved characters is rejected as a wrong password. Open the connection
+    here instead, with the password decoded.
+    """
 
     _module = "langgraph.checkpoint.mysql.aio"
     _class_name = "AIOMySQLSaver"
@@ -215,6 +227,28 @@ class LazyAsyncMySQLSaver(LazyAsyncPostgresSaver):
     @staticmethod
     def _normalize(url: str) -> str:
         return _mysql_dsn(url)
+
+    async def _open(self) -> tuple[Any, Any]:
+        import urllib.parse
+
+        import aiomysql
+        from langgraph.checkpoint.mysql.aio import AIOMySQLSaver
+
+        parsed = urllib.parse.urlparse(self.dsn)
+        connection = await aiomysql.connect(
+            host=parsed.hostname or "localhost",
+            port=parsed.port or 3306,
+            user=parsed.username,
+            password=urllib.parse.unquote(parsed.password or ""),
+            db=(parsed.path or "/").lstrip("/").split("?")[0],
+            autocommit=True,
+        )
+        saver = AIOMySQLSaver(connection)
+        await saver.setup()
+        return connection, saver
+
+    async def _close(self, context: Any) -> None:
+        context.close()
 
 
 def create_checkpointer(persistence_url: str) -> CheckpointerHandle:
