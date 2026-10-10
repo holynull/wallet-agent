@@ -258,3 +258,48 @@ async def test_build_native_transfer_attaches_prev_tx_only_for_legacy_inputs():
     assert [path for path in transport.paths if path.endswith("/hex")] == [
         f"/api/tx/{'cc' * 32}/hex"
     ]
+
+
+async def test_transaction_history_derives_direction_amount_and_counterparty():
+    class HistoryEsplora:
+        async def get(self, path, **_kwargs):
+            if path.endswith("/txs"):
+                return [
+                    {
+                        "txid": "aa" * 32,
+                        "status": {
+                            "confirmed": True,
+                            "block_height": 900_000,
+                            "block_time": 1_750_000_000,
+                        },
+                        "vin": [{"prevout": {"scriptpubkey_address": P2WPKH, "value": 100_000}}],
+                        "vout": [
+                            {"scriptpubkey_address": P2TR, "value": 99_000},
+                            {"scriptpubkey_address": P2WPKH, "value": 500},
+                        ],
+                    },
+                    {
+                        "txid": "bb" * 32,
+                        "status": {
+                            "confirmed": True,
+                            "block_height": 900_001,
+                            "block_time": 1_750_001_000,
+                        },
+                        "vin": [{"prevout": {"scriptpubkey_address": P2TR, "value": 40_000}}],
+                        "vout": [{"scriptpubkey_address": P2WPKH, "value": 40_000}],
+                    },
+                ]
+            return {}
+
+    records = await BitcoinChainAdapter(HistoryEsplora()).get_transaction_history(P2WPKH)
+    outgoing, incoming = records
+
+    assert outgoing.direction == "send"
+    assert outgoing.value == "99500"  # 100_000 spent, 500 returned as change
+    assert outgoing.counterparty == P2TR
+    assert outgoing.symbol == "BTC" and outgoing.decimals == 8
+    assert outgoing.occurred_at is not None
+
+    assert incoming.direction == "receive"
+    assert incoming.value == "40000"
+    assert incoming.counterparty == P2TR

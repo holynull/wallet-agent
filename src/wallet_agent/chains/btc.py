@@ -6,6 +6,7 @@ import base64
 import hashlib
 import math
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -203,6 +204,20 @@ class BitcoinChainAdapter:
             if not isinstance(item, Mapping):
                 continue
             status = item.get("status") if isinstance(item.get("status"), Mapping) else {}
+            received, sent, spent_from, paid_to = self._movements(item, address)
+            net = received - sent
+            if net > 0:
+                direction, counterparty, amount = "receive", spent_from, net
+            elif net < 0:
+                direction, counterparty, amount = "send", paid_to, -net
+            else:
+                direction, counterparty, amount = "unknown", paid_to, 0
+            block_time = status.get("block_time")
+            occurred_at = (
+                datetime.fromtimestamp(int(block_time), tz=timezone.utc)
+                if isinstance(block_time, (int, float))
+                else None
+            )
             records.append(
                 TransactionRecord(
                     chain=self.chain,
@@ -214,9 +229,46 @@ class BitcoinChainAdapter:
                         else TransactionStatus.PENDING
                     ),
                     block_number=status.get("block_height"),
+                    from_address=spent_from,
+                    to_address=paid_to,
+                    value=str(amount) if amount else None,
+                    direction=direction,
+                    symbol=self.native_asset.symbol,
+                    decimals=self.native_asset.decimals,
+                    counterparty=counterparty,
+                    occurred_at=occurred_at,
                 )
             )
         return records[:limit]
+
+    @staticmethod
+    def _movements(item: Mapping[str, Any], address: str) -> tuple[int, int, str, str]:
+        """(received, sent, first spender, first other payee) for one Esplora tx."""
+        received = 0
+        sent = 0
+        spent_from = ""
+        paid_to = ""
+        for row in item.get("vout") or []:
+            if not isinstance(row, Mapping):
+                continue
+            value = row.get("value")
+            if isinstance(value, (int, float)) and row.get("scriptpubkey_address") == address:
+                received += int(value)
+            elif not paid_to:
+                paid_to = str(row.get("scriptpubkey_address") or "")
+        for row in item.get("vin") or []:
+            if not isinstance(row, Mapping):
+                continue
+            previous = row.get("prevout")
+            if not isinstance(previous, Mapping):
+                continue
+            value = previous.get("value")
+            owner = str(previous.get("scriptpubkey_address") or "")
+            if not spent_from and owner:
+                spent_from = owner
+            if owner == address and isinstance(value, (int, float)):
+                sent += int(value)
+        return received, sent, spent_from, paid_to
 
     async def estimate_fee(
         self,
