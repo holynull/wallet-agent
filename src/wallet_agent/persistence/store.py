@@ -48,6 +48,9 @@ class SwapSessionRecord(DomainModel):
     revision: int = 0
     last_run_id: str | None = None
     last_error: dict | None = None
+    # First user utterance of the conversation; the App shows it as the row title.
+    title: str | None = None
+    pinned: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -64,10 +67,40 @@ class SessionRevisionConflict(RuntimeError):
         )
 
 
+def filter_sessions(
+    sessions: list[SwapSessionRecord],
+    *,
+    limit: int,
+    cursor: datetime | None = None,
+    query: str | None = None,
+) -> list[SwapSessionRecord]:
+    """Newest first, optionally older than ``cursor`` and matching ``query``.
+
+    ``query`` matches the conversation title; ``cursor`` is the ``updated_at``
+    of the last item of the previous page.
+    """
+    needle = (query or "").strip().lower()
+    matched = [
+        session
+        for session in sessions
+        if (not needle or needle in (session.title or "").lower())
+        and (cursor is None or session.updated_at < cursor)
+    ]
+    matched.sort(key=lambda item: item.updated_at, reverse=True)
+    return matched[:limit]
+
+
 class SessionStore(Protocol):
     async def save(self, session: SwapSessionRecord) -> SwapSessionRecord: ...
     async def get(self, session_id: str) -> SwapSessionRecord | None: ...
-    async def list_for_user(self, user_id: str, *, limit: int = 50) -> list[SwapSessionRecord]: ...
+    async def list_for_user(
+        self,
+        user_id: str,
+        *,
+        limit: int = 50,
+        cursor: datetime | None = None,
+        query: str | None = None,
+    ) -> list[SwapSessionRecord]: ...
     async def delete(self, session_id: str, *, user_id: str) -> bool: ...
     async def update(
         self,
@@ -95,13 +128,20 @@ class InMemorySessionStore:
             session = self._sessions.get(session_id)
             return session.model_copy(deep=True) if session is not None else None
 
-    async def list_for_user(self, user_id: str, *, limit: int = 50) -> list[SwapSessionRecord]:
+    async def list_for_user(
+        self,
+        user_id: str,
+        *,
+        limit: int = 50,
+        cursor: datetime | None = None,
+        query: str | None = None,
+    ) -> list[SwapSessionRecord]:
         async with self._lock:
             sessions = [
                 session for session in self._sessions.values() if session.user_id == user_id
             ]
-            sessions.sort(key=lambda item: item.updated_at, reverse=True)
-            return [session.model_copy(deep=True) for session in sessions[:limit]]
+            page = filter_sessions(sessions, limit=limit, cursor=cursor, query=query)
+            return [session.model_copy(deep=True) for session in page]
 
     async def delete(self, session_id: str, *, user_id: str) -> bool:
         async with self._lock:
@@ -207,7 +247,14 @@ class SqlSessionStore:
             row = await db.get(self.row_model, session_id)
             return SwapSessionRecord.model_validate_json(row.payload) if row else None
 
-    async def list_for_user(self, user_id: str, *, limit: int = 50) -> list[SwapSessionRecord]:
+    async def list_for_user(
+        self,
+        user_id: str,
+        *,
+        limit: int = 50,
+        cursor: datetime | None = None,
+        query: str | None = None,
+    ) -> list[SwapSessionRecord]:
         from sqlalchemy import select
 
         await self._ensure_init()
@@ -219,8 +266,7 @@ class SqlSessionStore:
             sessions = [
                 SwapSessionRecord.model_validate_json(row.payload) for row in rows.scalars()
             ]
-            sessions.sort(key=lambda session: session.updated_at, reverse=True)
-            return sessions[:limit]
+        return filter_sessions(sessions, limit=limit, cursor=cursor, query=query)
 
     async def delete(self, session_id: str, *, user_id: str) -> bool:
         from sqlalchemy import delete

@@ -9,6 +9,7 @@ import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import fields, is_dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
@@ -88,6 +89,14 @@ class WalletAccount(BaseModel):
     model_config = ConfigDict(extra="forbid")
     chain: str = Field(min_length=1, max_length=32)
     address: str = Field(min_length=1, max_length=128)
+
+
+class ConversationUpdateRequest(BaseModel):
+    """Rename or pin a conversation. Absent fields are left untouched."""
+
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    pinned: bool | None = None
 
 
 class TurnRequest(BaseModel):
@@ -195,6 +204,44 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     return value
+
+
+def _conversation_title(message: Any, *, limit: int = 40) -> str | None:
+    """First user utterance, whitespace-collapsed, used as the history row title."""
+    text = " ".join(str(message or "").split())
+    if not text:
+        return None
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _conversation_summary(session: Any) -> dict[str, Any]:
+    """List-row projection shared by the list and update endpoints."""
+    if session.quote is not None:
+        fallback = (
+            f"{session.quote.source_asset.symbol} → {session.quote.destination_asset.symbol}"
+        )
+    else:
+        fallback = "Wallet Agent 对话"
+    return {
+        "conversation_id": session.thread_id,
+        "session_id": session.session_id,
+        "title": session.title or fallback,
+        "pinned": bool(getattr(session, "pinned", False)),
+        "status": session.status,
+        "stage": session.stage,
+        "updated_at": session.updated_at,
+        "created_at": session.created_at,
+        "summary": fallback,
+    }
+
+
+def _conversation_cursor(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid cursor") from exc
 
 
 def _conversation_artifacts(state: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -827,31 +874,26 @@ def create_app(
 
     @app.get("/v1/agent/conversations")
     async def list_conversations(
-        request: Request, user_id: str = "browser-demo", limit: int = 50
+        request: Request,
+        user_id: str = "browser-demo",
+        limit: int = 50,
+        cursor: str | None = None,
+        q: str | None = None,
     ) -> dict[str, Any]:
+        """Newest first. ``cursor`` pages backwards, ``q`` matches the title."""
         owner = await authenticated_user(
             request, verifier=token_verifier, required=require_auth, fallback_user_id=user_id
         )
         limit = max(1, min(limit, 100))
-        sessions = await session_store.list_for_user(owner, limit=limit)
+        sessions = await session_store.list_for_user(
+            owner, limit=limit, cursor=_conversation_cursor(cursor), query=q
+        )
+        items = [_conversation_summary(session) for session in sessions]
         return {
-            "conversations": [
-                {
-                    "conversation_id": session.thread_id,
-                    "session_id": session.session_id,
-                    "status": session.status,
-                    "stage": session.stage,
-                    "updated_at": session.updated_at,
-                    "created_at": session.created_at,
-                    "summary": (
-                        f"{session.quote.source_asset.symbol} → "
-                        f"{session.quote.destination_asset.symbol}"
-                        if session.quote is not None
-                        else "Wallet Agent 对话"
-                    ),
-                }
-                for session in sessions
-            ]
+            "conversations": _jsonable(items),
+            "next_cursor": (
+                items[-1]["updated_at"] if len(items) == limit and items else None
+            ),
         }
 
     @app.get("/v1/agent/conversations/{conversation_id}")
@@ -896,6 +938,30 @@ def create_app(
         if checkpointer is not None and hasattr(checkpointer, "adelete_thread"):
             await checkpointer.adelete_thread(conversation_id)
         return {"conversation_id": conversation_id, "deleted": deleted}
+
+    @app.patch("/v1/agent/conversations/{conversation_id}")
+    async def update_conversation(
+        conversation_id: str,
+        payload: ConversationUpdateRequest,
+        request: Request,
+        user_id: str = "browser-demo",
+    ) -> dict[str, Any]:
+        owner = await authenticated_user(
+            request, verifier=token_verifier, required=require_auth, fallback_user_id=user_id
+        )
+        sessions = await session_store.list_for_user(owner, limit=100)
+        session = next((item for item in sessions if item.thread_id == conversation_id), None)
+        if session is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        changes = {
+            key: value
+            for key, value in {"title": payload.title, "pinned": payload.pinned}.items()
+            if value is not None
+        }
+        if not changes:
+            raise HTTPException(status_code=422, detail="nothing to update")
+        updated = await session_store.update(session.session_id, **changes)
+        return {"conversation": _jsonable(_conversation_summary(updated))}
 
     async def persist_assistant_history(
         conversation_id: str, state: Mapping[str, Any]
@@ -1539,6 +1605,7 @@ def create_app(
                         session_id=session_id,
                         user_id=user_id,
                         thread_id=conversation_id,
+                        title=_conversation_title(payload.message),
                     )
                 )
             elif existing_session.thread_id != conversation_id:

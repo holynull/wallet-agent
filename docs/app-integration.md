@@ -461,16 +461,63 @@ POST /v1/transfer/{session_id}/broadcast
 
 ## 7. 会话与历史
 
+### 7.1 接口
+
 | 操作 | 接口 |
 | --- | --- |
-| 列表 | `GET /v1/agent/conversations?user_id=...&limit=50` |
+| 列表 | `GET /v1/agent/conversations?user_id=...&limit=50&cursor=...&q=...` |
 | 详情 | `GET /v1/agent/conversations/{id}?user_id=...` |
+| 改名 / 置顶 | `PATCH /v1/agent/conversations/{id}?user_id=...` |
 | 删除 | `DELETE /v1/agent/conversations/{id}?user_id=...` |
+
+列表返回（`next_cursor` 为 `null` 表示没有更多）：
+
+```json
+{
+  "conversations": [
+    {
+      "conversation_id": "07f23a20-...",
+      "session_id": "2d6166a0-...",
+      "title": "我最近有哪些交易？",
+      "pinned": false,
+      "status": "created",
+      "stage": null,
+      "created_at": "2026-10-10T09:27:18Z",
+      "updated_at": "2026-10-10T09:27:32Z",
+      "summary": "Wallet Agent 对话"
+    }
+  ],
+  "next_cursor": "2026-10-10T09:27:32.800559Z"
+}
+```
+
+- **标题** `title`：首条用户消息（空白折叠、超过 40 字截断加省略号），兑换会话回退成
+  「BNB → ETH」；`summary` 是旧字段，仅为兼容保留，**新实现请用 `title`**。
+- **分页**：按 `updated_at` 倒序，`limit` 上限 100。把上一页的 `next_cursor` 原样回传即可翻页，
+  直到返回 `null`。
+- **搜索** `q`：按标题做大小写不敏感的子串匹配；分页与搜索可以同时使用。
+- **置顶** `pinned`：服务端只回标记，**排序仍按 `updated_at`**（保证翻页稳定），
+  置顶项的最终展示位置由 App 决定，不要把置顶当成服务端排序。
+- **改名 / 置顶**：`PATCH` 请求体 `{"title": "...", "pinned": true}`，只传要改的字段；
+  两个都没传返回 `422`，会话不存在返回 `404`。
+
+### 7.2 恢复对话
 
 详情返回 `messages`（含 `artifacts` 卡片快照，服务端在 SSE 中已剥离该字段以去重）、
 `latest_artifacts`、`model_trace`、`session_id`。App 冷启动时应据此恢复消息列表和当前卡片，
-而不是依赖 SSE 重放。
+而不是依赖 SSE 重放。投影规则与 §4.3 完全一致，**两处必须共用同一份实现**。
 
+### 7.3 已知限制与注意事项
+
+- **归属**：`user_id`（或 Bearer token）决定归属；用别人的 `conversation_id` 返回 **404**
+  而不是 403，这是刻意的——不要据此判断"会话是否存在"。
+- **删除是物理删除**：会话记录会和 LangGraph checkpoint 一起删除，**不可恢复**，
+  App 侧必须二次确认。
+- **按 id 操作有 100 条上限**：详情、改名、删除都是在"该用户最近 100 条会话"里查找，
+  超出范围的旧会话用列表分页能读到，但按 id 操作会返回 404。当前实现如此，
+  App 若要支持长期会话管理，需要服务端补一个按 `thread_id` 直查的路径。
+- **空会话**：只创建未产生回复的会话也可能出现在列表里（`status == "created"`），
+  是否展示由 App 决定。
 ## 8. 错误处理
 
 REST 错误统一信封：

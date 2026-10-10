@@ -1201,3 +1201,84 @@ async def test_assets_endpoint_filters_provider_and_deduplicates():
     assert response.status_code == 200
     assert len(response.json()["assets"]) == 1
     assert response.json()["assets"][0]["address"] == "0x" + "3" * 40
+
+
+@pytest.mark.asyncio
+async def test_conversation_list_titles_paging_and_search():
+    """History management: a readable title, backwards paging and a title search."""
+    from wallet_agent.api import create_app
+    from wallet_agent.persistence import InMemorySessionStore, SwapSessionRecord
+
+    class Graph:
+        async def ainvoke(self, *_args, **_kwargs):  # pragma: no cover - not used here
+            raise AssertionError("not used")
+
+    store = InMemorySessionStore()
+    for index, title in enumerate(["查一下余额", "转给朋友", "解释失败原因"]):
+        await store.save(
+            SwapSessionRecord(
+                session_id=f"s{index}",
+                user_id="alice",
+                thread_id=f"t{index}",
+                title=title,
+            )
+        )
+    app = create_app(graph=Graph(), store=store)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = await client.get("/v1/agent/conversations?user_id=alice&limit=2")
+        assert first.status_code == 200
+        body = first.json()
+        assert [item["title"] for item in body["conversations"]] == [
+            "解释失败原因",
+            "转给朋友",
+        ]
+        assert body["next_cursor"] == body["conversations"][-1]["updated_at"]
+
+        second = await client.get(
+            f"/v1/agent/conversations?user_id=alice&limit=2&cursor={body['next_cursor']}"
+        )
+        assert [item["title"] for item in second.json()["conversations"]] == ["查一下余额"]
+        assert second.json()["next_cursor"] is None
+
+        found = await client.get("/v1/agent/conversations?user_id=alice&q=朋友")
+        assert [item["title"] for item in found.json()["conversations"]] == ["转给朋友"]
+
+        bad = await client.get("/v1/agent/conversations?user_id=alice&cursor=not-a-date")
+        assert bad.status_code == 422
+
+        renamed = await client.patch(
+            "/v1/agent/conversations/t1?user_id=alice", json={"title": "给妈妈转账", "pinned": True}
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["conversation"]["title"] == "给妈妈转账"
+        assert renamed.json()["conversation"]["pinned"] is True
+
+        missing = await client.patch(
+            "/v1/agent/conversations/nope?user_id=alice", json={"pinned": True}
+        )
+        assert missing.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_a_turn_titles_the_new_conversation_with_the_first_message():
+    class Graph:
+        async def ainvoke(self, *_args, **_kwargs):
+            return {"response": {"kind": "react", "message": "ok"}, "conversation_history": []}
+
+    app, client = await client_for(graph=Graph())
+    async with client:
+        turn = await client.post(
+            "/v1/agent/turn",
+            json={"user_id": "alice", "message": "我最近有哪些交易？看看流水"},
+        )
+        assert turn.status_code == 200
+        await app.state.runs[turn.json()["run_id"]]["task"]
+
+        listed = await client.get("/v1/agent/conversations?user_id=alice")
+
+    conversations = listed.json()["conversations"]
+    assert len(conversations) == 1
+    assert conversations[0]["title"] == "我最近有哪些交易？看看流水"
+    assert conversations[0]["pinned"] is False
