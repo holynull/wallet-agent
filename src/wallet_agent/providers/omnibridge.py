@@ -462,5 +462,13 @@ class OmniBridgeProvider:
             tx_hash=data.get("transactionId"),
             refund_address=data.get("refundAddr"),
             completed_at=completed if normalized in {"completed", "refunded"} else None,
+            failure_reason=next(
+                (
+                    str(data[key])
+                    for key in ("refundReason", "reason", "errMsg", "errorMsg")
+                    if data.get(key) not in (None, "")
+                ),
+                None,
+            ),
             provider_payload=details,
         )

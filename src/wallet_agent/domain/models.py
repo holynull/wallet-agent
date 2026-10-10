@@ -334,6 +334,9 @@ class NormalizedOrderStatus(DomainModel):
     message: str | None = None
     tx_hash: str | None = None
     refund_address: str | None = None
+    # First-class "why" for the design's 解释失败原因 question; providers only
+    # fill it when they actually say something.
+    failure_reason: str | None = None
     completed_at: datetime | None = None
     expires_at: datetime | None = None
     provider_payload: dict[str, JsonValue] = Field(default_factory=dict)
@@ -458,6 +461,16 @@ class TransactionRecord(DomainModel):
     source: Literal["okx"] | None = None
     history_kind: Literal["full", "dex"] | None = None
     method_id: str | None = None
+    # Chat-card fields: what moved, in which direction, and when. Providers fill
+    # these when they can; consumers must tolerate them being absent.
+    direction: Literal["send", "receive", "swap", "unknown"] | None = None
+    symbol: str | None = None
+    decimals: int | None = Field(default=None, ge=0)
+    counterparty: str | None = None
+    occurred_at: datetime | None = None
+    # "Why did it fail" for the design's default question; None means the
+    # source did not tell us, which must not be presented as a reason.
+    failure_reason: str | None = None
 
 
 class TransactionHistoryPage(DomainModel):

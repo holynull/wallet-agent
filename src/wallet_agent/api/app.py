@@ -569,14 +569,6 @@ def _okx_chain_indexes(chains: str) -> list[str]:
     return indexes
 
 
-def _looks_like_swap(message: str) -> bool:
-    text = message.lower()
-    return any(
-        token in text
-        for token in ("swap", "exchange", "transfer", "send", "兑换", "换成", "换", "转账", "转")
-    )
-
-
 def _interrupt_values(snapshot: Any) -> list[Any]:
     next_nodes = tuple(getattr(snapshot, "next", ()) or ())
     values: list[Any] = []
@@ -1536,11 +1528,9 @@ def create_app(
         raw_gas_query = payload.metadata.get("gas_request") or payload.metadata.get("gas")
         raw_asset_query = payload.metadata.get("asset_query") or payload.metadata.get("assets")
         session_id = payload.session_id
-        if session_id is None and (
-            raw_swap_request is not None
-            or raw_transfer_request is not None
-            or _looks_like_swap(payload.message)
-        ):
+        # Every turn gets a session record so read-only conversations (asset,
+        # balance, receive-address questions) also show up in the chat history.
+        if session_id is None:
             session_id = str(uuid.uuid4())
         if session_id:
             if existing_session is None:

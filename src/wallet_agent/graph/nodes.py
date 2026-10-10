@@ -28,7 +28,7 @@ from langgraph.prebuilt import InjectedState, ToolNode
 from langgraph.types import interrupt
 
 from wallet_agent.chains._common import receipt_success
-from wallet_agent.domain.addresses import is_valid_address
+from wallet_agent.domain.addresses import EVM_ALIASES, is_valid_address
 from wallet_agent.domain.chains import native_decimals
 from wallet_agent.domain.models import (
     AgentError,
@@ -374,7 +374,9 @@ def _sanitize_response_suggestions(
     facts: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     allowed = _RESPONSE_DATA_KEYS.get(intent, set())
-    chains = {str(value).upper() for value in facts.get("supported_chains", [])}
+    # Compare chains through their canonical name so a suggestion that uses a
+    # provider alias (ARB) still matches the App's declared ARBITRUM.
+    chains = {canonical_chain(str(value)) for value in facts.get("supported_chains", [])}
     asset_keys = {
         (str(item.get("chain", "")).upper(), str(item.get("symbol", "")).upper())
         for item in facts.get("supported_assets", [])
@@ -400,7 +402,11 @@ def _sanitize_response_suggestions(
         clean["intent"] = clean_intent
         invalid = False
         for key in ("source_chain", "destination_chain", "chain"):
-            if clean.get(key) is not None and chains and str(clean[key]).upper() not in chains:
+            if (
+                clean.get(key) is not None
+                and chains
+                and canonical_chain(str(clean[key])) not in chains
+            ):
                 invalid = True
         if invalid:
             continue
@@ -2033,9 +2039,9 @@ def _swap_suggestions(
     missing: list[str],
     wallet_context: Mapping[str, Any] | None,
     providers: Mapping[str, Any] | None = None,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Offer explicit replies that fill slots without taking an action for the user."""
-    suggestions: list[dict[str, str]] = []
+    suggestions: list[dict[str, Any]] = []
     source_symbol = str(draft.get("source_symbol") or "").strip()
     destination_symbol = str(draft.get("destination_symbol") or "").strip()
     source_chain = str(draft.get("source_chain") or "").strip()
@@ -2044,13 +2050,20 @@ def _swap_suggestions(
 
     if wallet_chain and all(field in missing for field in ("source_chain", "destination_chain")):
         suggestions.append(
-            {"label": f"都在 {wallet_chain} 网络", "message": f"都在 {wallet_chain} 链"}
+            {
+                "label": f"都在 {wallet_chain} 网络",
+                "message": f"都在 {wallet_chain} 链",
+                "type": "chain",
+                "value": wallet_chain,
+            }
         )
     elif "source_chain" in missing and destination_chain:
         suggestions.append(
             {
                 "label": f"来源也在 {destination_chain} 网络",
                 "message": f"来源也在 {destination_chain} 链",
+                "type": "chain",
+                "value": destination_chain,
             }
         )
     elif "destination_chain" in missing and source_chain:
@@ -2058,6 +2071,8 @@ def _swap_suggestions(
             {
                 "label": f"目标也在 {source_chain} 网络",
                 "message": f"目标也在 {source_chain} 链",
+                "type": "chain",
+                "value": source_chain,
             }
         )
     if "source_symbol" in missing and destination_symbol:
@@ -2065,6 +2080,8 @@ def _swap_suggestions(
             {
                 "label": f"示例：用 USDC 换 {destination_symbol}",
                 "message": "用当前网络上的 USDC 换",
+                "type": "symbol",
+                "value": "USDC",
             }
         )
     if "destination_symbol" in missing and source_symbol:
@@ -2072,6 +2089,8 @@ def _swap_suggestions(
             {
                 "label": f"示例：把 {source_symbol} 换成 USDT",
                 "message": "换成当前网络上的 USDT",
+                "type": "symbol",
+                "value": "USDT",
             }
         )
     if "input_amount" in missing and source_symbol:
@@ -2085,10 +2104,14 @@ def _swap_suggestions(
         if minimums:
             message = f"{minimums[0]} {source_symbol}"
             label = f"最低 {message}"
+            amount_value: str | None = minimums[0]
         else:
             message = f"请输入 {source_symbol} 数量"
             label = f"填写 {source_symbol} 数量"
-        suggestions.append({"label": label, "message": message})
+            amount_value = None
+        suggestions.append(
+            {"label": label, "message": message, "type": "amount", "value": amount_value}
+        )
     return suggestions[:3]
 
 
@@ -2464,6 +2487,261 @@ def _utxo_source_addresses(
     return ordered
 
 
+_ZERO_EVM_ADDRESS = "0x" + "0" * 40
+
+# UI surfaces the App owns. The agent may ask for one, but never collects the
+# data inside them itself.
+_CLIENT_ACTION_TYPES = ("open_contacts", "scan_qr", "open_amount_keypad")
+
+
+def _address_risk(
+    sender: str | None,
+    recipient: str | None,
+    chain: str,
+    wallet_context: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Deterministic recipient risk used by the address-risk card.
+
+    Only checks this service can make honestly: a burn address, a transfer to
+    the sender itself, and a transfer to another address of this same wallet.
+    """
+    recipient_text = str(recipient or "").strip()
+    if not recipient_text:
+        return None
+    canonical = canonical_chain(str(chain or ""))
+    lowered = recipient_text.lower()
+    if canonical in EVM_ALIASES and lowered == _ZERO_EVM_ADDRESS:
+        return {
+            "level": "danger",
+            "code": "ZERO_ADDRESS_RECIPIENT",
+            "message": "收款地址是零地址，转入的资产会永久丢失，请重新核对。",
+        }
+    sender_text = str(sender or "").strip()
+    if sender_text and lowered == sender_text.lower():
+        return {
+            "level": "warning",
+            "code": "SELF_TRANSFER",
+            "message": "收款地址与付款地址相同，除网络手续费外不会有资产转移。",
+        }
+    declared = {address.lower() for address in _declared_accounts(wallet_context, canonical)}
+    if lowered in declared:
+        return {
+            "level": "warning",
+            "code": "OWN_ADDRESS_RECIPIENT",
+            "message": "收款地址属于本钱包自己的地址，请确认这是有意的（例如整理 UTXO）。",
+        }
+    return None
+
+
+def _history_targets(
+    wallet_context: Mapping[str, Any] | None, chain: str | None = None
+) -> list[tuple[str, str]]:
+    """(chain, address) pairs to query for the transaction-history card."""
+    context = wallet_context or {}
+    canonical = canonical_chain(str(chain or ""))
+    wanted = "" if canonical == "ALL" else canonical
+    targets: list[tuple[str, str]] = []
+    accounts = context.get("wallet_accounts")
+    if isinstance(accounts, list):
+        for item in accounts:
+            if not isinstance(item, Mapping):
+                continue
+            account_chain = canonical_chain(str(item.get("chain") or ""))
+            address = str(item.get("address") or "").strip()
+            if not account_chain or not address or not is_valid_address(account_chain, address):
+                continue
+            if wanted and account_chain != wanted:
+                continue
+            if (account_chain, address) not in targets:
+                targets.append((account_chain, address))
+    if targets:
+        return targets
+    legacy_chain = canonical_chain(str(context.get("chain") or ""))
+    legacy = str(context.get("address") or "").strip()
+    if legacy and is_valid_address(legacy_chain or wanted, legacy):
+        return [(legacy_chain or wanted, legacy)]
+    return []
+
+
+def _history_direction(record: Mapping[str, Any], address: str) -> str:
+    """Provider-declared direction wins; otherwise derive it from from/to."""
+    declared = str(record.get("direction") or "").strip().lower()
+    if declared in {"send", "receive", "swap"}:
+        return declared
+    target = str(address or "").strip().lower()
+    if not target:
+        return "unknown"
+    if str(record.get("to_address") or "").strip().lower() == target:
+        return "receive"
+    if str(record.get("from_address") or "").strip().lower() == target:
+        return "send"
+    return "unknown"
+
+
+def _transaction_history_item(record: Any, address: str) -> dict[str, Any]:
+    payload = record.model_dump(mode="json") if hasattr(record, "model_dump") else dict(record)
+    direction = _history_direction(payload, address)
+    if direction == "receive":
+        counterparty = payload.get("from_address")
+    else:
+        counterparty = payload.get("to_address") or payload.get("from_address")
+    return {
+        "chain": payload.get("chain"),
+        "tx_hash": payload.get("tx_hash"),
+        "status": payload.get("status"),
+        "direction": direction,
+        "symbol": payload.get("symbol"),
+        "decimals": payload.get("decimals"),
+        "amount_raw": payload.get("value"),
+        # OKX history rows carry no decimals; say so instead of letting the
+        # model invent a scale for the raw integer.
+        "raw_only": payload.get("decimals") is None,
+        "counterparty": counterparty,
+        "occurred_at": payload.get("occurred_at") or payload.get("confirmed_at"),
+        "failure_reason": payload.get("failure_reason"),
+        "block_number": payload.get("block_number"),
+    }
+
+
+def _transaction_history_payload(
+    items: Sequence[Mapping[str, Any]],
+    *,
+    direction: str | None = None,
+    chain: str | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Shape the fetched records into the v1.6.9 history card."""
+    wanted = str(direction or "").strip().lower()
+    counts: dict[str, int] = {}
+    for item in items:
+        key = str(item.get("direction") or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    visible = [item for item in items if not wanted or item.get("direction") == wanted]
+    visible = sorted(visible, key=lambda item: str(item.get("occurred_at") or ""), reverse=True)
+    selected = [dict(item) for item in visible[: max(1, limit)]]
+    summary = "、".join(
+        part
+        for part in (
+            f"{counts['send']} 笔转出" if counts.get("send") else "",
+            f"{counts['receive']} 笔入账" if counts.get("receive") else "",
+            f"{counts['swap']} 笔兑换" if counts.get("swap") else "",
+        )
+        if part
+    )
+    payload: dict[str, Any] = {
+        "ok": True,
+        "kind": "transaction_history",
+        "title": "最近交易记录",
+        "items": selected,
+        "total": len(selected),
+        "fetched": len(items),
+        "summary": summary,
+        "filter": {
+            "chain": canonical_chain(str(chain or "")) or None,
+            "direction": wanted or None,
+        },
+    }
+    if not selected:
+        payload["message"] = "没有查到符合条件的交易记录。"
+        return payload
+    confirmed = all(str(item.get("status") or "") == "confirmed" for item in selected)
+    tail = "都是已确认状态。" if confirmed else "其中包含未确认的交易。"
+    payload["message"] = (
+        f"最近 {len(selected)} 笔记录拉出来了 👆"
+        + (f" 其中 {summary}，" if summary else "，")
+        + tail
+        + "想看某笔详情或者筛选只看支出，跟我说一声。"
+    )
+    return payload
+
+
+_CHAIN_DISPLAY_NAMES = {
+    "ETH": "Ethereum",
+    "BSC": "BNB Chain",
+    "BASE": "Base",
+    "POLYGON": "Polygon",
+    "ARBITRUM": "Arbitrum",
+    "OPTIMISM": "Optimism",
+    "BTC": "Bitcoin",
+    "TRON": "TRON",
+    "SOLANA": "Solana",
+}
+
+
+def _receive_address_payload(wallet_context: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Group the App's declared accounts into per-family receive cards.
+
+    EVM chains share one account, so they collapse into a single card labelled
+    for every EVM network; each other chain family gets its own card.
+    """
+    context = wallet_context or {}
+    grouped: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    def add(raw_chain: Any, raw_address: Any) -> None:
+        canonical = canonical_chain(str(raw_chain or ""))
+        address = str(raw_address or "").strip()
+        if not canonical or not address or not is_valid_address(canonical, address):
+            return
+        family = "EVM" if canonical in EVM_ALIASES else canonical
+        entry = grouped.get(family)
+        if entry is None:
+            entry = {"group": family, "address": address, "addresses": [], "chains": []}
+            grouped[family] = entry
+            order.append(family)
+        if address not in entry["addresses"]:
+            entry["addresses"].append(address)
+        if canonical not in entry["chains"]:
+            entry["chains"].append(canonical)
+
+    accounts = context.get("wallet_accounts")
+    if isinstance(accounts, list):
+        for item in accounts:
+            if isinstance(item, Mapping):
+                add(item.get("chain"), item.get("address"))
+    if not order:
+        add(context.get("chain"), context.get("address"))
+
+    groups = [grouped[key] for key in order]
+    # The shared EVM account leads the receive card, as in the design.
+    groups.sort(key=lambda item: 0 if item["group"] == "EVM" else 1)
+    for item in groups:
+        if item["group"] == "EVM":
+            item["label"] = "支持所有 EVM 链" if len(item["chains"]) > 1 else "EVM 网络"
+        else:
+            item["label"] = _CHAIN_DISPLAY_NAMES.get(item["group"], item["group"])
+
+    supported: list[str] = []
+    for item in groups:
+        for chain in item["chains"]:
+            if chain not in supported:
+                supported.append(chain)
+
+    payload: dict[str, Any] = {
+        "ok": bool(groups),
+        "kind": "receive_address",
+        "groups": groups,
+        "address": groups[0]["address"] if groups else None,
+        "supported_chains": supported,
+        "display_chains": [_CHAIN_DISPLAY_NAMES.get(chain, chain) for chain in supported],
+    }
+    if not groups:
+        payload["code"] = "RECEIVE_ADDRESS_UNAVAILABLE"
+        payload["error"] = "App 还没有提供任何公共地址，无法给出收款地址。"
+        return payload
+    primary = groups[0]
+    if primary["group"] == "EVM":
+        display = " / ".join(
+            _CHAIN_DISPLAY_NAMES.get(chain, chain) for chain in primary["chains"]
+        )
+        payload["message"] = (
+            f"你的收款地址：{primary['address']} 👆 支持 EVM 链：{display} 等，直接转就行～"
+        )
+    else:
+        payload["message"] = f"你的 {primary['label']} 收款地址：{primary['address']} 👆"
+    return payload
+
+
 def _transfer_draft_request(
     draft: dict[str, Any], wallet_context: dict[str, Any] | None
 ) -> tuple[TransferRequest | None, list[str]]:
@@ -2658,6 +2936,18 @@ async def _transaction_preflight(
         add("addresses", "warning", "缺少地址上下文，无法完成地址校验。", code="CHECK_UNAVAILABLE")
     else:
         add("addresses", "warning", "当前链适配器不支持地址校验。", code="CHECK_UNAVAILABLE")
+
+    risk = _address_risk(sender, recipient, chain, wallet_context)
+    if risk is not None:
+        add(
+            "address_risk",
+            "failed" if risk["level"] == "danger" else "warning",
+            risk["message"],
+            code=risk["code"],
+            details={"level": risk["level"]},
+        )
+    elif recipient:
+        add("address_risk", "passed", "收款地址未命中已知风险。")
 
     if token is not None and str(token.chain).upper() != chain.upper():
         add("token_chain", "failed", "Token 所属链与交易链不一致.", code="TOKEN_CHAIN_MISMATCH")
@@ -2894,6 +3184,7 @@ async def _transaction_preflight(
             fee if isinstance(fee, dict) else (_fee_dump(fee) if fee is not None else None)
         ),
         "gas_sources": gas_sources,
+        "risk": risk,
         **({"simulation": _dump(simulation)} if simulation is not None else {}),
         "checks": checks,
         "warnings": [item for item in checks if item["status"] == "warning"],
@@ -3362,6 +3653,23 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             set(getattr(runtime.wallet_provider, "chain_index_by_name", {}) or {})
             | set(runtime.chains)
         )
+        app_networks = context.get("supported_networks")
+        if isinstance(app_networks, list) and app_networks:
+            # The provider knows more chains than this wallet app can use; only
+            # offer the networks the App actually declared, under the App's own
+            # spelling, collapsing provider aliases such as ARB / ARBITRUM.
+            app_label_by_canonical: dict[str, str] = {}
+            for item in app_networks:
+                app_label_by_canonical.setdefault(
+                    canonical_chain(str(item)), str(item).upper()
+                )
+            scoped: list[str] = []
+            for chain in supported_chains:
+                label = app_label_by_canonical.get(canonical_chain(chain))
+                if label is not None and label not in scoped:
+                    scoped.append(label)
+            if scoped:
+                supported_chains = scoped
         facts: dict[str, Any] = {
             "intent": intent,
             "missing_fields": list(missing),
@@ -3664,6 +3972,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             if language == "zh"
                             else "Use the connected wallet address as the recipient."
                         ),
+                        "type": "address",
+                        "value": str(wallet_address),
                         "data": {**base_data, "recipient": str(wallet_address)},
                     }
                 )
@@ -3676,9 +3986,37 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             if language == "zh"
                             else "Provide the recipient wallet address."
                         ),
-                        "data": base_data,
+                        "type": "action",
+                        "value": "input_address",
+                        "data": {"intent": "transfer"},
                     }
                 )
+            # Mirrors the transfer card's quick row: enter an address, pick a
+            # contact (App-side), or look at the balance before continuing.
+            suggestions.extend(
+                [
+                    {
+                        "label": "转给联系人" if language == "zh" else "Pick a contact",
+                        "message": (
+                            "我想从联系人里选一个收款地址。"
+                            if language == "zh"
+                            else "I want to pick the recipient from my contacts."
+                        ),
+                        "type": "action",
+                        "value": "pick_contact",
+                        "data": {"intent": "transfer"},
+                    },
+                    {
+                        "label": "先看看余额" if language == "zh" else "Check my balance",
+                        "message": (
+                            "先看看我的余额。" if language == "zh" else "Show my balance first."
+                        ),
+                        "type": "action",
+                        "value": "show_balance",
+                        "data": {"intent": "transfer"},
+                    },
+                ]
+            )
 
         if "transfer_token_address" in missing or "transfer_decimals" in missing:
             wallet_assets: list[Mapping[str, Any]] = []
@@ -3715,6 +4053,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             if language == "zh"
                             else "Use the token contract and precision from the wallet balance."
                         ),
+                        "type": "token",
+                        "value": asset.get("address"),
                         "data": {
                             **base_data,
                             "chain": asset_chain,
@@ -3741,13 +4081,29 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             if language == "zh"
                             else f"Continue this transfer on {supported_chain}."
                         ),
+                        "type": "chain",
+                        "value": supported_chain,
                         "data": {**base_data, "chain": supported_chain},
+                    }
+                )
+
+        if "transfer_amount" in missing and "transfer_recipient" not in missing:
+            # The amount card in the design offers 25/50/75/100% of the balance;
+            # the App converts the percentage using the balance it already shows.
+            for percent in ("25%", "50%", "75%", "100%"):
+                suggestions.append(
+                    {
+                        "label": f"用余额的 {percent}",
+                        "message": f"用余额的 {percent} 转这笔。",
+                        "type": "amount",
+                        "value": percent,
+                        "data": base_data,
                     }
                 )
 
         return _sanitize_response_suggestions(
             suggestions, intent="transfer", facts=facts
-        )
+        )[: 3 if "transfer_recipient" in missing else 4]
 
     async def naturalize_read_response(
         state: Mapping[str, Any], response: Mapping[str, Any]
@@ -4347,6 +4703,39 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "read_only_complete": False,
                     "read_only_pending": True,
                 }
+        if intent == "transaction_status":
+            # The App passes the chain/hash as transaction_query; the planner only
+            # sees the question text, so plan this call deterministically.
+            query = _mapping(state.get("transaction_query"))
+            tx_hash = str(
+                query.get("tx_hash")
+                or query.get("transaction_hash")
+                or query.get("hash")
+                or ""
+            ).strip()
+            if not tx_hash:
+                return {
+                    "response": {
+                        "kind": "clarification",
+                        "message": "请提供交易哈希，或从交易详情页进入。",
+                        "missing_fields": ["transaction_hash"],
+                    },
+                    "read_tool_call": None,
+                    "read_only_complete": True,
+                    "read_only_pending": False,
+                }
+            arguments = {
+                "chain": str(query.get("chain") or query.get("transaction_chain") or "").upper(),
+                "tx_hash": tx_hash,
+            }
+            return {
+                "read_tool_call": {
+                    "name": "transaction_status",
+                    "arguments": {key: value for key, value in arguments.items() if value},
+                },
+                "read_only_complete": False,
+                "read_only_pending": True,
+            }
         if callable(native_invoker):
             existing_react_messages = list(state.get("react_messages") or [])
             messages = existing_react_messages or list(state.get("read_messages") or [])
@@ -4687,9 +5076,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         async def transaction_status(args: dict[str, Any]) -> dict[str, Any]:
             """Read a transaction status."""
             context = state.get("wallet_context") or {}
+            # The App opens the assistant from a transaction detail screen with
+            # only the question text; the chain/hash arrive as transaction_query.
+            query = state.get("transaction_query") or {}
             return await transaction_status_tool(
-                str(args.get("chain") or context.get("chain") or ""),
-                str(args.get("tx_hash") or ""),
+                str(args.get("chain") or query.get("chain") or context.get("chain") or ""),
+                str(
+                    args.get("tx_hash")
+                    or query.get("tx_hash")
+                    or query.get("transaction_hash")
+                    or query.get("hash")
+                    or ""
+                ),
                 state.get("broadcast_status"),
             )
 
@@ -8128,6 +8526,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             try:
                 detail = await explorer.get_transaction_detail(chain, tx_hash)
                 status_value = getattr(detail.status, "value", str(detail.status))
+                failure_reason = getattr(detail, "failure_reason", None)
                 snapshot = {
                     "chain": chain,
                     "tx_hash": tx_hash,
@@ -8135,9 +8534,15 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "message": {
                         "pending": "交易已提交，正在等待链上确认。",
                         "confirmed": "交易已确认。",
-                        "failed": "交易执行失败或已回滚。",
+                        "failed": (
+                            f"交易执行失败：{failure_reason}"
+                            if failure_reason
+                            else "交易执行失败或已回滚。"
+                        ),
                         "unknown": "暂时无法确定交易状态。",
                     }.get(status_value, "暂时无法确定交易状态。"),
+                    "failure_reason": failure_reason,
+                    "reason_unavailable": status_value == "failed" and not failure_reason,
                     "source": "okx",
                     "detail": _dump(detail),
                 }
@@ -8841,15 +9246,229 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         )
         return {"ok": result.get("response", {}).get("kind") == "transfer_prepare", **result}
 
-    async def react_query_swap_status(
-        tx_hash: str,
+    async def react_receive_address(
         chain: str | None = None,
         *,
         state: Annotated[dict[str, Any], InjectedState],
     ) -> dict[str, Any]:
+        """The App's own receive addresses; nothing is read from a chain."""
+        payload = _receive_address_payload(state.get("wallet_context"))
+        canonical = canonical_chain(str(chain or ""))
+        if canonical and canonical != "ALL":
+            groups = [
+                item
+                for item in payload.get("groups") or []
+                if canonical in item.get("chains", [])
+            ]
+            if groups:
+                payload = {
+                    **payload,
+                    "groups": groups,
+                    "address": groups[0]["address"],
+                }
+        return payload
+
+    async def _explorer_history(
+        address: str, chain: str | None, limit: int, timeout: float
+    ) -> tuple[list[Any] | None, str | None]:
+        explorer = getattr(runtime, "explorer_provider", None)
+        if explorer is None or not hasattr(explorer, "get_transaction_history"):
+            return None, "unavailable"
+        try:
+            page = await asyncio.wait_for(
+                explorer.get_transaction_history(address, chain, limit=limit), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            return None, "timeout"
+        except Exception as exc:
+            return None, (str(exc) or "failed")
+        return list(getattr(page, "transactions", None) or []), None
+
+    async def _adapter_history(chain: str, address: str, limit: int) -> list[Any] | None:
+        adapter = execution_adapter(chain)
+        if adapter is None or not hasattr(adapter, "get_transaction_history"):
+            return None
+        try:
+            records = await adapter.get_transaction_history(address, limit=limit)
+        except Exception:
+            return None
+        return list(records or [])
+
+    async def react_request_client_action(
+        action: str,
+        reason: str | None = None,
+        chain: str | None = None,
+        symbol: str | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        """Ask the App to open one of its own surfaces (contacts, scanner, keypad)."""
+        name = str(action or "").strip()
+        if name not in _CLIENT_ACTION_TYPES:
+            return {
+                "ok": False,
+                "code": "CLIENT_ACTION_UNSUPPORTED",
+                "error": f"App 不支持的动作：{name or '未提供'}。",
+                "allowed_actions": list(_CLIENT_ACTION_TYPES),
+            }
+        slots = {
+            key: value
+            for key, value in {
+                "chain": canonical_chain(str(chain or "")) or None,
+                "symbol": str(symbol or "").strip().upper() or None,
+            }.items()
+            if value
+        }
+        return {
+            "ok": True,
+            "client_action": {
+                "type": name,
+                "reason": str(reason or "").strip() or None,
+                "slots": slots,
+            },
+        }
+
+    async def react_transfer_quick_replies(
+        chain: str | None = None,
+        symbol: str | None = None,
+        amount: str | None = None,
+        recipient: str | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        """Standard quick replies for the transfer card's parameter collection."""
+        missing = [
+            field
+            for field, value in (
+                ("transfer_chain", chain),
+                ("transfer_recipient", recipient),
+                ("transfer_amount", amount),
+            )
+            if not value
+        ]
+        if not missing:
+            return {"ok": True, "missing_fields": [], "suggestions": []}
+        draft = {
+            key: value
+            for key, value in (
+                ("chain", chain),
+                ("symbol", symbol),
+                ("amount", amount),
+                ("recipient", recipient),
+            )
+            if value
+        }
+        suggestions = await transfer_suggestions({**dict(state), "transfer_draft": draft}, missing)
+        return {
+            "ok": True,
+            "missing_fields": missing,
+            "suggestions": suggestions,
+        }
+
+    async def react_transaction_history(
+        chain: str | None = None,
+        direction: str | None = None,
+        limit: int | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        """Recent transactions across the App's declared accounts."""
+        context = state.get("wallet_context") or {}
+        requested = canonical_chain(str(chain or ""))
+        requested = "" if requested == "ALL" else requested
+        targets = _history_targets(context, chain)
+        if not targets:
+            return {
+                "ok": False,
+                "code": "HISTORY_ADDRESS_UNAVAILABLE",
+                "error": "App 还没有提供任何公共地址，无法查询交易记录。",
+            }
+        cap = max(1, min(int(limit or 10), 50))
+        chains_by_address: dict[str, list[str]] = {}
+        for item_chain, address in targets:
+            chains = chains_by_address.setdefault(address, [])
+            if item_chain not in chains:
+                chains.append(item_chain)
+
+        items: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        failures: list[str] = []
+        # OKX rejects a query without a chain, so always scope one chain per
+        # call. Some chains are very slow, so every call is capped and a slow
+        # chain is reported instead of sinking the whole card.
+        jobs: list[tuple[str, str]] = []
+        for address, address_chains in chains_by_address.items():
+            for item_chain in address_chains:
+                if requested and item_chain != requested:
+                    continue
+                jobs.append((item_chain, address))
+        skipped = jobs[12:]
+        jobs = jobs[:12]
+        budget = max(2.0, float(getattr(runtime, "react_tool_timeout_seconds", 20)) - 6)
+        per_call = max(2.0, min(8.0, budget))
+        # OKX rate-limits a burst of history queries, which surfaces as timeouts.
+        gate = asyncio.Semaphore(3)
+
+        async def fetch(chain: str, address: str) -> tuple[str, list[Any], str | None]:
+            async with gate:
+                records, error = await _explorer_history(address, chain, cap, per_call)
+                if error is None:
+                    return chain, list(records or []), None
+                fallback = await _adapter_history(chain, address, cap)
+            if fallback:
+                return chain, list(fallback), None
+            # No explorer answer and nothing from the fallback: report it rather
+            # than letting the chain look like "no transactions". An EVM adapter
+            # that swallows an unsupported RPC call is exactly this case.
+            return chain, [], f"{chain}:{error}"
+
+        tasks = [asyncio.create_task(fetch(*job)) for job in jobs]
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=budget)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        for (item_chain, address), task in zip(jobs, tasks):
+            if task.cancelled():
+                failures.append(f"{item_chain}:timeout")
+                continue
+            try:
+                _, records, failure = task.result()
+            except Exception:
+                failures.append(f"{item_chain}:failed")
+                continue
+            if failure:
+                failures.append(failure)
+            for record in records:
+                item = _transaction_history_item(record, address)
+                if requested and canonical_chain(str(item.get("chain") or "")) != requested:
+                    continue
+                key = (str(item.get("chain") or ""), str(item.get("tx_hash") or ""))
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(item)
+        failures.extend(f"{item_chain}:skipped" for item_chain, _ in skipped)
+
+        payload = _transaction_history_payload(
+            items, direction=direction, chain=requested or chain, limit=cap
+        )
+        if failures:
+            payload["partial_errors"] = sorted(set(failures))
+            if payload["items"]:
+                payload["message"] += "（部分地址本轮未返回。）"
+        return payload
+
+    async def react_query_swap_status(
+        tx_hash: str | None = None,
+        chain: str | None = None,
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        query = state.get("transaction_query") or {}
         return await transaction_status_tool(
-            str(chain or state.get("wallet_context", {}).get("chain") or ""),
-            tx_hash,
+            str(chain or query.get("chain") or state.get("wallet_context", {}).get("chain") or ""),
+            str(tx_hash or query.get("tx_hash") or query.get("hash") or ""),
             state.get("broadcast_status"),
         )
 
@@ -8904,9 +9523,50 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             description="查询链上交易状态。",
         ),
         StructuredTool.from_function(
+            coroutine=react_receive_address,
+            name="receive_address",
+            description=(
+                "获取用户自己的收款地址（收款码）。地址来自 App 提供的公共地址："
+                "所有 EVM 网络共用一个地址，BTC/TRON 等各自独立。"
+                "用户要“收款地址/收款码/我的地址/别人怎么给我转账”时调用；"
+                "用户问“你还支持哪些链”时用返回里的 supported_chains 回答。"
+                "注意：这里返回的是用户自己的地址，不是向用户索要对方的转账地址。"
+            ),
+        ),
+        StructuredTool.from_function(
             coroutine=react_get_swap_quote,
             name="get_swap_quote",
             description="根据来源/目标资产和数量获取兑换报价；自动发现合约和 decimals。",
+        ),
+        StructuredTool.from_function(
+            coroutine=react_transaction_history,
+            name="transaction_history",
+            description=(
+                "查询用户最近的交易记录（流水）。默认覆盖 App 声明的全部地址与网络；"
+                "可用 chain 只看某条链，用 direction 取值 send/receive/swap 实现"
+                "“只看支出/只看入账/只看兑换”。返回最近记录、笔数汇总和未确认提示。"
+                "用户问“我最近有哪些交易/交易记录/流水/花了多少钱”时调用。"
+            ),
+        ),
+        StructuredTool.from_function(
+            coroutine=react_transfer_quick_replies,
+            name="transfer_quick_replies",
+            description=(
+                "生成转账参数收集用的标准快捷选项（收款地址／转给联系人／先看看余额、"
+                "网络、Token、金额）。当你需要向用户补充转账信息时先调用它，"
+                "再把返回的选项连同你的提问一起给用户；不要自己编造选项。"
+            ),
+        ),
+        StructuredTool.from_function(
+            coroutine=react_request_client_action,
+            name="request_client_action",
+            description=(
+                "请求 App 弹出它自己的界面并把结果回填给这一轮对话。"
+                "action 取值：open_contacts（通讯录选联系人）、scan_qr（扫收款码）、"
+                "open_amount_keypad（数字键盘输入金额）。用户说“从联系人选/转给朋友”"
+                "“扫一扫”“输入金额”这类需要 App 出界面时调用它，"
+                "不要用文字向用户索要通讯录、二维码或键盘里的数据，也不要自己编造联系人。"
+            ),
         ),
         StructuredTool.from_function(
             coroutine=react_prepare_transfer,
@@ -9115,9 +9775,41 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "不能把未查询当零余额，不能把部分余额称全部。"
                 "保留极小但非零的美元余额，显示 <0.01；总值使用工具中同一份明细的 total_usd_value。"
                 "BTC 余额仅覆盖 App 提供的地址；未提供 BTC 地址时请提示 App 补充公共地址。"
+                "用户索要自己的收款地址或收款码时调用 receive_address 工具，不要反问用户要地址；"
+                "所有 EVM 网络共用一个收款地址，BTC/TRON 等各自独立，并说明支持的链。"
+                "用户问最近交易、交易记录或流水时调用 transaction_history 工具，"
+                "按方向筛选时传 direction，不要凭空推测交易。"
+                "交易记录里 raw_only 为 true 的条目金额是代币最小单位，"
+                "不要换算或估算，原样说明即可。"
+                "缺少转账参数时先调用 transfer_quick_replies 取得标准快捷选项，再提问。"
+                "需要通讯录、扫码或金额键盘时调用 request_client_action 请求 App 弹出，"
+                "自己不要收集这些界面里的数据。"
                 "短追问要结合历史理解；工具失败时说明真实原因并提出最小澄清；不要编造事实或描述内部推理。"
             )
         )
+        # The App can open the assistant from a transaction detail screen with a
+        # default question ("explain the failure"). Without this the model only
+        # sees the question text and has no hash to check.
+        tx_context = state.get("transaction_query") or request.get("transaction_query")
+        if isinstance(tx_context, Mapping):
+            tx_chain = str(
+                tx_context.get("chain") or tx_context.get("transaction_chain") or ""
+            ).upper()
+            tx_hash = str(
+                tx_context.get("tx_hash")
+                or tx_context.get("transaction_hash")
+                or tx_context.get("hash")
+                or ""
+            ).strip()
+            if tx_hash:
+                system = SystemMessage(
+                    content=str(system.content)
+                    + f"当前交易上下文：链 {tx_chain or '未知'}，交易哈希 {tx_hash}。"
+                    "用户多半是从这笔交易的详情页进来的，要解释它的状态、失败原因或为什么还在处理中；"
+                    "先用 transaction_status 工具查证再回答，"
+                    "工具没给失败原因时就说明来源没有提供，不要编造。"
+                )
+
         if not existing or not any(isinstance(item, SystemMessage) for item in existing):
             history_messages: list[Any] = [system]
             for item in _model_conversation_history(state.get("conversation_history")):
@@ -9286,6 +9978,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         react_results = [
             {"tool": name, "result": payload} for name, payload in tool_payloads
         ]
+        # A tool may hand back the standard quick replies (for example when the
+        # transfer card still needs a recipient); surface them on the response
+        # so the App can render the chip row next to the question.
+        quick_replies = next(
+            (
+                list(payload.get("suggestions") or [])
+                for _, payload in reversed(tool_payloads)
+                if isinstance(payload.get("suggestions"), list) and payload["suggestions"]
+            ),
+            None,
+        )
         response: dict[str, Any] = {
             "kind": "react",
             "message": content,
@@ -9295,6 +9998,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "route_mode": state.get("route_mode") or "react",
             "route_reason": state.get("route_reason") or "model_answer",
         }
+        if quick_replies:
+            response["suggestions"] = quick_replies
+        client_action = next(
+            (
+                dict(payload["client_action"])
+                for _, payload in reversed(tool_payloads)
+                if isinstance(payload.get("client_action"), Mapping)
+            ),
+            None,
+        )
+        if client_action:
+            response["client_action"] = client_action
         update: dict[str, Any] = {"response": response, "react_active": False}
         portfolio_result = next((payload.get("portfolio") for _, payload in reversed(tool_payloads)
                                  if isinstance(payload.get("portfolio"), Mapping)), None)

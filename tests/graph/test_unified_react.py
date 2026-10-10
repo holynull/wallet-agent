@@ -121,7 +121,11 @@ async def test_unified_react_uses_balance_and_price_from_full_context():
         "asset_discovery",
         "gas_estimate",
         "transaction_status",
+        "receive_address",
         "get_swap_quote",
+        "transaction_history",
+        "transfer_quick_replies",
+        "request_client_action",
         "prepare_transfer",
         "query_swap_status",
     ]

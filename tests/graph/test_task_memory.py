@@ -1215,6 +1215,8 @@ async def test_ethereum_swap_resolves_provider_metadata_then_quotes_amount_with_
         {
             "label": "填写 USDC 数量",
             "message": "请输入 USDC 数量",
+            "type": "amount",
+            "value": None,
             "data": {
                 "intent": "swap_quote",
                 "destination_symbol": "USDT",
@@ -1295,6 +1297,8 @@ async def test_swap_suggests_known_source_chain_instead_of_different_wallet_chai
     assert result["response"]["suggestions"][0] == {
         "label": "目标也在 ETH 网络",
         "message": "目标也在 ETH 链",
+        "type": "chain",
+        "value": "ETH",
         "data": {
             "intent": "swap_quote",
             "source_chain": "ETH",

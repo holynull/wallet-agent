@@ -474,6 +474,14 @@ class BridgersProvider:
             provider_reference=order.provider_reference,
             tx_hash=data.get("toHash") or data.get("hash"),
             completed_at=completed_at if normalized in {"completed", "refunded"} else None,
+            failure_reason=next(
+                (
+                    str(data[key])
+                    for key in ("refundReason", "errMsg", "errorMsg")
+                    if data.get(key) not in (None, "")
+                ),
+                None,
+            ),
             provider_payload=details,
         )
 
