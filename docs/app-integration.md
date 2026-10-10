@@ -364,6 +364,17 @@ POST /v1/transfer/{session_id}/broadcast
 
 文件：`Cat Wallet v1.6.0`，fileKey `2N2sTwtjY3OznWq8m9zpmR`，画布 `32786:19122`（v1.6.9 AI 助手）。
 
+#### 视觉参考（直接导出的节点截图）
+
+截图从 Figma 节点导出、与上表一一对应，方便离线对照和在评审里引用；
+**设计稿始终是最新来源**，改版后按同样的节点重新导出即可（文件名带版本号，过期一眼可见）。
+
+| 收款地址卡 | 交易记录卡 |
+| --- | --- |
+| ![收款地址卡](assets/figma/receive-address-v1.6.9.png) | ![交易记录卡](assets/figma/transaction-history-v1.6.9.png) |
+
+其余卡片（资产总览、转账参数、风险提示）目前只有节点链接——需要的话按同样方式补图。
+
 **快捷回复** `response.suggestions[]`（`kind == "clarification"`）
 
 | 字段 | 说明 |
