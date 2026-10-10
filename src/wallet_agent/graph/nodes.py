@@ -53,6 +53,7 @@ from wallet_agent.domain.normalization import (
     transaction_query_hints,
     unambiguous_amount_with_unit,
 )
+from wallet_agent.graph.emit import emit_response
 from wallet_agent.models import RouteDecision
 from wallet_agent.observability import MetadataCache, RuntimeMetrics, wallet_event
 from wallet_agent.portfolio import query_portfolio
@@ -10040,6 +10041,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             update["pending_transaction"] = dict(transfer_result["pending_transaction"])
             if isinstance(transfer_result.get("preflight"), Mapping):
                 update["preflight"] = dict(transfer_result["preflight"])
+        # Hosted on LangGraph Server the platform owns the transport, so publish
+        # the finished turn as a custom stream event; the FastAPI path ignores it.
+        emit_response(response)
         return update
 
     return locals()
