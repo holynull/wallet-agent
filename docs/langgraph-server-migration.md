@@ -82,22 +82,29 @@ LangChain 的条款，**必须向官方确认**；上生产前还应用 `langcha
 `PostgresSaver` / `AsyncPostgresSaver`，**没有 MySQL**；但社区有实现，我们已接入并实测通过：
 
 - 包：`langgraph-checkpoint-mysql`（第三方，作者 tjni，仓库 `github.com/tjni/langgraph-checkpoint-mysql`），
-  异步类 `AIOMySQLSaver`，其说明写明"尽量模仿 postgres 版以跟官方保持同步"；
+  异步类 `AsyncMySaver`，其说明写明"尽量模仿 postgres 版以跟官方保持同步"；
 - 接入方式：`create_checkpointer()` 把 `mysql://` / `mysql+aiomysql://` / `mysql+pymysql://`
-  统一归一为 `mysql+aiomysql://`，复用与 Postgres 相同的惰性打开逻辑（`LazyAsyncMySQLSaver`）；
-- 会话索引：`SqlSessionStore` 只加了一条方言映射（`mysql://` → `mysql+aiomysql://`），
+  统一归一为 `mysql+asyncmy://`，复用与 Postgres 相同的惰性打开逻辑（`LazyAsyncMySQLSaver`）；
+- 驱动选择：**只走 asyncmy，不用 aiomysql**。`langgraph-checkpoint-mysql` 和 SQLAlchemy
+  都有 asyncmy 后端；aiomysql 依赖 PyMySQL，而 PyMySQL >= 1.2 把 `escape_bytes_prefixed`
+  换成了字符串哨兵，导致二进制参数转义抛 `TypeError`，checkpoint blob 写不进去、
+  会话读回来是空的（表面上 `setup()`/`aput()` 都不报错）；
+- 密码解码：两个 saver 的 `from_conn_string()` 都用 `urlparse().password`，**不做 percent-decode**，
+  所以密码含 `#` 等保留字符会被当成"密码错误"。我们用自己的连接工厂 + `unquote()` 绕过；
+- 会话索引：`SqlSessionStore` 只加了一条方言映射（`mysql://` → `mysql+asyncmy://`），
   表结构由 SQLAlchemy `create_all` 建，无需改 DDL；
-- **必须安装 `cryptography`**：MySQL 8 默认 `caching_sha2_password`，aiomysql 缺了它会认证失败，
+- **必须安装 `cryptography`**：MySQL 8 默认 `caching_sha2_password`，asyncmy 缺了它会认证失败，
   而报错是" misleading 的 `Lost connection to MySQL server during query`"。
 
-实测（本地 MySQL 8 容器）：
+实测（测试服 MySQL 8.0.46，`tests/persistence/test_savers_integration.py -m integration`）：
 
 ```
-checkpointer class: AIOMySQLSaver
-checkpoint round-trip: OK            # setup + aput + aget_tuple
-session rows: [('转给朋友', True), ('查一下余额', False)]
-title search: ['转给朋友']            # 标题搜索 + pinned 都在 MySQL 上工作
+saver round-trip [mysql]: OK         # setup + aput + aget_tuple，且断言 channel_values 真的取回
+session store [mysql]: OK            # save / get / update / list / delete / ready
 ```
+
+只断言"取回了 tuple"是不够的：blob 丢失时 `aget_tuple()` 依然返回一个对象，只是
+`channel_values` 为空——所以集成测试断言的是**值**而不是存在性。
 
 **取舍**：这条依赖是第三方的（非 LangChain 官方），需要 pin 版本并关注上游；
 另外**平台自托管只吃 Postgres**，所以选 MySQL 等于放弃 LangGraph Server 这条路

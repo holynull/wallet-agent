@@ -20,7 +20,7 @@ dependencies = [
   "redis>=5,<7",
   "langgraph-checkpoint-postgres>=2,<4",
   "psycopg[binary]>=3.2,<4",
-  "langgraph-checkpoint-mysql[aiomysql,asyncmy]>=3.0.0",
+  "langgraph-checkpoint-mysql[asyncmy]>=3.0.0",
   "cryptography>=44.0.3",
 ]
 

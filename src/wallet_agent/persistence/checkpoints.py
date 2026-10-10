@@ -82,17 +82,18 @@ class LazyAsyncSqliteSaver:
 
 
 def _mysql_dsn(url: str) -> str:
-    """Normalize MySQL URLs for both the saver and SQLAlchemy.
+    """Normalize MySQL URLs to the asyncmy driver.
 
-    The checkpoint saver and our session store both speak SQLAlchemy URLs, and
+    The checkpoint saver and the session store both speak SQLAlchemy URLs, and
     the async path needs an async driver, so a bare ``mysql://`` (or the sync
-    pymysql driver) is rewritten to aiomysql.
+    ``pymysql`` / ``aiomysql`` drivers) is rewritten to asyncmy. asyncmy has no
+    PyMySQL dependency: PyMySQL >= 1.2 replaced ``escape_bytes_prefixed`` with a
+    string sentinel, which breaks aiomysql's binary parameter escaping.
     """
-    if url.startswith("mysql://"):
-        return f"mysql+aiomysql://{url[len('mysql://') :]}"
-    if url.startswith("mysql+pymysql://"):
-        return f"mysql+aiomysql://{url[len('mysql+pymysql://') :]}"
-    if url.startswith("mysql+aiomysql://"):
+    for prefix in ("mysql://", "mysql+pymysql://", "mysql+aiomysql://"):
+        if url.startswith(prefix):
+            return f"mysql+asyncmy://{url[len(prefix) :]}"
+    if url.startswith("mysql+asyncmy://"):
         return url
     raise ValueError(f"unsupported MySQL persistence URL: {url}")
 
@@ -215,14 +216,14 @@ class CheckpointerHandle:
 class LazyAsyncMySQLSaver(LazyAsyncPostgresSaver):
     """MySQL saver (community package, mirrors the official Postgres one).
 
-    ``AIOMySQLSaver.from_conn_string`` parses the URL with ``urlparse`` and hands
-    the *still percent-encoded* password to aiomysql, so a password containing
+    ``AsyncMySaver.from_conn_string`` parses the URL with ``urlparse`` and hands
+    the *still percent-encoded* password to the driver, so a password containing
     reserved characters is rejected as a wrong password. Open the connection
     here instead, with the password decoded.
     """
 
-    _module = "langgraph.checkpoint.mysql.aio"
-    _class_name = "AIOMySQLSaver"
+    _module = "langgraph.checkpoint.mysql.asyncmy"
+    _class_name = "AsyncMySaver"
 
     @staticmethod
     def _normalize(url: str) -> str:
@@ -231,24 +232,25 @@ class LazyAsyncMySQLSaver(LazyAsyncPostgresSaver):
     async def _open(self) -> tuple[Any, Any]:
         import urllib.parse
 
-        import aiomysql
-        from langgraph.checkpoint.mysql.aio import AIOMySQLSaver
+        import asyncmy
+        from langgraph.checkpoint.mysql.asyncmy import AsyncMySaver
 
         parsed = urllib.parse.urlparse(self.dsn)
-        connection = await aiomysql.connect(
+        connection = await asyncmy.connect(
             host=parsed.hostname or "localhost",
             port=parsed.port or 3306,
             user=parsed.username,
             password=urllib.parse.unquote(parsed.password or ""),
-            db=(parsed.path or "/").lstrip("/").split("?")[0],
+            db=(parsed.path or "/").lstrip("/").split("?")[0] or None,
             autocommit=True,
         )
-        saver = AIOMySQLSaver(connection)
+        saver = AsyncMySaver(connection)
         await saver.setup()
         return connection, saver
 
     async def _close(self, context: Any) -> None:
         context.close()
+        await context.ensure_closed()
 
 
 def create_checkpointer(persistence_url: str) -> CheckpointerHandle:

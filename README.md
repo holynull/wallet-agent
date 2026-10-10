@@ -160,10 +160,13 @@ CONVERSATION_LOCK_WAIT_SECONDS=30
 
 PostgreSQL owns LangGraph checkpoints and the app-facing session projection.
 MySQL is supported too: `PERSISTENCE_URL=mysql://user:pass@host:3306/db` (the driver
-is rewritten to `mysql+aiomysql`). Checkpoints use the community
-`langgraph-checkpoint-mysql` package; `cryptography` must stay installed for MySQL
-8's default `caching_sha2_password` auth -- without it the failure surfaces as a
-misleading "Lost connection to MySQL server during query".
+is rewritten to `mysql+asyncmy`). Checkpoints use the community
+`langgraph-checkpoint-mysql` package on its asyncmy backend. It deliberately avoids
+aiomysql: PyMySQL >= 1.2 replaced `escape_bytes_prefixed` with a string sentinel, which
+breaks aiomysql's binary parameter escaping and silently loses checkpoint blobs.
+`cryptography` must stay installed for MySQL 8's default `caching_sha2_password` auth
+-- without it the failure surfaces as a misleading "Lost connection to MySQL server
+during query".
 Redis Streams owns the cross-instance run-event log, while a renewable Redis
 lease serializes turns for the same `conversation_id`. Every SSE frame includes
 an `id`. Reconnect to the same `run_id` with `Last-Event-ID` or
@@ -248,6 +251,16 @@ python3 -m compileall src
 .venv/bin/python -m evals.wallet_app_evals
 .venv/bin/python -m evals.wallet_app_evals --scenario approval_pending_restart_resume
 .venv/bin/pytest -q tests/browser -m browser
+```
+
+`pytest -q` runs offline on in-memory and SQLite savers. The Postgres/MySQL savers and
+session store are covered by integration tests that skip unless a live database is
+provided:
+
+```bash
+TEST_POSTGRES_URL=postgresql://user:pass@127.0.0.1:5432/postgres \
+TEST_MYSQL_URL=mysql://user:pass@host:3306/wallet_agent \
+  .venv/bin/pytest -q -m integration tests/persistence/test_savers_integration.py
 ```
 
 `wallet_app_evals` drives the real FastAPI REST/SSE interface and compiled

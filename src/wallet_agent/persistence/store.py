@@ -185,9 +185,9 @@ def _async_database_url(url: str) -> str:
     if url.startswith("sqlite://") and not url.startswith("sqlite+aiosqlite://"):
         return f"sqlite+aiosqlite://{url[len('sqlite://') :]}"
     if url.startswith("mysql://"):
-        return f"mysql+aiomysql://{url[len('mysql://') :]}"
+        return f"mysql+asyncmy://{url[len('mysql://') :]}"
     if url.startswith("mysql+pymysql://"):
-        return f"mysql+aiomysql://{url[len('mysql+pymysql://') :]}"
+        return f"mysql+asyncmy://{url[len('mysql+pymysql://') :]}"
     return url
 
 
