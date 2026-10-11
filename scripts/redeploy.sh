@@ -70,7 +70,7 @@ if [[ -n "$PROXY_URL" ]]; then
   export HTTPS_PROXY="$PROXY_URL"
   export http_proxy="$PROXY_URL"
   export https_proxy="$PROXY_URL"
-  export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,postgres,redis}"
+  export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,mysql,postgres,redis}"
   export no_proxy="${no_proxy:-$NO_PROXY}"
   printf 'Using build proxy: %s\n' "$PROXY_URL"
 fi

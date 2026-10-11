@@ -63,7 +63,7 @@ docker compose up -d --force-recreate wallet-agent
 ```bash
 HTTP_PROXY=http://127.0.0.1:7890 \
 HTTPS_PROXY=http://127.0.0.1:7890 \
-NO_PROXY=localhost,127.0.0.1,postgres,redis \
+NO_PROXY=localhost,127.0.0.1,mysql,postgres,redis \
 docker compose build wallet-agent demo-next
 docker compose up -d
 ```
@@ -149,7 +149,7 @@ checkpoints/session projections and run events/locks remain in process. For two
 or more API instances, configure both shared backends:
 
 ```dotenv
-PERSISTENCE_URL=postgresql://wallet_agent:change-me@postgres:5432/wallet_agent
+PERSISTENCE_URL=mysql://wallet_agent:change-me@mysql:3306/wallet_agent
 REDIS_URL=redis://redis:6379/0
 REDIS_KEY_PREFIX=wallet-agent
 RUN_EVENT_TTL_SECONDS=86400
@@ -158,26 +158,33 @@ CONVERSATION_LOCK_LEASE_SECONDS=120
 CONVERSATION_LOCK_WAIT_SECONDS=30
 ```
 
-PostgreSQL owns LangGraph checkpoints and the app-facing session projection.
-MySQL is supported too: `PERSISTENCE_URL=mysql://user:pass@host:3306/db` (the driver
-is rewritten to `mysql+asyncmy`). Checkpoints use the community
+MySQL owns LangGraph checkpoints and the app-facing session projection in both
+the Compose stack and production: `PERSISTENCE_URL=mysql://user:pass@host:3306/db`
+(the driver is rewritten to `mysql+asyncmy`). Checkpoints use the community
 `langgraph-checkpoint-mysql` package on its asyncmy backend. It deliberately avoids
 aiomysql: PyMySQL >= 1.2 replaced `escape_bytes_prefixed` with a string sentinel, which
 breaks aiomysql's binary parameter escaping and silently loses checkpoint blobs.
 `cryptography` must stay installed for MySQL 8's default `caching_sha2_password` auth
 -- without it the failure surfaces as a misleading "Lost connection to MySQL server
 during query".
+Keep the server's stock utf8mb4 collation: `langgraph-checkpoint-mysql` compares
+`checkpoint_ns_hash` against `UNHEX(MD5(...))`, and creating the tables under a
+different `collation_server` (for example `utf8mb4_unicode_ci`) makes every
+checkpoint read fail with `(1267, "Illegal mix of collations ...")`. Verify the
+target server's default collation before pointing production at it.
 Redis Streams owns the cross-instance run-event log, while a renewable Redis
 lease serializes turns for the same `conversation_id`. Every SSE frame includes
 an `id`. Reconnect to the same `run_id` with `Last-Event-ID` or
 `?last_event_id=...`; only later events are replayed. Resume is bounded by
 `RUN_EVENT_TTL_SECONDS` and stream trimming.
 
-`docker compose up --build` starts the API with PostgreSQL and Redis. The
-Compose credentials are local-development defaults; replace them in a real
-deployment. An interrupted process is not silently re-executed by another API
-replica: persisted checkpoints make an explicit retry/resume safe, while Redis
-preserves events already emitted to the client.
+`docker compose up --build` starts the API with MySQL and Redis. The Compose
+credentials are local-development defaults; replace them in a real deployment.
+A Postgres service is still defined behind the `postgres` profile
+(`docker compose --profile postgres up -d`) for anyone testing that backend.
+An interrupted process is not silently re-executed by another API replica:
+persisted checkpoints make an explicit retry/resume safe, while Redis preserves
+events already emitted to the client.
 
 能力扩展路线见 [docs/wallet-agent-capability-roadmap.md](docs/wallet-agent-capability-roadmap.md)。
 资产组合和 Gas 助手还提供

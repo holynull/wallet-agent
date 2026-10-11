@@ -10,11 +10,11 @@ services:
       # Compose interpolates here. A separate variable name keeps the local
       # .env (sqlite, for ./scripts/start_local.sh) from silently changing what
       # the Compose stack uses.
-      PERSISTENCE_URL: ${DEPLOY_PERSISTENCE_URL:-postgresql://wallet_agent:wallet_agent@postgres:5432/wallet_agent}
+      PERSISTENCE_URL: ${DEPLOY_PERSISTENCE_URL:-mysql://wallet_agent:wallet_agent@mysql:3306/wallet_agent}
       REDIS_URL: redis://redis:6379/0
       LANGGRAPH_STRICT_MSGPACK: "true"
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -44,8 +44,28 @@ services:
       retries: 5
     restart: unless-stopped
 
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_DATABASE: wallet_agent
+      MYSQL_USER: wallet_agent
+      MYSQL_PASSWORD: wallet_agent
+      MYSQL_ROOT_PASSWORD: wallet_agent-root
+    volumes:
+      - wallet-agent-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # Legacy single-node Postgres backend. The stack now runs on MySQL; this stays
+  # available behind a profile for anyone still testing against Postgres:
+  #   docker compose --profile postgres up -d
   postgres:
     image: postgres:17-alpine
+    profiles: ["postgres"]
     environment:
       POSTGRES_DB: wallet_agent
       POSTGRES_USER: wallet_agent
@@ -72,5 +92,6 @@ services:
     restart: unless-stopped
 
 volumes:
+  wallet-agent-mysql:
   wallet-agent-postgres:
   wallet-agent-redis:
