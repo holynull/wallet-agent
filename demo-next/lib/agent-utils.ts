@@ -262,14 +262,45 @@ export const DEFAULT_APP_WALLET: AppWalletConfig = { networks: [...APP_NETWORKS]
 
 export function buildWalletAppContext(config: AppWalletConfig, connectedAddress = "") {
   const supported_networks = [...new Set(config.networks.filter((chain) => APP_NETWORKS.includes(chain)))];
-  const wallet_accounts: Array<{ chain: string; address: string }> = [];
+  const wallet_accounts: Array<BtcAccountInput & { chain: string }> = [];
   for (const chain of supported_networks) {
-    const addresses = chain === "BTC" ? config.btcAddresses.split(/[\s,;]+/) : [
-      chain === "TRON" ? config.tronAddress : chain === "SOLANA" ? config.solanaAddress : config.evmAddress.trim() || connectedAddress,
-    ];
-    for (const address of new Set(addresses.map((item) => item.trim()).filter(Boolean))) wallet_accounts.push({ chain, address });
+    const accounts: BtcAccountInput[] =
+      chain === "BTC"
+        ? parseBtcAccounts(config.btcAddresses)
+        : [{
+            address:
+              chain === "TRON" ? config.tronAddress : chain === "SOLANA" ? config.solanaAddress : config.evmAddress.trim() || connectedAddress,
+          }];
+    const seen = new Set<string>();
+    for (const account of accounts) {
+      const address = account.address.trim();
+      if (!address || seen.has(address)) continue;
+      seen.add(address);
+      wallet_accounts.push({ chain, ...account, address });
+    }
   }
   return { supported_networks, wallet_accounts };
+}
+
+export type BtcAccountInput = { address: string; pubkey?: string; derivation_path?: string; master_fingerprint?: string };
+
+// BTC accounts are one per line: "address[,pubkey,derivation_path[,master_fingerprint]]".
+// The public key and derivation path are what a PSBT signer needs; the App is the
+// only party that can supply them, so the demo forwards whatever is typed.
+// Legacy input without commas still works, including several addresses per line.
+export function parseBtcAccounts(value: unknown): BtcAccountInput[] {
+  return String(value ?? "")
+    .split(/[\s;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [address, pubkey, derivation_path, master_fingerprint] = entry.split(",").map((part) => part.trim());
+      const account: BtcAccountInput = { address };
+      if (pubkey) account.pubkey = pubkey;
+      if (derivation_path) account.derivation_path = derivation_path;
+      if (master_fingerprint) account.master_fingerprint = master_fingerprint;
+      return account;
+    });
 }
 
 // Render a raw integer amount with its token decimals, e.g. 120300000000000000 -> 0.1203.

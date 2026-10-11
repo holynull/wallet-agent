@@ -8,6 +8,27 @@ test("App context isolates address families and deduplicates BTC addresses", () 
   assert.deepEqual(buildWalletAppContext({ ...DEFAULT_APP_WALLET, networks: [] }, "0xevm"), { supported_networks: [], wallet_accounts: [] });
 });
 
+test("BTC accounts accept optional signing material per line", () => {
+  const context = buildWalletAppContext(
+    {
+      ...DEFAULT_APP_WALLET,
+      networks: ["BTC"],
+      btcAddresses: "bc1qexample,02ab,84'/0'/0'/0/0,a1b2c3d4\n3FGAexample,,,\nbc1qexample,02ab",
+    },
+    ""
+  );
+  assert.deepEqual(context.wallet_accounts, [
+    {
+      chain: "BTC",
+      address: "bc1qexample",
+      pubkey: "02ab",
+      derivation_path: "84'/0'/0'/0/0",
+      master_fingerprint: "a1b2c3d4",
+    },
+    { chain: "BTC", address: "3FGAexample" },
+  ]);
+});
+
 test("default demo wallet carries the three BTC addresses", () => {
   const btc = buildWalletAppContext(DEFAULT_APP_WALLET, "").wallet_accounts.filter((item) => item.chain === "BTC");
   assert.deepEqual(btc, [
