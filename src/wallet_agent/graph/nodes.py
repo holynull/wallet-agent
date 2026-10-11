@@ -2488,6 +2488,31 @@ def _utxo_source_addresses(
     return ordered
 
 
+async def _adapter_balance_rows(adapter: Any, addresses: Sequence[str]) -> list[Any]:
+    """Native balance pooled across ``addresses``, plus any token balances.
+
+    A UTXO wallet is spread over many addresses, so reading only the connected
+    one understates it. EVM-style chains pass a single address and are unchanged.
+    """
+    ordered = [str(item).strip() for item in addresses if str(item).strip()]
+    native: Any = None
+    total_raw = 0
+    for address in ordered:
+        balance = await adapter.get_native_balance(address)
+        if native is None:
+            native = balance
+        total_raw += int(balance.amount_raw)
+    rows: list[Any] = []
+    if native is not None:
+        if total_raw != int(native.amount_raw):
+            native = native.model_copy(update={"amount_raw": str(total_raw)})
+        rows.append(native)
+    if hasattr(adapter, "get_token_balances"):
+        for address in ordered:
+            rows.extend(await adapter.get_token_balances(address))
+    return rows
+
+
 _ZERO_EVM_ADDRESS = "0x" + "0" * 40
 
 # UI surfaces the App owns. The agent may ask for one, but never collects the
@@ -4313,10 +4338,34 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             except Exception as exc:
                 return {"ok": False, "error": str(exc), "code": "WALLET_QUERY_FAILED"}
+        adapter = execution_adapter(canonical_chain(chain))
+        if adapter is None or not hasattr(adapter, "get_native_balance"):
+            return {
+                "ok": False,
+                "error": "OKX 钱包数据服务暂不可用。",
+                "code": "OKX_CAPABILITY_UNAVAILABLE",
+            }
+        try:
+            balances = await _adapter_balance_rows(adapter, [address])
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "code": "WALLET_QUERY_FAILED"}
+        assets = [_dump(item) for item in balances]
+        requested_symbol = canonical_symbol(str(symbol or ""))
+        assets = _filter_balance_assets(assets, requested_symbol or None)
+        native = next(
+            (item for item in assets if not (item.get("asset") or {}).get("address")), None
+        )
         return {
-            "ok": False,
-            "error": "OKX 钱包数据服务暂不可用。",
-            "code": "OKX_CAPABILITY_UNAVAILABLE",
+            "ok": True,
+            "wallet": {
+                "address": address,
+                "chain": str(chain).upper(),
+                "native_balance": native,
+                "token_balances": [item for item in assets if item is not native],
+                "source": "chain",
+            },
+            "asset_scope": ({"symbol": requested_symbol} if requested_symbol else None),
+            "asset_count": len(assets),
         }
 
     wallet_tool_node = ToolNode([wallet_balance_tool], name="wallet_tools")
@@ -5069,10 +5118,39 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "code": "WALLET_CONTEXT_REQUIRED",
                     "error": "请先连接钱包并明确查询网络。",
                 }
+            adapter = execution_adapter(str(chain))
+            if adapter is None or not hasattr(adapter, "get_native_balance"):
+                return {
+                    "ok": False,
+                    "code": "OKX_CAPABILITY_UNAVAILABLE",
+                    "error": "该网络暂不支持余额查询。",
+                }
+            addresses = [str(address)]
+            if _is_utxo_adapter(adapter):
+                pooled = _utxo_source_addresses(context, str(chain), str(address))
+                if pooled:
+                    addresses = pooled
+            try:
+                assets = [_dump(item) for item in await _adapter_balance_rows(adapter, addresses)]
+            except Exception as exc:
+                return {"ok": False, "code": "WALLET_QUERY_FAILED", "error": str(exc)}
             requested_symbol = canonical_symbol(str(args.get("symbol") or ""))
-            return await wallet_balance_tool(
-                str(chain), str(address), requested_symbol or None
+            assets = _filter_balance_assets(assets, requested_symbol or None)
+            native = next(
+                (item for item in assets if not (item.get("asset") or {}).get("address")), None
             )
+            return {
+                "ok": True,
+                "wallet": {
+                    "address": str(address),
+                    "chain": str(chain).upper(),
+                    "native_balance": native,
+                    "token_balances": [item for item in assets if item is not native],
+                    "source": "chain",
+                },
+                "asset_scope": ({"symbol": requested_symbol} if requested_symbol else None),
+                "asset_count": len(assets),
+            }
 
         async def transaction_status(args: dict[str, Any]) -> dict[str, Any]:
             """Read a transaction status."""
@@ -8149,11 +8227,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
 
     async def wallet_query(state: dict[str, Any]) -> dict[str, Any]:
         request = state.get("request", {})
+        context = state.get("wallet_context") or {}
         chain = str(request.get("chain", ""))
         address = str(request.get("address", ""))
-        if runtime.wallet_provider is not None and hasattr(
+        use_okx = runtime.wallet_provider is not None and hasattr(
             runtime.wallet_provider, "get_token_balances"
-        ):
+        )
+        if use_okx:
             index = okx_chain_index(chain)
             if index is None:
                 return {
@@ -8161,26 +8241,41 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             try:
                 balances = await runtime.wallet_provider.get_token_balances(address, [index])
-                native = next((item for item in balances if item.asset.address is None), None)
-                snapshot = {
-                    "address": address,
-                    "chain": chain,
-                    "native_balance": _dump(native) if native else None,
-                    "token_balances": [
-                        _dump(item) for item in balances if item.asset.address is not None
-                    ],
-                    "source": "okx",
-                }
-                return {
-                    "wallet_context": snapshot,
-                    "response": {"kind": "wallet_query", "wallet": snapshot},
-                }
             except Exception as exc:
                 return {"errors": [_error("WALLET_QUERY_FAILED", str(exc))]}
+        else:
+            adapter = execution_adapter(chain)
+            if adapter is None or not hasattr(adapter, "get_native_balance"):
+                return {
+                    "errors": [
+                        _error(
+                            "OKX_CAPABILITY_UNAVAILABLE",
+                            "No wallet data provider is available for this chain.",
+                        )
+                    ]
+                }
+            addresses = [address]
+            if _is_utxo_adapter(adapter):
+                pooled = _utxo_source_addresses(context, chain, address)
+                if pooled:
+                    addresses = pooled
+            try:
+                balances = await _adapter_balance_rows(adapter, addresses)
+            except Exception as exc:
+                return {"errors": [_error("WALLET_QUERY_FAILED", str(exc))]}
+        native = next((item for item in balances if item.asset.address is None), None)
+        snapshot = {
+            "address": address,
+            "chain": chain,
+            "native_balance": _dump(native) if native else None,
+            "token_balances": [
+                _dump(item) for item in balances if item.asset.address is not None
+            ],
+            "source": "okx" if use_okx else "chain",
+        }
         return {
-            "errors": [
-                _error("OKX_CAPABILITY_UNAVAILABLE", "OKX wallet data provider unavailable.")
-            ]
+            "wallet_context": snapshot,
+            "response": {"kind": "wallet_query", "wallet": snapshot},
         }
 
     async def portfolio_query(state: dict[str, Any]) -> dict[str, Any]:
@@ -8188,21 +8283,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         context = state.get("wallet_context") or {}
         chain = str(raw.get("chain") or context.get("chain") or "").upper()
         address = str(raw.get("address") or context.get("address") or "")
-        adapter = None
-        if runtime.wallet_provider is None or not hasattr(
+        adapter = execution_adapter(chain) if chain else None
+        use_okx = runtime.wallet_provider is not None and hasattr(
             runtime.wallet_provider, "get_token_balances"
-        ):
-            return {
-                "response": {
-                    "kind": "error",
-                    "errors": [
-                        _error(
-                            "OKX_CAPABILITY_UNAVAILABLE",
-                            "OKX wallet data provider unavailable.",
-                        )
-                    ],
-                }
-            }
+        )
         if not address:
             return {
                 "response": {
@@ -8211,11 +8295,25 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "missing_fields": ["wallet_address"],
                 }
             }
-        if runtime.wallet_provider is not None and hasattr(
-            runtime.wallet_provider, "get_token_balances"
-        ):
+        source = "okx"
+        balances: list[Any] = []
+        if use_okx:
             index = okx_chain_index(chain)
-            if index is None:
+            if index is not None:
+                try:
+                    balances = await runtime.wallet_provider.get_token_balances(address, [index])
+                except Exception as exc:
+                    if adapter is None:
+                        return {
+                            "response": {
+                                "kind": "error",
+                                "errors": [
+                                    _error("PORTFOLIO_QUERY_FAILED", str(exc), retryable=True)
+                                ],
+                            }
+                        }
+                    source = "chain"
+            elif adapter is None:
                 return {
                     "response": {
                         "kind": "error",
@@ -8224,8 +8322,30 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         ],
                     }
                 }
+            else:
+                source = "chain"
+        else:
+            source = "chain"
+        if source == "chain":
+            if adapter is None or not hasattr(adapter, "get_native_balance"):
+                return {
+                    "response": {
+                        "kind": "error",
+                        "errors": [
+                            _error(
+                                "OKX_CAPABILITY_UNAVAILABLE",
+                                "No wallet data provider is available for this chain.",
+                            )
+                        ],
+                    }
+                }
+            addresses = [address]
+            if _is_utxo_adapter(adapter):
+                pooled = _utxo_source_addresses(context, chain, address)
+                if pooled:
+                    addresses = pooled
             try:
-                balances = await runtime.wallet_provider.get_token_balances(address, [index])
+                balances = await _adapter_balance_rows(adapter, addresses)
             except Exception as exc:
                 return {
                     "response": {
@@ -8233,14 +8353,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         "errors": [_error("PORTFOLIO_QUERY_FAILED", str(exc), retryable=True)],
                     }
                 }
-        else:
-            balances = []
         try:
-            if adapter is not None:
-                native = await adapter.get_native_balance(address)
-                balances.append(native)
-                if hasattr(adapter, "get_token_balances"):
-                    balances.extend(await adapter.get_token_balances(address))
             assets = [_dump(balance) for balance in balances]
             prices: list[Any] = []
             price_status = "unavailable"
@@ -8301,7 +8414,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "total_usd_value": str(total_usd) if has_usd_value else None,
                 "price_status": price_status,
                 "price_snapshots": [_dump(price) for price in prices],
-                "source": "okx" if runtime.wallet_provider is not None else "chain",
+                "source": source,
             }
             if price_error:
                 snapshot["price_error"] = "价格服务暂时不可用。"

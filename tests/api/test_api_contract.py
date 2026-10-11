@@ -1062,6 +1062,38 @@ async def test_transaction_status_endpoint_accepts_a_bitcoin_txid():
 
 
 @pytest.mark.asyncio
+async def test_balances_endpoint_falls_back_to_the_chain_adapter_without_okx():
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+
+    class Adapter:
+        async def get_native_balance(self, _address):
+            return TokenBalance(
+                asset=Asset(chain="BTC", symbol="BTC", decimals=8),
+                amount=Decimal("0.015"),
+                amount_raw="1500000",
+            )
+
+        async def get_token_balances(self, _address):
+            return []
+
+    class Registry:
+        def get_adapter(self, _chain):
+            return Adapter()
+
+    _app, client = await client_for(chain_registry=Registry())
+    async with client:
+        response = await client.get(
+            "/v1/wallet/bc1qdqahz8x62rsyfmlkv0m5e5rc234zr7vyl690d5/balances?chain=BTC"
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"] == "chain"
+    assert body["native"]["amount_raw"] == "1500000"
+
+
+@pytest.mark.asyncio
 async def test_turn_accepts_explicit_transaction_query():
     class CapturingGraph:
         def __init__(self):

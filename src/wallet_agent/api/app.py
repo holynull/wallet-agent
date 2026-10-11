@@ -2650,6 +2650,32 @@ def create_app(
                     detail={"code": exc.code, "message": exc.message},
                 ) from exc
         if operation in {"balances", "transactions"}:
+            if operation == "balances":
+                try:
+                    adapter = execution_adapter(chain)
+                except Exception:
+                    adapter = None
+                if adapter is not None and hasattr(adapter, "get_native_balance"):
+                    try:
+                        native = await adapter.get_native_balance(address)
+                        tokens = (
+                            await adapter.get_token_balances(address)
+                            if hasattr(adapter, "get_token_balances")
+                            else []
+                        )
+                    except Exception as exc:
+                        raise HTTPException(
+                            status_code=502,
+                            detail={
+                                "code": "BALANCE_QUERY_FAILED",
+                                "message": str(exc),
+                            },
+                        ) from exc
+                    return {
+                        "native": _jsonable(native),
+                        "tokens": _jsonable(tokens),
+                        "source": "chain",
+                    }
             raise HTTPException(
                 status_code=503,
                 detail={

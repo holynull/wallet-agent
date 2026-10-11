@@ -6,6 +6,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from wallet_agent.domain.models import Asset, TokenBalance
 from wallet_agent.graph.build import build_graph
+from wallet_agent.graph.nodes import GraphRuntime, make_nodes
 
 EVM = "0x" + "1" * 40
 BTC = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"
@@ -247,3 +248,64 @@ async def test_multiple_distinct_btc_accounts_sum_and_ignore_total_value_api():
     assert data["portfolio"]["total_usd_value"] == "1200"
     assert data["portfolio"]["assets"][0]["amount"] == "0.02"
     assert data["portfolio"]["assets"][0]["amount_raw"] == "2000000"
+
+
+class BtcChainAdapter:
+    """Bitcoin adapter stub: only the balance surface matters here."""
+
+    transaction_model = "utxo"
+
+    def __init__(self, sats):
+        self.sats = sats
+        self.seen: list[str] = []
+
+    async def get_native_balance(self, address):
+        self.seen.append(address)
+        raw = self.sats[address]
+        return TokenBalance(
+            asset=Asset(chain="BTC", symbol="BTC", decimals=8),
+            amount=Decimal(raw) / Decimal(10**8),
+            amount_raw=str(raw),
+        )
+
+    async def get_token_balances(self, _address):
+        return []
+
+
+@pytest.mark.asyncio
+async def test_portfolio_query_falls_back_to_the_chain_adapter_without_okx():
+    """Without OKX the Esplora adapter still answers, pooling every BTC address."""
+    second = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"
+    adapter = BtcChainAdapter({BTC: 1_000_000, second: 500_000})
+    nodes = make_nodes(GraphRuntime(model=PortfolioModel(), providers={}, chains={"BTC": adapter}))
+    result = await nodes["portfolio_query"](
+        {
+            "portfolio_request": {"chain": "BTC"},
+            "wallet_context": {
+                "address": BTC,
+                "chain": "BTC",
+                "supported_networks": ["BTC"],
+                "wallet_accounts": [
+                    {"chain": "BTC", "address": BTC},
+                    {"chain": "BTC", "address": second},
+                ],
+            },
+        }
+    )
+    portfolio = result["portfolio_snapshot"]
+    assert portfolio["source"] == "chain"
+    assert portfolio["assets"][0]["amount_raw"] == "1500000"
+    assert sorted(adapter.seen) == sorted([BTC, second])
+
+
+@pytest.mark.asyncio
+async def test_portfolio_query_reports_when_no_provider_can_serve_the_chain():
+    nodes = make_nodes(GraphRuntime(model=PortfolioModel(), providers={}, chains={}))
+    result = await nodes["portfolio_query"](
+        {
+            "portfolio_request": {"chain": "BTC"},
+            "wallet_context": {"address": BTC, "chain": "BTC"},
+        }
+    )
+    errors = result["response"]["errors"]
+    assert errors[0]["code"] == "OKX_CAPABILITY_UNAVAILABLE"
