@@ -46,6 +46,10 @@ services:
 
   mysql:
     image: mysql:8.0
+    # Bundled database for the local stack. Deployments that point
+    # DEPLOY_PERSISTENCE_URL at their own server leave this profile off, so no
+    # unused MySQL container is started next to the managed one.
+    profiles: ["bundled-db"]
     environment:
       MYSQL_DATABASE: wallet_agent
       MYSQL_USER: wallet_agent

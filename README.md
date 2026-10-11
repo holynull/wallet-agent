@@ -178,13 +178,16 @@ an `id`. Reconnect to the same `run_id` with `Last-Event-ID` or
 `?last_event_id=...`; only later events are replayed. Resume is bounded by
 `RUN_EVENT_TTL_SECONDS` and stream trimming.
 
-`docker compose up --build` starts the API with MySQL and Redis. The Compose
-credentials are local-development defaults; replace them in a real deployment.
-A Postgres service is still defined behind the `postgres` profile
-(`docker compose --profile postgres up -d`) for anyone testing that backend.
-An interrupted process is not silently re-executed by another API replica:
-persisted checkpoints make an explicit retry/resume safe, while Redis preserves
-events already emitted to the client.
+`docker compose up --build` starts the API with MySQL and Redis. The bundled
+MySQL service sits behind the `bundled-db` profile, enabled by
+`COMPOSE_PROFILES=bundled-db` in `.env` (see `.env.example`); a deployment that
+sets `DEPLOY_PERSISTENCE_URL` to its own server leaves the profile off and starts
+no local database. The Compose credentials are local-development defaults;
+replace them in a real deployment. Postgres is still defined behind the
+`postgres` profile (`docker compose --profile postgres up -d`) for anyone
+testing that backend. An interrupted process is not silently re-executed by
+another API replica: persisted checkpoints make an explicit retry/resume safe,
+while Redis preserves events already emitted to the client.
 
 能力扩展路线见 [docs/wallet-agent-capability-roadmap.md](docs/wallet-agent-capability-roadmap.md)。
 资产组合和 Gas 助手还提供
