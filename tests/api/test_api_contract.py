@@ -1039,6 +1039,29 @@ async def test_transaction_status_endpoint_rejects_invalid_hash():
 
 
 @pytest.mark.asyncio
+async def test_transaction_status_endpoint_accepts_a_bitcoin_txid():
+    from wallet_agent.domain.models import TransactionDetail, TransactionStatus
+
+    class Explorer:
+        async def get_transaction_detail(self, chain, tx_hash):
+            return TransactionDetail(
+                chain=chain,
+                chain_id=None,
+                tx_hash=tx_hash,
+                status=TransactionStatus.CONFIRMED,
+                source="okx",
+            )
+
+    _app, client = await client_for(explorer_provider=Explorer())
+    async with client:
+        response = await client.get("/v1/transactions/BTC/" + "c" * 64)
+        rejected = await client.get("/v1/transactions/BTC/not-a-bitcoin-txid")
+    assert response.status_code == 200
+    assert response.json()["chain"] == "BTC"
+    assert rejected.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_turn_accepts_explicit_transaction_query():
     class CapturingGraph:
         def __init__(self):

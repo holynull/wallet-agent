@@ -173,6 +173,8 @@ class EsploraFake:
             return [{"txid": "aa" * 32, "vout": 0, "value": 200_000, "status": {}}]
         if path.endswith("/fee-estimates"):
             return {"6": 3.0}
+        if path.endswith("/status"):
+            return {"confirmed": True}
         if "/address/" in path:
             return {"chain_stats": {"funded_txo_sum": 200_000, "spent_txo_sum": 0}}
         return {}
@@ -210,6 +212,42 @@ async def test_bitcoin_transfer_prepare_returns_a_psbt():
     assert base64.b64decode(transaction["data"]).startswith(PSBT_MAGIC)
     assert transaction["display"]["action"] == "native_transfer"
     assert transaction["display"]["fee_raw"] == "459"
+
+
+@pytest.mark.asyncio
+async def test_bitcoin_transfer_broadcast_accepts_a_bitcoin_txid():
+    """The app signs the PSBT itself and reports the txid back."""
+    from wallet_agent.chains.btc import BitcoinChainAdapter
+
+    adapter = BitcoinChainAdapter(EsploraFake())
+    graph = build_graph(model=Model(), chains={"BTC": adapter})
+    store = InMemorySessionStore()
+    await store.save(SwapSessionRecord(session_id="btc-2", user_id="alice", thread_id="btc-t2"))
+    app = create_app(graph=graph, chain_registry=Registry(adapter), store=store)
+    txid = "b" * 64
+    prepare_payload = {
+        "user_id": "alice",
+        "chain": "BTC",
+        "sender": BTC_SENDER,
+        "recipient": BTC_RECIPIENT,
+        "amount": "0.0012",
+        "amount_raw": "120000",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        prepared = await client.post("/v1/transfer/btc-2/prepare", json=prepare_payload)
+        assert prepared.status_code == 200
+        response = await client.post(
+            "/v1/transfer/btc-2/broadcast",
+            json={"user_id": "alice", "chain": "BTC", "tx_hash": txid},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["broadcast_status"] == "confirmed"
+    persisted = await store.get("btc-2")
+    assert persisted is not None
+    assert persisted.broadcast_tx_hash == txid
 
 
 def test_assistant_content_explains_bitcoin_psbt_signing():

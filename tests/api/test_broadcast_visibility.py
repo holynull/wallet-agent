@@ -1,6 +1,7 @@
 import pytest
 
 from wallet_agent.api.app import _chain_broadcast_status
+from wallet_agent.domain.models import TransactionStatus
 
 
 @pytest.mark.asyncio
@@ -69,3 +70,34 @@ async def test_chain_broadcast_status_classifies_sender_nonce_advanced_as_replac
         )
         == "dropped_or_replaced"
     )
+
+
+@pytest.mark.asyncio
+async def test_chain_broadcast_status_uses_the_status_probe_without_a_receipt():
+    """Bitcoin and account-model chains only expose ``get_transaction_status``."""
+
+    class Confirmed:
+        async def get_transaction_status(self, _hash):
+            return TransactionStatus.CONFIRMED
+
+    class Pending:
+        async def get_transaction_status(self, _hash):
+            return TransactionStatus.PENDING
+
+    class Inconclusive:
+        async def get_transaction_status(self, _hash):
+            return TransactionStatus.UNKNOWN
+
+    txid = "a" * 64
+    assert await _chain_broadcast_status(Confirmed(), txid) == "confirmed"
+    assert await _chain_broadcast_status(Pending(), txid) == "broadcast_pending"
+    assert await _chain_broadcast_status(Inconclusive(), txid) == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_chain_broadcast_status_is_unknown_when_nothing_can_observe():
+    class Blind:
+        async def get_native_balance(self, _address):  # pragma: no cover - unused
+            return None
+
+    assert await _chain_broadcast_status(Blind(), "0x" + "9" * 64) == "unknown"

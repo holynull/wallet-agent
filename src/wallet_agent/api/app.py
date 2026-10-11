@@ -72,6 +72,15 @@ _AGENT_TEST_INTENTS = {
 
 _BROADCAST_RPC_ATTEMPTS = 3
 _BROADCAST_RPC_DELAY_SECONDS = 0.2
+#: Two ways a chain can report on a wallet-returned hash. EVM exposes a
+#: transaction receipt; Bitcoin and the account-model chains expose only a
+#: status lookup, so the probe result is mapped onto the same broadcast states.
+_BROADCAST_STATUS_BY_PROBE = {
+    "confirmed": "confirmed",
+    "pending": "broadcast_pending",
+    "failed": "failed",
+    "dropped": "dropped_or_replaced",
+}
 BroadcastStatus = Literal[
     "broadcast_seen",
     "broadcast_pending",
@@ -536,6 +545,17 @@ def _display_int(record: SwapSessionRecord, *keys: str) -> int | None:
         return None
 
 
+def _can_observe_broadcast(adapter: Any) -> bool:
+    """Whether the adapter can classify a wallet-returned hash at all."""
+    return hasattr(adapter, "get_transaction_receipt") or hasattr(
+        adapter, "get_transaction_status"
+    )
+
+
+def _transaction_status_value(status: Any) -> str:
+    return str(getattr(status, "value", status)).strip().lower()
+
+
 async def _chain_broadcast_status(
     adapter: Any,
     tx_hash: str,
@@ -547,20 +567,34 @@ async def _chain_broadcast_status(
     last_error: Exception | None = None
     observer_succeeded = False
     observer_error = False
+    has_receipt = hasattr(adapter, "get_transaction_receipt")
+    has_transaction = hasattr(adapter, "get_transaction")
+    # UTXO chains (Bitcoin) and account-model chains have no EVM-style receipt,
+    # so the status lookup is the only signal available for them.
+    has_probe = hasattr(adapter, "get_transaction_status") and not has_receipt
     for attempt in range(_BROADCAST_RPC_ATTEMPTS):
         try:
-            receipt = await adapter.get_transaction_receipt(tx_hash)
-            observer_succeeded = True
-            if receipt is not None:
-                success = receipt_success(receipt)
-                if success is False:
-                    return "failed"
-                return "confirmed" if success is True else "broadcast_pending"
-            if hasattr(adapter, "get_transaction"):
+            if has_receipt:
+                receipt = await adapter.get_transaction_receipt(tx_hash)
+                observer_succeeded = True
+                if receipt is not None:
+                    success = receipt_success(receipt)
+                    if success is False:
+                        return "failed"
+                    return "confirmed" if success is True else "broadcast_pending"
+            if has_transaction:
                 transaction = await adapter.get_transaction(tx_hash)
                 observer_succeeded = True
                 if transaction is not None:
                     return "broadcast_pending"
+            if has_probe:
+                probe = _BROADCAST_STATUS_BY_PROBE.get(
+                    _transaction_status_value(await adapter.get_transaction_status(tx_hash))
+                )
+                observer_succeeded = True
+                # An inconclusive probe stays inconclusive instead of being
+                # misreported as "the hash never reached the chain".
+                return probe or "unknown"
         except Exception as exc:
             last_error = exc
             observer_error = True
@@ -582,6 +616,8 @@ async def _chain_broadcast_status(
     if observer_error:
         return "unknown"
     if last_error is not None and not observer_succeeded:
+        return "unknown"
+    if not observer_succeeded:
         return "unknown"
     return "not_propagated"
 
@@ -610,6 +646,8 @@ def _qualified_hash(chain: str, tx_hash: str) -> bool:
         )
     if chain in {"TRON", "TRX"}:
         return len(value) == 64 and all(c.isalnum() for c in value)
+    if chain in {"BTC", "BITCOIN"}:
+        return len(value) == 64 and all(c in "0123456789abcdefABCDEF" for c in value)
     if chain in {"SOLANA", "SOL"}:
         return 32 <= len(value) <= 128 and all(c.isalnum() for c in value)
     return False
@@ -1956,7 +1994,7 @@ def create_app(
             adapter = execution_adapter(payload.chain)
         except Exception:
             adapter = None
-        if adapter is not None and hasattr(adapter, "get_transaction_receipt"):
+        if adapter is not None and _can_observe_broadcast(adapter):
             sender = _display_text(
                 session,
                 "from",
@@ -2296,7 +2334,7 @@ def create_app(
         except Exception:
             adapter = None
         broadcast_status: BroadcastStatus = "unknown"
-        if adapter is not None and hasattr(adapter, "get_transaction_receipt"):
+        if adapter is not None and _can_observe_broadcast(adapter):
             broadcast_status = await _chain_broadcast_status(
                 adapter,
                 payload.tx_hash,
