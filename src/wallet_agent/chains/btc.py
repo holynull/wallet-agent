@@ -32,6 +32,18 @@ DUST_LIMIT = 546
 DEFAULT_FEE_RATE_SAT_VB = Decimal("2")
 DEFAULT_FEE_TARGET = 6
 
+# BIP174 key types. Signers need the redeem script and the BIP32 derivation of
+# every input, and they verify that change belongs to the wallet, so a PSBT
+# without them cannot be signed by Bitcoin Core or a hardware wallet.
+PSBT_IN_NON_WITNESS_UTXO = 0x00
+PSBT_IN_WITNESS_UTXO = 0x01
+PSBT_IN_REDEEM_SCRIPT = 0x04
+PSBT_IN_BIP32_DERIVATION = 0x06
+PSBT_OUT_SCRIPT = 0x00
+PSBT_OUT_BIP32_DERIVATION = 0x07
+
+_HARDENED = 0x80000000
+
 # Conservative per-input/output virtual sizes keyed by address family.
 _INPUT_VBYTES = {"p2pkh": 148, "p2sh": 91, "p2wpkh": 68, "p2tr": 58}
 _OUTPUT_VBYTES = {"p2pkh": 34, "p2sh": 32, "p2wpkh": 31, "p2tr": 43}
@@ -117,26 +129,111 @@ def _key_value(key_type: int, key_data: bytes, value: bytes) -> bytes:
     return _varint(len(key)) + key + _varint(len(value)) + value
 
 
+def _hex_bytes(value: Any) -> bytes | None:
+    text = str(value or "").strip()
+    if text.lower().startswith("0x"):
+        text = text[2:]
+    if not text or len(text) % 2:
+        return None
+    try:
+        return bytes.fromhex(text)
+    except ValueError:
+        return None
+
+
+def p2sh_redeem_script(pubkey: bytes) -> bytes:
+    """BIP49 redeem script: a P2WPKH program wrapping the compressed pubkey."""
+    return b"\x00\x14" + hash160(pubkey)
+
+
+def bip32_derivation_value(fingerprint: str, path: str) -> bytes:
+    """``fingerprint(4) || uint32 LE per index`` as BIP174 encodes it."""
+    raw = _hex_bytes(fingerprint)
+    if raw is None or len(raw) != 4:
+        raise ValueError("master_fingerprint must be 4 bytes of hex")
+    value = raw
+    for segment in str(path).split("/"):
+        index = segment.strip()
+        if not index or index in {"m", "M"}:
+            continue
+        hardened = index[-1] in {"'", "h", "H"}
+        number = int(index[:-1] if hardened else index)
+        if not 0 <= number < _HARDENED:
+            raise ValueError(f"derivation index out of range: {index}")
+        value += (number | (_HARDENED if hardened else 0)).to_bytes(4, "little")
+    return value
+
+
+def _derivation_fields(
+    info: Mapping[str, Any] | None, key_type: int
+) -> list[tuple[int, bytes, bytes]]:
+    """BIP32 derivation entry for one input or output, when the App supplied it."""
+    data = info or {}
+    pubkey = _hex_bytes(data.get("pubkey"))
+    path = str(data.get("derivation_path") or "").strip()
+    fingerprint = str(data.get("master_fingerprint") or "").strip()
+    if pubkey is None or not path or not fingerprint:
+        return []
+    try:
+        value = bip32_derivation_value(fingerprint, path)
+    except ValueError:
+        return []
+    return [(key_type, pubkey, value)]
+
+
 def build_psbt(
     unsigned_tx: bytes,
     *,
-    input_metadata: Sequence[Mapping[str, bytes]],
+    input_metadata: Sequence[Sequence[tuple[int, bytes, bytes]]],
     output_scripts: Sequence[bytes],
+    output_metadata: Sequence[Sequence[tuple[int, bytes, bytes]]] = (),
 ) -> str:
     """Wrap an unsigned transaction and per-input UTXO metadata into a base64 PSBT."""
     payload = PSBT_MAGIC + _key_value(0, b"", unsigned_tx) + b"\x00"
-    for metadata in input_metadata:
-        for key_type, value in metadata.items():
-            payload += _key_value(int(key_type), b"", value)
+    for fields in input_metadata:
+        for key_type, key_data, value in fields:
+            payload += _key_value(key_type, key_data, value)
         payload += b"\x00"
-    for script in output_scripts:
-        payload += _key_value(0, b"", script)
+    for index, script in enumerate(output_scripts):
+        payload += _key_value(PSBT_OUT_SCRIPT, b"", script)
+        extra = output_metadata[index] if index < len(output_metadata) else ()
+        for key_type, key_data, value in extra:
+            payload += _key_value(key_type, key_data, value)
         payload += b"\x00"
     return base64.b64encode(payload).decode("ascii")
 
 
 def _witness_utxo(value: int, script: bytes) -> bytes:
     return value.to_bytes(8, "little") + _varint(len(script)) + script
+
+
+def _matches_p2sh(address: str, pubkey: bytes) -> bool:
+    """Whether ``pubkey`` really is the BIP49 key behind this P2SH address."""
+    # ``base58check_payload`` keeps the version byte, so drop it before comparing.
+    payload = base58check_payload(address, version=5)
+    return payload is not None and payload[1:] == hash160(p2sh_redeem_script(pubkey))
+
+
+def pubkey_matches_address(address: str, family: str, pubkey: bytes) -> bool:
+    """Whether the reported pubkey actually controls ``address``.
+
+    Signing metadata is only useful when it is tied to the address being spent,
+    so anything that does not match is dropped rather than passed to the signer.
+    """
+    try:
+        script = script_pubkey(address)
+    except ValueError:
+        return False
+    if family == "p2wpkh":
+        return script == b"\x00\x14" + hash160(pubkey)
+    if family == "p2pkh":
+        return script == b"\x76\xa9\x14" + hash160(pubkey) + b"\x88\xac"
+    if family == "p2tr":
+        internal = pubkey[1:] if len(pubkey) == 33 else pubkey
+        return len(internal) == 32 and script == b"\x51\x20" + internal
+    if family == "p2sh":
+        return _matches_p2sh(address, pubkey)
+    return False
 
 
 class BitcoinChainAdapter:
@@ -308,6 +405,7 @@ class BitcoinChainAdapter:
         to_address: str,
         amount_raw: str,
         from_addresses: Sequence[str] | None = None,
+        signing_info: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> UnsignedTransaction:
         """Build an unsigned PSBT paying ``to_address``.
 
@@ -315,6 +413,10 @@ class BitcoinChainAdapter:
         (receiving and change addresses included); their UTXOs are pooled so a
         transfer is no longer capped at the balance of a single address. Change
         returns to ``from_address``, which also labels the transaction.
+
+        ``signing_info`` maps an address to the ``pubkey`` / ``derivation_path`` /
+        ``master_fingerprint`` the App reported for it. Without it a nested SegWit
+        input has no redeem script and no signer can produce a signature.
         """
         if not valid_bitcoin_address(from_address) or not valid_bitcoin_address(to_address):
             raise ValueError("invalid Bitcoin address")
@@ -333,9 +435,22 @@ class BitcoinChainAdapter:
         if change:
             outputs.append((script_pubkey(from_address), change))
         unsigned_tx = serialize_unsigned_transaction(selected, outputs)
-        metadata = await self._input_metadata(selected)
+        metadata = await self._input_metadata(selected, signing_info)
+        output_metadata: list[list[tuple[int, bytes, bytes]]] = [[] for _ in outputs]
+        if change and pubkey_matches_address(
+            from_address,
+            address_family(from_address),
+            _hex_bytes((signing_info or {}).get(from_address, {}).get("pubkey")) or b"",
+        ):
+            # A signer verifies that the change output belongs to this wallet.
+            output_metadata[1] = _derivation_fields(
+                (signing_info or {}).get(from_address), PSBT_OUT_BIP32_DERIVATION
+            )
         psbt = build_psbt(
-            unsigned_tx, input_metadata=metadata, output_scripts=[script for script, _ in outputs]
+            unsigned_tx,
+            input_metadata=metadata,
+            output_scripts=[script for script, _ in outputs],
+            output_metadata=output_metadata,
         )
         return UnsignedTransaction(
             chain=self.chain,
@@ -471,26 +586,54 @@ class BitcoinChainAdapter:
         return int(math.ceil(Decimal(size) * rate))
 
     async def _input_metadata(
-        self, inputs: Sequence[Mapping[str, Any]]
-    ) -> list[dict[str, bytes]]:
-        metadata: list[dict[str, bytes]] = []
+        self,
+        inputs: Sequence[Mapping[str, Any]],
+        signing_info: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> list[list[tuple[int, bytes, bytes]]]:
+        signing = signing_info or {}
+        metadata: list[list[tuple[int, bytes, bytes]]] = []
         for item in inputs:
-            family = address_family(str(item.get("address") or ""))
-            script = script_pubkey(str(item.get("address") or ""))
+            address = str(item.get("address") or "")
+            family = address_family(address)
+            script = script_pubkey(address)
+            fields: list[tuple[int, bytes, bytes]] = []
+            info = signing.get(address)
+            pubkey = _hex_bytes((info or {}).get("pubkey"))
+            matched = pubkey is not None and pubkey_matches_address(address, family, pubkey)
+            if not matched:
+                pubkey = None
             if family in {"p2wpkh", "p2tr"}:
-                metadata.append({"1": _witness_utxo(int(item["value"]), script)})
-                continue
-            previous = await http_call(
-                self.transport,
-                "get",
-                f"{self.base_path}/tx/{item['txid']}/hex",
-                text=True,
-            )
-            if not isinstance(previous, str) or not previous:
-                raise ValueError(
-                    f"cannot fetch the previous transaction for UTXO {item['txid']}"
+                fields.append(
+                    (PSBT_IN_WITNESS_UTXO, b"", _witness_utxo(int(item["value"]), script))
                 )
-            metadata.append({"0": bytes.fromhex(previous)})
+            else:
+                redeem = (
+                    p2sh_redeem_script(pubkey)
+                    if family == "p2sh" and pubkey is not None
+                    else None
+                )
+                if redeem is not None:
+                    # Nested SegWit is a witness spend, so the signer needs the
+                    # witness UTXO plus the redeem script, not the previous
+                    # transaction hex.
+                    fields.append(
+                        (PSBT_IN_WITNESS_UTXO, b"", _witness_utxo(int(item["value"]), script))
+                    )
+                    fields.append((PSBT_IN_REDEEM_SCRIPT, b"", redeem))
+                else:
+                    previous = await http_call(
+                        self.transport,
+                        "get",
+                        f"{self.base_path}/tx/{item['txid']}/hex",
+                        text=True,
+                    )
+                    if not isinstance(previous, str) or not previous:
+                        raise ValueError(
+                            f"cannot fetch the previous transaction for UTXO {item['txid']}"
+                        )
+                    fields.append((PSBT_IN_NON_WITNESS_UTXO, b"", bytes.fromhex(previous)))
+            fields.extend(_derivation_fields(info, PSBT_IN_BIP32_DERIVATION) if matched else [])
+            metadata.append(fields)
         return metadata
 
 

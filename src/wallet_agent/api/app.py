@@ -99,6 +99,12 @@ class WalletAccount(BaseModel):
     model_config = ConfigDict(extra="forbid")
     chain: str = Field(min_length=1, max_length=32)
     address: str = Field(min_length=1, max_length=128)
+    # Public signing material for UTXO chains, supplied by the App. A PSBT signer
+    # needs the pubkey, its derivation path and the master fingerprint; none of
+    # these can spend on their own.
+    pubkey: str | None = Field(default=None, max_length=130)
+    derivation_path: str | None = Field(default=None, max_length=128)
+    master_fingerprint: str | None = Field(default=None, max_length=16)
 
 
 class ConversationUpdateRequest(BaseModel):
@@ -1674,7 +1680,10 @@ def create_app(
             wallet_context["supported_networks"] = payload.supported_networks
         if payload.wallet_accounts is not None:
             wallet_context["wallet_accounts"] = [
-                item.model_dump(mode="json") for item in payload.wallet_accounts
+                # Absent signing fields stay absent: an App that does not report
+                # them must forward exactly what it sent before.
+                item.model_dump(mode="json", exclude_none=True)
+                for item in payload.wallet_accounts
             ]
         metadata_chain_id = payload.metadata.get("wallet_chain_id")
         if metadata_chain_id is not None:

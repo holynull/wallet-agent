@@ -4,9 +4,15 @@ import pytest
 
 from wallet_agent.chains.btc import (
     DUST_LIMIT,
+    PSBT_IN_BIP32_DERIVATION,
+    PSBT_IN_REDEEM_SCRIPT,
     PSBT_MAGIC,
+    PSBT_OUT_BIP32_DERIVATION,
     BitcoinChainAdapter,
+    _key_value,
     address_family,
+    bip32_derivation_value,
+    hash160,
     script_pubkey,
 )
 from wallet_agent.domain.models import TransactionStatus
@@ -15,6 +21,29 @@ P2PKH = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"
 P2SH = "3FGALr2UNebKnBTErhePUk3CuzmDd9FJux"
 P2WPKH = "bc1qdqahz8x62rsyfmlkv0m5e5rc234zr7vyl690d5"
 P2TR = "bc1p47u7v2k5cpfqt0gxftkat3ade7ucs588g8lr0znzr9le06taty6q6x9gut"
+
+PUBKEY = "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+FINGERPRINT = "a1b2c3d4"
+DERIVATION = "49'/0'/0'/0/0"
+
+
+def _nested_segwit_address(pubkey: bytes) -> str:
+    """Independent Base58Check encoding of the BIP49 address for ``pubkey``."""
+    import hashlib
+
+    redeem = b"\x00\x14" + hashlib.new("ripemd160", hashlib.sha256(pubkey).digest()).digest()
+    payload = b"\x05" + hashlib.new("ripemd160", hashlib.sha256(redeem).digest()).digest()
+    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    number = int.from_bytes(payload + checksum, "big")
+    encoded = ""
+    while number:
+        number, remainder = divmod(number, 58)
+        encoded = alphabet[remainder] + encoded
+    return encoded
+
+
+NESTED_SEGWIT = _nested_segwit_address(bytes.fromhex(PUBKEY))
 
 UTXOS = [
     {"txid": "aa" * 32, "vout": 0, "value": 200_000, "status": {"confirmed": True}},
@@ -125,6 +154,59 @@ async def test_build_native_transfer_attaches_prev_tx_for_legacy_inputs():
     assert tx.display["fee_raw"] == "531"
     assert any(path.endswith(f"/tx/{'aa' * 32}/hex") for path in transport.paths)
     assert base64.b64decode(tx.data).startswith(PSBT_MAGIC)
+
+
+async def test_build_native_transfer_signs_nested_segwit_with_reported_material():
+    """A BIP49 input needs the redeem script; a signer needs the BIP32 path."""
+    transport = EsploraFake()
+    adapter = BitcoinChainAdapter(transport)
+    signing = {
+        NESTED_SEGWIT: {
+            "pubkey": PUBKEY,
+            "derivation_path": DERIVATION,
+            "master_fingerprint": FINGERPRINT,
+        }
+    }
+
+    tx = await adapter.build_native_transfer(
+        from_address=NESTED_SEGWIT,
+        to_address=P2TR,
+        amount_raw="120000",
+        signing_info=signing,
+    )
+
+    blob = base64.b64decode(tx.data)
+    key = bytes.fromhex(PUBKEY)
+    derivation = bip32_derivation_value(FINGERPRINT, DERIVATION)
+    assert _key_value(PSBT_IN_REDEEM_SCRIPT, b"", b"\x00\x14" + hash160(key)) in blob
+    assert _key_value(PSBT_IN_BIP32_DERIVATION, key, derivation) in blob
+    # The change output proves it belongs to this wallet.
+    assert _key_value(PSBT_OUT_BIP32_DERIVATION, key, derivation) in blob
+    # Nested SegWit is a witness spend: no previous-transaction fetch is needed.
+    assert not any(path.endswith("/hex") for path in transport.paths)
+
+
+async def test_build_native_transfer_drops_signing_material_for_another_address():
+    transport = EsploraFake()
+    adapter = BitcoinChainAdapter(transport)
+
+    tx = await adapter.build_native_transfer(
+        from_address=P2SH,
+        to_address=P2TR,
+        amount_raw="120000",
+        signing_info={
+            P2SH: {
+                "pubkey": PUBKEY,
+                "derivation_path": DERIVATION,
+                "master_fingerprint": FINGERPRINT,
+            }
+        },
+    )
+
+    blob = base64.b64decode(tx.data)
+    assert bytes.fromhex(PUBKEY) not in blob
+    # With no verified key it falls back to the previous-transaction hex.
+    assert any(path.endswith("/hex") for path in transport.paths)
 
 
 async def test_build_native_transfer_selects_extra_inputs_and_rejects_dust_balance():

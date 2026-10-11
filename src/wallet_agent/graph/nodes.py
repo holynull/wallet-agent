@@ -626,6 +626,7 @@ async def _deposit_order_to_transaction(
     adapter: Any,
     sender: str,
     from_addresses: Sequence[str] | None = None,
+    wallet_context: Mapping[str, Any] | None = None,
 ) -> UnsignedTransaction | Any:
     """Turn a provider deposit order into the source-chain wallet transaction."""
     if not isinstance(order, DepositOrder):
@@ -655,6 +656,13 @@ async def _deposit_order_to_transaction(
         native_kwargs: dict[str, Any] = {}
         if from_addresses:
             native_kwargs["from_addresses"] = list(from_addresses)
+        signing_info = (
+            _utxo_signing_info(wallet_context, order.source_asset.chain)
+            if _is_utxo_adapter(adapter)
+            else {}
+        )
+        if signing_info:
+            native_kwargs["signing_info"] = signing_info
         transaction = await _resolve(
             builder(
                 from_address=sender,
@@ -750,7 +758,11 @@ async def _resolve_swap_transaction(
         if order is None:
             return prepared
         return await _deposit_order_to_transaction(
-            order, adapter=adapter, sender=sender, from_addresses=sources
+            order,
+            adapter=adapter,
+            sender=sender,
+            from_addresses=sources,
+            wallet_context=wallet_context,
         )
     if isinstance(prepared, DepositOrder):
         if adapter is None:
@@ -2511,6 +2523,34 @@ async def _adapter_balance_rows(adapter: Any, addresses: Sequence[str]) -> list[
         for address in ordered:
             rows.extend(await adapter.get_token_balances(address))
     return rows
+
+
+def _utxo_signing_info(
+    wallet_context: Mapping[str, Any] | None, chain: str
+) -> dict[str, dict[str, Any]]:
+    """Per-address signing material the App reported for a UTXO chain.
+
+    Only public data: a compressed pubkey plus the derivation path and master
+    fingerprint a BIP174 signer needs. Nothing here can spend on its own.
+    """
+    canonical = canonical_chain(str(chain or ""))
+    info: dict[str, dict[str, Any]] = {}
+    for item in (wallet_context or {}).get("wallet_accounts") or []:
+        if not isinstance(item, Mapping):
+            continue
+        if canonical_chain(str(item.get("chain") or "")) != canonical:
+            continue
+        address = str(item.get("address") or "").strip()
+        pubkey = str(item.get("pubkey") or "").strip()
+        if not address or not pubkey:
+            continue
+        entry: dict[str, Any] = {"pubkey": pubkey}
+        for field in ("derivation_path", "master_fingerprint"):
+            value = str(item.get(field) or "").strip()
+            if value:
+                entry[field] = value
+        info[address] = entry
+    return info
 
 
 _ZERO_EVM_ADDRESS = "0x" + "0" * 40
