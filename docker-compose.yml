@@ -14,8 +14,6 @@ services:
       REDIS_URL: redis://redis:6379/0
       LANGGRAPH_STRICT_MSGPACK: "true"
     depends_on:
-      mysql:
-        condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
@@ -44,28 +42,9 @@ services:
       retries: 5
     restart: unless-stopped
 
-  mysql:
-    image: mysql:8.0
-    # Bundled database for the local stack. Deployments that point
-    # DEPLOY_PERSISTENCE_URL at their own server leave this profile off, so no
-    # unused MySQL container is started next to the managed one.
-    profiles: ["bundled-db"]
-    environment:
-      MYSQL_DATABASE: wallet_agent
-      MYSQL_USER: wallet_agent
-      MYSQL_PASSWORD: wallet_agent
-      MYSQL_ROOT_PASSWORD: wallet_agent-root
-    volumes:
-      - wallet-agent-mysql:/var/lib/mysql
-    healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-    restart: unless-stopped
-
-  # Legacy single-node Postgres backend. The stack now runs on MySQL; this stays
-  # available behind a profile for anyone still testing against Postgres:
+  # Legacy single-node Postgres backend. The stack now runs on MySQL (bundled
+  # via docker-compose.bundled-db.yml); this stays available behind a profile
+  # for anyone still testing against Postgres:
   #   docker compose --profile postgres up -d
   postgres:
     image: postgres:17-alpine
@@ -96,6 +75,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  wallet-agent-mysql:
   wallet-agent-postgres:
   wallet-agent-redis:

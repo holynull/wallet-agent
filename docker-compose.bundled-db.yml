@@ -1,0 +1,34 @@
+# Bundled MySQL for the local stack.
+#
+# Included by scripts/redeploy.sh and by:
+#   docker compose -f docker-compose.yml -f docker-compose.bundled-db.yml up -d --build
+#
+# A deployment that points DEPLOY_PERSISTENCE_URL at its own MySQL must NOT
+# include this file, otherwise an unused database container is started next to
+# the managed one.
+services:
+  wallet-agent:
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_DATABASE: wallet_agent
+      MYSQL_USER: wallet_agent
+      MYSQL_PASSWORD: wallet_agent
+      MYSQL_ROOT_PASSWORD: wallet_agent-root
+    volumes:
+      - wallet-agent-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  wallet-agent-mysql:

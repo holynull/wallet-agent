@@ -4,6 +4,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-${REPO_ROOT}/docker-compose.yml}"
+BUNDLED_DB_FILE="${REPO_ROOT}/docker-compose.bundled-db.yml"
 TIMEOUT_SECONDS="${DEPLOY_TIMEOUT_SECONDS:-120}"
 NO_CACHE=0
 PROXY_URL=""
@@ -75,7 +76,14 @@ if [[ -n "$PROXY_URL" ]]; then
   printf 'Using build proxy: %s\n' "$PROXY_URL"
 fi
 
+# A deployment that brings its own database (DEPLOY_PERSISTENCE_URL, typically in
+# .env) must not start the bundled MySQL container next to it.
 compose=(docker compose -f "$COMPOSE_FILE")
+if [[ -z "${DEPLOY_PERSISTENCE_URL:-}" ]] \
+  && { [[ ! -f "${REPO_ROOT}/.env" ]] || ! grep -qs '^DEPLOY_PERSISTENCE_URL=' "${REPO_ROOT}/.env"; } \
+  && [[ -f "$BUNDLED_DB_FILE" ]]; then
+  compose+=(-f "$BUNDLED_DB_FILE")
+fi
 if ((NO_CACHE)); then
   printf 'Building images without cache...\n'
   "${compose[@]}" build --no-cache wallet-agent demo-next
