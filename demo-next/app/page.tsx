@@ -735,7 +735,10 @@ export default function Home() {
     });
     if (finalMessage) {
       const key = eventName ? `${value?.runId || "stream"}:${response.kind || "response"}:${finalMessage}` : undefined;
-      appendAssistantMessage(finalMessage, response?.kind === "clarification" ? response.suggestions || [] : [], artifacts, key);
+      // The App renders suggestion chips for every response kind (the transfer
+      // card's 输入地址 / 转给联系人 / 先看看余额 row arrives on a react turn),
+      // so the demo must not filter them down to clarifications.
+      appendAssistantMessage(finalMessage, response?.suggestions || [], artifacts, key);
     }
   }
   async function send(event?: FormEvent) {
