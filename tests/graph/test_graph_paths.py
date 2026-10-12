@@ -520,6 +520,48 @@ async def test_swap_asset_resolution_accepts_native_destination_without_contract
     assert request.destination_asset.address is None
 
 
+BTC_SENDER = "bc1qdqahz8x62rsyfmlkv0m5e5rc234zr7vyl690d5"
+EVM_ACCOUNT = "0x" + "1" * 40
+
+
+@pytest.mark.parametrize(
+    "connected_address", [EVM_ACCOUNT, BTC_SENDER], ids=["evm-wallet", "btc-wallet"]
+)
+def test_swap_draft_request_resolves_each_side_against_its_own_chain(connected_address: str):
+    """A cross-family swap must not quote with the connected wallet's address.
+
+    A BTC source quoted with the browser wallet's EVM account, or a USDT(ETH)
+    destination pointed at a BTC account, only fails later at the provider's
+    swap step ("invalid address"), so both sides resolve against the accounts
+    the App declared for that chain.
+    """
+    request, missing = _swap_draft_request(
+        {
+            "source_chain": "BTC",
+            "source_symbol": "BTC",
+            "source_decimals": 8,
+            "destination_chain": "ETH",
+            "destination_symbol": "USDT",
+            "destination_token_address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "destination_decimals": 6,
+            "input_amount": "0.0002",
+        },
+        {
+            "address": connected_address,
+            "chain": "ETH" if connected_address == EVM_ACCOUNT else "BTC",
+            "wallet_accounts": [
+                {"chain": "ETH", "address": EVM_ACCOUNT},
+                {"chain": "BTC", "address": BTC_SENDER},
+            ],
+        },
+    )
+
+    assert missing == []
+    assert request is not None
+    assert request.sender_address == BTC_SENDER
+    assert request.recipient_address == EVM_ACCOUNT
+
+
 @pytest.mark.asyncio
 async def test_swap_asset_resolution_accepts_native_source_without_contract_address():
     resolved, candidates, errors = await _resolve_swap_assets(

@@ -2493,6 +2493,23 @@ def _chain_sender(wallet_context: Mapping[str, Any] | None, chain: str) -> str |
     return accounts[0] if accounts else None
 
 
+def _swap_address_for_chain(
+    wallet_context: Mapping[str, Any] | None, chain: str, current: str | None
+) -> str:
+    """Keep an address that matches ``chain``, else use the App's account for it.
+
+    A BTC-source swap quoted with the browser wallet's EVM account produced a
+    quote that the provider later rejected as ``invalid address`` on the swap
+    step, and a BTC address used as the USDT(ETH) receiver was rejected the same
+    way. Prefer the account the App declared for the chain, and keep the given
+    value when it declared none: an unknown family must not block the quote.
+    """
+    value = str(current or "").strip()
+    if not chain or not value or is_valid_address(chain, value):
+        return value
+    return _chain_sender(wallet_context, chain) or value
+
+
 def _utxo_source_addresses(
     wallet_context: Mapping[str, Any] | None, chain: str, primary: str | None = None
 ) -> list[str]:
@@ -3269,8 +3286,19 @@ def _swap_draft_request(
     context = wallet_context or {}
     normalized = dict(draft)
     normalized.setdefault("slippage_bps", 100)
-    normalized.setdefault("sender_address", context.get("address"))
-    normalized.setdefault("recipient_address", context.get("address"))
+    # Both sides must live on their own chain: the connected wallet address is
+    # only valid for its own family, and quotes built with a foreign address are
+    # rejected at the swap step rather than at the quote step.
+    normalized["sender_address"] = _swap_address_for_chain(
+        context,
+        str(normalized.get("source_chain") or ""),
+        normalized.get("sender_address") or context.get("address"),
+    )
+    normalized["recipient_address"] = _swap_address_for_chain(
+        context,
+        str(normalized.get("destination_chain") or ""),
+        normalized.get("recipient_address") or context.get("address"),
+    )
     required = [
         "source_chain",
         "destination_chain",
@@ -9265,12 +9293,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         destination_chain: str | None = None,
         source_token_address: str | None = None,
         destination_token_address: str | None = None,
+        recipient_address: str | None = None,
         slippage_bps: int | None = None,
         provider_name: str | None = None,
         *,
         state: Annotated[dict[str, Any], InjectedState],
     ) -> dict[str, Any]:
-        """Resolve human asset names and request one or all provider quotes."""
+        """Resolve human asset names and request one or all provider quotes.
+
+        Pass ``recipient_address`` whenever the user names where the swapped
+        asset should land (an exchange address, a different account, or the
+        target-chain address of a cross-chain swap).
+        """
         if amount_mode not in (None, "exact_in", "exact_out"):
             return {
                 "ok": False,
@@ -9295,6 +9329,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "destination_chain": destination_chain,
             "source_token_address": source_token_address,
             "destination_token_address": destination_token_address,
+            "recipient_address": recipient_address,
             "slippage_bps": slippage_bps,
         }
         # Preserve the user's fiat-target semantics when the model calls the
