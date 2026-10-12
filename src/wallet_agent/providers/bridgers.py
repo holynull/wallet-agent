@@ -390,22 +390,36 @@ class BridgersProvider:
         tx = data.get("txData", {})
         if not isinstance(tx, dict):
             tx = tx_data
+        # UTXO chains get a deposit address instead of calldata, and Bridgers
+        # names it ``toAddress`` there (EVM payloads use ``to``). An empty
+        # destination would otherwise surface as an unsigned transfer to nowhere.
+        destination = str(tx.get("to") or tx.get("toAddress") or "")
+        if not destination:
+            raise ProviderResponseError(
+                "100", "Provider returned no deposit address", category="client"
+            )
+        display = {
+            "input_amount": str(quote.input_amount),
+            "expected_output": str(quote.expected_output),
+            "minimum_output": str(quote.minimum_output)
+            if quote.minimum_output is not None
+            else "",
+        }
+        memo = str(tx.get("memo") or "")
+        if memo:
+            # Bitcoin deposits carry the routing hint the provider uses for the
+            # order; show it rather than dropping it.
+            display["memo"] = memo
         return UnsignedTransaction(
             chain=quote.source_asset.chain,
             chain_id=quote.source_asset.chain_id,
-            to=str(tx.get("to", "")),
+            to=destination,
             data=str(tx.get("data", "")),
             value=str(tx.get("value", "0x0")),
             gas_limit=None,
             provider="bridgers",
             provider_reference=quote.provider_reference,
-            display={
-                "input_amount": str(quote.input_amount),
-                "expected_output": str(quote.expected_output),
-                "minimum_output": str(quote.minimum_output)
-                if quote.minimum_output is not None
-                else "",
-            },
+            display=display,
         )
 
     async def register_broadcast(self, provider_reference: str, tx_hash: str) -> ProviderOrder:

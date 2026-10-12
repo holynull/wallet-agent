@@ -364,6 +364,11 @@ POST /v1/transfer/{session_id}/broadcast
   此时 PSBT 的 `display.rbf` 为 `"true"`）。
 
 - 兑换：`display.deposit_address` 是 Provider 的充值地址，`to` 与之一致；签名广播后同样用
+- 兑换（BTC 实测注意）：Provider 返回的是 `txData.toAddress`（EVM 才是 `txData.to`），
+  服务端已兼容两者；若响应里还有 `memo`，会原样出现在 `display.memo` 里。充值地址是
+  "一单一地址"，所以**不强制** App 提供 `refund_address`，保持可选透传。
+- 实测还发现 Bridgers 对**中国大陆出口 IP** 返回 `resCode 1114`（不在服务地区），
+  因此部署出口必须在境外（测试服 us-east-1 正常）；App 侧遇到该错误应提示用户，不要当成参数错误。
   `/v1/swap/{session_id}/broadcast` 回传哈希，再按 Provider 订单轮询状态。
 - 服务端只在本地根据 UTXO 组装 PSBT（含手续费与找零），**不持有私钥、不签名、不广播**。
 - 浏览器插件若暂时没有 BTC 签名 API，可先把 PSBT（`data`）或 `display.unsigned_tx_hex`

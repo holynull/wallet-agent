@@ -303,7 +303,17 @@ async def test_bridgers_quote_resolves_native_asset_addresses_from_catalog():
             },
         },
         quote_response(),
-        quote_response(),
+        {
+            "resCode": 100,
+            "resMsg": "success",
+            "data": {
+                "txData": {
+                    "to": "0x00000000000000000000000000000000000000bb",
+                    "data": "0x",
+                    "value": "0x0",
+                }
+            },
+        },
     )
     provider = BridgersProvider.from_transport(transport, source_flag="wallet-agent")
     request = valid_quote_request().model_copy(
@@ -483,6 +493,46 @@ async def test_bridgers_prepare_uses_quote_minimum_and_returns_unsigned_transact
     assert payload["fromTokenAmount"] == "10000000"
     assert payload["amountOutMin"] == "9700000"
     assert payload["slippage"] == "0.01"
+
+
+@pytest.mark.asyncio
+async def test_bridgers_prepare_reads_a_utxo_deposit_address_and_memo():
+    """Bitcoin deposits arrive as ``toAddress``; there is no ``to`` for them."""
+    deposit = "bc1qjn7e2xk99m4g4d4j3hszxqfh4uk585jq5m6dt7"
+    transport = FakeTransport(
+        quote_response(),
+        {
+            "resCode": "100",
+            "resMsg": "success",
+            "data": {
+                "txData": {
+                    "amount": "100000",
+                    "toAddress": deposit,
+                    "memo": "Y4c:to:USDT(ERC20):0x1a9d699aee3a56ca49d0cc3b542ae3a37885a3e1",
+                }
+            },
+        },
+    )
+    provider = BridgersProvider.from_transport(transport, source_flag="wallet-agent")
+    quote = await provider.quote(valid_quote_request())
+
+    transaction = await provider.prepare(quote)
+
+    assert transaction.to == deposit
+    assert transaction.display["memo"].startswith("Y4c:to:USDT")
+
+
+@pytest.mark.asyncio
+async def test_bridgers_prepare_rejects_a_payload_without_a_destination():
+    transport = FakeTransport(
+        quote_response(),
+        {"resCode": "100", "resMsg": "success", "data": {"txData": {"data": "0x"}}},
+    )
+    provider = BridgersProvider.from_transport(transport, source_flag="wallet-agent")
+    quote = await provider.quote(valid_quote_request())
+
+    with pytest.raises(ProviderResponseError):
+        await provider.prepare(quote)
 
 
 @pytest.mark.asyncio
