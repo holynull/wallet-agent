@@ -4064,6 +4064,63 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "suggestions": suggestions,
         }
 
+    def _order_supported_chains(
+        chains: Any, current: Any
+    ) -> list[str]:
+        """Return supported chains with the wallet's current network first.
+
+        The design's chain card leads with the current network (e.g. the
+        connected chain), then lists the rest; the App renders them as the
+        chain options.
+        """
+        ordered = [str(value) for value in (chains or [])]
+        if not current:
+            return ordered
+        current_name = canonical_chain(str(current))
+        current_label = next(
+            (name for name in ordered if canonical_chain(name) == current_name),
+            None,
+        )
+        if current_label is None:
+            return ordered
+        rest = [
+            name for name in ordered if canonical_chain(name) != current_name
+        ]
+        return [current_label, *rest]
+
+    def _transfer_wallet_asset(
+        context: Mapping[str, Any], chain: Any, symbol: Any
+    ) -> dict[str, Any] | None:
+        """Return the unique wallet asset matching chain+symbol, if unambiguous.
+
+        Native coins (no contract) return None; a token whose address can be
+        pinned to a single (chain, symbol) pair yields its address/decimals so
+        the App's amount card can identify the exact asset.
+        """
+        if not chain or not symbol:
+            return None
+        wallet_assets: list[Mapping[str, Any]] = []
+        for raw_balance in (
+            context.get("token_balances") or context.get("assets") or []
+        ):
+            item = raw_balance.get("asset") if isinstance(raw_balance, Mapping) else None
+            if isinstance(item, Mapping):
+                wallet_assets.append(item)
+        matching = [
+            item
+            for item in wallet_assets
+            if item.get("address")
+            and canonical_chain(str(item.get("chain"))) == canonical_chain(str(chain))
+            and canonical_symbol(str(item.get("symbol"))) == canonical_symbol(str(symbol))
+        ]
+        unique = {
+            (str(item.get("address")).lower(), item.get("decimals")): item
+            for item in matching
+        }
+        if len(unique) == 1:
+            return next(iter(unique.values()))
+        return None
+
     async def transfer_suggestions(
         state: Mapping[str, Any], missing: list[str]
     ) -> list[dict[str, Any]]:
@@ -4144,26 +4201,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             )
 
         if "transfer_token_address" in missing or "transfer_decimals" in missing:
-            wallet_assets: list[Mapping[str, Any]] = []
-            for raw_balance in context.get("token_balances") or context.get("assets") or []:
-                item = raw_balance.get("asset") if isinstance(raw_balance, Mapping) else None
-                if isinstance(item, Mapping):
-                    wallet_assets.append(item)
-            matching_assets = [
-                item
-                for item in wallet_assets
-                if item.get("address")
-                and chain
-                and symbol
-                and canonical_chain(str(item.get("chain"))) == canonical_chain(str(chain))
-                and canonical_symbol(str(item.get("symbol"))) == canonical_symbol(str(symbol))
-            ]
-            unique_assets = {
-                (str(item.get("address")).lower(), item.get("decimals")): item
-                for item in matching_assets
-            }
-            if len(unique_assets) == 1:
-                asset = next(iter(unique_assets.values()))
+            asset = _transfer_wallet_asset(context, chain, symbol)
+            if asset is not None:
                 asset_chain = asset.get("chain") or chain
                 asset_symbol = asset.get("symbol") or symbol
                 suggestions.append(
@@ -4191,8 +4230,15 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 )
 
         if "transfer_chain" in missing:
-            for supported_chain in facts.get("supported_chains", []):
-                if len(suggestions) >= 3:
+            # Design's chain card leads with the wallet's current network and
+            # lists the rest after it. Chain is the next unanswered slot, so
+            # only chain options are offered on this step (address → chain →
+            # amount, one card at a time).
+            ordered_chains = _order_supported_chains(
+                facts.get("supported_chains", []), context.get("chain")
+            )
+            for supported_chain in ordered_chains:
+                if len(suggestions) >= 4:
                     break
                 suggestions.append(
                     {
@@ -4212,9 +4258,20 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     }
                 )
 
-        if "transfer_amount" in missing and "transfer_recipient" not in missing:
+        if (
+            "transfer_amount" in missing
+            and "transfer_recipient" not in missing
+            and "transfer_chain" not in missing
+        ):
             # The amount card in the design offers 25/50/75/100% of the balance;
             # the App converts the percentage using the balance it already shows.
+            # Carry the asset identity so the App can pin the exact token on the
+            # card's asset-and-balance line.
+            asset_data = dict(base_data)
+            asset = _transfer_wallet_asset(context, chain, symbol)
+            if asset is not None:
+                asset_data["token_address"] = asset.get("address")
+                asset_data["decimals"] = asset.get("decimals")
             for percent in ("25%", "50%", "75%", "100%"):
                 suggestions.append(
                     {
@@ -4222,7 +4279,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         "message": f"用余额的 {percent} 转这笔。",
                         "type": "amount",
                         "value": percent,
-                        "data": base_data,
+                        "data": asset_data,
                     }
                 )
 
@@ -10012,7 +10069,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "按方向筛选时传 direction，不要凭空推测交易。"
                 "交易记录里 raw_only 为 true 的条目金额是代币最小单位，"
                 "不要换算或估算，原样说明即可。"
-                "缺少转账参数时先调用 transfer_quick_replies 取得标准快捷选项，再提问。"
+                "缺少转账参数时先调用 transfer_quick_replies 取得标准快捷选项，再提问；"
+                "逐步收集（先地址、再网络、再金额），网络未明确时给链选择卡，"
+                "不要默认使用钱包当前网络。"
                 "需要通讯录、扫码、金额键盘或地址输入时调用 request_client_action 请求 App 弹出，"
                 "自己不要收集这些界面里的数据。"
                 "短追问要结合历史理解；工具失败时说明真实原因并提出最小澄清；不要编造事实或描述内部推理。"

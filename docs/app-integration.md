@@ -445,6 +445,10 @@ POST /v1/transfer/{session_id}/broadcast
 
 - `type: "action"` 的胶囊是**动作**不是槽位值，不要当参数提交。
 - `type: "amount"` 的 `value` 可能是 `25%` 这种比例，需要 App 用当前余额换算出具体数量再提交。
+- `type: "chain"` 的胶囊是**链选择卡**的选项，`value` 即链名，`data.chain` 相同；
+  第一个胶囊是钱包当前网络，其余按支持列表顺序。
+- `type: "amount"` 的 `data` 会带上 `token_address` / `decimals`（钱包可唯一定位该资产时），
+  App 的金额输入卡可据此渲染「资产与余额」一行；余额本身由 App 侧持有。
 
 **客户端动作** `response.client_action`
 

@@ -133,6 +133,102 @@ async def test_missing_amount_offers_balance_percentage_presets():
     ]
 
 
+@pytest.mark.asyncio
+async def test_missing_chain_offers_only_a_chain_card_with_current_network_first():
+    class ChainCardModel:
+        """Leaves the chain unanswered so transfer_quick_replies returns the
+        chain card with the connected network first."""
+
+        async def invoke_react(self, messages, tools):
+            if not [m for m in messages if isinstance(m, ToolMessage)]:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "qr-1",
+                            "name": "transfer_quick_replies",
+                            "args": {"symbol": "USDT", "recipient": EVM},
+                        }
+                    ],
+                )
+            return AIMessage(content="要转哪条链？ 👇")
+
+    graph = build_graph(
+        model=ChainCardModel(),
+        chains={"BASE": object(), "ETH": object(), "BSC": object()},
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "转给 0x… USDT", "address": EVM, "chain": "ETH"},
+            "wallet_context": {
+                "address": EVM,
+                "chain": "ETH",
+                "wallet_accounts": [{"chain": "ETH", "address": EVM}],
+            },
+            "conversation_history": [],
+        },
+        config={"configurable": {"thread_id": "transfer-chain-card"}},
+    )
+
+    response = result["response"]
+    assert response["kind"] == "react"
+    # The chain card lists the supported chains with the connected network
+    # first, and does not mix in amount presets on this step.
+    assert [(item["type"], item["value"]) for item in response["suggestions"]] == [
+        ("chain", "ETH"),
+        ("chain", "BASE"),
+        ("chain", "BSC"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_missing_amount_carries_the_wallet_asset_identity():
+    token_address = "0x" + "4" * 40
+    graph = build_graph(model=FakeModel(), chains={"BASE": object()})
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "转给 0x… BASE 链 USDT", "address": EVM, "chain": "BASE"},
+            "intent": "transfer",
+            "transfer_draft": {
+                "chain": "BASE",
+                "symbol": "USDT",
+                "recipient": "0x" + "2" * 40,
+            },
+            "wallet_context": {
+                "address": EVM,
+                "chain": "BASE",
+                "wallet_accounts": [{"chain": "BASE", "address": EVM}],
+                "token_balances": [
+                    {
+                        "asset": {
+                            "chain": "BASE",
+                            "symbol": "USDT",
+                            "address": token_address,
+                            "decimals": 18,
+                        },
+                        "amount": "12.5",
+                    }
+                ],
+            },
+            "conversation_history": [],
+        },
+        config={"configurable": {"thread_id": "transfer-amount-asset"}},
+    )
+
+    response = result["response"]
+    assert response["missing_fields"] == ["transfer_amount"]
+    suggestions = response["suggestions"]
+    assert [(item["type"], item["value"]) for item in suggestions] == [
+        ("amount", "25%"),
+        ("amount", "50%"),
+        ("amount", "75%"),
+        ("amount", "100%"),
+    ]
+    # The amount card pins the exact token so the App can render the asset line.
+    assert all(item["data"]["token_address"] == token_address for item in suggestions)
+    assert all(item["data"]["decimals"] == 18 for item in suggestions)
+
+
 def test_provider_alias_still_matches_the_app_declared_chain():
     facts = {"supported_chains": ["ETH", "ARBITRUM"], "supported_assets": [], "balances": []}
 

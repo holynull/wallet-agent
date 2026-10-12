@@ -159,6 +159,10 @@ ReAct 工具：`wallet_balance`、`portfolio_snapshot`、`price_lookup`、`marke
    模型需要用户粘贴收款地址时还会下发
    `response.client_action {type: "address_input", slots: {chain}}`，App 据此弹出地址输入框
    （与 `open_contacts` / `scan_qr` / `open_amount_keypad` 同一通道）。
+   缺链时给出**链选择卡**（`type: "chain"`，钱包当前网络排第一、纯链选项）；
+   缺金额时给出**金额输入卡**（`type: "amount"` 的 25%/50%/75%/100%，`data` 带
+   `token_address` / `decimals` 供 App 定位资产；余额与百分比换算留在客户端）。
+   模型逐步收集（先地址 → 再网络 → 再金额），网络未明确时不再默认使用钱包当前网络。
 4. ~~**风险提示卡**~~ 已完成：`_address_risk`（`nodes.py`）产出等级与文案，进入预检查的
    `address_risk` 检查项并作为 `preflight.risk` 返回；零地址为 `danger` 直接阻断，
    自转与"转给本钱包其他地址"为 `warning`。Demo 新增 `data-card-kind="risk"`。
