@@ -184,6 +184,54 @@ async def test_omnibridge_800_quote_normalizes_amounts_and_preserves_source_flag
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("chain", ["BTC", "bitcoin"])
+async def test_omnibridge_quote_uses_the_bare_native_coin_code(chain: str):
+    """Omni rejects ``BTC(BTC)`` with resCode 913: its catalog code is ``BTC``."""
+    transport = FakeTransport(quote_response())
+    provider = OmniBridgeProvider.from_transport(transport, source_flag="wallet-agent")
+    request = SwapQuoteRequest(
+        source_asset=Asset(chain=chain, symbol="BTC", decimals=8),
+        destination_asset=Asset(
+            chain="ETH",
+            chain_id=1,
+            symbol="USDT(ERC20)",
+            decimals=6,
+            address="0x0000000000000000000000000000000000000022",
+        ),
+        input_amount=Decimal("0.0002"),
+        input_amount_raw="20000",
+        sender_address="bc1qdqahz8x62rsyfmlkv0m5e5rc234zr7vyl690d5",
+        recipient_address="0x1234567890abcdef1234567890abcdef12345678",
+    )
+
+    await provider.quote(request)
+
+    assert transport.calls[0]["payload"]["depositCoinCode"] == "BTC"
+    assert transport.calls[0]["payload"]["receiveCoinCode"] == "USDT(ERC20)"
+
+
+@pytest.mark.asyncio
+async def test_omnibridge_catalog_skips_coins_without_a_decimal_scale():
+    """The live catalog carries null decimals for 14 coins; those must not
+    fail the whole catalog for every other asset that shares it."""
+    transport = FakeTransport(
+        {
+            "resCode": "800",
+            "resMsg": "Success",
+            "data": [
+                {"mainNetwork": "XLM", "coinCode": "XLM", "coinDecimal": None},
+                {"mainNetwork": "BTC", "coinCode": "BTC", "coinDecimal": 8},
+            ],
+        }
+    )
+    provider = OmniBridgeProvider.from_transport(transport, source_flag="wallet-agent")
+
+    assets = await provider.list_assets(AssetQuery())
+
+    assert [asset.symbol for asset in assets] == ["BTC"]
+
+
+@pytest.mark.asyncio
 async def test_omnibridge_quote_truncates_deposit_amount_to_eight_places():
     transport = FakeTransport(
         quote_response(depositMin="0.001"),

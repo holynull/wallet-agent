@@ -78,6 +78,12 @@ def _coin_code(asset: Asset) -> str:
     """Return Omni's catalog coin code, not our normalized chain label."""
     symbol = str(asset.symbol)
     if not asset.address:
+        # A chain's own coin is spelled as a bare code on the network's own
+        # label (BTC, ETH, AVAX); wrapped and bridged natives carry the
+        # ``SYMBOL(NETWORK)`` spelling (BNB(BSC), ETH(BASE)). Deriving
+        # ``BTC(BTC)`` instead of ``BTC`` is rejected with resCode 913.
+        if canonical_chain(asset.chain) == canonical_symbol(symbol):
+            return symbol
         return symbol.split("(", 1)[0] if asset.chain == "ETH" else f"{symbol}({asset.chain})"
     if symbol.endswith("(ERC20)"):
         return symbol
@@ -140,8 +146,15 @@ class OmniBridgeProvider:
             for x in items:
                 if not isinstance(x, dict):
                     continue
+                raw_decimals = x.get("coinDecimal", x.get("decimals"))
+                if raw_decimals is None:
+                    # The live catalog lists coins it cannot trade (XLM, XMR,
+                    # USDT(OMNI), …) with a null decimal. They have no usable
+                    # scale, so skip them instead of failing the whole catalog
+                    # — and every other asset that shares it.
+                    continue
                 try:
-                    decimals = int(x.get("coinDecimal", x.get("decimals", 0)))
+                    decimals = int(raw_decimals)
                 except (TypeError, ValueError) as exc:
                     raise ProviderResponseError(
                         "800", "Invalid catalog decimals", category="client"
