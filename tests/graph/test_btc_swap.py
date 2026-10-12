@@ -243,6 +243,7 @@ class BridgersFake:
     """Provider that quotes BTC -> ETH and returns an EVM-shaped deposit payload."""
 
     provider_name = "bridgers"
+    memo = "xpt:to:USDT(ERC20):0x" + "2" * 40
 
     async def quote(self, request):
         return NormalizedQuote(
@@ -264,7 +265,7 @@ class BridgersFake:
             value="0x1d4c0",
             provider="bridgers",
             provider_reference=quote.provider_reference,
-            display={"deposit_address": P2TR},
+            display={"deposit_address": P2TR, "memo": self.memo},
         )
 
     async def register_broadcast(self, provider_reference, tx_hash):
@@ -319,5 +320,7 @@ async def test_btc_swap_prepare_returns_a_psbt_paying_the_deposit_address():
     assert transaction["value"] == "120000"
     assert transaction["display"]["action"] == "provider_deposit"
     assert transaction["display"]["deposit_address"] == P2TR
+    # The provider's routing hint must survive the rebuild into a PSBT.
+    assert transaction["display"]["memo"] == BridgersFake.memo
     assert transaction["display"]["unsigned_tx_hex"].startswith("0200000001")
     assert base64.b64decode(transaction["data"]).startswith(PSBT_MAGIC)

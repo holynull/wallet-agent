@@ -367,6 +367,11 @@ POST /v1/transfer/{session_id}/broadcast
 - 兑换（BTC 实测注意）：Provider 返回的是 `txData.toAddress`（EVM 才是 `txData.to`），
   服务端已兼容两者；若响应里还有 `memo`，会原样出现在 `display.memo` 里。充值地址是
   "一单一地址"，所以**不强制** App 提供 `refund_address`，保持可选透传。
+- 兑换的 `recipient_address` 必须是**目标链**上的地址：BTC → USDT(ETH) 要填 `0x…` 收款地址。
+  填成源链地址时 Provider 不会报价而是直接拒绝（Bridgers 实测 `resCode 103 / invalid address`），
+  服务端归一化成 `PROVIDER_PREPARE_FAILED`（`details.provider_code = "103"`）；App 应提示用户
+  检查收款地址，不要当成可重试的服务故障。BTC 兑换的 `pending_transaction` 与转账同形：
+  `display.format = "psbt"`，另有 `input_count` / `fee_raw` / `change_raw` / `unsigned_tx_hex`。
 - 实测还发现 Bridgers 对**中国大陆出口 IP** 返回 `resCode 1114`（不在服务地区），
   因此部署出口必须在境外（测试服 us-east-1 正常）；App 侧遇到该错误应提示用户，不要当成参数错误。
   `/v1/swap/{session_id}/broadcast` 回传哈希，再按 Provider 订单轮询状态。

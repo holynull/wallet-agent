@@ -315,6 +315,9 @@ class DepositOrder(DomainModel):
     expires_at: datetime | None = None
     provider_reference: str
     provider_payload: dict[str, JsonValue] = Field(default_factory=dict)
+    #: Some providers route a deposit with a memo/tag (Bridgers returns one for
+    #: UTXO chains). It is shown to the App, never signed into the transaction.
+    memo: str | None = None
 
 
 class ProviderOrder(DomainModel):

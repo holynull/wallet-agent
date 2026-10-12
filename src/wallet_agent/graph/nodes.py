@@ -682,6 +682,8 @@ async def _deposit_order_to_transaction(
         "input_amount_raw": order.input_amount_raw,
         "provider_order_id": order.provider_order_id,
     }
+    if getattr(order, "memo", None):
+        display["memo"] = str(order.memo)
     return transaction.model_copy(
         update={
             "provider": order.provider,
@@ -730,6 +732,10 @@ def _utxo_deposit_order(quote: Any, prepared: Any) -> DepositOrder | None:
         input_amount_raw=quote.input_amount_raw,
         expires_at=getattr(prepared, "expires_at", None) or quote.expires_at,
         provider_reference=quote.provider_reference,
+        # The provider's memo must survive the rebuild, or the App loses the
+        # routing hint the provider (Bridgers, UTXO chains) sends with the
+        # deposit address.
+        memo=str(display.get("memo")) if display.get("memo") else None,
     )
 
 
