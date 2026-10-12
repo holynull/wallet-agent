@@ -4434,7 +4434,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "broadcast_pending": "交易已广播，正在等待链上确认。",
             "confirmed": "交易已确认。",
             "failed": "交易执行失败或已回滚。",
-            "dropped_or_replaced": "交易可能已被丢弃或替换，请检查钱包 nonce。",
+            "dropped_or_replaced": (
+                # Only EVM sequences transactions by nonce.
+                "交易可能已被丢弃或替换，请检查钱包 nonce。"
+                if canonical_chain(str(chain)) not in {"BTC", "TRON", "SOLANA"}
+                else "交易可能已失效（未被打包或被网络丢弃），请重新发起。"
+            ),
             "unknown": "暂时无法确定交易状态。",
         }[broadcast_status]
         return {

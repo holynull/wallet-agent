@@ -330,6 +330,39 @@ POST /v1/transfer/{session_id}/broadcast
 {"user_id":"app-user-42","chain":"BTC","tx_hash":"<64 hex>"}
 ```
 
+服务端接受 64 位十六进制（大小写均可）的 BTC 交易哈希，并会用 Esplora
+`/tx/{hash}/status` 观察上链情况：已确认返回 `confirmed`，已进入内存池返回
+`broadcast_pending`，观察不到返回 `unknown`。兑换回传走
+`/v1/swap/{session_id}/broadcast`，语义相同。
+
+- **App 需要提供的签名材料**：BIP174 签名器要求每个输入带上原 UTXO 之外的信息，
+  App 在上报 `wallet_accounts` 时按地址补充这三项（都是公开数据，服务端只用于组装
+  PSBT，不参与签名）：
+
+```json
+{
+  "chain": "BTC",
+  "address": "3FGA…",
+  "pubkey": "02ab…（33 字节压缩公钥；p2tr 传 32 字节 x-only）",
+  "derivation_path": "49'/0'/0'/0/0",
+  "master_fingerprint": "a1b2c3d4"
+}
+```
+
+  - BIP49（`3…`）**必须**提供 `pubkey`，否则 PSBT 里没有 redeem script，标准签名器
+    与硬件钱包都无法签；提供后该输入改用 witness UTXO，不再依赖上一笔交易 hex。
+  - 提供 `pubkey` 还让服务端能在 PSBT 中写入 `PSBT_IN_BIP32_DERIVATION` 与找零输出的
+    `PSBT_OUT_BIP32_DERIVATION`（硬件钱包签名的前提）。
+  - 服务端会校验 `pubkey` 确实控制该地址，不匹配时**静默丢弃**该地址的签名材料并退回
+    原有行为，因此填错不会生成错误 PSBT，只会签不出来。
+  - 只填地址（不带签名材料）仍然可用，只是 BIP49 地址无法签出有效交易。
+
+- **UTXO 与费率策略**（服务端配置，App 无需感知）：默认只花费节点报告为已确认的
+  UTXO（`BTC_MIN_CONFIRMATIONS=1`，设 0 才允许花未确认的）；费率默认取 mempool 6 区块
+  目标（`BTC_FEE_TARGET_BLOCKS`），也可用 `BTC_FEE_RATE_SAT_VB` 固定费率；默认
+  **不**开启 RBF（`BTC_RBF_ENABLED=true` 时输入使用 `nSequence=0xfffffffd`，交易可加价，
+  此时 PSBT 的 `display.rbf` 为 `"true"`）。
+
 - 兑换：`display.deposit_address` 是 Provider 的充值地址，`to` 与之一致；签名广播后同样用
   `/v1/swap/{session_id}/broadcast` 回传哈希，再按 Provider 订单轮询状态。
 - 服务端只在本地根据 UTXO 组装 PSBT（含手续费与找零），**不持有私钥、不签名、不广播**。
