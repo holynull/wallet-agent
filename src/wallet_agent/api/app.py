@@ -452,16 +452,42 @@ def _assistant_history_entry(
     return entry
 
 
+#: State the App never consumes but every SSE frame used to carry. The
+#: LangChain message list alone (system prompt, token usage, raw tool payloads)
+#: was ~30 KiB per turn and dominated the App's debug logs; ``request`` and
+#: ``wallet_context`` echo back what the App just sent, and the rest is internal
+#: bookkeeping. Measured on a two-turn conversation: 191.6 KiB -> see
+#: tests/api/test_stream_payload.py for the assertion that keeps this small.
+_STREAM_PRIVATE_KEYS = frozenset(
+    {
+        "messages",
+        "request",
+        "wallet_context",
+        "dialogue",
+        "facts",
+        "operation_history",
+        "supervisor_decision",
+        "supervisor_output",
+        "predicted_intent",
+    }
+)
+
+#: A history entry the App may render; card artifacts stay in the conversation
+#: endpoint, and internal fields never leave the checkpoint.
+_STREAM_HISTORY_KEYS = ("role", "content", "id", "suggestions")
+
+
 def _stream_state(state: Mapping[str, Any]) -> dict[str, Any]:
-    """Keep persisted card snapshots out of SSE state duplication."""
+    """Return the App-facing projection of graph state for an SSE frame."""
     public_state = _jsonable(state)
+    for key in _STREAM_PRIVATE_KEYS:
+        public_state.pop(key, None)
     history = public_state.get("conversation_history")
     if isinstance(history, list):
         public_state["conversation_history"] = [
-            {key: value for key, value in item.items() if key != "artifacts"}
-            if isinstance(item, dict)
-            else item
+            {key: item[key] for key in _STREAM_HISTORY_KEYS if key in item}
             for item in history
+            if isinstance(item, Mapping)
         ]
     return public_state
 
@@ -1407,9 +1433,15 @@ def create_app(
                         # are progress, while graph state responses are user-facing
                         # only when they contain a typed response object.
                         if mode == "updates" and isinstance(event, Mapping):
-                            response_value = event.get("response")
-                            if isinstance(response_value, Mapping):
-                                event = {"response": _jsonable(response_value)}
+                            # Project node updates exactly like the terminal
+                            # frame: LangGraph hands over raw node payloads, and
+                            # for the ReAct nodes those are entire message lists
+                            # (system prompt included). A node update that
+                            # carries nothing the App renders is not worth a
+                            # frame at all.
+                            event = _stream_state(event)
+                            if not event:
+                                continue
                         event_name = "progress" if mode == "custom" else (
                             "response"
                             if isinstance(event, Mapping)

@@ -164,6 +164,12 @@ data: {"event":"response","state":{...}}
 
 实现要点（对应 `demo-next/app/page.tsx:481`）：
 
+`state` 只带 App 渲染需要的东西：Agent 的 LangChain 消息（系统提示词、
+token 用量、原始工具载荷）、`request` / `wallet_context` 回显、以及服务端内部
+簿记都**不下发**（此前一轮对话就有 30 KiB 是这些内容，App 侧看 log 全是噪声）。
+历史记录请用 `GET /v1/agent/conversations/{id}`；流里的 `conversation_history`
+只保留 `role` / `content` / `id` / `suggestions`。
+
 - 保存每个帧的 `id` 作为游标；只有整帧解析成功后才更新游标。
 - 断线**不要重新发 turn**，用游标续传：
 
