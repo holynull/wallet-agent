@@ -203,7 +203,15 @@ class SqlSessionStore:
 
         from .tables import SwapSessionRow
 
-        self.engine = create_async_engine(_async_database_url(url))
+        self.engine = create_async_engine(
+            _async_database_url(url),
+            # MySQL closes idle connections (wait_timeout), and a pooled one that
+            # the server already dropped surfaces as "(2006, 'MySQL server has
+            # gone away')" on the next query. Validate before use and retire
+            # connections well before the default 8h timeout.
+            pool_pre_ping=True,
+            pool_recycle=1800,
+        )
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
         self.row_model = SwapSessionRow
         self._initialized = False

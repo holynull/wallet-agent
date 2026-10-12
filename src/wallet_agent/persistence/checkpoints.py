@@ -243,6 +243,12 @@ class LazyAsyncMySQLSaver(LazyAsyncPostgresSaver):
             password=urllib.parse.unquote(parsed.password or ""),
             db=(parsed.path or "/").lstrip("/").split("?")[0] or None,
             autocommit=True,
+            # The saver keeps one connection for the process lifetime, so an idle
+            # 8h (the server default) is enough for MySQL to drop it and make the
+            # next checkpoint raise "(2006, 'MySQL server has gone away')".
+            # Pinging per call would interleave with concurrent queries on the
+            # same socket, so keep the session alive instead.
+            init_command="SET SESSION wait_timeout=31536000",
         )
         saver = AsyncMySaver(connection)
         await saver.setup()
