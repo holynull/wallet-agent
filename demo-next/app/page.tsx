@@ -18,15 +18,17 @@ type AgentTest = {
   intent: string;
   message: string;
   requiresWallet?: boolean;
+  requiresBtcAccount?: boolean;
   expectedKinds?: string[];
   expectedStages?: string[];
   requiresQuote?: boolean;
   requiresPrices?: boolean;
   requiresAssets?: boolean;
   acceptsPreflightFailure?: boolean;
-  metadata?: (wallet: typeof walletShape) => Record<string, unknown>;
+  metadata?: (wallet: AgentTestWallet) => Record<string, unknown>;
 };
 type WalletShape = { address: string; chain: string };
+type AgentTestWallet = WalletShape & { btcAddress: string; evmAddress: string };
 
 const API_BASE = process.env.NEXT_PUBLIC_AGENT_API_URL ?? "http://localhost:8000";
 const walletShape = {} as WalletShape;
@@ -147,6 +149,19 @@ function agentSwapMetadata(address: string) {
     input_amount: "10", input_amount_raw: "10000000", sender_address: address, recipient_address: address,
   } };
 }
+/** BTC source paid by the App's Bitcoin account, USDT landing on the EVM account. */
+function agentBtcSwapMetadata(btcAddress: string, evmAddress: string) {
+  return { swap_request: {
+    source_asset: { chain: "BTC", symbol: "BTC", decimals: 8 },
+    destination_asset: { chain: "ETH", chain_id: 1, symbol: "USDT", decimals: 6, address: "0xdAC17F958D2ee523a2206206994597C13D831ec7" },
+    input_amount: "0.0002", input_amount_raw: "20000", sender_address: btcAddress, recipient_address: evmAddress,
+  } };
+}
+/** First address of the App's BTC list; each line may carry ",pubkey,path[,fingerprint]". */
+function appBtcAddress(config: AppWalletConfig) {
+  const line = config.btcAddresses.split("\n").map((item) => item.trim()).find(Boolean) || "";
+  return line.split(",")[0].trim();
+}
 function BitcoinSigningCard({ transaction, kind }: { transaction: any; kind: string }) {
   const [copied, setCopied] = useState("");
   const fields = bitcoinSigningFields(transaction);
@@ -180,7 +195,8 @@ const AGENT_TESTS: AgentTest[] = [
   { id: "transaction_status", name: "交易状态查询", intent: "transaction_status", message: "查询交易状态", expectedKinds: ["transaction_status"], metadata: ({ chain }) => ({ transaction_query: { chain, tx_hash: `0x${"a".repeat(64)}` } }) },
   { id: "transfer", name: "转账预检查与准备", intent: "transfer", message: "准备一笔只读转账测试", expectedKinds: ["transfer_prepare"], acceptsPreflightFailure: true, metadata: ({ address, chain }) => ({ transfer_request: { chain, sender: address, recipient: `0x${"2".repeat(40)}`, amount: "0.000001", amount_raw: "1000000000000", token: null } }) },
   { id: "swap_quote", name: "兑换报价", intent: "swap_quote", message: "准备兑换报价测试", expectedKinds: ["swap_quote"], requiresQuote: true, metadata: ({ address }) => agentSwapMetadata(address) },
-  { id: "swap_select", name: "报价选择分支", intent: "swap_select", message: "测试报价选择分支", expectedStages: ["quote_selection_required"] },
+  { id: "swap_quote_btc", name: "BTC 兑换报价", intent: "swap_quote", message: "准备 BTC 兑换报价测试", expectedKinds: ["swap_quote", "confirmation_required"], requiresQuote: true, requiresBtcAccount: true, metadata: ({ btcAddress, evmAddress }) => agentBtcSwapMetadata(btcAddress, evmAddress) },
+  { id: "swap_select", name: "报价选择分支", intent: "swap_select", message: "测试报价选择分支", expectedKinds: ["clarification"] },
   { id: "swap_allowance", name: "Allowance 检查分支", intent: "swap_allowance", message: "测试 Allowance 检查分支", expectedStages: ["quote_selection_required"] },
   { id: "swap_prepare", name: "兑换交易准备边界", intent: "swap_prepare", message: "测试兑换交易准备边界", expectedKinds: ["clarification"], metadata: ({ address }) => agentSwapMetadata(address) },
   { id: "swap_status", name: "兑换订单状态", intent: "swap_status", message: "测试兑换订单状态分支", expectedKinds: ["swap_status"] },
@@ -490,12 +506,19 @@ export default function Home() {
       setAgentTests((current) => ({ ...current, [spec.id]: "运行中" }));
       const address = wallet?.address || `0x${"1".repeat(40)}`;
       const chain = wallet?.chain || "BASE";
+      const btcAddress = appBtcAddress(appWallet);
+      const evmAddress = appWallet.evmAddress.trim() || address;
       if (spec.requiresWallet && !wallet) {
         setAgentTests((current) => ({ ...current, [spec.id]: "阻塞：需要连接钱包" }));
         log(`AGENT TEST ${spec.id}`, { skipped: true, reason: "wallet_not_connected" });
         continue;
       }
-      const metadata = { ...(spec.metadata?.({ address, chain }) || {}), agent_test_intent: spec.intent };
+      if (spec.requiresBtcAccount && !btcAddress) {
+        setAgentTests((current) => ({ ...current, [spec.id]: "阻塞：需要在上方「模拟钱包 App」里填 BTC 地址" }));
+        log(`AGENT TEST ${spec.id}`, { skipped: true, reason: "btc_account_missing" });
+        continue;
+      }
+      const metadata = { ...(spec.metadata?.({ address, chain, btcAddress, evmAddress }) || {}), agent_test_intent: spec.intent };
       const request = {
         user_id: "browser-demo", conversation_id: `agent-test-${Date.now()}-${spec.id}`,
         message: spec.message, address: spec.requiresWallet ? address : undefined,
