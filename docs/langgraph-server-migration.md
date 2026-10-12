@@ -1,4 +1,11 @@
-# LangGraph Server 迁移评估（spike 结论）
+# LangGraph Server 迁移评估（spike 结论，已归档）
+
+> **决策更新（2026-10-12）：不采用 LangGraph Server。**
+> spike 产物已删除：`langgraph.json`、`src/wallet_agent/graph/server_app.py`、
+> 自定义卡片事件（`graph/emit.py`，它同时是 SSE 中卡片被重复下发三次的来源）、
+> `USE_PLATFORM_CHECKPOINTER` 开关。`langgraph-cli[inmem]` 仍留在 dev 依赖里，
+> 下次动 `pyproject.toml` 时可一并去掉（需要重新 lock）。
+> 本文档保留为当时的评估记录，不再代表维护方向。
 
 > **决策（2026-10-10）：暂不迁移。**
 > 技术上已验证可行（见下），但先用现有自建服务。重启迁移的前置条件见第七节「待官方确认」。
@@ -115,10 +122,11 @@ session store [mysql]: OK            # save / get / update / list / delete / rea
 先不迁。若要迁，顺序是：① 钱包上下文与 thread metadata 的契约设计（需 App 配合）；
 ② 鉴权与事件形状映射；③ Demo / 文档重写；④ 授权确认后再定自托管还是 LangSmith Deployment。
 
-**spike 产物对现网零影响**：`langgraph.json`、`src/wallet_agent/graph/server_app.py`、
+**spike 产物对现网零影响**（当时）：`langgraph.json`、`src/wallet_agent/graph/server_app.py`、
 `langgraph-cli[inmem]`（dev 依赖）都是旁路；对主路径的改动只有三处，都可单独回退——
 `build_graph` 的 `checkpointer=False` 语义、`USE_PLATFORM_CHECKPOINTER` 开关（默认关）、
-`build_runtime_graph` 的 `split_graphs` 覆盖（默认跟随设置）。
+`build_runtime_graph` 的 `split_graphs` 覆盖（默认跟随设置）。前两项与前两个旁路产物已随
+2026-10-12 的决定删除，`split_graphs` / `checkpointer` 参数保留（测试与自建路径都在用）。
 
 
 ## 七、待官方确认（重启迁移的前置）

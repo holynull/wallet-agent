@@ -39,9 +39,6 @@ class Settings(BaseSettings):
     read_agent_thinking_enabled: bool = True
     read_agent_reasoning_effort: str = "low"
     react_compatibility_mode: bool = False
-    # When the graph is hosted by LangGraph Server the platform owns
-    # persistence; compiling our own checkpointer would shadow it.
-    use_platform_checkpointer: bool = False
     react_max_steps: int = Field(default=8, ge=1, le=32)
     react_tool_timeout_seconds: float = Field(default=20, gt=0, le=300)
     openai_base_url: str | None = "https://api.deepseek.com"

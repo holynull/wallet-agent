@@ -68,10 +68,3 @@ def test_settings_rejects_invalid_polling_and_timeout_values(monkeypatch, field,
         Settings(_env_file=None, **{field: value})
 
 
-def test_platform_checkpointer_is_opt_in(monkeypatch):
-    """Hosting on LangGraph Server must be an explicit choice, not a default."""
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
-    assert Settings(_env_file=None).use_platform_checkpointer is False
-
-    monkeypatch.setenv("USE_PLATFORM_CHECKPOINTER", "true")
-    assert Settings(_env_file=None).use_platform_checkpointer is True
