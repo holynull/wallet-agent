@@ -409,6 +409,9 @@ POST /v1/transfer/{session_id}/broadcast
 失效时到 [figma-ai-assistant-alignment.md](figma-ai-assistant-alignment.md) 找最新对照。
 节点编号就是可点链接，点开直接定位到 Figma 里那一屏）：
 
+> 每张卡片从哪个响应字段取数、怎么渲染、点按后怎么回传，见
+> [app-cards-integration.md](app-cards-integration.md)；本表只列设计稿对照锚点。
+
 | 卡片 | Figma 节点 |
 | --- | --- |
 | 空态 + 快捷胶囊行 | [`33715:148396`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33715-148396) |

@@ -8,7 +8,9 @@
 的条目标题有待补充确认。
 
 本文只跟踪**设计 → 能力**的对齐与差距；卡片字段级的数据契约以
-[app-integration.md](app-integration.md#56-对话卡片字段契约) §5.6 为准，两边不要互相复制。
+[app-integration.md](app-integration.md#56-对话卡片字段契约) §5.6 为准；
+每张卡片怎么接（取数/渲染/回传）见 [app-cards-integration.md](app-cards-integration.md)，
+两边不要互相复制。
 
 ## 一、设计稿要求的 Agent 能力
 
@@ -192,8 +194,9 @@ ReAct 工具：`wallet_balance`、`portfolio_snapshot`、`price_lookup`、`marke
    现在 `transaction_status` 只返回状态枚举与固定文案，`TransactionDetail` 没有 `failure_reason`，
    订单状态没有预计到账（`expires_at` 不等于 ETA）。需要补字段，并让 App 进入对话时带上
    交易上下文（tx hash 已支持，订单上下文需要扩展 `metadata`）。
-3. **金额比例快捷**：设计在金额输入卡给出 25%／50%／75%／100%。快捷建议已支持 `type: "amount"`，
-   但目前只在「最低金额」场景生成；应补百分比预设（值形如 `25%`，余额换算留在客户端）。
+3. ~~**金额比例快捷**~~ 已完成：金额输入卡给出 25%／50%／75%／100%（`type: "amount"`），
+   `data` 带 `token_address`/`decimals` 供 App 定位资产；余额换算留在客户端
+   （见 [app-cards-integration.md](app-cards-integration.md) §3.10）。
 4. **入口与默认问题**：发送/兑换详情页的「问问 Cat Wallet AI」需要 App 把当前交易上下文
    带进这一轮，否则 agent 只能反问。
 5. **语音输入**：属于输入模式而非卡片；服务端没有 STT，需要先定产品方案
