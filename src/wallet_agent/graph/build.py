@@ -68,7 +68,6 @@ class GraphRouter:
         )
 
     async def _state_graph(self, config: Any) -> Any:
-        conversation_state = await self.conversation_graph.aget_state(config)
         lifecycle_state = await self.lifecycle_graph.aget_state(config)
         return (
             self.lifecycle_graph

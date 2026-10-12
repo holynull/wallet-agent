@@ -1223,7 +1223,11 @@ async def test_all_chain_portfolio_queries_every_supported_network():
                     amount_raw="5000000",
                 ),
             ]
-            return [item for item in balances if self.chain_index_by_name[item.asset.chain] in chain_indexes]
+            return [
+                item
+                for item in balances
+                if self.chain_index_by_name[item.asset.chain] in chain_indexes
+            ]
 
         async def get_total_value(self, _address, chain_indexes):
             assert chain_indexes == ["1", "8453"]
@@ -1442,7 +1446,11 @@ async def test_all_chain_balance_filters_assets_with_zero_usd_value():
                     usd_value=Decimal("0"),
                 ),
             ]
-            return [item for item in balances if self.chain_index_by_name[item.asset.chain] in chain_indexes]
+            return [
+                item
+                for item in balances
+                if self.chain_index_by_name[item.asset.chain] in chain_indexes
+            ]
 
         async def get_total_value(self, _address, chain_indexes):
             return {"total_value": "250", "chain_indexes": chain_indexes}

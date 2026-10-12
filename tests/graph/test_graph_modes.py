@@ -183,10 +183,18 @@ async def test_router_reads_lifecycle_checkpoint_when_confirmation_is_pending():
         def get_state(self, _config):
             return self.state
 
-    conversation_state = SimpleNamespace(next=(), tasks=(), values={"graph_role": "conversation"})
+    conversation_state = SimpleNamespace(
+        next=(), tasks=(), values={"graph_role": "conversation"}
+    )
     lifecycle_state = SimpleNamespace(
         next=("confirmation_wait",),
-        tasks=(SimpleNamespace(interrupts=(SimpleNamespace(value={"kind": "confirmation_required"}),)),),
+        tasks=(
+            SimpleNamespace(
+                interrupts=(
+                    SimpleNamespace(value={"kind": "confirmation_required"}),
+                )
+            ),
+        ),
         values={"confirmation_state": {"status": "requested"}, "graph_role": "lifecycle"},
     )
     router = GraphRouter(StateGraph(conversation_state), StateGraph(lifecycle_state), model=None)

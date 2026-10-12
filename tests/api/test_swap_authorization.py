@@ -7,6 +7,7 @@ import pytest
 from langgraph.types import Command
 
 from wallet_agent.api import create_app
+from wallet_agent.api.app import _interrupt_values
 from wallet_agent.chains.execution_observer import ExecutionObserver
 from wallet_agent.chains.registry import ChainAdapterRegistry
 from wallet_agent.domain.models import (
@@ -22,7 +23,6 @@ from wallet_agent.domain.models import (
 from wallet_agent.graph.build import build_graph
 from wallet_agent.persistence import InMemorySessionStore, SwapSessionRecord
 from wallet_agent.providers.http import ProviderResponseError
-from wallet_agent.api.app import _interrupt_values
 
 
 class Model:
@@ -89,7 +89,7 @@ class StatusModel(Model):
         return await super().ainvoke(value)
 
 
-def test_interrupt_values_infers_confirmation_from_checkpoint_values_when_task_interrupts_are_empty():
+def test_interrupt_values_infers_confirmation_from_checkpoint_values_when_task_interrupts_are_empty():  # noqa: E501
     snapshot = SimpleNamespace(
         next=("confirmation_wait",),
         tasks=(),
