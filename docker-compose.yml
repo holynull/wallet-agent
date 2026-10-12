@@ -31,7 +31,10 @@ services:
         # browser rather than from inside the Compose network.
         NEXT_PUBLIC_AGENT_API_URL: ${NEXT_PUBLIC_AGENT_API_URL:-http://localhost:8000}
     ports:
-      - "3000:3000"
+      # Host port is configurable per deployment (local .env sets
+      # DEMO_NEXT_PORT, e.g. 3001 when 3000 is taken); the container always
+      # listens on 3000 inside the network.
+      - "${DEMO_NEXT_PORT:-3000}:3000"
     depends_on:
       wallet-agent:
         condition: service_healthy
