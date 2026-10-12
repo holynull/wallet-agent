@@ -154,6 +154,8 @@ ReAct 工具：`wallet_balance`、`portfolio_snapshot`、`price_lookup`、`marke
    `amount`／`address`／`token`／`action`）。转账缺收款人时按设计给出三个胶囊：
    输入地址／转给联系人／先看看余额（后两个是 `action`，由 App 处理）。Demo 里的胶囊
    按钮会带上类型，且刷新后仍保留（随 artifacts 一起投影）。
+   第一位固定为「输入地址」：不再把「使用当前钱包地址」放在首位（会把自转当成默认收款人），
+   当前钱包地址交给 App 的地址输入卡自行决定是否提供。
 4. ~~**风险提示卡**~~ 已完成：`_address_risk`（`nodes.py`）产出等级与文案，进入预检查的
    `address_risk` 检查项并作为 `preflight.risk` 返回；零地址为 `danger` 直接阻断，
    自转与"转给本钱包其他地址"为 `warning`。Demo 新增 `data-card-kind="risk"`。

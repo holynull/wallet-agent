@@ -4092,36 +4092,27 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         language = facts["language_hint"]
 
         if "transfer_recipient" in missing:
-            wallet_address = context.get("address")
-            if wallet_address:
-                suggestions.append(
-                    {
-                        "label": "使用当前钱包地址" if language == "zh" else "Use current wallet",
-                        "message": (
-                            "使用当前连接钱包地址作为收款地址。"
-                            if language == "zh"
-                            else "Use the connected wallet address as the recipient."
-                        ),
-                        "type": "address",
-                        "value": str(wallet_address),
-                        "data": {**base_data, "recipient": str(wallet_address)},
-                    }
-                )
-            else:
-                suggestions.append(
-                    {
-                        "label": "填写收款地址" if language == "zh" else "Provide recipient",
-                        "message": (
-                            "请提供收款钱包地址。"
-                            if language == "zh"
-                            else "Provide the recipient wallet address."
-                        ),
-                        "type": "action",
-                        "value": "input_address",
-                        "data": {"intent": "transfer"},
-                    }
-                )
-            # Mirrors the transfer card's quick row: enter an address, pick a
+            # Design v1.6.9's address-input card leads with 输入地址: the user
+            # types or pastes the address and the App opens its own input
+            # surface. Leading with the wallet's own address made a
+            # self-transfer shortcut look like the default answer.
+            suggestions.append(
+                {
+                    "label": "输入地址" if language == "zh" else "Enter an address",
+                    "message": (
+                        "我来提供收款地址。"
+                        if language == "zh"
+                        else "I'll provide the recipient address."
+                    ),
+                    "type": "action",
+                    "value": "input_address",
+                    # Carry the slots already collected so the App can continue
+                    # this task after its address input, but never a recipient:
+                    # the connected wallet must not become the default payee.
+                    "data": dict(base_data),
+                }
+            )
+            # Mirrors the design's quick row order: enter an address, pick a
             # contact (App-side), or look at the balance before continuing.
             suggestions.extend(
                 [

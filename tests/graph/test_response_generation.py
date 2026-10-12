@@ -230,12 +230,13 @@ async def test_transfer_clarification_uses_model_message_and_never_exposes_inter
     response = result["response"]
     assert response["message"] == "Who should receive the 1 USDC transfer?"
     assert "transfer_recipient" not in response["message"]
+    # The address chip continues the task with the collected slots, but it must
+    # not preselect the connected wallet as the payee.
     assert response["suggestions"][0]["data"] == {
         "intent": "transfer",
         "amount": "1",
         "chain": "ETH",
         "symbol": "USDC",
-        "recipient": WALLET,
     }
 
 

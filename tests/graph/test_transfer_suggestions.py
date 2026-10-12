@@ -38,15 +38,18 @@ async def test_missing_recipient_offers_a_typed_three_chip_row():
 
     assert response["kind"] == "clarification"
     assert response["missing_fields"] == ["transfer_recipient"]
-    assert [item["type"] for item in response["suggestions"]] == ["address", "action", "action"]
+    # The design's address-input card always leads with 输入地址; the wallet's
+    # own address must not become the default recipient.
+    assert [item["type"] for item in response["suggestions"]] == ["action", "action", "action"]
     assert [item["value"] for item in response["suggestions"]] == [
-        EVM,
+        "input_address",
         "pick_contact",
         "show_balance",
     ]
-    # The address chip still carries the slot data a client needs to continue.
-    assert response["suggestions"][0]["data"]["recipient"] == EVM
-    assert response["suggestions"][0]["data"]["intent"] == "transfer"
+    # The chips still carry the slot data a client needs to continue, and none
+    # of them preselects the connected wallet as the recipient.
+    assert [item["data"]["intent"] for item in response["suggestions"]] == ["transfer"] * 3
+    assert not any(item["data"].get("recipient") for item in response["suggestions"])
 
 
 @pytest.mark.asyncio
@@ -92,8 +95,8 @@ async def test_react_turn_surfaces_the_quick_reply_chips_on_the_response():
 
     response = result["response"]
     assert response["kind"] == "react"
-    assert [item["type"] for item in response["suggestions"]] == ["address", "action", "action"]
-    assert response["suggestions"][0]["value"] == EVM
+    assert [item["type"] for item in response["suggestions"]] == ["action", "action", "action"]
+    assert response["suggestions"][0]["value"] == "input_address"
     assert response["suggestions"][1]["value"] == "pick_contact"
 
 

@@ -289,7 +289,7 @@ async def test_transfer_clarification_retains_known_slots_in_active_task():
 
 
 @pytest.mark.asyncio
-async def test_transfer_suggestions_match_missing_recipient_and_use_wallet_address():
+async def test_transfer_suggestions_match_missing_recipient_with_the_design_chip():
     model = UnderstandingModel(
         ["transfer"],
         transfer=[TransferSlotPatch(chain="BASE", symbol="ETH", amount="0.01")],
@@ -302,8 +302,10 @@ async def test_transfer_suggestions_match_missing_recipient_and_use_wallet_addre
     )
 
     suggestion = result["response"]["suggestions"][0]
-    assert suggestion["label"] == "使用当前钱包地址"
-    assert suggestion["data"]["recipient"] == WALLET
+    assert suggestion["label"] == "输入地址"
+    assert suggestion["value"] == "input_address"
+    # The connected wallet must not be preselected as the recipient.
+    assert "recipient" not in suggestion["data"]
     assert "transfer_recipient" in result["response"]["missing_fields"]
 
 
