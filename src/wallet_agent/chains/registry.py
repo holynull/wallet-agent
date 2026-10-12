@@ -41,6 +41,21 @@ class ChainAdapterRegistry:
 ChainRegistry = ChainAdapterRegistry
 
 
+def _btc_options(
+    min_confirmations: int,
+    fee_target_blocks: int,
+    fee_rate_sat_vb: float | None,
+    rbf_enabled: bool,
+) -> dict[str, Any]:
+    """UTXO knobs shared by both Bitcoin adapter construction paths."""
+    return {
+        "min_confirmations": min_confirmations,
+        "fee_target_blocks": fee_target_blocks,
+        "fee_rate_sat_vb": fee_rate_sat_vb,
+        "rbf_enabled": rbf_enabled,
+    }
+
+
 def _esplora_host(url: str) -> str:
     """Normalize an Esplora endpoint to its host.
 
@@ -61,6 +76,10 @@ def build_default_registry(
     rpc_urls: dict[str, str | list[str]] | None = None,
     rpc_timeout_seconds: float = 10,
     rpc_max_attempts: int = 2,
+    btc_min_confirmations: int = 1,
+    btc_fee_target_blocks: int = 6,
+    btc_fee_rate_sat_vb: float | None = None,
+    btc_rbf_enabled: bool = False,
     include_stubs: bool = True,
 ) -> ChainAdapterRegistry:
     adapters: dict[str, Any] = {}
@@ -72,7 +91,9 @@ def build_default_registry(
     if tron_transport is not None:
         adapters["TRON"] = TronChainAdapter(tron_transport)
     if btc_transport is not None:
-        adapters["BTC"] = BitcoinChainAdapter(btc_transport)
+        adapters["BTC"] = BitcoinChainAdapter(btc_transport, **_btc_options(
+            btc_min_confirmations, btc_fee_target_blocks, btc_fee_rate_sat_vb, btc_rbf_enabled
+        ))
     if solana_transport is not None:
         adapters["SOLANA"] = SolanaChainAdapter(solana_transport)
     if rpc_urls:
@@ -121,7 +142,13 @@ def build_default_registry(
                 FailoverHttpTransport(
                     [_esplora_host(url) for url in urls("BTC")],
                     timeout_seconds=rpc_timeout_seconds,
-                )
+                ),
+                **_btc_options(
+                    btc_min_confirmations,
+                    btc_fee_target_blocks,
+                    btc_fee_rate_sat_vb,
+                    btc_rbf_enabled,
+                ),
             )
         if "SOLANA" not in adapters and urls("SOLANA"):
             adapters["SOLANA"] = SolanaChainAdapter(

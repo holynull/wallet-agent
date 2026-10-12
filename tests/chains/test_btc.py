@@ -209,6 +209,38 @@ async def test_build_native_transfer_drops_signing_material_for_another_address(
     assert any(path.endswith("/hex") for path in transport.paths)
 
 
+async def test_unconfirmed_outputs_are_not_spendable_by_default():
+    utxos = [{"txid": "ee" * 32, "vout": 0, "value": 200_000, "status": {"confirmed": False}}]
+    adapter = BitcoinChainAdapter(EsploraFake(utxos=utxos))
+
+    with pytest.raises(ValueError, match="no spendable Bitcoin UTXOs"):
+        await adapter.build_native_transfer(
+            from_address=P2WPKH, to_address=P2TR, amount_raw="120000"
+        )
+
+    permissive = BitcoinChainAdapter(EsploraFake(utxos=utxos), min_confirmations=0)
+    tx = await permissive.build_native_transfer(
+        from_address=P2WPKH, to_address=P2TR, amount_raw="120000"
+    )
+    assert tx.display["format"] == "psbt"
+
+
+async def test_rbf_is_opt_in_and_visible_in_the_display():
+    adapter = BitcoinChainAdapter(EsploraFake())
+    locked = await adapter.build_native_transfer(
+        from_address=P2WPKH, to_address=P2TR, amount_raw="120000"
+    )
+    assert locked.display["rbf"] == "false"
+    assert "ffffffff" in locked.display["unsigned_tx_hex"]  # nSequence opts out
+
+    bumpable = BitcoinChainAdapter(EsploraFake(), rbf_enabled=True)
+    replaceable = await bumpable.build_native_transfer(
+        from_address=P2WPKH, to_address=P2TR, amount_raw="120000"
+    )
+    assert replaceable.display["rbf"] == "true"
+    assert "fdffffff" in replaceable.display["unsigned_tx_hex"]
+
+
 async def test_build_native_transfer_selects_extra_inputs_and_rejects_dust_balance():
     adapter = BitcoinChainAdapter(EsploraFake())
     tx = await adapter.build_native_transfer(

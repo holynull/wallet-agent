@@ -31,6 +31,9 @@ PSBT_MAGIC = b"psbt\xff"
 DUST_LIMIT = 546
 DEFAULT_FEE_RATE_SAT_VB = Decimal("2")
 DEFAULT_FEE_TARGET = 6
+#: BIP125 replacement-enabled sequence. The default 0xffffffff opts out, which
+#: leaves a stuck transfer with no way to bump the fee.
+RBF_SEQUENCE = 0xFFFFFFFD
 
 # BIP174 key types. Signers need the redeem script and the BIP32 derivation of
 # every input, and they verify that change belongs to the wallet, so a PSBT
@@ -111,13 +114,18 @@ def _outpoint(txid: str, vout: int) -> bytes:
 
 
 def serialize_unsigned_transaction(
-    inputs: Sequence[Mapping[str, Any]], outputs: Sequence[tuple[bytes, int]]
+    inputs: Sequence[Mapping[str, Any]],
+    outputs: Sequence[tuple[bytes, int]],
+    *,
+    sequence: int | None = None,
 ) -> bytes:
     """Serialize a legacy-format unsigned transaction (no witness, empty scriptsigs)."""
+    # No sequence means the historical non-replaceable transaction.
+    n_sequence = (0xFFFFFFFF if sequence is None else int(sequence)).to_bytes(4, "little")
     payload = (2).to_bytes(4, "little") + _varint(len(inputs))
     for item in inputs:
         payload += _outpoint(str(item["txid"]), int(item["vout"]))
-        payload += b"\x00" + b"\xff\xff\xff\xff"
+        payload += b"\x00" + n_sequence
     payload += _varint(len(outputs))
     for script, amount in outputs:
         payload += amount.to_bytes(8, "little") + _varint(len(script)) + script
@@ -207,6 +215,12 @@ def _witness_utxo(value: int, script: bytes) -> bytes:
     return value.to_bytes(8, "little") + _varint(len(script)) + script
 
 
+def _unconfirmed(row: Mapping[str, Any]) -> bool:
+    """Whether Esplora positively reports this output as unconfirmed."""
+    status = row.get("status")
+    return isinstance(status, Mapping) and status.get("confirmed") is False
+
+
 def _matches_p2sh(address: str, pubkey: bytes) -> bool:
     """Whether ``pubkey`` really is the BIP49 key behind this P2SH address."""
     # ``base58check_payload`` keeps the version byte, so drop it before comparing.
@@ -254,6 +268,8 @@ class BitcoinChainAdapter:
         base_path: str = "/api",
         fee_rate_sat_vb: Decimal | float | str | None = None,
         fee_target_blocks: int = DEFAULT_FEE_TARGET,
+        min_confirmations: int = 1,
+        rbf_enabled: bool = False,
     ) -> None:
         self.transport = transport or http_transport or http
         if self.transport is None:
@@ -268,6 +284,8 @@ class BitcoinChainAdapter:
             Decimal(str(fee_rate_sat_vb)) if fee_rate_sat_vb is not None else None
         )
         self.fee_target_blocks = int(fee_target_blocks)
+        self.min_confirmations = int(min_confirmations)
+        self.rbf_enabled = bool(rbf_enabled)
 
     @property
     def capabilities(self) -> CapabilitySnapshot:
@@ -434,7 +452,9 @@ class BitcoinChainAdapter:
         outputs: list[tuple[bytes, int]] = [(script_pubkey(to_address), amount)]
         if change:
             outputs.append((script_pubkey(from_address), change))
-        unsigned_tx = serialize_unsigned_transaction(selected, outputs)
+        unsigned_tx = serialize_unsigned_transaction(
+            selected, outputs, sequence=RBF_SEQUENCE if self.rbf_enabled else None
+        )
         metadata = await self._input_metadata(selected, signing_info)
         output_metadata: list[list[tuple[int, bytes, bytes]]] = [[] for _ in outputs]
         if change and pubkey_matches_address(
@@ -470,6 +490,7 @@ class BitcoinChainAdapter:
                 "fee_rate_sat_vb": str(rate),
                 "change_raw": str(change),
                 "input_count": str(len(selected)),
+                "rbf": "true" if self.rbf_enabled else "false",
                 "unsigned_tx_hex": unsigned_tx.hex(),
             },
         )
@@ -497,11 +518,18 @@ class BitcoinChainAdapter:
 
     async def _utxos(self, address: str) -> list[dict[str, Any]]:
         rows = await http_call(self.transport, "get", f"{self.base_path}/address/{address}/utxo")
-        utxos = [
-            {"txid": str(row["txid"]), "vout": int(row["vout"]), "value": int(row["value"])}
-            for row in (rows if isinstance(rows, list) else [])
-            if isinstance(row, Mapping) and "txid" in row and "vout" in row
-        ]
+        utxos: list[dict[str, Any]] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, Mapping) or "txid" not in row or "vout" not in row:
+                continue
+            if self.min_confirmations > 0 and _unconfirmed(row):
+                # Spending an unconfirmed output can fail outright (or be
+                # replaced underneath us), so only clearly-confirmed outputs are
+                # spendable when a confirmation floor is configured.
+                continue
+            utxos.append(
+                {"txid": str(row["txid"]), "vout": int(row["vout"]), "value": int(row["value"])}
+            )
         return sorted(utxos, key=lambda item: item["value"], reverse=True)
 
     @staticmethod

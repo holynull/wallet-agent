@@ -222,6 +222,10 @@ def build_graph_dependencies(settings: Settings) -> dict[str, Any]:
         rpc_urls=settings.rpc_urls,
         rpc_timeout_seconds=settings.rpc_timeout_seconds,
         rpc_max_attempts=settings.rpc_max_attempts,
+        btc_min_confirmations=settings.btc_min_confirmations,
+        btc_fee_target_blocks=settings.btc_fee_target_blocks,
+        btc_fee_rate_sat_vb=settings.btc_fee_rate_sat_vb,
+        btc_rbf_enabled=settings.btc_rbf_enabled,
     )
     execution_observer = ExecutionObserver(chain_registry)
 

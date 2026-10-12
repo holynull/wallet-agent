@@ -56,6 +56,15 @@ class Settings(BaseSettings):
     rpc_timeout_seconds: float = Field(default=10, gt=0)
     rpc_max_attempts: int = Field(default=2, ge=1, le=5)
 
+    # Bitcoin/UTXO behaviour. Every other chain has no UTXO selection to tune.
+    # 0 lets a transfer spend unconfirmed outputs; the default only spends
+    # outputs the node reports as confirmed.
+    btc_min_confirmations: int = Field(default=1, ge=0, le=100)
+    btc_fee_target_blocks: int = Field(default=6, ge=1, le=144)
+    btc_fee_rate_sat_vb: float | None = Field(default=None, gt=0)
+    # BIP125 opt-in. Off keeps the historical non-replaceable behaviour.
+    btc_rbf_enabled: bool = False
+
     okx_enabled: bool = False
     okx_base_url: str = "https://web3.okx.com"
     okx_api_key: SecretStr | None = None
