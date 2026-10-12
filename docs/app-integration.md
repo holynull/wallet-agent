@@ -170,6 +170,10 @@ token 用量、原始工具载荷）、`request` / `wallet_context` 回显、以
 历史记录请用 `GET /v1/agent/conversations/{id}`；流里的 `conversation_history`
 只保留 `role` / `content` / `id` / `suggestions`。
 
+卡片只出现两次：`response` 帧（本轮业务响应）与终态帧的 `state.response`。
+`progress` 只用于 loading 文案（`message` / `elapsed_ms`），不再重复整张卡片
+——此前同一张资产卡会被 progress / response / complete 各发一份。
+
 - 保存每个帧的 `id` 作为游标；只有整帧解析成功后才更新游标。
 - 断线**不要重新发 turn**，用游标续传：
 

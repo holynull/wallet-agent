@@ -100,3 +100,26 @@ async def test_stream_keeps_the_app_facing_projection_and_trims_history():
     assert all(
         set(item) <= {"role", "content", "id", "suggestions"} for item in history
     )
+
+
+@pytest.mark.asyncio
+async def test_progress_frames_are_loading_text_not_a_second_card():
+    """The card belongs to the ``response`` frame and the terminal state.
+
+    It used to be published again as a custom ``wallet_agent_card`` event on
+    every progress frame — a leftover from the LangGraph Server spike — which
+    sent a 25-asset portfolio card three times per turn.
+    """
+    import json
+
+    frames = await _turn_frames()
+    for kind, body in frames:
+        payload = json.loads(body)
+        data = payload.get("data")
+        # The deleted spike re-published every card as a custom event.
+        if isinstance(data, dict):
+            assert data.get("kind") != "wallet_agent_card"
+        # Progress frames, when a path emits them, are loading text only.
+        if kind == "progress":
+            assert isinstance(data, dict)
+            assert "response" not in data
