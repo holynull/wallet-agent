@@ -1480,20 +1480,19 @@ def create_app(
                     getattr(snapshot, "next", ())
                 )
                 if interrupted or "__interrupt__" in result:
+                    # Project the session index *before* the terminal frame: the
+                    # client reacts to ``action_required`` immediately (confirm,
+                    # or read the session), and a session that is not yet
+                    # updated would look like a missing swap.
+                    await project_session(
+                        session_id, result, status="awaiting_confirmation", run_id=run_id
+                    )
                     await append_run_event(
                         run_id,
                         {"event": "action_required", "state": _stream_state(result)}
                     )
                     await event_store.set_status(run_id, "awaiting_confirmation")
-                    await project_session(
-                        session_id, result, status="awaiting_confirmation", run_id=run_id
-                    )
                 else:
-                    await append_run_event(
-                        run_id,
-                        {"event": "complete", "state": _stream_state(result)}
-                    )
-                    await event_store.set_status(run_id, "complete")
                     response_kind = (result.get("response") or {}).get("kind")
                     session_status = None
                     if response_kind == "transfer_prepare":
@@ -1534,6 +1533,14 @@ def create_app(
                         # transfer/swap session status.
                         session_status = None
                     await project_session(session_id, result, status=session_status, run_id=run_id)
+                    # Terminal frame last, for the same reason as above: a client
+                    # that reads or selects a quote the moment the run ends must
+                    # find the session already projected.
+                    await append_run_event(
+                        run_id,
+                        {"event": "complete", "state": _stream_state(result)}
+                    )
+                    await event_store.set_status(run_id, "complete")
             if await event_store.get_status(run_id) == "running":
                 await event_store.set_status(run_id, "complete")
         except _GraphInterruptConflict as exc:
