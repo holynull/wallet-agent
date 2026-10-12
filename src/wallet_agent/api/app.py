@@ -472,6 +472,14 @@ _STREAM_PRIVATE_KEYS = frozenset(
     }
 )
 
+#: ReAct loop node updates whose only App-relevant content is the LangChain
+#: ``messages`` list (system prompt, per-message token usage, raw tool payloads)
+#: published under the node key. The App renders none of it — it only logs these
+#: frames — and once the internals are stripped the rest is bookkeeping
+#: (react_steps, route fields, ...), so the whole frame is dropped instead of
+#: shipping the message list Lif flagged in the turn logs.
+_STREAM_REACT_NODES = frozenset({"react_entry", "react_agent", "react_tools"})
+
 #: A history entry the App may render; card artifacts stay in the conversation
 #: endpoint, and internal fields never leave the checkpoint.
 _STREAM_HISTORY_KEYS = ("role", "content", "id", "suggestions")
@@ -1442,6 +1450,18 @@ def create_app(
                             event = _stream_state(event)
                             if not event:
                                 continue
+                            # The projection strips top-level private keys, but
+                            # the ReAct loop publishes its messages nested under
+                            # the node name (react_entry / react_agent /
+                            # react_tools), so those lists would still ride
+                            # along. The App only logs these node frames — none
+                            # of the remaining fields is rendered — so drop the
+                            # frame outright.
+                            if (
+                                len(event) == 1
+                                and next(iter(event)) in _STREAM_REACT_NODES
+                            ):
+                                continue
                         event_name = "progress" if mode == "custom" else (
                             "response"
                             if isinstance(event, Mapping)
@@ -1945,7 +1965,11 @@ def create_app(
                     detail={
                         "code": "CONFIRMATION_NOT_PENDING",
                         "message": "当前兑换确认状态已变化，请刷新后再试。",
-                        "details": {"interrupt_kinds": sorted(kind or "unknown" for kind in interrupt_kinds)},
+                        "details": {
+                            "interrupt_kinds": sorted(
+                                kind or "unknown" for kind in interrupt_kinds
+                            )
+                        },
                     },
                 )
             result = await graph.ainvoke(
@@ -1958,8 +1982,13 @@ def create_app(
             else:
                 snapshot = graph.get_state(config)
             values = getattr(snapshot, "values", None) or {}
-            confirmation_state = values.get("confirmation_state") or result.get("confirmation_state")
-            if isinstance(confirmation_state, Mapping) and confirmation_state.get("status") == "requested":
+            confirmation_state = values.get("confirmation_state") or result.get(
+                "confirmation_state"
+            )
+            if (
+                isinstance(confirmation_state, Mapping)
+                and confirmation_state.get("status") == "requested"
+            ):
                 raise HTTPException(
                     status_code=409,
                     detail={

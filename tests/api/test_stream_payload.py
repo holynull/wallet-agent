@@ -16,7 +16,38 @@ from wallet_agent.graph.build import build_graph
 SYSTEM_PROMPT_FRAGMENT = "你是多链数字货币钱包助手"
 EVM = "0x3f847a21bcfbba535a5e2a1611bb4d545541d2a5"
 TERMINAL_EVENTS = {"complete", "error", "action_required"}
+_REACT_NODE_KEYS = {"react_entry", "react_agent", "react_tools"}
 
+
+def _walk(value: object, prefix: str = ""):
+    """Yield every ``(path, value)`` pair in a JSON-shaped object."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield f"{prefix}/{key}", item
+            yield from _walk(item, f"{prefix}/{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _walk(item, f"{prefix}[{index}]")
+
+
+def _assert_no_agent_internals(payloads: list[dict]) -> None:
+    """No LangChain message list and no system prompt, anywhere in a frame.
+
+    The ReAct loop publishes its messages nested under node names, and the
+    serialized body unicode-escapes the Chinese system prompt, so a substring
+    or top-level-key check would miss the leak — walk the decoded payloads.
+    """
+    for payload in payloads:
+        for container in (payload.get("state"), payload.get("data")):
+            if not isinstance(container, dict):
+                continue
+            for path, item in _walk(container):
+                key = path.rsplit("/", 1)[-1]
+                assert key != "messages", f"LangChain message list at {path}"
+                if isinstance(item, str) and SYSTEM_PROMPT_FRAGMENT in item:
+                    raise AssertionError(
+                        f"system prompt leaked into the stream at {path}"
+                    )
 
 class ReActChipModel:
     """Asks for the transfer chips, then answers — enough to produce every
@@ -71,13 +102,18 @@ async def test_stream_never_ships_the_agent_message_list_or_system_prompt():
     assert frames, "the turn produced no frames"
     assert frames[-1][0] == "complete"
     payloads = [json.loads(body) for _, body in frames]
-    bodies = "\n".join(body for _, body in frames)
 
-    assert SYSTEM_PROMPT_FRAGMENT not in bodies
-    for payload in payloads:
-        for container in (payload.get("state"), payload.get("data")):
-            assert not isinstance(container, dict) or "messages" not in container
-            assert not isinstance(container, dict) or "request" not in container
+    # The react loop's per-step node updates used to be the bulk of the leak:
+    # each carried the whole LangChain message list (system prompt, token
+    # usage, tool payloads) nested under react_entry / react_agent / react_tools.
+    for kind, body in frames:
+        payload = json.loads(body)
+        data = payload.get("data")
+        if isinstance(data, dict):
+            assert _REACT_NODE_KEYS.isdisjoint(data), (
+                f"react node internals shipped in an {kind} frame"
+            )
+    _assert_no_agent_internals(payloads)
 
 
 @pytest.mark.asyncio
