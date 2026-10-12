@@ -1474,9 +1474,12 @@ def confirmation_payload_hash(summary: Mapping[str, Any]) -> str:
 
 
 def _swap_confirmation_summary(
-    selected: Mapping[str, Any], *, slippage_bps: int | None = None
+    selected: Mapping[str, Any],
+    *,
+    slippage_bps: int | None = None,
+    recipient_address: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    summary = {
         "provider": selected.get("provider"),
         "provider_reference": selected.get("provider_reference"),
         "source_asset": selected.get("source_asset"),
@@ -1489,6 +1492,29 @@ def _swap_confirmation_summary(
             else (selected.get("slippage_bps") if selected.get("slippage_bps") is not None else 100)
         ),
     }
+    if recipient_address:
+        # Where the destination asset lands is the one thing worth checking
+        # before approving, so the confirmation must carry it.
+        summary["recipient_address"] = recipient_address
+    return summary
+
+
+def _swap_recipient_address(
+    state: Mapping[str, Any], task: Mapping[str, Any] | None = None
+) -> str | None:
+    """The destination address the provider will be told to send to, if known.
+
+    Read from the same place the prepare step reads it, so the confirmation
+    shows exactly the address the order carries.
+    """
+    request = state.get("swap_request")
+    recipient = request.get("recipient_address") if isinstance(request, Mapping) else None
+    if not recipient:
+        slots = (task or {}).get("slots")
+        if isinstance(slots, Mapping):
+            recipient = slots.get("recipient_address")
+    value = str(recipient or "").strip()
+    return value or None
 
 
 def _confirmation_stale(state: Mapping[str, Any], confirmation: Mapping[str, Any]) -> bool:
@@ -1511,7 +1537,11 @@ def _confirmation_stale(state: Mapping[str, Any], confirmation: Mapping[str, Any
         return True
     task_slippage = ((task or {}).get("slots") or {}).get("slippage_bps")
     return confirmation.get("payload_hash") != confirmation_payload_hash(
-        _swap_confirmation_summary(selected, slippage_bps=task_slippage)
+        _swap_confirmation_summary(
+            selected,
+            slippage_bps=task_slippage,
+            recipient_address=_swap_recipient_address(state, task),
+        )
     )
 
 
@@ -6312,7 +6342,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         )
         task_revision = int(task.get("revision") or 0) if task is not None else 0
         task_slippage = ((task or {}).get("slots") or {}).get("slippage_bps")
-        summary = _swap_confirmation_summary(selected, slippage_bps=task_slippage)
+        summary = _swap_confirmation_summary(
+            selected,
+            slippage_bps=task_slippage,
+            recipient_address=_swap_recipient_address(state, task),
+        )
         gas_estimate = await baseline_swap_gas_estimate(selected)
         confirmation = _confirmation_snapshot(
             action="swap",

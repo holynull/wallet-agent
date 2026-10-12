@@ -12,7 +12,7 @@ from wallet_agent.domain.models import (
     UnsignedTransaction,
 )
 from wallet_agent.graph.build import build_graph
-from wallet_agent.graph.nodes import confirmation_payload_hash
+from wallet_agent.graph.nodes import _swap_confirmation_summary, confirmation_payload_hash
 
 
 class PrepareProvider:
@@ -124,6 +124,71 @@ def test_confirmation_payload_hash_is_stable_across_key_order():
     assert confirmation_payload_hash({"provider": "bridgers", "input_amount": "1"}) == (
         confirmation_payload_hash({"input_amount": "1", "provider": "bridgers"})
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("approved_recipient", "stale"),
+    [("0x2", False), ("0x3", True)],
+    ids=["same-recipient", "changed-recipient"],
+)
+async def test_confirmation_binds_the_recipient_address(approved_recipient: str, stale: bool):
+    """Approving a swap approves the address it lands on, so a later change
+    invalidates the confirmation instead of silently retargeting the order."""
+    provider = PrepareProvider()
+    graph = build_graph(model=object(), providers=[provider])
+    quote = selected_quote()
+    summary = _swap_confirmation_summary(quote, recipient_address="0x2")
+    now = datetime.now(timezone.utc)
+
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "recipient-confirmation",
+            "intent": "swap_prepare",
+            "active_task": {
+                "task_id": "swap-task",
+                "kind": "swap",
+                "status": "ready",
+                "stage": "ready_for_prepare",
+                "revision": 1,
+                "slots": {"recipient_address": "0x2"},
+                "slot_sources": {},
+                "missing_fields": [],
+            },
+            "selected_quote": quote,
+            "wallet_context": {"address": "0x1", "chain": "BASE"},
+            "swap_request": {
+                "source_asset": quote["source_asset"],
+                "destination_asset": quote["destination_asset"],
+                "input_amount": "1",
+                "input_amount_raw": "1000000",
+                "sender_address": "0x1",
+                "recipient_address": approved_recipient,
+            },
+            "confirmation_state": {
+                "action": "swap",
+                "status": "requested",
+                "requested_at": now.isoformat(),
+                "expires_at": (now + timedelta(minutes=5)).isoformat(),
+                "summary": summary,
+                "reason": None,
+                "task_id": "swap-task",
+                "task_revision": 1,
+                "payload_hash": confirmation_payload_hash(summary),
+            },
+        },
+        config={"configurable": {"thread_id": f"recipient-{approved_recipient}"}},
+    )
+
+    assert summary["recipient_address"] == "0x2"
+    if stale:
+        assert result["response"]["errors"][0]["code"] == "CONFIRMATION_STALE"
+        assert provider.prepare_calls == 0
+    else:
+        assert "CONFIRMATION_STALE" not in str(result)
+        # The unchanged confirmation still asks for the user's answer.
+        assert result.get("task_stage") == "awaiting_confirmation"
+        assert provider.prepare_calls == 0
 
 
 @pytest.mark.asyncio

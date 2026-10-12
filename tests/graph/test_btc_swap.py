@@ -313,8 +313,13 @@ async def test_btc_swap_prepare_returns_a_psbt_paying_the_deposit_address():
             f"/v1/swap/{session_id}/confirm",
             json={"user_id": "alice", "approved": True},
         )
+        session = (
+            await client.get(f"/v1/swap/{session_id}", params={"user_id": "alice"})
+        ).json()
 
     transaction = prepared.json()["pending_transaction"]
+    # The confirmation the user approves must name the address the order pays out to.
+    assert session["confirmation_state"]["summary"]["recipient_address"] == P2WPKH
     assert transaction["chain"] == "BTC"
     assert transaction["to"] == P2TR
     assert transaction["value"] == "120000"

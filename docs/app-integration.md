@@ -196,7 +196,7 @@ const response = current?.response?.response || current?.response || current;
 | `gas_check` | `gas` | Gas 估算、`sufficient`、`shortfall_raw` |
 | `asset_discovery` | `assets` | 资产发现（含合约地址、精度） |
 | `swap_quote` | `quotes[]` | 报价列表，必须全部展示，**不要**自动选 |
-| `confirmation_required` | `confirmation` | 二次确认卡片 |
+| `confirmation_required` | `confirmation` | 二次确认卡片；`confirmation.summary` 含 `recipient_address`（目标资产到账地址），批准前必须让用户核对 |
 | `approval_required` | `approval_transaction` | 需要先 Approve |
 | `swap_prepare` / `transfer_prepare` | `pending_transaction`、`preflight` | 待签名交易 |
 | `swap_status` / `transaction_status` | `status` | 链上状态 |
@@ -209,6 +209,10 @@ const response = current?.response?.response || current?.response || current;
 
 ReAct 响应（`kind: "react"`）里，业务卡片统一从 `react_results[]` 按 `tool` 名取；
 `suggestions`（快捷回复）和 `client_action`（客户端动作）是**响应级字段**，不在 `react_results` 里。
+
+**「还差一步选报价」的判定依据**（不要依赖别的字段）：`kind === "swap_quote"` 且 `quotes[]` 非空
+（此时会话 `stage` 为 `selecting_quote`）。`response.stage === "quote_selection_required"` 只在
+Allowance 分支出现，**不是**通用信号。
 
 恢复历史时需要同样的投影逻辑：`GET /v1/agent/conversations/{id}` 返回 `latest_artifacts`，
 字段与上表一一对应（`quotes` / `confirmation` / `approval` / `pending_transaction` / `pending_kind` /
