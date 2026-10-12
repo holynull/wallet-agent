@@ -321,6 +321,7 @@ export function clientActionLabel(type: unknown): string {
   if (type === "open_contacts") return "打开通讯录，选择一个转账联系人";
   if (type === "scan_qr") return "打开扫一扫，读取收款码";
   if (type === "open_amount_keypad") return "打开金额键盘，输入转账金额";
+  if (type === "address_input") return "打开地址输入框，粘贴收款地址";
   return "需要 App 弹出自己的界面";
 }
 

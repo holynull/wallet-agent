@@ -452,7 +452,8 @@ POST /v1/transfer/{session_id}/broadcast
 {"type": "open_contacts", "reason": "用户要给朋友转账", "slots": {"chain": "BTC"}}
 ```
 
-- `type` 取 `open_contacts` / `scan_qr` / `open_amount_keypad`，App 收到后弹出自己的界面。
+- `type` 取 `open_contacts` / `scan_qr` / `open_amount_keypad` / `address_input`，
+  App 收到后弹出自己的界面（`address_input` 弹地址输入框让用户粘贴收款地址）。
 - 用户选完，把结果作为**下一轮** `turn` 的输入回传（地址文本，或 `metadata.suggestion_data`）。
 - 服务端只会下发白名单内的动作；工具遇到其它取值返回 `CLIENT_ACTION_UNSUPPORTED`，不会误导 App 弹窗。
 

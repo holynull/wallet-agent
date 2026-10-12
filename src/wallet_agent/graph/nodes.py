@@ -2609,7 +2609,12 @@ _ZERO_EVM_ADDRESS = "0x" + "0" * 40
 
 # UI surfaces the App owns. The agent may ask for one, but never collects the
 # data inside them itself.
-_CLIENT_ACTION_TYPES = ("open_contacts", "scan_qr", "open_amount_keypad")
+_CLIENT_ACTION_TYPES = (
+    "open_contacts",
+    "scan_qr",
+    "open_amount_keypad",
+    "address_input",
+)
 
 
 def _address_risk(
@@ -9787,8 +9792,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             description=(
                 "请求 App 弹出它自己的界面并把结果回填给这一轮对话。"
                 "action 取值：open_contacts（通讯录选联系人）、scan_qr（扫收款码）、"
-                "open_amount_keypad（数字键盘输入金额）。用户说“从联系人选/转给朋友”"
-                "“扫一扫”“输入金额”这类需要 App 出界面时调用它，"
+                "open_amount_keypad（数字键盘输入金额）、"
+                "address_input（弹出地址输入框让用户粘贴收款地址）。"
+                "用户说“从联系人选/转给朋友”“扫一扫”“输入金额”，"
+                "或需要用户提供收款地址时调用它，"
                 "不要用文字向用户索要通讯录、二维码或键盘里的数据，也不要自己编造联系人。"
             ),
         ),
@@ -10006,7 +10013,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "交易记录里 raw_only 为 true 的条目金额是代币最小单位，"
                 "不要换算或估算，原样说明即可。"
                 "缺少转账参数时先调用 transfer_quick_replies 取得标准快捷选项，再提问。"
-                "需要通讯录、扫码或金额键盘时调用 request_client_action 请求 App 弹出，"
+                "需要通讯录、扫码、金额键盘或地址输入时调用 request_client_action 请求 App 弹出，"
                 "自己不要收集这些界面里的数据。"
                 "短追问要结合历史理解；工具失败时说明真实原因并提出最小澄清；不要编造事实或描述内部推理。"
             )

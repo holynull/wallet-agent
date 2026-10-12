@@ -425,6 +425,7 @@ test("projects the client action the agent asked the App to open", () => {
   assert.deepEqual(artifacts?.clientAction, client_action);
   assert.equal(clientActionLabel("open_contacts"), "打开通讯录，选择一个转账联系人");
   assert.equal(clientActionLabel("scan_qr"), "打开扫一扫，读取收款码");
+  assert.equal(clientActionLabel("address_input"), "打开地址输入框，粘贴收款地址");
   assert.equal(clientActionLabel(undefined), "需要 App 弹出自己的界面");
 });
 

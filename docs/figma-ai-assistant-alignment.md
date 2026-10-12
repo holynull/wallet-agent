@@ -156,6 +156,9 @@ ReAct 工具：`wallet_balance`、`portfolio_snapshot`、`price_lookup`、`marke
    按钮会带上类型，且刷新后仍保留（随 artifacts 一起投影）。
    第一位固定为「输入地址」：不再把「使用当前钱包地址」放在首位（会把自转当成默认收款人），
    当前钱包地址交给 App 的地址输入卡自行决定是否提供。
+   模型需要用户粘贴收款地址时还会下发
+   `response.client_action {type: "address_input", slots: {chain}}`，App 据此弹出地址输入框
+   （与 `open_contacts` / `scan_qr` / `open_amount_keypad` 同一通道）。
 4. ~~**风险提示卡**~~ 已完成：`_address_risk`（`nodes.py`）产出等级与文案，进入预检查的
    `address_risk` 检查项并作为 `preflight.risk` 返回；零地址为 `danger` 直接阻断，
    自转与"转给本钱包其他地址"为 `warning`。Demo 新增 `data-card-kind="risk"`。

@@ -61,6 +61,25 @@ async def test_contacts_request_reaches_the_app_as_a_client_action():
 
 
 @pytest.mark.asyncio
+async def test_address_input_request_reaches_the_app_as_a_client_action():
+    result = await _run(
+        {"action": "address_input", "reason": "transfer_recipient", "chain": "BASE"},
+        "client-action-address-input",
+    )
+
+    response = result["response"]
+    assert response["kind"] == "react"
+    assert response["client_action"] == {
+        "type": "address_input",
+        "reason": "transfer_recipient",
+        "slots": {"chain": "BASE"},
+    }
+    # The tool result stays available for the App's audit trail.
+    tool_messages = [item for item in result["messages"] if isinstance(item, ToolMessage)]
+    assert tool_messages and "address_input" in tool_messages[0].content
+
+
+@pytest.mark.asyncio
 async def test_unknown_client_action_is_rejected_without_telling_the_app_to_act():
     result = await _run({"action": "open_calendar"}, "client-action-unknown")
 
