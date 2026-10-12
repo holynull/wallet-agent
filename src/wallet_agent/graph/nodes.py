@@ -4593,6 +4593,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             "failed": "交易执行失败或已回滚。",
                         }.get(value, "暂时无法确定交易状态。"),
                         "source": "okx",
+                        # Top-level "why" / ETA for the design's detail page.
+                        "failure_reason": getattr(detail, "failure_reason", None),
+                        "eta": getattr(detail, "eta", None),
                         "detail": _dump(detail),
                     },
                 }
@@ -9151,6 +9154,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "broadcast_status": broadcast_status,
                 "confirmation_status": broadcast_status,
                 "tx_hash": state.get("broadcast_tx_hash"),
+                # The design's 预计耗时 / 解释失败原因 surface on the detail
+                # page: expose them at the top level so the App does not dig
+                # into the nested order status.
+                "failure_reason": dumped.get("failure_reason"),
+                "eta": dumped.get("eta"),
                 "message": message,
             }
             return {
@@ -9751,7 +9759,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         *,
         state: Annotated[dict[str, Any], InjectedState],
     ) -> dict[str, Any]:
-        query = state.get("transaction_query") or {}
+        # Fall back to either the transaction or the swap-order entry context so
+        # a "为什么还在处理中？" opened from the order detail page can be
+        # answered without the user restating the hash.
+        query = state.get("swap_query") or state.get("transaction_query") or {}
         return await transaction_status_tool(
             str(chain or query.get("chain") or state.get("wallet_context", {}).get("chain") or ""),
             str(tx_hash or query.get("tx_hash") or query.get("hash") or ""),
@@ -10098,6 +10109,32 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "用户多半是从这笔交易的详情页进来的，要解释它的状态、失败原因或为什么还在处理中；"
                     "先用 transaction_status 工具查证再回答，"
                     "工具没给失败原因时就说明来源没有提供，不要编造。"
+                )
+
+        # The App can also open the assistant from a swap order detail screen
+        # ("为什么还在处理中？") and pass its order context, mirroring the
+        # transaction entry above.
+        swap_context = state.get("swap_query") or request.get("swap_query")
+        if isinstance(swap_context, Mapping):
+            order_id = str(
+                swap_context.get("provider_order_id")
+                or swap_context.get("order_id")
+                or swap_context.get("session_id")
+                or ""
+            ).strip()
+            tx_hash = str(swap_context.get("tx_hash") or "").strip()
+            if order_id or tx_hash:
+                system = SystemMessage(
+                    content=str(system.content)
+                    + (
+                        f"当前兑换订单上下文：订单 {order_id}。"
+                        if order_id
+                        else "当前兑换订单上下文。"
+                    )
+                    + ("广播哈希 " + tx_hash + "。" if tx_hash else "")
+                    + "用户多半是从兑换详情页进来的，要解释它的状态、失败原因或为什么还在处理中；"
+                    "先用 query_swap_status / transaction_status 查证再回答，"
+                    "来源没给失败原因时就说明没有提供，不要编造。"
                 )
 
         if not existing or not any(isinstance(item, SystemMessage) for item in existing):

@@ -187,18 +187,18 @@ ReAct 工具：`wallet_balance`、`portfolio_snapshot`、`price_lookup`、`marke
 
 ### 4.5 仍未对齐的卡片（按建议顺序）
 
-1. **多链资产总览卡**：`portfolio` 内部已经算出单价（`price_map`），但没有透出到资产行——
-   资产行现在是 `asset／amount／amount_raw／usd_value／addresses`。补上单价与空态标记，
-   App 才能渲染设计里的「名称（链）+ 单价 + 数量 + 估值」四要素。
-2. **交易状态 / 失败解释**：设计详情页的默认问题是「解释失败原因？」和「为什么还在处理中？」。
-   现在 `transaction_status` 只返回状态枚举与固定文案，`TransactionDetail` 没有 `failure_reason`，
-   订单状态没有预计到账（`expires_at` 不等于 ETA）。需要补字段，并让 App 进入对话时带上
-   交易上下文（tx hash 已支持，订单上下文需要扩展 `metadata`）。
+1. ~~**多链资产总览卡**~~ 已完成：`query_portfolio` 资产行透出 `unit_price`（含按
+   估值反推的兜底），并带 `has_assets` / `network_status` / `complete` /
+   `valuation_complete`，支撑「名称（链）+ 单价 + 数量 + 估值」与「暂无资产数据」空态。
+2. ~~**交易状态 / 失败解释**~~ 已完成：`TransactionDetail` / `NormalizedOrderStatus`
+   补 `failure_reason` 与 `eta`（来源给才填，不给为 `null`）；`transaction_status` /
+   `swap_status` / `/v1/transactions` 顶层透出；入口默认问题支持
+   `metadata.transaction_query`（tx hash）与 `metadata.swap_query`（订单上下文）。
 3. ~~**金额比例快捷**~~ 已完成：金额输入卡给出 25%／50%／75%／100%（`type: "amount"`），
    `data` 带 `token_address`/`decimals` 供 App 定位资产；余额换算留在客户端
    （见 [app-cards-integration.md](app-cards-integration.md) §3.10）。
-4. **入口与默认问题**：发送/兑换详情页的「问问 Cat Wallet AI」需要 App 把当前交易上下文
-   带进这一轮，否则 agent 只能反问。
+4. ~~**入口与默认问题**~~ 已完成：发送/兑换详情页进入对话时 App 传
+   `metadata.transaction_query` / `metadata.swap_query`，模型先查证再解释。
 5. **语音输入**：属于输入模式而非卡片；服务端没有 STT，需要先定产品方案
    （客户端转写 vs 服务端识别）。
 

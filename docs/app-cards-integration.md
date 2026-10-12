@@ -148,12 +148,12 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 
 - 触发：详情页点「解释失败原因？」/「为什么还在处理中？」。
 - 数据：`response` = `{chain, tx_hash, status(pending/confirmed/failed/unknown),
-  message, source, transaction(详情)}`；REST 版 `GET /v1/transactions/{chain}/{tx_hash}`。
+  message, source, failure_reason, eta, transaction(详情)}`；REST 版
+  `GET /v1/transactions/{chain}/{tx_hash}` 同样返回顶层 `failure_reason` / `eta`。
 - App 接入要点：从详情页进入对话时，把 `tx_hash` 和链放进
   **`metadata.transaction_query`**（服务端已支持，模型会先查证再回答）。
-- ⚠️ **差距**：链级 `TransactionDetail` **没有 `failure_reason` 和预计到账（ETA）**；
-  `failure_reason` 目前只在兑换订单状态（`NormalizedOrderStatus`）上。
-  设计稿的「交易完成/失败 + 预计耗时 30.22 分钟」需要补字段。
+- ✅ 对齐：`failure_reason`（来源给出时）与 `eta`（来源给出时）已透出；
+  来源没给原因/耗时时为 `null`，**不要**编造或显示固定值。
 
 ### 3.7 收款地址卡 / 支持链卡（`receive_address`）
 
@@ -241,7 +241,8 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 ### 3.16 兑换状态卡（`swap_status`）
 
 - 数据：`broadcast_status`（`broadcast_pending` / `confirmed` / `failed` 等）+
-  `tx_hash` + `message`；也见于 `GET /v1/swap/{session_id}`。
+  `tx_hash` + `message` + 顶层 `failure_reason` / `eta`（订单状态里的字段）；
+  `GET /v1/swap/{session_id}` 的 `order_status` 里同样可读。
 - App 接入：广播后轮询展示「交易中…／完成／失败」。
 - 对齐：✅（`data-card-kind="status"`）。
 
@@ -250,21 +251,22 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 - 设计节点：分区 [`33617:39513`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33617-39513)。
 - 需求：详情页「问问 Cat Wallet AI」默认问「解释失败原因？」/「为什么还在处理中？」。
 - App 接入：进入对话时把交易上下文放进 **`metadata.transaction_query`**
-  （`{chain, tx_hash}`；订单上下文扩展 `metadata` 待后端支持）。
-- ⚠️ 差距：订单级 ETA / 失败原因字段待补（见 3.6）。
+  （`{chain, tx_hash}`）；兑换订单页也可传 **`metadata.swap_query`**
+  （`{provider_order_id | order_id | session_id, tx_hash}`），模型会先
+  `query_swap_status` / `transaction_status` 查证再解释。
+- ✅ 对齐：tx 与订单两种入口上下文都已支持。
 
 ## 4. 未对齐 / 待办汇总
 
 按优先级：
 
-1. **多链资产总览卡**：后端资产行补 `unit_price` + 空态标记（`total_usd_value == null`），
-   App 才能渲染「名称（链）+ 单价 + 数量 + 估值」与「暂无资产数据」。
-2. **交易状态/失败解释**：链级 `TransactionDetail` 补 `failure_reason`；兑换订单补
-   预计到账（ETA，`expires_at` 不等于 ETA）；详情页进入对话需 App 传
-   `metadata.transaction_query`。
-3. **入口默认问题**：依赖第 2 项字段 + App 传上下文。
-4. **语音输入**：先定 STT 归属（客户端转写 vs 服务端识别），再谈接法。
-5. **版本确认**：v1.6.9 与 v1.7.0 设计页以哪版为准（涉及卡片字段增减）。
+1. ~~**多链资产总览卡**~~ 已完成：资产行 `unit_price` + `has_assets` 空态标记已透出。
+2. ~~**交易状态/失败解释**~~ 已完成：`TransactionDetail` / `NormalizedOrderStatus` 补
+   `failure_reason` 与 `eta`（来源给才填），`transaction_status` / `swap_status` /
+   `/v1/transactions` 顶层透出；详情页入口支持 `metadata.transaction_query` /
+   `metadata.swap_query`。
+3. **语音输入**：先定 STT 归属（客户端转写 vs 服务端识别），再谈接法。
+4. **版本确认**：v1.6.9 与 v1.7.0 设计页以哪版为准（涉及卡片字段增减）。
 
 ## 5. 参考实现
 

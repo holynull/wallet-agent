@@ -57,6 +57,8 @@ class BroadcastProvider:
             provider_reference=order.provider_reference,
             status="processing",
             tx_hash=order.tx_hash,
+            failure_reason="provider rejected",
+            eta="30 min",
         )
 
 
@@ -376,5 +378,9 @@ async def test_active_swap_status_followup_polls_existing_provider_order():
     assert result["supervisor_decision"]["source"] == "swap_context"
     assert result["response"]["kind"] == "swap_status"
     assert result["response"]["provider_status"] == "processing"
+    # The order detail page's 预计耗时 / 解释失败原因 fields surface at the
+    # top level of the swap status response.
+    assert result["response"]["failure_reason"] == "provider rejected"
+    assert result["response"]["eta"] == "30 min"
     assert provider.status_calls == 1
     assert provider.broadcast_calls == 0

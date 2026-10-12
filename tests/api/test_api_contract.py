@@ -1016,6 +1016,8 @@ async def test_transaction_status_endpoint_returns_user_readable_status():
                 source="okx",
                 history_kind="full",
                 block_number=16,
+                failure_reason="Out of gas",
+                eta=None,
             )
 
     _app, client = await client_for(explorer_provider=Explorer())
@@ -1027,6 +1029,10 @@ async def test_transaction_status_endpoint_returns_user_readable_status():
     assert response.json()["message"] == "交易已确认。"
     assert response.json()["source"] == "okx"
     assert response.json()["transaction"]["history_kind"] == "full"
+    # The detail-page "解释失败原因" fields surface at the top level.
+    assert response.json()["failure_reason"] == "Out of gas"
+    assert "eta" in response.json()
+    assert response.json()["eta"] is None
 
 
 @pytest.mark.asyncio

@@ -340,6 +340,9 @@ class NormalizedOrderStatus(DomainModel):
     # First-class "why" for the design's 解释失败原因 question; providers only
     # fill it when they actually say something.
     failure_reason: str | None = None
+    # Estimated time until the swap lands on the destination chain (design's
+    # 预计耗时). Null when the provider does not disclose it — never fabricate.
+    eta: str | None = None
     completed_at: datetime | None = None
     expires_at: datetime | None = None
     provider_payload: dict[str, JsonValue] = Field(default_factory=dict)
@@ -504,6 +507,9 @@ class TransactionDetail(TransactionRecord):
     transaction_index: str | None = None
     block_hash: str | None = None
     fee: str | None = None
+    # Estimated confirmation/landing time (design's 预计耗时); None when the
+    # source does not disclose it — never fabricate.
+    eta: str | None = None
     token_transfers: list[TokenTransfer] = Field(default_factory=list)
 
 

@@ -2474,6 +2474,8 @@ def create_app(
                         "unknown": "暂时无法确定交易状态。",
                     }.get(detail.status.value, "暂时无法确定交易状态。"),
                     "source": detail.source or "okx",
+                    "failure_reason": detail.failure_reason,
+                    "eta": detail.eta,
                     "transaction": _jsonable(detail),
                 }
                 return result

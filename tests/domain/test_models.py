@@ -87,6 +87,8 @@ def test_order_models_keep_provider_payloads_redacted_and_expiry_explicit():
         provider_order_id="order-123",
         status="processing",
         provider_reference="order-123",
+        failure_reason="insufficient liquidity",
+        eta="30 min",
     )
 
     assert deposit.expires_at is None
@@ -97,6 +99,8 @@ def test_order_models_keep_provider_payloads_redacted_and_expiry_explicit():
     }
     assert provider_order.tx_hash is None
     assert status.completed_at is None
+    assert status.failure_reason == "insufficient liquidity"
+    assert status.eta == "30 min"
 
 
 def test_wallet_snapshot_uses_decimal_human_balance_and_raw_integer_balance():
