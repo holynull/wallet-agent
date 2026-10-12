@@ -3,8 +3,8 @@
 > **决策更新（2026-10-12）：不采用 LangGraph Server。**
 > spike 产物已删除：`langgraph.json`、`src/wallet_agent/graph/server_app.py`、
 > 自定义卡片事件（`graph/emit.py`，它同时是 SSE 中卡片被重复下发三次的来源）、
-> `USE_PLATFORM_CHECKPOINTER` 开关。`langgraph-cli[inmem]` 仍留在 dev 依赖里，
-> 下次动 `pyproject.toml` 时可一并去掉（需要重新 lock）。
+> `USE_PLATFORM_CHECKPOINTER` 开关，以及 `langgraph-cli[inmem]`（dev 依赖，
+> 一并清掉后锁文件瘦了 438 行，运行时与测试都不依赖它）。
 > 本文档保留为当时的评估记录，不再代表维护方向。
 
 > **决策（2026-10-10）：暂不迁移。**
