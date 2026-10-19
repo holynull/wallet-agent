@@ -357,6 +357,45 @@ async def test_model_router_responds_with_facts_and_structured_contract():
 
 
 @pytest.mark.asyncio
+async def test_respond_redacts_service_source_from_facts():
+    """The narrator must never see or echo the provider brand in facts."""
+
+    class CapturingResponseModel:
+        def __init__(self):
+            self.inputs = []
+
+        async def ainvoke(self, value):
+            self.inputs.append(value)
+            return {"language": "zh", "message": "查询完成", "suggestions": []}
+
+    response_model = CapturingResponseModel()
+    router = ModelRouter(
+        ModelRegistry(
+            {"deepseek-chat": FakeModel()},
+            default_model_id="deepseek-chat",
+            responses={"deepseek-chat": response_model},
+        )
+    )
+    facts = {
+        "transaction": {
+            "chain": "ETH",
+            "tx_hash": "0xabc",
+            "status": "confirmed",
+            "source": "okx",
+            "token_transfers": [{"symbol": "USDT", "amount": "10", "source": "okx"}],
+        },
+        "nested": {"source": "local"},
+    }
+    await router.respond({"message": "查一下这笔交易"}, facts)
+    assert response_model.inputs
+    serialized = " ".join(str(item.content) for item in response_model.inputs[0])
+    assert "OKX" not in serialized
+    assert "okx" not in serialized
+    # Non-provider source labels are preserved.
+    assert "local" in serialized
+
+
+@pytest.mark.asyncio
 async def test_model_router_response_preserves_react_tool_transcript():
     """Removing the transcript argument would hide tool observations from final generation."""
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage

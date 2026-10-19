@@ -39,10 +39,10 @@ _CHAIN_IDS = {
 _SYMBOL_NOISE = re.compile(r"[\s'\-`\u2018\u2019]+")
 _PROVIDER_NETWORK_SUFFIX = re.compile(r"\((?:ERC20|BEP20|TRC20)\)$")
 _AMOUNT_WITH_UNIT = re.compile(
-    r"^\s*((?:\d+(?:\.\d*)?|\.\d+))\s*([A-Za-z][A-Za-z0-9()'`\-]*)\s*$"
+    r"^\s*((?:\d+(?:\.\d*)?|\.\d+)(?!x|X))\s*([A-Za-z][A-Za-z0-9()'`\-]*)\s*$"
 )
 _AMOUNT_WITH_UNIT_MENTION = re.compile(
-    r"(?<![A-Za-z0-9_.])((?:\d+(?:\.\d*)?|\.\d+))\s*"
+    r"(?<![A-Za-z0-9_.])((?:\d+(?:\.\d*)?|\.\d+)(?!x|X))\s*"
     r"([A-Za-z][A-Za-z0-9()'`\-]*)"
 )
 _AMOUNT_ONLY = re.compile(r"^\s*((?:\d+(?:\.\d*)?|\.\d+))\s*$")
@@ -131,6 +131,16 @@ _CHAIN_NAME = (
 )
 _SOURCE_CHAIN_ASSET_SWAP_PATTERN = re.compile(
     rf"(?:^|\s)(?:用\s*)?({_CHAIN_NAME})\s*(?:链|网络)?\s*上(?:的)?\s*"
+    rf"(?:(?:\d+(?:\.\d*)?|\.\d+)\s*)?{_TOKEN_SYMBOL}(?:\s*来)?\s*"
+    rf"(?:兑换|换)(?:成|为)?\s*{_TOKEN_SYMBOL}\s*$",
+    re.IGNORECASE,
+)
+# “用eth的usdt换trx” / “用BSC链的BNB换USDT”: a possessive 的 binds the chain to
+# the source coin. Without an explicit 上 the other source-chain patterns miss
+# it, and the model then guesses a source chain (e.g. TRON for a TRX target),
+# producing ASSET_NOT_FOUND on the real source.
+_SOURCE_CHAIN_POSSESSIVE_SWAP_PATTERN = re.compile(
+    rf"(?:用\s*)?({_CHAIN_NAME})\s*(?:链|网络)?\s*的\s*"
     rf"(?:(?:\d+(?:\.\d*)?|\.\d+)\s*)?{_TOKEN_SYMBOL}(?:\s*来)?\s*"
     rf"(?:兑换|换)(?:成|为)?\s*{_TOKEN_SYMBOL}\s*$",
     re.IGNORECASE,
@@ -251,6 +261,11 @@ def swap_direction_hints(value: str) -> dict[str, str]:
         hints["source_chain"] = canonical_chain(source_chain_asset_match.group(1))
         hints["source_symbol"] = canonical_symbol(source_chain_asset_match.group(2))
         hints["destination_symbol"] = canonical_symbol(source_chain_asset_match.group(3))
+    possessive_source_match = _SOURCE_CHAIN_POSSESSIVE_SWAP_PATTERN.search(message)
+    if possessive_source_match:
+        hints["source_chain"] = canonical_chain(possessive_source_match.group(1))
+        hints["source_symbol"] = canonical_symbol(possessive_source_match.group(2))
+        hints["destination_symbol"] = canonical_symbol(possessive_source_match.group(3))
     all_chains_match = _ALL_SWAP_CHAINS_PATTERN.search(message)
     if all_chains_match:
         chain = canonical_chain(all_chains_match.group(1))

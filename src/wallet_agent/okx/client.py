@@ -155,7 +155,7 @@ class OkxSignedClient:
                     type(exc).__name__,
                 )
                 if attempt + 1 >= self.max_attempts:
-                    raise OkxClientError("transport_error", "OKX transport unavailable") from exc
+                    raise OkxClientError("transport_error", "Transport unavailable") from exc
                 await self._wait(None, attempt)
                 continue
 
@@ -179,7 +179,7 @@ class OkxSignedClient:
                 if attempt + 1 >= self.max_attempts:
                     raise OkxClientError(
                         "http_error",
-                        "OKX service temporarily unavailable",
+                        "Upstream service temporarily unavailable",
                         retryable=True,
                         status_code=response.status_code,
                     )
@@ -188,25 +188,27 @@ class OkxSignedClient:
             if response.status_code >= 400:
                 raise OkxClientError(
                     "http_error",
-                    "OKX request was rejected",
+                    "The request was rejected",
                     status_code=response.status_code,
                 )
             try:
                 payload = response.json()
             except (ValueError, json.JSONDecodeError) as exc:
-                raise OkxClientError("invalid_response", "OKX returned invalid JSON") from exc
+                raise OkxClientError(
+                    "invalid_response", "The service returned invalid data"
+                ) from exc
             if not isinstance(payload, dict):
-                raise OkxClientError("invalid_response", "OKX response must be an object")
+                raise OkxClientError("invalid_response", "The response must be an object")
             code = payload.get("code")
             if str(code) != "0":
                 raise OkxClientError(
                     str(code or "unknown"),
-                    "OKX application request failed",
+                    "The application request failed",
                     retryable=False,
                     status_code=response.status_code,
                 )
             return payload
-        raise OkxClientError("retry_exhausted", "OKX request failed after retries", retryable=True)
+        raise OkxClientError("retry_exhausted", "The request failed after retries", retryable=True)
 
     async def _wait(self, retry_after: float | None, attempt: int) -> None:
         if retry_after is not None:

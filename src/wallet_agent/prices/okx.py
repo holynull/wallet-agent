@@ -225,18 +225,18 @@ class OkxPriceProvider:
             try:
                 payload = await self.client.request(method, path, **kwargs)
                 if not isinstance(payload, dict) or str(payload.get("code")) != "0":
-                    raise PriceProviderError("OKX price provider returned an application error.")
+                    raise PriceProviderError("Price provider returned an application error.")
             except PriceProviderError:
                 raise
             except Exception as exc:
                 self.last_error = AgentError(
                     code="OKX_PRICE_UNAVAILABLE",
-                    message="OKX price provider is unavailable.",
+                    message="Price provider is unavailable.",
                     retryable=True,
                     details={"provider": "okx"},
                 )
                 raise PriceProviderError(
-                    "OKX price provider is unavailable.", retryable=True
+                    "Price provider is unavailable.", retryable=True
                 ) from exc
             self.last_error = None
             if self.ttl_seconds:
@@ -283,7 +283,7 @@ class OkxPriceProvider:
             return self.chain_index_by_name[asset.chain.upper()]
         except KeyError as exc:
             raise PriceProviderError(
-                "Unsupported OKX chain.", code="OKX_CHAIN_UNSUPPORTED"
+                "Unsupported chain.", code="OKX_CHAIN_UNSUPPORTED"
             ) from exc
 
     def _candle_address(self, asset: Asset) -> str:
@@ -301,7 +301,7 @@ class OkxPriceProvider:
     def _rows(payload):
         rows = payload.get("data")
         if not isinstance(rows, list):
-            raise PriceProviderError("Malformed OKX price response.")
+            raise PriceProviderError("Malformed price response.")
         return rows
 
     @staticmethod
@@ -312,7 +312,7 @@ class OkxPriceProvider:
                 raise InvalidOperation
             return result
         except (InvalidOperation, TypeError, ValueError) as exc:
-            raise PriceProviderError(f"Malformed OKX {field}.") from exc
+            raise PriceProviderError(f"Malformed {field}.") from exc
 
     @classmethod
     def _optional_decimal(cls, value, field):
@@ -337,4 +337,4 @@ class OkxPriceProvider:
                 number //= 1000
             return datetime.fromtimestamp(number, tz=timezone.utc)
         except (TypeError, ValueError, OSError) as exc:
-            raise PriceProviderError("Malformed OKX timestamp.") from exc
+            raise PriceProviderError("Malformed timestamp.") from exc

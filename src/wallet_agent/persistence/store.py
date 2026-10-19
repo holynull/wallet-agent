@@ -43,6 +43,11 @@ class SwapSessionRecord(DomainModel):
     preflight: dict | None = None
     confirmation_state: dict | None = None
     gas_estimate: dict | None = None
+    #: Display-only identity of what the current operation moves (a transfer's
+    #: asset, a swap's source asset) with its icon already resolved, so the
+    #: unsigned-transaction card renders the same row from the session endpoints.
+    asset: dict | None = None
+    chain_logo_url: str | None = None
     operation_history: list[dict] = Field(default_factory=list)
     state_schema_version: int = 1
     revision: int = 0

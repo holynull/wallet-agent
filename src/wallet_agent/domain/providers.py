@@ -1,6 +1,6 @@
 """Provider and chain protocols consumed by the orchestration layer."""
 
-from typing import Protocol
+from typing import Any, Protocol
 
 from .chains import CapabilitySnapshot
 from .models import (
@@ -33,7 +33,13 @@ class SwapProvider(Protocol):
 
     async def prepare(self, quote: NormalizedQuote) -> UnsignedTransaction | DepositOrder: ...
 
-    async def register_broadcast(self, provider_reference: str, tx_hash: str) -> ProviderOrder: ...
+    async def register_broadcast(
+        self,
+        provider_reference: str,
+        tx_hash: str,
+        *,
+        quote: Any | None = None,
+    ) -> ProviderOrder: ...
 
     async def get_status(self, order: ProviderOrder) -> NormalizedOrderStatus: ...
 

@@ -251,7 +251,9 @@ class FakeSwapProvider:
             provider_reference=quote.provider_reference,
         )
 
-    async def register_broadcast(self, _provider_reference: str, _tx_hash: str) -> None:
+    async def register_broadcast(
+        self, _provider_reference: str, _tx_hash: str, **kwargs
+    ) -> None:
         self.broadcast_calls += 1
 
 
@@ -879,8 +881,15 @@ async def run_react_offline_evals() -> dict[str, Any]:
             timings = state.get("react_tool_timings") or []
             if not timings:
                 failures.append("react_tool_timings: expected at least one tool call")
-            if case["tool"] == "get_swap_quote" and state.get("selected_quote") is not None:
-                failures.append("lifecycle_boundary: quote was implicitly selected")
+            # The react graph may deterministically pick a default quote so the
+            # App renders the confirmation card straight away (design: one
+            # channel, no channel picker). What it must never do is cross into
+            # lifecycle write territory: prepare/sign/broadcast artifacts stay
+            # in the lifecycle graph behind wallet confirmation.
+            if state.get("pending_transaction") is not None:
+                failures.append("lifecycle_boundary: react graph prepared a transaction")
+            if state.get("broadcast_tx_hash"):
+                failures.append("lifecycle_boundary: react graph broadcast a transaction")
             if case["tool"] == "portfolio_snapshot":
                 payloads = [
                     item.get("result")
@@ -901,7 +910,8 @@ async def run_react_offline_evals() -> dict[str, Any]:
                 "tool_count": len((state or {}).get("react_tool_timings") or []),
                 "answer_scope": case["answer_scope"],
                 "lifecycle_boundary": case["lifecycle_boundary"]
-                and (state or {}).get("selected_quote") is None,
+                and (state or {}).get("pending_transaction") is None
+                and not (state or {}).get("broadcast_tx_hash"),
                 "latency_budget": all(
                     float(item.get("elapsed_ms") or 0) <= 1_000
                     for item in (state or {}).get("react_tool_timings") or []

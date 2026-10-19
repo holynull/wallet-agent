@@ -59,7 +59,7 @@ class FakeProvider:
             provider_reference=quote.provider_reference,
         )
 
-    async def register_broadcast(self, provider_reference, tx_hash):
+    async def register_broadcast(self, provider_reference, tx_hash, **kwargs):
         self.broadcast_calls += 1
         return ProviderOrder(
             provider="bridgers",
@@ -195,9 +195,38 @@ async def test_okx_price_enrichment_survives_session_projection_and_confirmation
     assert session.status_code == 200
     assert session.json()["status"] == "awaiting_confirmation"
     assert session.json()["quote_candidates"][0]["price_snapshots"][0]["provider"] == "okx"
+    # The quote card's chain badges survive the session projection: adding
+    # display-only fields to a candidate must not break NormalizedQuote
+    # (DomainModel forbids extra fields) and must not be dropped either.
+    projected = session.json()["quote_candidates"][0]
+    assert projected["source_chain_logo_url"].endswith("/blockchains/base/info/logo.png")
+    assert projected["destination_chain_logo_url"].endswith(
+        "/blockchains/binance/info/logo.png"
+    )
     assert session.json()["quote"]["price_snapshots"][0]["provider"] == "okx"
     assert session.json()["quote"]["usd_input_value"] == "10"
+    # Display enrichment: reference rate (price ratio when prices are known),
+    # total payment (source asset incl. fees) and ETA are on the quote and the
+    # confirmation summary so the App does not recompute them itself.
+    assert session.json()["quote"]["reference_rate"] == "1"
+    assert session.json()["quote"]["total_payment"] == "10"
+    assert session.json()["quote"]["eta"] == "约 1-2 分钟"
     assert session.json()["selected_provider_reference"] == "quote-ref"
+    # The confirmation card renders the same asset rows as the quote list.
+    summary = session.json()["confirmation_state"]["summary"]
+    assert summary["source_chain_logo_url"].endswith("/blockchains/base/info/logo.png")
+    assert summary["destination_chain_logo_url"].endswith(
+        "/blockchains/binance/info/logo.png"
+    )
+    assert summary["source_asset"]["logo_url"] is None  # USDC has no provider logo here
+    assert summary["reference_rate"] == "1"
+    assert summary["total_payment"] == "10"
+    assert summary["eta"] == "约 1-2 分钟"
+    assert summary["usd_input_value"] == "10"
+    # FakeProvider returns no fee fields, so the confirmation mirrors them as
+    # None (the App falls back gracefully) while the derived values still exist.
+    assert summary["network_fee"] is None
+    assert summary["provider_fee"] is None
     card_kinds = [
         next(iter(item["artifacts"].keys() - {"response"}))
         for item in conversation.json()["messages"]
@@ -591,6 +620,12 @@ async def test_status_turn_preserves_not_propagated_broadcast_state_without_prov
     assert response.status_code == 200
     assert complete["response"]["status"] == "not_propagated"
     assert complete["response"]["broadcast_status"] == "not_propagated"
+    # The swap-status card identifies the order, so both sides of the swap keep
+    # their icons even before the provider reports anything.
+    assert complete["response"]["chain"] == "BASE"
+    assert complete["response"]["chain_logo_url"].endswith("/blockchains/base/info/logo.png")
+    assert complete["response"]["asset"]["symbol"] == "USDC"
+    assert complete["response"]["destination_asset"]["symbol"] == "USDT"
     assert provider.broadcast_calls == 0
 
 
@@ -690,7 +725,7 @@ async def test_omnibridge_deposit_order_becomes_wallet_transaction_and_registers
                 provider_reference="order-omni",
             )
 
-        async def register_broadcast(self, provider_reference, tx_hash):
+        async def register_broadcast(self, provider_reference, tx_hash, **kwargs):
             self.registered_reference = provider_reference
             return ProviderOrder(
                 provider="omnibridge",
@@ -814,7 +849,7 @@ async def test_provider_registration_timeout_allows_same_hash_retry_without_dupl
             self.register_attempts = 0
             self.created_orders = 0
 
-        async def register_broadcast(self, provider_reference, tx_hash):
+        async def register_broadcast(self, provider_reference, tx_hash, **kwargs):
             self.register_attempts += 1
             if self.register_attempts == 1:
                 raise TimeoutError("provider timed out")

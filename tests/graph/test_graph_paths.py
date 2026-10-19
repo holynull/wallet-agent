@@ -752,7 +752,51 @@ async def test_swap_asset_resolution_does_not_treat_unknown_symbol_as_native():
 
 
 @pytest.mark.asyncio
-async def test_quote_path_preserves_all_candidates_and_price_snapshots_without_selection():
+async def test_same_name_token_candidates_carry_their_own_logos():
+    """The picker shows one row per candidate, so each row needs its own icons."""
+    provider = AssetDiscoveryProvider(
+        "catalog",
+        [
+            Asset(
+                chain="ETH",
+                symbol="USDC",
+                decimals=6,
+                address="0x" + "1" * 40,
+                logo_url="https://static.okx.com/usdc.png",
+            ),
+            Asset(
+                chain="ETH",
+                symbol="USDC",
+                decimals=18,
+                address="0x" + "2" * 40,
+            ),
+        ],
+    )
+
+    _, candidates, errors = await _resolve_swap_assets(
+        {
+            "source_chain": "ETH",
+            "source_symbol": "USDC",
+            "destination_chain": "BSC",
+            "destination_symbol": "BNB",
+            "input_amount": "1",
+        },
+        {"catalog": provider},
+    )
+
+    assert errors == []
+    by_address = {item["address"]: item for item in candidates}
+    assert set(by_address) == {"0x" + "1" * 40, "0x" + "2" * 40}
+    for item in by_address.values():
+        assert item["chain_logo_url"].endswith("/blockchains/ethereum/info/logo.png")
+    assert by_address["0x" + "1" * 40]["logo_url"] == "https://static.okx.com/usdc.png"
+    # USDC is not a native coin and this provider had no icon, so the App draws
+    # its placeholder rather than borrowing the chain logo.
+    assert by_address["0x" + "2" * 40]["logo_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_quote_path_preserves_all_candidates_and_defaults_a_quote():
     source = Asset(chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x1")
     destination = Asset(chain="BSC", chain_id=56, symbol="USDT", decimals=6, address="0x2")
     graph = build_graph(
@@ -785,7 +829,8 @@ async def test_quote_path_preserves_all_candidates_and_price_snapshots_without_s
         "bridgers",
         "omnibridge",
     ]
-    assert result["selected_quote"] is None
+    # Equal outputs tie-break on the provider reference deterministically.
+    assert result["selected_quote"]["provider"] == "omnibridge"
     assert result["response"]["kind"] == "swap_quote"
     assert result["response"]["price_snapshots"]["BASE:8453:USDC:0x1"]["usd_price"] == "1"
     assert result["response"]["price_snapshots"]["BSC:56:USDT:0x2"]["usd_price"] == "1"
@@ -1232,6 +1277,61 @@ async def test_transaction_status_node_returns_human_readable_result():
     )
     assert result["response"]["kind"] == "transaction_status"
     assert result["transaction_status_snapshot"]["status"] == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_transaction_status_node_exposes_erc20_amount_and_symbol():
+    """A confirmed ERC20 transfer must surface its moved amount up top (not the
+    0 native value) so the App status card never renders "-" or "0 ETH"."""
+    from wallet_agent.domain.models import TokenTransfer, TransactionDetail, TransactionStatus
+
+    class Explorer:
+        async def get_transaction_detail(self, chain, tx_hash):
+            return TransactionDetail(
+                chain=chain,
+                chain_id="1",
+                tx_hash=tx_hash,
+                status=TransactionStatus.CONFIRMED,
+                source="okx",
+                history_kind="full",
+                value="0",
+                symbol="ETH",
+                method_id="0xa9059cbb",
+                token_transfers=[
+                    TokenTransfer(
+                        token="0xdac17f958d2ee523a2206206994597c13d831ec7",
+                        symbol="USDT",
+                        amount="10",
+                        from_address="0x" + "1" * 40,
+                        to_address="0x" + "2" * 40,
+                    )
+                ],
+            )
+
+    graph = build_graph(
+        model=FakeModel(),
+        chains={"ETH": TransferAdapter()},
+        explorer_provider=Explorer(),
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "tx-erc20",
+            "user_id": "u1",
+            "intent": "transaction_status",
+            "transaction_query": {
+                "chain": "ETH",
+                "tx_hash": "0x" + "a" * 64,
+            },
+        },
+        config={"configurable": {"thread_id": "tx-erc20"}},
+    )
+
+    snapshot = result["transaction_status_snapshot"]
+    assert snapshot["status"] == "confirmed"
+    assert snapshot["amount"] == "10"
+    assert snapshot["symbol"] == "USDT"
+    assert snapshot["detail"]["token_transfers"][0]["amount"] == "10"
+    assert snapshot["detail"]["token_transfers"][0]["symbol"] == "USDT"
 
 
 @pytest.mark.asyncio

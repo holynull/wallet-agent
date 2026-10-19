@@ -79,3 +79,23 @@ Do not place private keys, seed phrases, signer objects, wallet clients, signed
 transactions, or provider credentials into requests, prompts, graph state,
 checkpoints, logs, demo debug output, or issue reports. Broadcast endpoints
 accept only a transaction hash plus chain.
+
+## Team and communication context
+
+- All Wallet Agent issues and requirements are discussed and resolved in the
+  Feishu/Lark group **「Wallet Agent」** (chat id `oc_ee76e70943f07579eb18057471e01d69`).
+  When Lif / Eddie raise something in that group, treat it as the issue to work
+  on here.
+- **speak** (open id `ou_df83a3169307274ec686d80ce5d54e10`) — owns production
+  deployment and operations (部署/运维) for Wallet Agent.
+- **Lif** (open id `ou_268e9b0efb8b6c6a68355cef452af2f6`) — owns the App-side
+  (client) development (App 端开发); App integration questions come from Lif.
+  The App-side (Lif) connects to the **remote test server** `catwallet-test`
+  (`ssh catwallet-test`, `/home/ubuntu/wallet-agent`, compose stack with
+  postgres/redis). Fixes must be synced there and rebuilt, not just to the
+  local Docker stack, or Lif will keep seeing old behavior.
+- **Eddie** (open id `ou_d4c04462532faecbff9b1a99b7296209`) — backend owner
+  (this repository).
+- Design source of truth: Figma `Cat Wallet v1.6.0` (`2N2sTwtjY3OznWq8m9zpmR`),
+  canvas "v1.6.9 AI 助手" (`32786:19122`). Card-by-card App integration is in
+  `docs/app-cards-integration.md`.

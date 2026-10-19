@@ -41,12 +41,47 @@ def test_payload_collapses_evm_and_lists_every_supported_chain():
     assert "Ethereum / BNB Chain" in payload["message"]
 
 
+def test_payload_merges_secondary_evm_chains_into_the_evm_group():
+    """AVAXC/ROBINHOOD/MEGAETH/CELO/ARC share the EVM address and must not end
+    up as separate groups."""
+    context = {
+        **CONTEXT,
+        "supported_networks": ["ETH", "AVAXC", "CELO", "BTC", "TRON"],
+        "wallet_accounts": [
+            {"chain": "ETH", "address": EVM},
+            {"chain": "AVAXC", "address": EVM},
+            {"chain": "CELO", "address": EVM},
+            {"chain": "BTC", "address": BTC_SEGWIT},
+            {"chain": "TRON", "address": TRON},
+        ],
+    }
+
+    payload = _receive_address_payload(context)
+
+    assert [group["group"] for group in payload["groups"]] == ["EVM", "BTC", "TRON"]
+    evm = payload["groups"][0]
+    assert set(evm["chains"]) == {"ETH", "AVAXC", "CELO"}
+    assert evm["addresses"] == [EVM]
+
+
 def test_payload_falls_back_to_the_single_connected_account():
     payload = _receive_address_payload({"chain": "TRON", "address": TRON})
 
     assert payload["address"] == TRON
     assert payload["supported_chains"] == ["TRON"]
     assert payload["groups"][0]["label"] == "TRON"
+
+
+def test_payload_exposes_a_badge_for_every_supported_chain():
+    """The card's chain chips are text today; the lookup lets the App badge them."""
+    payload = _receive_address_payload(CONTEXT)
+
+    logos = payload["chain_logo_urls"]
+    assert set(logos) == {"ETH", "BSC", "BTC", "TRON"}
+    assert logos["ETH"].endswith("/blockchains/ethereum/info/logo.png")
+    assert logos["BSC"].endswith("/blockchains/binance/info/logo.png")
+    assert logos["BTC"].endswith("/blockchains/bitcoin/info/logo.png")
+    assert logos["TRON"].endswith("/blockchains/tron/info/logo.png")
 
 
 def test_payload_reports_when_no_address_is_available():

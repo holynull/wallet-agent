@@ -1,0 +1,43 @@
+# HTTPS overlay for the local stack.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.https.yml up -d --build
+#
+# Adds a Caddy reverse proxy that terminates TLS for both the demo page and the
+# API from one origin (https://localhost:8443 by default), so the browser never
+# mixes HTTP API calls into an HTTPS page. Full instructions:
+# deploy/https/README.md.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      # The Caddyfile binds https://localhost:{$HTTPS_PORT}; keep it in sync with
+      # the host port mapping and the demo's baked-in API base URL below.
+      HTTPS_PORT: "${HTTPS_PORT:-8443}"
+    ports:
+      # Host HTTPS port; the container listens on the same port.
+      - "${HTTPS_PORT:-8443}:${HTTPS_PORT:-8443}"
+    volumes:
+      - ./deploy/https/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Persist the internal PKI so the locally-trusted root CA stays stable
+      # across restarts (export it once, trust it once on the host).
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      wallet-agent:
+        condition: service_healthy
+      demo-next:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Rebuild the demo so its baked-in API base points at the HTTPS proxy origin.
+  # The browser then reaches /v1/* and /health over HTTPS (same origin, so no
+  # mixed content and no CORS round-trip) instead of http://localhost:8000.
+  demo-next:
+    build:
+      args:
+        NEXT_PUBLIC_AGENT_API_URL: "https://localhost:${HTTPS_PORT:-8443}"
+
+volumes:
+  caddy-data:
+  caddy-config:

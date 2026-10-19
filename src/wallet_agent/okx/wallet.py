@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any
@@ -154,7 +155,7 @@ class OkxWalletAdapter:
                 if chain is None:
                     raise OkxWalletError(
                         "OKX_CHAIN_UNSUPPORTED",
-                        "OKX returned an unsupported chain.",
+                        "The provider returned an unsupported chain.",
                         details={"chain_index": chain_index},
                     )
                 entries_by_chain.append((chain_index, chain, entry))
@@ -295,7 +296,7 @@ class OkxWalletAdapter:
                 if chain is None:
                     raise OkxWalletError(
                         "OKX_CHAIN_UNSUPPORTED",
-                        "OKX returned an unsupported chain.",
+                        "The provider returned an unsupported chain.",
                         details={"chain_index": chain_index},
                     )
                 result.append(self._token_balance(entry, chain))
@@ -355,13 +356,13 @@ class OkxWalletAdapter:
         except OkxClientError as exc:
             raise OkxWalletError(
                 "OKX_PROVIDER_ERROR",
-                "OKX wallet provider is unavailable.",
+                "Wallet data provider is unavailable.",
                 retryable=exc.retryable,
             ) from exc
         except Exception as exc:
             raise OkxWalletError(
                 "OKX_PROVIDER_ERROR",
-                "OKX wallet provider is unavailable.",
+                "Wallet data provider is unavailable.",
             ) from exc
         if not isinstance(payload, dict) or str(payload.get("code")) != "0":
             raise self._malformed("provider response")
@@ -369,7 +370,7 @@ class OkxWalletAdapter:
 
     def _resolve_chain_indexes(self, chains: list[str]) -> list[str]:
         if not chains:
-            raise OkxWalletError("OKX_CHAIN_UNSUPPORTED", "At least one OKX chain is required.")
+            raise OkxWalletError("OKX_CHAIN_UNSUPPORTED", "At least one chain is required.")
         resolved: list[str] = []
         for chain in chains:
             value = str(chain)
@@ -379,7 +380,7 @@ class OkxWalletAdapter:
             if index is None:
                 raise OkxWalletError(
                     "OKX_CHAIN_UNSUPPORTED",
-                    "The requested chain is not supported by OKX.",
+                    "The requested chain is not supported.",
                     details={"chain": value},
                 )
             resolved.append(index)
@@ -409,6 +410,7 @@ class OkxWalletAdapter:
             symbol=str(symbol),
             decimals=decimals,
             address=str(address) if address else None,
+            logo_url=self._optional_logo(entry),
         )
         amount = self._decimal(entry.get("balance", entry.get("tokenAmount")), "balance")
         raw_value = entry.get(
@@ -462,7 +464,10 @@ class OkxWalletAdapter:
             return data[0]
         if isinstance(data, dict):
             return data
-        raise OkxWalletError("OKX_MALFORMED_RESPONSE", f"OKX returned malformed {label} data.")
+        raise OkxWalletError(
+            "OKX_MALFORMED_RESPONSE",
+            f"The provider returned malformed {label} data.",
+        )
 
     @staticmethod
     def _decimal(value: Any, field: str) -> Decimal:
@@ -473,7 +478,7 @@ class OkxWalletAdapter:
             return parsed
         except (InvalidOperation, TypeError, ValueError) as exc:
             raise OkxWalletError(
-                "OKX_MALFORMED_RESPONSE", f"OKX returned malformed {field} data."
+                "OKX_MALFORMED_RESPONSE", f"The provider returned malformed {field} data."
             ) from exc
 
     @staticmethod
@@ -482,8 +487,20 @@ class OkxWalletAdapter:
             return None
         text = str(value)
         if not text.isdigit():
-            raise OkxWalletError("OKX_MALFORMED_RESPONSE", "OKX returned malformed raw amount.")
+            raise OkxWalletError(
+            "OKX_MALFORMED_RESPONSE",
+            "The provider returned malformed raw amount.",
+        )
         return text
+
+    @staticmethod
+    def _optional_logo(entry: Mapping[str, Any]) -> str | None:
+        """Token icon URL from any of the spellings OKX has used for it."""
+        for key in ("logoUrl", "tokenLogoUrl", "iconUrl", "icon", "logo"):
+            value = entry.get(key)
+            if value not in (None, ""):
+                return str(value)
+        return None
 
     @staticmethod
     def _derived_raw(amount: Decimal, decimals: int) -> str:
@@ -492,7 +509,7 @@ class OkxWalletAdapter:
             scaled = amount * (Decimal(10) ** decimals)
         if scaled != scaled.to_integral_value():
             raise OkxWalletError(
-                "OKX_MALFORMED_RESPONSE", "OKX returned an imprecise token amount."
+                "OKX_MALFORMED_RESPONSE", "The provider returned an imprecise token amount."
             )
         return str(int(scaled))
 
@@ -512,11 +529,11 @@ class OkxWalletAdapter:
     @staticmethod
     def _validate_asset_type(asset_type: str) -> None:
         if str(asset_type) not in {"0", "1", "2"}:
-            raise OkxWalletError("OKX_INVALID_ARGUMENT", "Unsupported OKX asset type.")
+            raise OkxWalletError("OKX_INVALID_ARGUMENT", "Unsupported asset type.")
 
     @staticmethod
     def _malformed(label: str) -> OkxWalletError:
         return OkxWalletError(
             "OKX_MALFORMED_RESPONSE",
-            f"OKX returned malformed {label} data.",
+            f"The provider returned malformed {label} data.",
         )

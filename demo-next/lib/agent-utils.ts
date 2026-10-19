@@ -221,6 +221,11 @@ export function responseMessage(response: any): string {
       ? "Bitcoin 转账交易已准备好，请把 PSBT 导入比特币钱包签名并广播。"
       : "Bitcoin 兑换交易已准备好，请把 PSBT 导入比特币钱包签名并广播。";
   }
+  if (prepareKind && isTronSigningTransaction(response.pending_transaction || response.transaction)) {
+    return prepareKind === "transfer"
+      ? "TRON 转账交易已准备好，请在 TronLink 中签名并广播。"
+      : "TRON 兑换交易已准备好，请在 TronLink 中签名并广播。";
+  }
   const status = response.provider_status || response.confirmation_status || response.stage || (typeof response.status === "object" ? response.status?.status || response.status?.state : response.status);
   return messages[status] || messages[response.kind] || (status ? `交易状态：${status}` : "");
 }
@@ -322,6 +327,7 @@ export function clientActionLabel(type: unknown): string {
   if (type === "scan_qr") return "打开扫一扫，读取收款码";
   if (type === "open_amount_keypad") return "打开金额键盘，输入转账金额";
   if (type === "address_input") return "打开地址输入框，粘贴收款地址";
+  if (type === "select_btc_address") return "选择 BTC 出金地址";
   return "需要 App 弹出自己的界面";
 }
 
@@ -499,6 +505,13 @@ export function isBitcoinSigningTransaction(transaction: any): boolean {
   return chain === "BTC" || chain === "BITCOIN" || format === "psbt";
 }
 
+/** TRON transactions are node-built protobufs (raw_data_hex), not EVM calldata. */
+export function isTronSigningTransaction(transaction: any): boolean {
+  if (!transaction || typeof transaction !== "object") return false;
+  const chain = String(transaction.chain || "").toUpperCase();
+  return chain === "TRON" || chain === "TRX";
+}
+
 export function formatSigningDecimal(value: unknown): string {
   if (value === null || value === undefined || value === "") return "";
   const amount = Number(value);
@@ -536,6 +549,27 @@ export function bitcoinSigningFields(transaction: any): SigningField[] {
   push("订单号", display.provider_order_id);
   push("PSBT (base64)", transaction?.data, true);
   push("未签名交易 (hex)", display.unsigned_tx_hex, true);
+  return fields;
+}
+
+/** Human-readable TRON signing payload: the raw_data_hex a TronLink wallet signs. */
+export function tronSigningFields(transaction: any): SigningField[] {
+  const display = transaction?.display || {};
+  const fields: SigningField[] = [];
+  const push = (label: string, value: unknown, copy = false) => {
+    const text = value === null || value === undefined ? "" : String(value);
+    if (!text) return;
+    fields.push({ label, value: text, copy });
+  };
+  const action = String(display.action || "");
+  push("操作", action === "provider_deposit" ? "兑换（调用兑换合约）" : action === "contract_call" ? "合约调用（兑换）" : "TRON 转账");
+  push("网络", "TRON (TRX)");
+  push("目标地址", display.deposit_address || transaction?.to);
+  push("金额 (raw)", transaction?.value);
+  push("Provider", transaction?.provider);
+  push("订单号", display.provider_order_id);
+  push("调用数据 (calldata)", display.calldata, true);
+  push("未签名交易 (raw_data_hex)", transaction?.data, true);
   return fields;
 }
 

@@ -87,11 +87,13 @@ def _slot_model_input(task_kind: str, request: Mapping[str, Any]) -> list[HumanM
             "只返回合法 JSON，允许且必须仅使用这些 key：source_chain、destination_chain、"
             "source_symbol、destination_symbol、source_token_address、"
             "destination_token_address、input_amount、output_amount、amount_mode、"
-            "target_value_amount、target_value_currency、slippage_bps。"
+            "target_value_amount、target_value_currency、slippage_bps、sender_address。"
             "只提取本轮用户明确提供或明确修改的值；"
             "未提供的值返回 null，不要重复旧值。input_amount/output_amount 保留人类可读字符串。"
             "如果 request.suggestion_data 存在，它是用户点击建议明确确认的槽位输入，"
             "优先使用其中的值，仍须遵守本规则。"
+            "sender_address 只接受用户通过建议明确选定的 BTC 出金地址；"
+            "不要在对话历史中猜测钱包地址，也不要把连接钱包地址填进去。"
             "滑点使用基点整数：1% 写 100，0.5% 写 50，25 bps 写 25。"
             "不要猜测 Token 地址、精度、金额或链。"
             "中文里‘换一些 USDT’、‘兑换一点 USDT’表示目标资产是 USDT，必须写入"
@@ -133,12 +135,21 @@ def _response_model_input(
     messages: list[Any] | None = None,
 ) -> list[Any]:
     payload = json.dumps(
-        {"request": dict(request), "facts": dict(facts)}, ensure_ascii=False, default=str
+        {
+            "request": dict(request),
+            # The data source is internal plumbing: dropping ``source: okx``
+            # keeps the model from narrating a provider brand to the user.
+            "facts": _redact_service_source(facts),
+        },
+        ensure_ascii=False,
+        default=str,
     )
     instructions = (
         "你是 Wallet Agent 的用户回复生成器。根据用户本轮语言与给定 facts，生成简洁、自然的回复；"
         "用户用英文就全程英文，用户用中文就全程中文，不要中英混排。"
         "不要输出 Markdown、代码块或解释模型自身。"
+        "不要提及任何数据服务商、交易渠道或品牌名称（例如钱包数据、行情、交易记录来源），"
+        "只陈述用户关心的链、资产、数量、金额和状态。"
         "你只能复述 facts 中明确提供的余额、支持链、资产和价格，不能编造或推断事实。"
         "需要补充信息时，提出自然的问题，并可提供最多 3 个建议。"
         "每条建议必须包含 label、message、data；"
@@ -165,6 +176,28 @@ def _response_model_input(
             )
         ),
     ]
+
+
+def _redact_service_source(value: Any) -> Any:
+    """Recursively drop ``source`` facts that name a specific data provider.
+
+    ``TransactionRecord.source`` / tool payload ``source`` keep the OKX value
+    internally, but the user-facing narrator must never echo it. Other source
+    labels (e.g. ``local`` or ``chain``) are kept unchanged.
+    """
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if (
+                str(key).strip().lower() == "source"
+                and str(item or "").strip().lower() == "okx"
+            ):
+                continue
+            redacted[str(key)] = _redact_service_source(item)
+        return redacted
+    if isinstance(value, (list, tuple)):
+        return [_redact_service_source(item) for item in value]
+    return value
 
 
 def _read_model_input(request: Mapping[str, Any]) -> list[HumanMessage]:

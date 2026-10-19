@@ -47,6 +47,71 @@ async def test_native_pol_and_btc_balances_resolve_precision_without_metadata(
     assert balances[0].amount == Decimal(amount)
 
 
+@pytest.mark.asyncio
+async def test_token_balance_carries_okx_logo_url():
+    client = FakeClient(
+        {
+            "/api/v6/dex/balance/all-token-balances-by-address": {
+                "code": "0",
+                "data": [
+                    {
+                        "tokenAssets": [
+                            {
+                                "chainIndex": "8453",
+                                "symbol": "USDC",
+                                "balance": "1.5",
+                                "rawBalance": "1500000",
+                                "tokenContractAddress": "0x" + "a" * 40,
+                                "logoUrl": "https://static.okx.com/usdc.png",
+                            }
+                        ]
+                    }
+                ],
+            },
+            "/api/v6/dex/aggregator/all-tokens": {
+                "code": "0",
+                "data": [
+                    {
+                        "tokenContractAddress": "0x" + "a" * 40,
+                        "tokenSymbol": "USDC",
+                        "decimals": "6",
+                    }
+                ],
+            },
+        }
+    )
+    balances = await OkxWalletAdapter(client, {"BASE": "8453"}).get_token_balances(
+        ADDRESS, ["8453"]
+    )
+    assert balances[0].asset.logo_url == "https://static.okx.com/usdc.png"
+
+
+@pytest.mark.asyncio
+async def test_token_balance_tolerates_missing_logo():
+    client = FakeClient(
+        {
+            "/api/v6/dex/balance/all-token-balances-by-address": {
+                "code": "0",
+                "data": [
+                    {
+                        "tokenAssets": [
+                            {
+                                "chainIndex": "1",
+                                "symbol": "ETH",
+                                "balance": "0.1",
+                                "rawBalance": "100000000000000000",
+                                "tokenContractAddress": "",
+                            }
+                        ]
+                    }
+                ],
+            }
+        }
+    )
+    balances = await OkxWalletAdapter(client, {"ETH": "1"}).get_token_balances(ADDRESS, ["1"])
+    assert balances[0].asset.logo_url is None
+
+
 class FakeClient:
     def __init__(self, responses=None, error=None):
         self.responses = responses or {}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any
@@ -25,10 +26,31 @@ from .http import ProviderResponseError
 
 _RETRYABLE = {"412", "413", "415", "777"}
 _PERMANENT = {"906", "907", "908", "999", "1114", "1145"}
+# Bridgers' getToken filter spells the TRON network as ``TRX`` while catalog
+# entries report ``chain: "TRON"``. Passing ``TRON`` returns zero tokens, so a
+# TRX(TRON) swap could not resolve its token address (Lif: ETH USDT → TRX
+# 报价失败). Map the canonical network label to the API filter spelling.
+_CHAIN_FILTER_ALIASES = {"TRON": "TRX"}
 
 
 def _code(response: dict[str, Any]) -> str:
     return str(response.get("resCode", ""))
+
+
+def _member(value: Any, name: str, default: Any = None) -> Any:
+    """Read a field from either a dict or an object."""
+    if value is None:
+        return default
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _coin_code(asset: Any) -> str:
+    """Render a Bridgers ``COIN(CHAIN)`` code from an Asset (dict or object)."""
+    if asset is None:
+        return ""
+    return f"{_member(asset, 'symbol', '')}({_member(asset, 'chain', '')})"
 
 
 def _ensure_success(response: dict[str, Any], *, upload: bool = False) -> dict[str, Any]:
@@ -119,7 +141,13 @@ class BridgersProvider:
     async def list_assets(self, query: AssetQuery) -> list[Asset]:
         chain_filter = canonical_chain(query.chain) if query.chain else None
         search_filter = canonical_symbol(query.search) if query.search else None
-        payload = {"chain": chain_filter} if chain_filter else {}
+        # The API filter spelling can differ from the chain label the catalog
+        # reports (TRON → ``TRX``), so keep the two apart: ``api_chain`` is
+        # sent to Bridgers, ``chain_filter`` still matches returned entries.
+        api_chain = (
+            _CHAIN_FILTER_ALIASES.get(chain_filter, chain_filter) if chain_filter else None
+        )
+        payload = {"chain": api_chain} if api_chain else {}
 
         async def load() -> list[Asset]:
             data = _ensure_success(
@@ -422,23 +450,56 @@ class BridgersProvider:
             display=display,
         )
 
-    async def register_broadcast(self, provider_reference: str, tx_hash: str) -> ProviderOrder:
+    async def register_broadcast(
+        self,
+        provider_reference: str,
+        tx_hash: str,
+        *,
+        quote: Any | None = None,
+    ) -> ProviderOrder:
         meta = self._quotes.get(provider_reference, {})
+        payload = dict(_member(quote, "provider_payload", {}) or {})
         request = dict(meta.get("request", {}))
         if not request:
+            # The in-memory quote cache can miss (process restart, a different
+            # provider instance, a long-lived session). Bridgers rejects the
+            # minimal fallback with resCode 101 "required parameter is empty",
+            # which surfaced to App as 503 PROVIDER_REGISTRATION_FAILED. Rebuild
+            # the full request from the persisted session quote instead. The
+            # quote may arrive as a NormalizedQuote (API path) or its JSON dict
+            # (graph state path), so read fields through _member.
+            source_asset = _member(quote, "source_asset", None)
+            destination_asset = _member(quote, "destination_asset", None)
             request = {
-                "equipmentNo": meta.get("equipment_no", ""),
-                "sourceFlag": meta.get("source_flag", self.source_flag),
+                "equipmentNo": str(payload.get("equipment_no", "") or ""),
+                "sourceFlag": str(payload.get("source_flag") or self.source_flag),
+                "fromTokenAddress": str(payload.get("from_token_address", "") or ""),
+                "toTokenAddress": str(payload.get("to_token_address", "") or ""),
+                "fromTokenAmount": str(
+                    _member(quote, "input_amount_raw", "") or ""
+                ),
+                "fromTokenChain": str(_member(source_asset, "chain", "") or ""),
+                "toTokenChain": str(_member(destination_asset, "chain", "") or ""),
+                "userAddr": str(payload.get("sender_address", "") or ""),
+                "fromCoinCode": _coin_code(source_asset),
+                "toCoinCode": _coin_code(destination_asset),
             }
         request.update(
             {
                 "hash": tx_hash,
                 "fromAddress": meta.get(
-                    "from_address", meta.get("sender_address", request.get("userAddr", ""))
-                ),
-                "toAddress": meta.get("to_address", meta.get("recipient_address", "")),
-                "amountOutMin": (meta.get("tx_data", {}) or {}).get(
-                    "amountOutMin", meta.get("amount_out_min_raw", "")
+                    "from_address",
+                    meta.get("sender_address", request.get("userAddr", "")),
+                )
+                or str(payload.get("sender_address", "") or ""),
+                "toAddress": meta.get(
+                    "to_address", meta.get("recipient_address", "")
+                )
+                or str(payload.get("recipient_address", "") or ""),
+                "amountOutMin": (
+                    (meta.get("tx_data", {}) or {}).get("amountOutMin")
+                    or meta.get("amount_out_min_raw", "")
+                    or str(payload.get("amount_out_min_raw", "") or "")
                 ),
             }
         )

@@ -12,6 +12,7 @@ from wallet_agent.domain.addresses import (
     is_valid_address,
     valid_bitcoin_address,
 )
+from wallet_agent.domain.chains import chain_logo_url, token_logo_url
 from wallet_agent.domain.normalization import canonical_chain, canonical_symbol
 from wallet_agent.okx import OKX_CHAIN_INDEX_BY_NAME
 
@@ -32,7 +33,7 @@ async def query_portfolio(
         return {
             "ok": False,
             "code": "OKX_CAPABILITY_UNAVAILABLE",
-            "error": "OKX 钱包数据服务暂不可用。",
+            "error": "钱包数据服务暂不可用。",
         }
     deadline = monotonic() + timeout + 2
     indexes = {
@@ -179,7 +180,16 @@ async def query_portfolio(
                 )
                 if identity not in rows:
                     rows[identity] = {
-                        "asset": {**asset.model_dump(mode="json"), "chain": chain},
+                        "asset": {
+                            **asset.model_dump(mode="json"),
+                            "chain": chain,
+                            # Native coins have no provider logo; reuse the
+                            # chain logo so the App always has one icon field.
+                            "logo_url": token_logo_url(
+                                chain, asset.symbol, fallback=asset.logo_url
+                            ),
+                        },
+                        "chain_logo_url": chain_logo_url(chain),
                         "amount": Decimal(0),
                         "amount_raw": 0,
                         "usd_value": Decimal(0),

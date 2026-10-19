@@ -10,6 +10,7 @@ from wallet_agent.api import create_app
 from wallet_agent.api.app import _interrupt_values
 from wallet_agent.chains.execution_observer import ExecutionObserver
 from wallet_agent.chains.registry import ChainAdapterRegistry
+from wallet_agent.chains.tron import TronChainAdapter
 from wallet_agent.domain.models import (
     AllowanceRequirement,
     Asset,
@@ -63,7 +64,7 @@ class Provider:
             chain=quote.source_asset.chain, to="0x" + "4" * 40, data="0xabc", value="0"
         )
 
-    async def register_broadcast(self, provider_reference, tx_hash):
+    async def register_broadcast(self, provider_reference, tx_hash, **kwargs):
         return ProviderOrder(
             provider="bridgers",
             provider_order_id="order-1",
@@ -581,6 +582,120 @@ async def test_continue_rechecks_pending_approval_until_receipt_confirms():
 
 
 @pytest.mark.asyncio
+async def test_tron_swap_approval_gate_reaches_swap_ready_with_raw_data_hex():
+    owner = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    spender = "TFutBMkB47rYtn5EwECfnfDgDmkUP361Sy"
+    token = Asset(chain="TRON", symbol="USDT", decimals=6, address=owner)
+    requirement = AllowanceRequirement(
+        token=token,
+        owner=owner,
+        spender=spender,
+        required_amount_raw="1000000",
+        current_allowance_raw="0",
+    )
+    quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=token,
+        destination_asset=Asset(chain="ETH", symbol="USDT", decimals=6, address="0x" + "5" * 40),
+        input_amount=Decimal("1"),
+        input_amount_raw="1000000",
+        expected_output=Decimal("1"),
+        expected_output_raw="1000000",
+        provider_reference="ref-tron",
+        allowance_requirement=requirement,
+    )
+
+    class TronTransport:
+        def __init__(self):
+            self.receipt = None  # None = pending, "SUCCESS" = confirmed
+            self.allowance = "0"
+            self.posts: list[tuple[str, dict]] = []
+
+        async def get(self, path, **kwargs):
+            if path.startswith("/wallet/gettransactionbyid"):
+                return {} if self.receipt is None else {"ret": [{"contractRet": self.receipt}]}
+            if path.endswith("getchainparameters"):
+                return {"chainParameter": [{"key": "getTransactionFee", "value": 1000}]}
+            if path.startswith("/v1/accounts/"):
+                return {"data": [{"balance": 5_000_000_000}]}
+            return {}
+
+        async def post(self, path, **kwargs):
+            payload = kwargs.get("json") or {}
+            self.posts.append((path, payload))
+            if path.endswith("/triggersmartcontract"):
+                return {
+                    "result": {"result": True},
+                    "transaction": {"txID": "cc" * 32, "raw_data_hex": "0a02cafe"},
+                }
+            if path.endswith("/triggerconstantcontract"):
+                return {"constant_result": ["0" * 62 + f"{int(self.allowance):x}"]}
+            return {}
+
+    class TronProvider(Provider):
+        async def prepare(self, quote):
+            self.prepare_calls += 1
+            return UnsignedTransaction(
+                chain="TRON",
+                to=spender,
+                data="0xdeadbeef",
+                value="0x0",
+                provider="bridgers",
+                provider_reference=quote.provider_reference,
+            )
+
+    transport = TronTransport()
+    adapter = TronChainAdapter(transport)
+    provider = TronProvider()
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-tron",
+            user_id="alice",
+            thread_id="t-tron",
+            quote_candidates=[quote],
+        )
+    )
+    graph = build_graph(model=Model(), providers=[provider], chains={"TRON": adapter})
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        chain_registry=ChainAdapterRegistry({"TRON": adapter}),
+        store=store,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        confirmed = await select_and_confirm(client, "s-tron", "ref-tron")
+        assert confirmed.status_code == 200
+        assert confirmed.json()["stage"] == "approval_required"
+        approval = confirmed.json()["approval_transaction"]
+        assert approval["data"] == "0a02cafe"  # node-built protobuf approve
+        assert approval["chain"] == "TRON"
+
+        await client.post(
+            "/v1/swap/s-tron/approve-broadcast",
+            json={
+                "user_id": "alice",
+                "chain": "TRON",
+                "approve_tx_hash": "aa" * 32,
+            },
+        )
+        pending = await client.post("/v1/swap/s-tron/continue", json={"user_id": "alice"})
+        assert pending.json()["stage"] == "approval_pending"
+
+        transport.receipt = "SUCCESS"
+        transport.allowance = "1000000"
+        ready = await client.post("/v1/swap/s-tron/continue", json={"user_id": "alice"})
+
+    assert ready.status_code == 200
+    assert ready.json()["stage"] == "swap_ready"
+    assert ready.json()["pending_transaction"]["data"] == "0a02cafe"
+    assert ready.json()["pending_transaction"]["display"]["action"] == "contract_call"
+    assert provider.prepare_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_swap_transaction_includes_contextual_gas_estimate():
     class FeeAdapter(Adapter):
         def __init__(self):
@@ -785,7 +900,7 @@ async def test_broadcast_persists_deposit_metadata_after_provider_restart():
     class RestartedProvider:
         provider_name = "omnibridge"
 
-        async def register_broadcast(self, provider_reference, tx_hash):
+        async def register_broadcast(self, provider_reference, tx_hash, **kwargs):
             assert provider_reference == pending.provider_reference
             return ProviderOrder(
                 provider="omnibridge",

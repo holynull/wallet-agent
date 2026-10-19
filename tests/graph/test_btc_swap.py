@@ -268,7 +268,7 @@ class BridgersFake:
             display={"deposit_address": P2TR, "memo": self.memo},
         )
 
-    async def register_broadcast(self, provider_reference, tx_hash):
+    async def register_broadcast(self, provider_reference, tx_hash, **kwargs):
         return ProviderOrder(
             provider="bridgers",
             provider_order_id="order-btc",

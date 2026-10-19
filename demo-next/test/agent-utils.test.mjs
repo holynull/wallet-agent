@@ -81,7 +81,9 @@ import {
   DEFAULT_APP_WALLET,
   formatBalanceUsd,
   isBitcoinSigningTransaction,
+  isTronSigningTransaction,
   bitcoinSigningFields,
+  tronSigningFields,
   formatSigningDecimal,
   satsToBtc,
 } from "../lib/agent-utils.ts";
@@ -560,6 +562,43 @@ test("Bitcoin signing payload is detected by chain or PSBT format", () => {
   assert.equal(isBitcoinSigningTransaction({ chain: "ETH", display: { format: "psbt" } }), true);
   assert.equal(isBitcoinSigningTransaction({ chain: "BASE", display: { format: "calldata" } }), false);
   assert.equal(isBitcoinSigningTransaction(null), false);
+});
+
+test("TRON signing payload is detected by chain", () => {
+  assert.equal(isTronSigningTransaction({ chain: "TRON", data: "0a02cafe" }), true);
+  assert.equal(isTronSigningTransaction({ chain: "trx", data: "0a02cafe" }), true);
+  assert.equal(isTronSigningTransaction({ chain: "BASE", data: "0xabc" }), false);
+  assert.equal(isTronSigningTransaction(null), false);
+});
+
+test("tron signing fields expose the raw_data_hex an app must sign", () => {
+  const transaction = {
+    chain: "TRON",
+    to: "TFutBMkB47rYtn5EwECfnfDgDmkUP361Sy",
+    value: "0",
+    data: "0a02cafe",
+    provider: "bridgers",
+    display: {
+      action: "contract_call",
+      calldata: "0xa9059cbb00",
+      provider_order_id: "order-tron",
+    },
+  };
+  const fields = tronSigningFields(transaction);
+  const byLabel = Object.fromEntries(fields.map((field) => [field.label, field]));
+  assert.equal(byLabel["目标地址"].value, "TFutBMkB47rYtn5EwECfnfDgDmkUP361Sy");
+  assert.equal(byLabel["订单号"].value, "order-tron");
+  assert.equal(byLabel["调用数据 (calldata)"].value, "0xa9059cbb00");
+  assert.equal(byLabel["调用数据 (calldata)"].copy, true);
+  assert.equal(byLabel["未签名交易 (raw_data_hex)"].value, "0a02cafe");
+  assert.equal(byLabel["未签名交易 (raw_data_hex)"].copy, true);
+  assert.equal(byLabel["操作"].value, "合约调用（兑换）");
+});
+
+test("tron signing fields label plain transfers and omit optional values", () => {
+  const fields = tronSigningFields({ chain: "TRON", to: "TFut", value: "1500000", data: "0a02dead" });
+  assert.equal(fields.find((field) => field.label === "操作").value, "TRON 转账");
+  assert.equal(fields.some((field) => field.label === "订单号"), false);
 });
 
 test("sats convert to a trimmed BTC amount", () => {

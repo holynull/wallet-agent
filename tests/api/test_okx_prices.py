@@ -66,6 +66,39 @@ async def test_market_history_and_candle_routes_return_typed_normalized_data():
 
 
 @pytest.mark.asyncio
+async def test_price_routes_carry_the_asset_icon_and_chain_badge():
+    """Price rows are built by the price provider, so their icon must be filled
+    in here rather than left to the App."""
+    app = create_app(price_provider=PriceProvider())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        token = await client.get(
+            "/v1/prices/token", params={"chain": "BSC", "symbol": "BNB"}
+        )
+        market = await client.get(
+            "/v1/prices/market", params={"chain": "BSC", "symbol": "BNB"}
+        )
+        history = await client.get(
+            "/v1/prices/history", params={"chain": "BSC", "symbol": "BNB", "period": "1h"}
+        )
+
+    bnb_logo = (
+        "https://raw.githubusercontent.com/trustwallet/assets/master"
+        "/blockchains/binance/info/logo.png"
+    )
+    price_row = token.json()["prices"][0]
+    assert price_row["chain_logo_url"] == bnb_logo
+    # BNB is the native coin, so its icon is the chain logo.
+    assert price_row["asset"]["logo_url"] == bnb_logo
+    assert market.json()["asset"]["logo_url"] == bnb_logo
+    assert market.json()["details"][0]["chain_logo_url"] == bnb_logo
+    # A history page has no asset of its own: the resolved identity rides beside it.
+    assert history.json()["asset"]["symbol"] == "BNB"
+    assert history.json()["chain_logo_url"] == bnb_logo
+
+
+@pytest.mark.asyncio
 async def test_price_routes_validate_provider_limits_and_disabled_mode():
     app = create_app()
     async with httpx.AsyncClient(

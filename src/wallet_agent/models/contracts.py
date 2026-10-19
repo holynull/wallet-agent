@@ -1,5 +1,6 @@
 """Narrow structured-output contracts for wallet request understanding."""
 
+import re
 from collections.abc import Mapping
 from typing import Any, Literal
 
@@ -36,9 +37,61 @@ ReadToolName = Literal[
     "portfolio_snapshot",
 ]
 
+_JSON_MODE_TYPES = {"json_object", "response"}
+_CJK = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _strip_json_mode_envelope(value: Any) -> Any:
+    """Unwrap DeepSeek json-mode envelopes that wrap the real structured output.
+
+    DeepSeek (with thinking enabled) sometimes returns ``{type: "json_object",
+    message|content: <actual JSON>}`` instead of the schema JSON directly. The
+    actual draft may be merged at the top level (``message`` as the reply text
+    plus ``suggestions``), or nested under ``content``/``data``/``result``.
+    Clean dicts are returned untouched.
+    """
+    if not isinstance(value, Mapping):
+        return value
+    data = dict(value)
+    if str(data.get("type") or "") not in _JSON_MODE_TYPES:
+        return data
+    data.pop("type", None)
+    nested = None
+    for key in ("content", "data", "result"):
+        if isinstance(data.get(key), Mapping):
+            nested = data.pop(key)
+            break
+    if nested is not None:
+        draft = dict(nested)
+        if "message" not in draft and isinstance(draft.get("reply"), str):
+            draft["message"] = draft.pop("reply")
+        # Preserve any sibling top-level keys (e.g. a language hint) while the
+        # nested draft's own fields win.
+        for key, value in data.items():
+            draft.setdefault(key, value)
+        return draft
+    for key in ("content", "reply"):
+        if isinstance(data.get(key), str):
+            data["message"] = data[key]
+            data.pop(key, None)
+            break
+    return data
+
 
 class UnderstandingModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def strip_json_mode_marker(cls, value: Any) -> Any:
+        data = _strip_json_mode_envelope(value)
+        if not isinstance(data, Mapping) or "language" not in cls.model_fields:
+            return data
+        if not str(data.get("language") or "").strip():
+            message = str(data.get("message") or "")
+            data = dict(data)
+            data["language"] = "zh" if _CJK.search(message) else "en"
+        return data
 
 
 class ResponseSuggestion(UnderstandingModel):

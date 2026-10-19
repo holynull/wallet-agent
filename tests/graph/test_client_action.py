@@ -90,3 +90,89 @@ async def test_unknown_client_action_is_rejected_without_telling_the_app_to_act(
     assert '"ok": false' in tool_messages[0].content
     assert "CLIENT_ACTION_UNSUPPORTED" in tool_messages[0].content
     assert "open_contacts" in tool_messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_amount_keypad_turn_does_not_project_a_portfolio_card():
+    """A transfer amount step (open_amount_keypad) must not also render an
+    asset-overview card from the same round's wallet_balance observation."""
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+    from wallet_agent.graph.build import build_graph
+
+    class KeypadWalletProvider:
+        chain_index_by_name = {"BSC": "56"}
+
+        async def get_token_balances(self, address, indexes):
+            assert indexes == ["56"]
+            return [
+                TokenBalance(
+                    asset=Asset(chain="BSC", chain_id=56, symbol="USDT", decimals=18),
+                    amount=Decimal("11.72"),
+                    amount_raw="11720000000000000000",
+                    usd_value=Decimal("11.72"),
+                )
+            ]
+
+    class KeypadWithBalanceModel:
+        async def invoke_react(self, messages, tools):
+            tool_messages = [
+                item for item in messages if isinstance(item, ToolMessage)
+            ]
+            if not tool_messages:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "wb-1",
+                            "name": "wallet_balance",
+                            "args": {"chain": "BSC", "symbol": "USDT"},
+                        },
+                        {
+                            "id": "ca-1",
+                            "name": "request_client_action",
+                            "args": {
+                                "action": "open_amount_keypad",
+                                "chain": "BSC",
+                                "symbol": "USDT",
+                                "reason": "输入 BSC 网络 USDT 的转账金额",
+                            },
+                        },
+                    ],
+                )
+            return AIMessage(content="你 BSC 上的 USDT 余额约 11.72，请输入要转账的金额。")
+
+    graph = build_graph(
+        model=KeypadWithBalanceModel(),
+        wallet_provider=KeypadWalletProvider(),
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {
+                "message": "转 USDT",
+                "address": EVM,
+                "chain": "BSC",
+                "metadata": {
+                    "suggestion_data": {"intent": "transfer", "chain": "BSC", "symbol": "USDT"}
+                },
+            },
+            "wallet_context": {
+                "address": EVM,
+                "chain": "BSC",
+                "wallet_accounts": [{"chain": "BSC", "address": EVM}],
+            },
+            "conversation_history": [],
+        },
+        config={"configurable": {"thread_id": "client-action-keypad-portfolio"}},
+    )
+
+    response = result["response"]
+    assert response["kind"] == "react"
+    assert response["client_action"]["type"] == "open_amount_keypad"
+    assert response["client_action"]["slots"]["chain"] == "BSC"
+    assert response["client_action"]["slots"]["symbol"] == "USDT"
+    # The same round's wallet_balance observation stays in react_results for
+    # the audit trail but is never elevated to a top-level portfolio card.
+    assert "portfolio" not in response
+    assert "wallet_balance" in [item["tool"] for item in response["react_results"]]

@@ -147,7 +147,11 @@ async def test_session_is_projected_before_the_terminal_stream_frame():
             await client.get(f"/v1/swap/{session_id}", params={"user_id": USER})
         ).json()
 
-    assert terminal == "complete"
+    # A swap turn with every required field defaults to one channel and
+    # auto-continues into the confirmation interrupt, so the run ends at
+    # ``action_required`` — but the session index carrying the quotes must
+    # still be projected before that terminal SSE frame.
+    assert terminal == "action_required"
     kinds = [item[0] for item in order]
     terminal_index = kinds.index("terminal_frame")
     projection_index = kinds.index("session_projection")
@@ -156,5 +160,6 @@ async def test_session_is_projected_before_the_terminal_stream_frame():
     )
     assert projection_index < terminal_index
     assert projected[1] == 2
-    assert session["stage"] == "selecting_quote"
+    assert session["stage"] == "awaiting_confirmation"
+    assert session["selected_provider_reference"] == "bridgers-ref"
     assert len(session["quote_candidates"]) == 2

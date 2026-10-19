@@ -2,11 +2,13 @@ import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from wallet_agent.models import (
+    AgentResponseDraft,
     ModelRegistry,
     ModelRouter,
     PriceSlotPatch,
     RouteDecision,
     SwapSlotPatch,
+    TransactionStatusSlotPatch,
     TransferSlotPatch,
 )
 
@@ -49,6 +51,67 @@ def test_route_decision_accepts_deepseek_json_object_marker():
 
     assert decision.intent == "wallet_query"
     assert decision.model_dump() == {"intent": "wallet_query"}
+
+
+def test_response_draft_accepts_merged_json_object_envelope():
+    """DeepSeek sometimes merges the draft into {type, message, suggestions}."""
+    draft = AgentResponseDraft.model_validate(
+        {
+            "type": "json_object",
+            "message": "这笔交易已确认：转出 10 USDT。",
+            "suggestions": [
+                {
+                    "label": "查看详情",
+                    "message": "查看详情",
+                    "data": {"intent": "transaction_status"},
+                }
+            ],
+        }
+    )
+
+    assert draft.language == "zh"
+    assert draft.message == "这笔交易已确认：转出 10 USDT。"
+    assert draft.suggestions[0].label == "查看详情"
+
+
+def test_response_draft_accepts_nested_content_envelope_and_preserves_language():
+    draft = AgentResponseDraft.model_validate(
+        {
+            "type": "json_object",
+            "content": {
+                "reply": "你的钱包在 ETH 链上余额为 1.5 ETH。",
+                "suggestions": [
+                    {"label": "查看价格", "message": "查看价格", "data": {"chain": "ETH"}}
+                ],
+            },
+        }
+    )
+
+    assert draft.language == "zh"
+    assert draft.message == "你的钱包在 ETH 链上余额为 1.5 ETH。"
+    assert draft.suggestions[0].label == "查看价格"
+
+
+def test_response_draft_accepts_plain_content_string_and_defaults_language():
+    draft = AgentResponseDraft.model_validate(
+        {"type": "response", "content": "交易已提交，正在等待确认。"}
+    )
+    assert draft.language == "zh"
+    assert draft.message == "交易已提交，正在等待确认。"
+
+    english = AgentResponseDraft.model_validate(
+        {"type": "json_object", "content": "Your transaction is confirmed."}
+    )
+    assert english.language == "en"
+    assert english.message == "Your transaction is confirmed."
+
+
+def test_slot_patches_strip_json_object_marker():
+    patch = TransactionStatusSlotPatch.model_validate(
+        {"type": "json_object", "transaction_chain": "ETH", "transaction_hash": "0x" + "a" * 64}
+    )
+    assert patch.transaction_chain == "ETH"
+    assert patch.transaction_hash == "0x" + "a" * 64
 
 
 @pytest.mark.asyncio

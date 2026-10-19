@@ -82,6 +82,12 @@ def _coin_code(asset: Asset) -> str:
         # label (BTC, ETH, AVAX); wrapped and bridged natives carry the
         # ``SYMBOL(NETWORK)`` spelling (BNB(BSC), ETH(BASE)). Deriving
         # ``BTC(BTC)`` instead of ``BTC`` is rejected with resCode 913.
+        # Omni labels the TRON network as ``TRX`` (coinCode ``TRX``,
+        # coinCodeShow ``TRX(TRON)``), so TRX must be sent bare too; deriving
+        # ``TRX(TRON)`` is rejected as “接收货币币种不存在” (Lif: ETH USDT →
+        # TRX 报价失败).
+        if canonical_chain(asset.chain) == "TRON" and canonical_symbol(symbol) == "TRX":
+            return "TRX"
         if canonical_chain(asset.chain) == canonical_symbol(symbol):
             return symbol
         return symbol.split("(", 1)[0] if asset.chain == "ETH" else f"{symbol}({asset.chain})"
@@ -211,6 +217,32 @@ class OmniBridgeProvider:
         if not isinstance(data, dict):
             raise ProviderResponseError("800", "Malformed quote data", category="client")
         self.minimum_source_amount = str(data.get("depositMin", "0"))
+        # Reject out-of-bounds deposit amounts here, at quote time, instead of
+        # letting the user approve a quote that prepare() later rejects
+        # (App-side report: 0.003 ETH under Omni's 0.003302 minimum surfaced as
+        # PROVIDER_PREPARE_FAILED on /confirm). The App then sees a clear
+        # "amount too small/large" error on the quote card instead of a failed
+        # confirmation with no pending transaction.
+        try:
+            minimum = Decimal(str(data.get("depositMin", "0")))
+            maximum = Decimal(str(data.get("depositMax", "Infinity")))
+        except (InvalidOperation, ValueError, TypeError):
+            minimum, maximum = Decimal("0"), Decimal("Infinity")
+        if request.input_amount < minimum:
+            raise ProviderResponseError(
+                "BELOW_MIN_DEPOSIT",
+                (
+                    f"低于该渠道最低兑换金额（至少 {_decimal_text(minimum)} "
+                    f"{request.source_asset.symbol}），请增加金额后重试。"
+                ),
+                category="client",
+            )
+        if request.input_amount > maximum:
+            raise ProviderResponseError(
+                "ABOVE_MAX_DEPOSIT",
+                "超过该渠道单笔最高兑换金额，请减少金额或分笔兑换。",
+                category="client",
+            )
         try:
             rate = Decimal(str(data.get("instantRate", "0")))
             fee_rate = Decimal(str(data.get("depositCoinFeeRate", "0")))

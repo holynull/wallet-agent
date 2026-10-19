@@ -10,7 +10,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from time import perf_counter
 from typing import Annotated, Any
 
@@ -29,7 +29,13 @@ from langgraph.types import interrupt
 
 from wallet_agent.chains._common import receipt_success
 from wallet_agent.domain.addresses import EVM_ALIASES, is_valid_address
-from wallet_agent.domain.chains import native_decimals
+from wallet_agent.domain.chains import (
+    asset_logo_fields,
+    chain_logo_url,
+    native_decimals,
+    native_symbol,
+    token_logo_url,
+)
 from wallet_agent.domain.models import (
     AgentError,
     ApprovalTransaction,
@@ -93,9 +99,29 @@ _RESPONSE_DATA_KEYS = {
         "target_value_amount",
         "target_value_currency",
         "slippage_bps",
+        # The App returns the chosen BTC 出金地址 here when the user taps one
+        # of the addresses in the select_btc_address surface.
+        "sender_address",
+        # The App may pin a swap channel (provider) here, e.g. "bridgers",
+        # so the backend quotes and prepares through only that provider.
+        "provider",
     },
     "transfer": {"intent", "chain", "symbol", "token_address", "decimals", "amount", "recipient"},
 }
+
+
+def _looks_like_asset_symbol(value: Any) -> bool:
+    """A plausible ticker: an uppercase letter followed by letters/digits.
+
+    Guards against a stray numeric token (e.g. a "0" the user mistyped as an
+    amount) being carried into a suggestion's ``symbol`` slot — the amount card
+    would otherwise render the coin as "0". Rejects pure digits, empty values
+    and over-long noise; accepts ETH/USDT/TRX-style symbols.
+    """
+    text = str(value or "").strip().upper()
+    if not text or len(text) > 12:
+        return False
+    return re.fullmatch(r"[A-Z][A-Z0-9]*", text) is not None
 
 
 def _normalize_price_asset(
@@ -400,6 +426,13 @@ def _sanitize_response_suggestions(
         if clean.get("intent") not in (None, clean_intent):
             continue
         clean["intent"] = clean_intent
+        if clean.get("symbol") is not None and not _looks_like_asset_symbol(
+            clean["symbol"]
+        ):
+            # A "symbol" that is pure digits (a mistyped amount) must never
+            # reach the coin/amount card. Drop the suggestion instead of
+            # rendering a "0" coin (App-side report).
+            continue
         invalid = False
         for key in ("source_chain", "destination_chain", "chain"):
             if (
@@ -698,6 +731,11 @@ def _is_utxo_adapter(adapter: Any) -> bool:
     return getattr(adapter, "transaction_model", None) == "utxo"
 
 
+def _is_account_adapter(adapter: Any) -> bool:
+    """Account-model chains (TRON, Solana) sign node-built protobuf transactions."""
+    return getattr(adapter, "transaction_model", None) == "account"
+
+
 def _utxo_deposit_order(quote: Any, prepared: Any) -> DepositOrder | None:
     """Reinterpret an EVM-shaped provider payload as a UTXO deposit transfer.
 
@@ -738,6 +776,55 @@ def _utxo_deposit_order(quote: Any, prepared: Any) -> DepositOrder | None:
     )
 
 
+async def _account_contract_swap(
+    prepared: Any, *, adapter: Any, sender: str
+) -> Any:
+    """Rebuild a provider's EVM-shaped calldata as an account-model transaction.
+
+    Bridgers returns TRON swap payloads in EVM shape (``{to, data, value}``), but
+    account-model wallets (TronLink) sign the node-built protobuf
+    (``raw_data_hex``). Rebuild the calldata through the adapter's contract-call
+    builder so the App receives a signable transaction; already chain-ready
+    payloads (a deposit order handled above, or a transaction the adapter built
+    itself) pass through unchanged.
+    """
+    if not isinstance(prepared, UnsignedTransaction):
+        return prepared
+    display = dict(getattr(prepared, "display", {}) or {})
+    if display.get("action") in {"contract_call", "native_transfer", "provider_deposit"}:
+        return prepared
+    calldata = str(getattr(prepared, "data", "") or "")
+    if not calldata:
+        return prepared
+    builder = getattr(adapter, "build_smart_contract_call", None)
+    if builder is None or not sender:
+        return prepared
+    transaction = await _resolve(
+        builder(
+            from_address=sender,
+            contract_address=prepared.to,
+            calldata=calldata,
+            value_raw=str(getattr(prepared, "value", "0") or "0"),
+        )
+    )
+    if not isinstance(transaction, UnsignedTransaction):
+        return prepared
+    merged = {
+        **dict(getattr(transaction, "display", {}) or {}),
+        **display,
+        "provider": prepared.provider or display.get("provider") or "",
+        "provider_order_id": prepared.provider_reference or "",
+    }
+    return transaction.model_copy(
+        update={
+            "provider": prepared.provider,
+            "provider_reference": prepared.provider_reference,
+            "expires_at": prepared.expires_at,
+            "display": merged,
+        }
+    )
+
+
 async def _resolve_swap_transaction(
     prepared: Any,
     *,
@@ -749,9 +836,11 @@ async def _resolve_swap_transaction(
 ) -> Any:
     """Normalize a provider's prepared output into a source-chain transaction.
 
-    EVM and account-model chains sign the provider's calldata directly. UTXO
-    chains (Bitcoin) cannot, so a provider deposit payload is rebuilt as a
-    native transfer paying the deposit address.
+    EVM chains sign the provider's calldata directly. UTXO chains (Bitcoin)
+    cannot, so a provider deposit payload is rebuilt as a native transfer paying
+    the deposit address. Account-model chains (TRON, Solana) cannot sign raw EVM
+    calldata either, so a provider's EVM-shaped swap payload is rebuilt through
+    the adapter's contract-call builder into the node-built protobuf.
     """
     if _is_utxo_adapter(adapter):
         sources = _utxo_source_addresses(wallet_context, chain, sender)
@@ -773,6 +862,8 @@ async def _resolve_swap_transaction(
         if adapter is None:
             raise ValueError(f"Chain adapter unavailable for {chain} deposit")
         return await _deposit_order_to_transaction(prepared, adapter=adapter, sender=sender)
+    if _is_account_adapter(adapter):
+        return await _account_contract_swap(prepared, adapter=adapter, sender=sender)
     return prepared
 
 
@@ -903,6 +994,44 @@ def _best_react_quote_result(
     return candidates[-1] if candidates else None
 
 
+def _default_quote(
+    quotes: list[Mapping[str, Any]], request: Mapping[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """Deterministically default one quote so the App skips the channel picker.
+
+    Once coin/amount/chain are complete, the design renders the confirmation
+    card straight away with a default channel instead of asking the user to
+    compare providers. For an exact-in swap pick the highest expected output;
+    for an exact-out swap pick the lowest input amount. Ties break on the
+    provider reference so the default is stable across retries.
+    """
+    usable = [dict(item) for item in quotes if _quote_is_usable(item)]
+    if not usable:
+        return None
+    exact_out = False
+    if isinstance(request, Mapping):
+        exact_out = (
+            str(request.get("amount_mode") or "") == "exact_out"
+            or (
+                request.get("output_amount") not in (None, "")
+                and not request.get("input_amount")
+            )
+        )
+
+    def amount(quote: Mapping[str, Any], field: str) -> Decimal:
+        try:
+            return Decimal(str(quote.get(field) or "0"))
+        except (ArithmeticError, TypeError, ValueError):
+            return Decimal(0)
+
+    field = "input_amount" if exact_out else "expected_output"
+
+    def sort_key(quote: Mapping[str, Any]) -> tuple[Decimal, str]:
+        return amount(quote, field), str(quote.get("provider_reference") or "")
+
+    return (min if exact_out else max)(usable, key=sort_key)
+
+
 def _valid_react_quotes(messages: list[Any]) -> list[dict[str, Any]]:
     """Extract valid quote observations from the current ReAct transcript."""
     result: list[dict[str, Any]] = []
@@ -921,6 +1050,773 @@ def _valid_react_quotes(messages: list[Any]) -> list[dict[str, Any]]:
             if isinstance(item, Mapping) and _quote_is_usable(item)
         )
     return result
+
+
+_SWAP_STABLECOIN_SYMBOLS = ("USDT", "USDC")
+_SWAP_PAIR_LIMIT = 3
+_SWAP_DEFAULT_PAIRS = (
+    ({"chain": "ETH", "symbol": "ETH"}, {"chain": "ETH", "symbol": "USDT"}),
+    ({"chain": "ETH", "symbol": "USDC"}, {"chain": "ETH", "symbol": "ETH"}),
+)
+_COMMON_ASSET_SYMBOLS = {
+    "BTC", "ETH", "BNB", "TRX", "SOL", "USDT", "USDC", "DAI", "LTC", "DOGE",
+    "XRP", "ADA", "AVAX", "MATIC", "POL", "ARB", "OP", "TON", "BUSD", "FDUSD",
+    "WBTC", "WETH", "SHIB", "PEPE", "DOT", "LINK", "UNI", "AAVE", "SUI", "APT",
+}
+
+
+def _swap_row_usd(row: Mapping[str, Any]) -> Decimal:
+    try:
+        return Decimal(str(row.get("usd_value") or "0"))
+    except (ArithmeticError, TypeError, ValueError):
+        return Decimal(0)
+
+
+def _swap_row_positive(row: Mapping[str, Any]) -> bool:
+    """A row counts as a holding when its amount (or USD value) is non-zero."""
+    amount = row.get("amount")
+    if amount is not None:
+        try:
+            if Decimal(str(amount)) > 0:
+                return True
+        except (ArithmeticError, TypeError, ValueError):
+            pass
+    return _swap_row_usd(row) > 0
+
+
+def _swap_asset_descriptor(
+    chain: str | None, symbol: str | None, row: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """A chip's source/destination descriptor: chain+symbol plus known metadata.
+
+    Only real balance rows carry address/decimals/logo; a synthesized side (the
+    stablecoin leg of a recommended pair) keeps chain+symbol and lets
+    ``get_swap_quote`` resolve the contract, so we never invent an address.
+    """
+    canonical_chain_name = canonical_chain(str(chain or ""))
+    canonical_symbol_name = canonical_symbol(str(symbol or ""))
+    asset = row.get("asset") if isinstance(row, Mapping) else None
+    if isinstance(asset, Mapping):
+        resolved_chain = canonical_chain_name or canonical_chain(str(asset.get("chain") or ""))
+        resolved_symbol = canonical_symbol_name or canonical_symbol(
+            str(asset.get("symbol") or "")
+        )
+        descriptor = {"chain": resolved_chain, "symbol": resolved_symbol}
+        if asset.get("address"):
+            descriptor["address"] = str(asset["address"])
+        if asset.get("decimals") is not None:
+            descriptor["decimals"] = int(asset["decimals"])
+        descriptor.update(
+            asset_logo_fields(resolved_chain, resolved_symbol, asset.get("logo_url"))
+        )
+        return descriptor
+    descriptor = {"chain": canonical_chain_name, "symbol": canonical_symbol_name}
+    descriptor.update(asset_logo_fields(canonical_chain_name, canonical_symbol_name))
+    return descriptor
+
+
+def _swap_balance_rows(
+    wallet_context: Mapping[str, Any],
+    tool_payloads: list[tuple[str, dict[str, Any]]] | None,
+    read_facts: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Non-zero balance rows usable for swap-pair recommendations.
+
+    Sources in order of freshness: this turn's balance observations, the cached
+    read-only snapshot, then the App-provided wallet balances.
+    """
+    rows: list[dict[str, Any]] = []
+    for name, payload in tool_payloads or []:
+        if name not in ("portfolio_snapshot", "wallet_balance") or not payload.get("ok"):
+            continue
+        portfolio = payload.get("portfolio")
+        if isinstance(portfolio, Mapping):
+            rows.extend(portfolio.get("assets") or [])
+    if not rows and isinstance(read_facts, Mapping):
+        snapshot = read_facts.get("portfolio_snapshot")
+        if isinstance(snapshot, Mapping) and snapshot.get("ok"):
+            portfolio = snapshot.get("portfolio")
+            if isinstance(portfolio, Mapping):
+                rows.extend(portfolio.get("assets") or [])
+    if not rows:
+        token_balances = wallet_context.get("token_balances")
+        if isinstance(token_balances, list):
+            rows.extend(token_balances)
+        native_balance = wallet_context.get("native_balance")
+        if isinstance(native_balance, Mapping):
+            rows.append(native_balance)
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, Mapping):
+            continue
+        asset = item.get("asset")
+        if not isinstance(asset, Mapping):
+            continue
+        chain = canonical_chain(str(asset.get("chain") or ""))
+        symbol = canonical_symbol(str(asset.get("symbol") or ""))
+        address = str(asset.get("address") or "").lower()
+        if not chain or not symbol:
+            continue
+        key = (chain, symbol, address)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _swap_recommended_pairs(
+    rows: list[Mapping[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Recommend swap pairs from the user's non-zero balances.
+
+    Sells each top non-stable holding for a stablecoin on the same chain and,
+    when the user holds a stablecoin, offers buying the top holding back with
+    it. Returns ``(source, destination)`` descriptors.
+    """
+    holdings = [
+        item
+        for item in rows
+        if canonical_symbol(str((item.get("asset") or {}).get("symbol") or ""))
+        not in _SWAP_STABLECOIN_SYMBOLS
+        and _swap_row_positive(item)
+    ]
+    stables = [
+        item
+        for item in rows
+        if canonical_symbol(str((item.get("asset") or {}).get("symbol") or ""))
+        in _SWAP_STABLECOIN_SYMBOLS
+        and _swap_row_positive(item)
+    ]
+    holdings.sort(key=_swap_row_usd, reverse=True)
+    stables.sort(key=_swap_row_usd, reverse=True)
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    def add(source: dict[str, Any], destination: dict[str, Any]) -> None:
+        key = (
+            source.get("chain") or "",
+            source.get("symbol") or "",
+            destination.get("chain") or "",
+            destination.get("symbol") or "",
+        )
+        if key in seen or len(pairs) >= _SWAP_PAIR_LIMIT:
+            return
+        seen.add(key)
+        pairs.append((source, destination))
+
+    for holding in holdings:
+        if len(pairs) >= _SWAP_PAIR_LIMIT:
+            break
+        asset = holding.get("asset") or {}
+        chain = canonical_chain(str(asset.get("chain") or ""))
+        symbol = canonical_symbol(str(asset.get("symbol") or ""))
+        stable_row = next(
+            (
+                item
+                for item in stables
+                if canonical_chain(str((item.get("asset") or {}).get("chain") or "")) == chain
+            ),
+            None,
+        )
+        stable_symbol = (
+            canonical_symbol(str((stable_row.get("asset") or {}).get("symbol") or ""))
+            if stable_row
+            else "USDT"
+        )
+        add(
+            _swap_asset_descriptor(chain, symbol, holding),
+            (
+                _swap_asset_descriptor(chain, stable_symbol, stable_row)
+                if stable_row
+                else _swap_asset_descriptor(chain, stable_symbol, None)
+            ),
+        )
+    for stable in stables:
+        if len(pairs) >= _SWAP_PAIR_LIMIT:
+            break
+        asset = stable.get("asset") or {}
+        chain = canonical_chain(str(asset.get("chain") or ""))
+        stable_symbol = canonical_symbol(str(asset.get("symbol") or ""))
+        holding = next(
+            (
+                item
+                for item in holdings
+                if canonical_chain(str((item.get("asset") or {}).get("chain") or "")) == chain
+            ),
+            None,
+        )
+        if holding is None:
+            holding = holdings[0] if holdings else None
+        if holding is None:
+            break
+        holding_asset = holding.get("asset") or {}
+        add(
+            _swap_asset_descriptor(chain, stable_symbol, stable),
+            _swap_asset_descriptor(
+                canonical_chain(str(holding_asset.get("chain") or "")),
+                canonical_symbol(str(holding_asset.get("symbol") or "")),
+                holding,
+            ),
+        )
+    return pairs
+
+
+def _swap_pair_label(source: Mapping[str, Any], destination: Mapping[str, Any]) -> str:
+    source_chain = str(source.get("chain") or "")
+    source_symbol = str(source.get("symbol") or "")
+    destination_chain = str(destination.get("chain") or "")
+    destination_symbol = str(destination.get("symbol") or "")
+    if source_chain and source_chain == destination_chain:
+        return f"{source_symbol} → {destination_symbol}"
+    return f"{source_chain} {source_symbol} → {destination_chain} {destination_symbol}"
+
+
+def _swap_pair_message(
+    source: Mapping[str, Any], destination: Mapping[str, Any], language: str | None
+) -> str:
+    source_chain = str(source.get("chain") or "")
+    source_symbol = str(source.get("symbol") or "")
+    destination_chain = str(destination.get("chain") or "")
+    destination_symbol = str(destination.get("symbol") or "")
+    if source_chain and source_chain == destination_chain:
+        from_text, to_text = source_symbol, destination_symbol
+    else:
+        from_text = f"{source_chain} {source_symbol}"
+        to_text = f"{destination_chain} {destination_symbol}"
+    if language == "en":
+        return f"Swap {from_text} to {to_text}"
+    return f"把 {from_text} 换成 {to_text}"
+
+
+def _swap_pair_chip(
+    source: Mapping[str, Any], destination: Mapping[str, Any], language: str | None
+) -> dict[str, Any]:
+    return {
+        "type": "swap_pair",
+        "label": _swap_pair_label(source, destination),
+        "message": _swap_pair_message(source, destination, language),
+        "value": (
+            f"{source.get('chain') or ''}:{source.get('symbol') or ''}"
+            f"→{destination.get('chain') or ''}:{destination.get('symbol') or ''}"
+        ),
+        "data": {
+            "intent": "swap",
+            "source": dict(source),
+            "destination": dict(destination),
+        },
+    }
+
+
+def _swap_entry_chip(kind: str, language: str | None) -> dict[str, Any]:
+    """The swap card's entry chips: pick another pair or go cross-chain."""
+    if kind == "cross_chain":
+        return {
+            "type": "action",
+            "label": "跨链换" if language != "en" else "Cross-chain swap",
+            "message": "我想跨链兑换。" if language != "en" else "I want a cross-chain swap.",
+            "value": "swap_cross_chain",
+            "data": {"intent": "swap"},
+        }
+    return {
+        "type": "action",
+        "label": "其他币对" if language != "en" else "Other pairs",
+        "message": "我来选择其他币对。" if language != "en" else "I'll pick another pair.",
+        "value": "swap_custom",
+        "data": {"intent": "swap"},
+    }
+
+
+def _swap_context_has_accounts(wallet_context: Mapping[str, Any]) -> bool:
+    context = wallet_context or {}
+    return bool(context.get("wallet_accounts") or context.get("address"))
+
+
+def _swap_recommendation_desired(
+    message: str, rows: list[Mapping[str, Any]]
+) -> bool:
+    """The swap-intent card only fires for an open-ended swap request.
+
+    A question about swap (fees, supported pairs, slippage) or a message that
+    already names a full pair should not be answered with a recommendation
+    card; the model keeps driving those.
+    """
+    text = "".join(str(message or "").lower().split())
+    if not text:
+        return False
+    if any(
+        marker in text
+        for marker in (
+            "?", "？", "多少", "哪些", "怎么", "如何", "吗", "支持",
+            "费率", "手续费", "滑点", "是什么",
+        )
+    ):
+        return False
+    symbols = set(_COMMON_ASSET_SYMBOLS)
+    for item in rows:
+        asset = item.get("asset") if isinstance(item, Mapping) else None
+        if isinstance(asset, Mapping):
+            symbol = canonical_symbol(str(asset.get("symbol") or "")).upper()
+            if symbol:
+                symbols.add(symbol)
+    upper = text.upper()
+    found = {symbol for symbol in symbols if symbol in upper}
+    return len(found) < 2
+
+
+async def _react_swap_pair_suggestions(
+    *,
+    wallet_provider: Any,
+    wallet_context: Mapping[str, Any],
+    tool_payloads: list[tuple[str, dict[str, Any]]] | None = None,
+    read_facts: Mapping[str, Any] | None = None,
+    language: str | None = "zh",
+    timeout: float = 4,
+) -> list[dict[str, Any]]:
+    """Figma swap-intent card: recommend pairs from the user's balance.
+
+    Reads the freshest balance source available (this turn, cached read facts,
+    App-provided balances, then a bounded live portfolio read) and returns the
+    swap-pair chips plus the ``其他币对`` / ``跨链换`` entries. The live read is
+    best-effort: any failure falls back to the default pairs.
+    """
+    rows = _swap_balance_rows(wallet_context, tool_payloads, read_facts)
+    if not rows and wallet_provider is not None and _swap_context_has_accounts(wallet_context):
+        try:
+            observation = await query_portfolio(
+                wallet_provider,
+                dict(wallet_context),
+                {"chain": "ALL"},
+                timeout=timeout,
+            )
+            portfolio = (observation or {}).get("portfolio") or {}
+            rows = [item for item in portfolio.get("assets") or [] if isinstance(item, Mapping)]
+        except Exception:
+            rows = []
+    pairs = _swap_recommended_pairs(rows)
+    if not pairs:
+        pairs = [tuple(dict(item) for item in pair) for pair in _SWAP_DEFAULT_PAIRS]
+    suggestions = [
+        _swap_pair_chip(source, destination, language) for source, destination in pairs
+    ]
+    suggestions.append(_swap_entry_chip("custom", language))
+    suggestions.append(_swap_entry_chip("cross_chain", language))
+    return suggestions
+
+
+def _react_turn_tool_payloads(state: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Tool observations in the current turn (after the latest user message)."""
+    messages = list(state.get("messages") or [])
+    current_user_index = max(
+        (
+            index
+            for index, message in enumerate(messages)
+            if isinstance(message, HumanMessage)
+        ),
+        default=-1,
+    )
+    turn_messages = messages[current_user_index + 1 :] if current_user_index >= 0 else messages
+    tool_payloads: list[tuple[str, dict[str, Any]]] = []
+    for message in turn_messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        try:
+            payload = json.loads(str(message.content))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, Mapping):
+            tool_payloads.append((str(message.name or ""), dict(payload)))
+    return tool_payloads
+
+
+_CHAIN_ADDRESS_PROBES = ("ETH", "BSC", "TRON", "SOLANA", "BTC")
+
+
+def _react_transfer_supported_chains(state: Mapping[str, Any]) -> list[str]:
+    """Chains the App declared, falling back to the known native-chain set."""
+    context = state.get("wallet_context") or {}
+    networks = context.get("supported_networks")
+    if isinstance(networks, list) and networks:
+        return [str(item) for item in networks]
+    return list(_NATIVE_ASSET_DECIMALS)
+
+
+def _react_transfer_context(state: Mapping[str, Any]) -> bool:
+    """Whether the conversation is clearly inside a transfer-collection flow."""
+    request = state.get("request") or {}
+    metadata = request.get("metadata") if isinstance(request, Mapping) else None
+    suggestion = (
+        metadata.get("suggestion_data")
+        if isinstance(metadata, Mapping) and isinstance(metadata.get("suggestion_data"), Mapping)
+        else None
+    )
+    if isinstance(suggestion, Mapping) and suggestion.get("intent") == "transfer":
+        return True
+    for msg in state.get("messages") or []:
+        text = str(getattr(msg, "content", "") or "")
+        if isinstance(msg, HumanMessage):
+            if _looks_like_transfer_message(text):
+                return True
+        elif isinstance(msg, AIMessage):
+            if "收款地址" in text or "输入地址" in text:
+                return True
+    return False
+
+
+def _react_transfer_collection(
+    state: Mapping[str, Any],
+) -> tuple[list[str], dict[str, Any]] | None:
+    """Reconstruct a transfer collection step deterministically.
+
+    The model sometimes answers a collection step (recipient → chain → coin →
+    amount) with prose instead of calling ``transfer_quick_replies``, and the
+    App renders cards from suggestions, not prose. Return the next missing slot
+    and a draft so ``finalize_response`` can attach the right card; ``None``
+    when no transfer collection card is due.
+    """
+    slots: dict[str, Any] = {}
+    chain_names = {
+        canonical_chain(str(chain)) for chain in _react_transfer_supported_chains(state)
+    }
+    request = state.get("request") or {}
+    metadata = request.get("metadata") if isinstance(request, Mapping) else None
+    suggestion = (
+        metadata.get("suggestion_data")
+        if isinstance(metadata, Mapping) and isinstance(metadata.get("suggestion_data"), Mapping)
+        else None
+    )
+    if isinstance(suggestion, Mapping):
+        if suggestion.get("recipient"):
+            slots["recipient"] = str(suggestion["recipient"]).strip()
+        if suggestion.get("chain"):
+            slots["chain"] = canonical_chain(str(suggestion["chain"]))
+        if suggestion.get("symbol"):
+            slots["symbol"] = canonical_symbol(str(suggestion["symbol"]))
+    for msg in state.get("messages") or []:
+        if not isinstance(msg, HumanMessage):
+            continue
+        text = str(msg.content or "").strip()
+        if not text:
+            continue
+        if "recipient" not in slots and any(
+            is_valid_address(chain, text) for chain in _CHAIN_ADDRESS_PROBES
+        ):
+            slots["recipient"] = text
+            continue
+        canonical = canonical_chain(text)
+        if "chain" not in slots and canonical in chain_names:
+            slots["chain"] = canonical
+            continue
+        if (
+            "symbol" not in slots
+            and "recipient" in slots
+            and "chain" in slots
+            and canonical not in chain_names
+        ):
+            symbol = canonical_symbol(text)
+            # A numeric token is a mistyped amount, not a coin: only a
+            # letter-led ticker may fill the symbol slot (App-side report: a
+            # stray "0" was surfacing as the amount card's coin).
+            if _looks_like_asset_symbol(symbol):
+                slots["symbol"] = symbol
+    if not slots.get("recipient") or not _react_transfer_context(state):
+        return None
+    draft: dict[str, Any] = {"recipient": slots["recipient"]}
+    if slots.get("chain"):
+        draft["chain"] = slots["chain"]
+    if slots.get("symbol"):
+        draft["symbol"] = slots["symbol"]
+    if not slots.get("chain"):
+        return ["transfer_chain"], draft
+    # Coin unknown: the amount card needs a symbol to anchor its balance
+    # presets, so the amount slot is "missing" and transfer_suggestions will
+    # offer the coin card instead.
+    return ["transfer_amount"], draft
+
+
+def _react_transfer_user_symbol(state: Mapping[str, Any]) -> str:
+    """The coin the user actually chose, not one the model defaulted.
+
+    A coin counts as chosen only when the App echoes a tapped card's
+    ``suggestion_data`` (which carries ``symbol``) or the user typed a bare coin
+    into the conversation. The model filling the chain's native coin into a
+    keypad is not a user choice and must not skip the coin-selection step.
+    """
+    request = state.get("request") or {}
+    metadata = request.get("metadata") if isinstance(request, Mapping) else None
+    suggestion = (
+        metadata.get("suggestion_data")
+        if isinstance(metadata, Mapping) and isinstance(metadata.get("suggestion_data"), Mapping)
+        else None
+    )
+    if isinstance(suggestion, Mapping) and suggestion.get("symbol"):
+        return canonical_symbol(str(suggestion["symbol"]))
+    collection = _react_transfer_collection(state)
+    if collection is not None and collection[1].get("symbol"):
+        return canonical_symbol(str(collection[1]["symbol"]))
+    return ""
+
+
+def _react_swap_selected(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The source coin of the swap pair the user tapped, if any.
+
+    The App echoes a tapped ``swap_pair`` card back as
+    ``metadata.suggestion_data = {intent: "swap", source: {...}, destination: {...}}``.
+    Return the ``source`` descriptor (chain/symbol plus optional
+    address/decimals/logo) so an amount keypad can be anchored to the exact
+    asset; ``None`` when the turn is not a swap-pair selection.
+    """
+    request = state.get("request") or {}
+    metadata = request.get("metadata") if isinstance(request, Mapping) else None
+    suggestion = (
+        metadata.get("suggestion_data")
+        if isinstance(metadata, Mapping) and isinstance(metadata.get("suggestion_data"), Mapping)
+        else None
+    )
+    if (
+        isinstance(suggestion, Mapping)
+        and str(suggestion.get("intent") or "").strip().lower() == "swap"
+        and isinstance(suggestion.get("source"), Mapping)
+    ):
+        return dict(suggestion["source"])
+    return None
+
+
+def _react_swap_keypad_slots(
+    keypad_slots: Mapping[str, Any],
+    state: Mapping[str, Any],
+    swap_intent: bool,
+) -> dict[str, Any] | None:
+    """Slots for an amount keypad inside a swap flow, or ``None`` otherwise.
+
+    A swap amount step keeps the keypad (the App renders it as the swap amount
+    card) and enriches its slots with ``intent: "swap"`` plus, when the user
+    tapped a pair card, the source asset's token address/decimals. A transfer
+    keypad is not handled here — the transfer-specific reconciliation in
+    ``finalize_response`` owns that path.
+    """
+    slots = dict(keypad_slots)
+    if str(slots.get("intent") or "").strip().lower() == "swap":
+        slots.setdefault("intent", "swap")
+        return slots
+    if not swap_intent:
+        return None
+    selected = _react_swap_selected(state)
+    if selected is None and not str(slots.get("symbol") or "").strip():
+        # No tapped pair and no coin at all: the keypad cannot anchor an amount.
+        return None
+    slots.setdefault("intent", "swap")
+    if not slots.get("chain") and selected and selected.get("chain"):
+        slots["chain"] = str(selected["chain"])
+    if not slots.get("symbol") and selected and selected.get("symbol"):
+        slots["symbol"] = str(selected["symbol"])
+    if selected:
+        if "token_address" not in slots and selected.get("address"):
+            slots["token_address"] = str(selected["address"])
+        if "decimals" not in slots and selected.get("decimals") is not None:
+            slots["decimals"] = int(selected["decimals"])
+    return slots
+
+
+def _react_swap_pair_from_message(message: str) -> tuple[str, str] | None:
+    """Extract (source_symbol, destination_symbol) from an explicit swap request.
+
+    Understands the phrasing the swap card and users emit — “把 X 换成 Y”,
+    “用 X 换 Y”, “X 兑 Y”, “swap X for/to Y”, “exchange X to Y” — and returns
+    canonical symbols, or ``None`` when no explicit pair is named.
+    """
+    compact = "".join(str(message or "").split()).lower()
+    if not compact:
+        return None
+    match = re.search(
+        r"(?:把|将|用|拿)?([a-z][a-z0-9]{1,10})"
+        r"(?:换成|换为|兑成|兑换成|兑换|换|兑)"
+        r"([a-z][a-z0-9]{1,10})",
+        compact,
+    )
+    if match:
+        source, destination = match.group(1), match.group(2)
+        if source != destination:
+            return canonical_symbol(source), canonical_symbol(destination)
+    match = re.search(
+        r"(?:swap|exchange)\s+([a-z][a-z0-9]{1,10})\s+(?:to|for)\s+([a-z][a-z0-9]{1,10})",
+        str(message or "").lower(),
+    )
+    if match:
+        source, destination = match.group(1), match.group(2)
+        if source != destination:
+            return canonical_symbol(source), canonical_symbol(destination)
+    return None
+
+
+def _react_swap_pinned_chain(state: Mapping[str, Any]) -> str | None:
+    """The source chain the user pinned by tapping a chain chip, if any.
+
+    The App echoes a tapped ``type:"chain"`` swap chip as
+    ``metadata.suggestion_data = {intent: "swap", chain, symbol, ...}``. A pinned
+    chain means the ambiguity is already resolved, so the chain-selection card
+    must not be offered again.
+    """
+    request = state.get("request") or {}
+    metadata = request.get("metadata") if isinstance(request, Mapping) else None
+    suggestion = (
+        metadata.get("suggestion_data")
+        if isinstance(metadata, Mapping) and isinstance(metadata.get("suggestion_data"), Mapping)
+        else None
+    )
+    if (
+        isinstance(suggestion, Mapping)
+        and str(suggestion.get("intent") or "").strip().lower() == "swap"
+    ):
+        chain = suggestion.get("chain")
+        if chain:
+            return canonical_chain(str(chain))
+    return None
+
+
+def _react_swap_continuation(message: str) -> bool:
+    """Whether a bare message confirms an in-progress swap pair.
+
+    “兑换” / “继续兑换” / “换” / “继续” continue the pair already named earlier in
+    the conversation; “我要兑换” / “我想换成什么” open a NEW swap and must not reuse
+    an old pair. A message that names a symbol carries its own pair, so it is not
+    a continuation by itself.
+    """
+    text = "".join(str(message or "").lower().split())
+    if not text:
+        return False
+    if re.search(r"[a-z][a-z0-9]{1,10}", text):
+        return False
+    if any(
+        marker in text
+        for marker in (
+            "我要", "我想", "想兑换", "想换", "帮我", "准备", "打算",
+            "怎么", "如何", "可以", "吗", "？", "?", "什么",
+        )
+    ):
+        return False
+    return any(token in text for token in ("兑换", "换", "swap", "exchange", "继续"))
+
+
+def _react_established_swap_pair(state: Mapping[str, Any]) -> tuple[str, str] | None:
+    """The swap pair named in an earlier turn, before the current request.
+
+    Lets a bare “兑换” confirmation keep the pair the user already picked instead
+    of bouncing back to the recommended-pair card. Only pairs from prior user
+    turns count; the current request's own message is excluded.
+    """
+    current = str(
+        (state.get("request") or {}).get("message") or state.get("message") or ""
+    ).strip()
+    for message in reversed(list(state.get("messages") or [])):
+        if not isinstance(message, HumanMessage):
+            continue
+        text = str(message.content or "").strip()
+        if not text or text == current:
+            continue
+        pair = _react_swap_pair_from_message(text)
+        if pair is not None:
+            return pair
+    return None
+
+
+def _swap_source_chain_rows(
+    wallet_context: Mapping[str, Any],
+    tool_payloads: list[tuple[str, dict[str, Any]]] | None,
+    read_facts: Mapping[str, Any] | None,
+    source_symbol: str,
+) -> dict[str, dict[str, Any]]:
+    """Per-chain descriptors for the swap source coin the user actually holds.
+
+    Keyed by canonical chain name; each descriptor carries ``chain``/``symbol``
+    plus, when known, ``token_address``/``decimals`` so a tapped chain chip can
+    pin the exact asset. Only non-empty holdings count (a coin with zero
+    balance on a network cannot be the source of a swap).
+    """
+    symbol = canonical_symbol(source_symbol)
+    rows = _swap_balance_rows(wallet_context, tool_payloads, read_facts)
+    per_chain: dict[str, dict[str, Any]] = {}
+    for item in rows:
+        asset = item.get("asset") if isinstance(item, Mapping) else None
+        if not isinstance(asset, Mapping):
+            continue
+        chain = canonical_chain(str(asset.get("chain") or ""))
+        if not chain or canonical_symbol(str(asset.get("symbol") or "")) != symbol:
+            continue
+        descriptor = {"chain": chain, "symbol": symbol}
+        if asset.get("address"):
+            descriptor["token_address"] = str(asset["address"])
+        if asset.get("decimals") is not None:
+            descriptor["decimals"] = int(asset["decimals"])
+        per_chain.setdefault(chain, descriptor)
+    return per_chain
+
+
+_MARKDOWN_IMAGE_RE = re.compile(
+    r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+['\"][^'\"]*['\"])?\)"
+)
+_MARKDOWN_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_MARKDOWN_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
+#: Option blocks the model sometimes dumps into prose instead of leaving them
+#: to the structured ``suggestions`` field (``<suggestions>[...]</suggestions>``
+#: and the like). Removed wholesale in ``_plain_text_message``.
+_OPTION_BLOCK_RE = re.compile(
+    r"<\s*(suggestions?|options?|choices?|selects?)\b[^>]*>.*?"
+    r"<\s*/\s*\1\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _markdown_cells(line: str) -> list[str]:
+    """Split a Markdown table row into trimmed cells."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _plain_text_message(content: str) -> str:
+    """Reduce a model answer to the plain text the App can render.
+
+    The App renders ``message`` as a short plain-text sentence and coin icons /
+    chips arrive as structured fields, never as inline Markdown. The model
+    sometimes embeds Markdown images (``![ETH](https://…/logo.png)``) or tables
+    anyway, and occasionally dumps the structured suggestions back into prose
+    (``<suggestions>[...]</suggestions>``). Strip image syntax down to its alt
+    text, drop option blocks, and flatten any table so the client never has to
+    size a runaway image, style a table it does not render, or display option
+    JSON as chat text.
+    """
+    if not content:
+        return content
+    text = _MARKDOWN_IMAGE_RE.sub(
+        lambda match: (match.group(1) or "").strip(), content
+    )
+    text = _OPTION_BLOCK_RE.sub("", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    lines = text.splitlines()
+    flattened: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not _MARKDOWN_TABLE_ROW_RE.match(line):
+            flattened.append(line)
+            index += 1
+            continue
+        block = [line]
+        index += 1
+        while index < len(lines) and _MARKDOWN_TABLE_ROW_RE.match(lines[index]):
+            block.append(lines[index])
+            index += 1
+        for row in block:
+            if _MARKDOWN_TABLE_SEPARATOR_RE.match(row):
+                continue
+            cells = _markdown_cells(row)
+            flattened.append("，".join(cells) if cells else row)
+    return "\n".join(flattened).strip()
 
 
 def _model_conversation_history(history: Any, *, limit: int = 12) -> list[dict[str, Any]]:
@@ -1128,12 +2024,13 @@ def _asset_value_response(
 
     balance_asset = (selected_balance or {}).get("asset") or {}
     price_asset = (selected_price or {}).get("asset") or {}
-    asset = dict(price_asset or balance_asset)
+    asset = _asset_with_logo(price_asset or balance_asset) or dict(price_asset or balance_asset)
     amount = (selected_balance or {}).get("amount")
     usd_price = (selected_price or {}).get("usd_price")
     response: dict[str, Any] = {
         "kind": "asset_value",
         "asset": asset,
+        "chain_logo_url": chain_logo_url(str(asset.get("chain") or "")),
         "balance": selected_balance,
         "price": selected_price,
     }
@@ -1478,11 +2375,21 @@ def _swap_confirmation_summary(
     slippage_bps: int | None = None,
     recipient_address: str | None = None,
 ) -> dict[str, Any]:
+    # The confirmation card renders the same asset rows as the quote list: the
+    # coin's icon on the asset and the chain badge next to it.
+    source_asset = _asset_with_logo(selected.get("source_asset"))
+    destination_asset = _asset_with_logo(selected.get("destination_asset"))
     summary = {
         "provider": selected.get("provider"),
         "provider_reference": selected.get("provider_reference"),
-        "source_asset": selected.get("source_asset"),
-        "destination_asset": selected.get("destination_asset"),
+        "source_asset": source_asset,
+        "destination_asset": destination_asset,
+        "source_chain_logo_url": chain_logo_url(
+            str((source_asset or {}).get("chain") or "")
+        ),
+        "destination_chain_logo_url": chain_logo_url(
+            str((destination_asset or {}).get("chain") or "")
+        ),
         "input_amount": selected.get("input_amount"),
         "expected_output": selected.get("expected_output"),
         "slippage_bps": (
@@ -1495,7 +2402,65 @@ def _swap_confirmation_summary(
         # Where the destination asset lands is the one thing worth checking
         # before approving, so the confirmation must carry it.
         summary["recipient_address"] = recipient_address
+    # The confirmation card also renders the fee breakdown / estimates. These
+    # are display-derived and read straight off the enriched quote so the App
+    # does not have to recompute (and possibly pick the wrong asset) itself.
+    summary["usd_input_value"] = selected.get("usd_input_value")
+    summary["usd_expected_output"] = selected.get("usd_expected_output")
+    summary["network_fee"] = selected.get("network_fee")
+    summary["provider_fee"] = selected.get("provider_fee")
+    summary["reference_rate"] = selected.get("reference_rate")
+    summary["total_payment"] = selected.get("total_payment")
+    summary["eta"] = selected.get("eta") or _provider_eta_estimate(
+        selected.get("provider")
+    )
     return summary
+
+
+_PROVIDER_ETA_ESTIMATES = {
+    "bridgers": "约 1-2 分钟",
+    "omnibridge": "约 1-2 分钟",
+}
+
+
+def _provider_eta_estimate(provider: Any) -> str | None:
+    """Operational display estimate for providers that do not disclose an ETA.
+
+    These are SLA-style labels, not fabricated on-chain data; they exist so the
+    confirmation card can render 预计完成时间 even when the provider keeps it
+    opaque. Providers that do report a value always win via ``quote.eta``.
+    """
+    value = str(provider or "").lower()
+    return _PROVIDER_ETA_ESTIMATES.get(value)
+
+
+def _snapshot_price(snapshots: Any, asset: Mapping[str, Any]) -> Decimal | None:
+    """Best-effort USD price for an asset from a quote's price snapshots."""
+    chain = str(asset.get("chain") or "").upper()
+    symbol = str(asset.get("symbol") or "").upper()
+    address = str(asset.get("address") or "").lower()
+    if isinstance(snapshots, Mapping):
+        rows = list(snapshots.values())
+    elif isinstance(snapshots, list):
+        rows = snapshots
+    else:
+        rows = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        candidate = row.get("asset") or row
+        if not isinstance(candidate, Mapping):
+            continue
+        if (
+            str(candidate.get("chain") or "").upper() == chain
+            and str(candidate.get("symbol") or "").upper() == symbol
+            and str(candidate.get("address") or "").lower() == address
+        ):
+            try:
+                return Decimal(str(row.get("usd_price") or 0))
+            except InvalidOperation:
+                return None
+    return None
 
 
 def _swap_recipient_address(
@@ -1713,6 +2678,115 @@ def _filter_balance_assets(
             == symbol
         )
     ]
+
+
+def _balance_row_with_chain_logo(dumped: Any) -> Any:
+    """Balance row carries its chain logo next to the asset logo."""
+    if not isinstance(dumped, Mapping):
+        return dumped
+    asset = dumped.get("asset")
+    chain = asset.get("chain") if isinstance(asset, Mapping) else None
+    if not chain:
+        return dumped
+    row = dict(dumped)
+    if "chain_logo_url" not in row:
+        row["chain_logo_url"] = chain_logo_url(chain)
+    if isinstance(asset, Mapping):
+        # Native coins have no provider logo, so the chain logo stands in; a
+        # token whose logo no source supplied stays null for the App placeholder.
+        row["asset"] = {
+            **asset,
+            "logo_url": token_logo_url(
+                str(chain), str(asset.get("symbol") or ""), fallback=asset.get("logo_url")
+            ),
+        }
+    return row
+
+
+def _quote_with_chain_logos(dumped: Mapping[str, Any]) -> dict[str, Any]:
+    """A quote carries the source/destination chain logos next to the assets."""
+    result = dict(dumped)
+    source = result.get("source_asset") or {}
+    destination = result.get("destination_asset") or {}
+    if isinstance(source, Mapping) and source.get("chain"):
+        result["source_chain_logo_url"] = chain_logo_url(source["chain"])
+    if isinstance(destination, Mapping) and destination.get("chain"):
+        result["destination_chain_logo_url"] = chain_logo_url(destination["chain"])
+    return result
+
+
+def _asset_with_logo(value: Any) -> dict[str, Any] | None:
+    """Copy an asset with its icon filled in.
+
+    A provider logo wins; a native coin reuses its chain logo so every card that
+    shows the asset (quote rows, confirmation summary) has the same field.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    asset = dict(value)
+    chain = asset.get("chain")
+    if chain:
+        asset["logo_url"] = token_logo_url(
+            str(chain),
+            str(asset.get("symbol") or ""),
+            fallback=(
+                str(asset.get("logo_url")) if asset.get("logo_url") else None
+            ),
+        )
+    return asset
+
+
+def _price_with_logos(value: Any) -> Any:
+    """A price (or market) row with the asset's icon and chain badge attached.
+
+    Price rows are the one asset payload the price providers build themselves, so
+    their ``asset.logo_url`` is always empty; filling it here keeps the market
+    cards on the same convention as the balance rows.
+    """
+    row = _dump(value)
+    if not isinstance(row, Mapping):
+        return row
+    dumped = dict(row)
+    asset = _asset_with_logo(dumped.get("asset"))
+    if asset is None:
+        return dumped
+    chain = str(asset.get("chain") or "")
+    return {
+        **dumped,
+        "asset": asset,
+        "chain_logo_url": chain_logo_url(chain) if chain else None,
+    }
+
+
+def _swap_status_logo_context(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Chain and asset identity for the swap-status card, when the order knows it.
+
+    The status payload is built from several different states (broadcast only,
+    prepared, polled order), so this reads whichever of them still carries the
+    request's assets instead of expecting one fixed shape.
+    """
+    selected = _mapping(state.get("selected_quote"))
+    pending = _mapping(state.get("pending_transaction"))
+    request = _mapping(state.get("request"))
+    source = _mapping(selected.get("source_asset")) or _mapping(pending.get("source_asset"))
+    destination = _mapping(selected.get("destination_asset")) or _mapping(
+        pending.get("destination_asset")
+    )
+    chain = (
+        pending.get("chain")
+        or source.get("chain")
+        or request.get("chain")
+        or _mapping(state.get("wallet_context")).get("chain")
+    )
+    context: dict[str, Any] = {}
+    if chain:
+        context["chain"] = str(chain)
+        context["chain_logo_url"] = chain_logo_url(str(chain))
+    if source:
+        context["asset"] = _asset_with_logo(source)
+    if destination:
+        context["destination_asset"] = _asset_with_logo(destination)
+    return context
 
 
 def _explicit_balance_chain(message: str, supported_chains: set[str]) -> str | None:
@@ -2103,6 +3177,7 @@ def _swap_suggestions(
                 "message": f"都在 {wallet_chain} 链",
                 "type": "chain",
                 "value": wallet_chain,
+                **asset_logo_fields(wallet_chain, source_symbol or destination_symbol),
             }
         )
     elif "source_chain" in missing and destination_chain:
@@ -2112,6 +3187,7 @@ def _swap_suggestions(
                 "message": f"来源也在 {destination_chain} 链",
                 "type": "chain",
                 "value": destination_chain,
+                **asset_logo_fields(destination_chain, source_symbol),
             }
         )
     elif "destination_chain" in missing and source_chain:
@@ -2121,6 +3197,7 @@ def _swap_suggestions(
                 "message": f"目标也在 {source_chain} 链",
                 "type": "chain",
                 "value": source_chain,
+                **asset_logo_fields(source_chain, destination_symbol),
             }
         )
     if "source_symbol" in missing and destination_symbol:
@@ -2245,6 +3322,58 @@ _NATIVE_ASSET_DECIMALS = {
     "TRON": 6,
     "SOLANA": 9,
 }
+
+
+def _transfer_coin_choices(
+    context: Mapping[str, Any], chain: str
+) -> list[dict[str, Any]]:
+    """Native coin plus the wallet's token assets on ``chain``, for the coin card.
+
+    The amount card anchors its 25/50/75/100% presets to one asset's balance, so
+    it is meaningless before the user picks the coin. This returns the chain's
+    native coin first, then the token assets the App reported for the chain, so
+    the coin card can ask for exactly that.
+    """
+    canonical = canonical_chain(str(chain or ""))
+    native = _native_symbol(str(chain or ""), dict(context))
+    choices: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if native:
+        seen.add(native.upper())
+        choices.append(
+            {
+                "symbol": native,
+                "token_address": None,
+                "decimals": _NATIVE_ASSET_DECIMALS.get(
+                    canonical, native_decimals(canonical)
+                ),
+                # The native coin's icon is its chain logo; the caller resolves
+                # it through ``asset_logo_fields``.
+                "logo_url": None,
+            }
+        )
+    for raw_balance in context.get("token_balances") or context.get("assets") or []:
+        item = raw_balance.get("asset") if isinstance(raw_balance, Mapping) else None
+        if not isinstance(item, Mapping):
+            continue
+        if canonical_chain(str(item.get("chain") or "")) != canonical:
+            continue
+        address = str(item.get("address") or "").strip()
+        if not address:
+            continue
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        choices.append(
+            {
+                "symbol": symbol,
+                "token_address": address,
+                "decimals": item.get("decimals"),
+                "logo_url": item.get("logo_url"),
+            }
+        )
+    return choices
 
 
 def _unique_native_chain(symbol: str, explicit_address: Any = None) -> str | None:
@@ -2552,6 +3681,103 @@ def _utxo_source_addresses(
     return ordered
 
 
+def _btc_swap_source_options(
+    wallet_context: Mapping[str, Any] | None, chain: str
+) -> list[str]:
+    """Declared BTC addresses offered as a swap 出金 (source) address."""
+    canonical = canonical_chain(str(chain or ""))
+    if canonical not in {"BTC", "BITCOIN"}:
+        return []
+    return _utxo_source_addresses(wallet_context, canonical)
+
+
+def _pinned_swap_provider(
+    state: Mapping[str, Any], providers: Mapping[str, Any]
+) -> str | None:
+    """The swap provider the App explicitly pinned via suggestion_data.
+
+    ``metadata.suggestion_data = {intent: "swap", provider: "bridgers"}`` lets
+    the App drive the channel (Lif: 测试 Bridgers 完整授权流程需要能指定渠道).
+    The pin is persisted on the swap ``active_task``, so the App only needs to
+    send it once (e.g. the coin-selection turn); later amount/quote turns that
+    omit ``provider`` keep quoting/preparing through the pinned channel.
+    Returns the canonical provider key when the pinned name matches an enabled
+    provider; otherwise ``None`` so normal automatic selection is unchanged.
+    """
+    explicit = _suggestion_pinned_provider(state, providers)
+    if explicit is not None:
+        return explicit
+    # Cross-turn fallback: the App pinned the channel on an earlier turn of the
+    # same swap task and this turn did not repeat it. Only an ongoing swap task
+    # keeps the pin; a new transfer/swap task starts unpinned.
+    active_task = state.get("active_task")
+    if not isinstance(active_task, Mapping):
+        return None
+    if str(active_task.get("kind") or "") != "swap":
+        return None
+    if active_task.get("status") in {"completed", "cancelled"}:
+        return None
+    persisted = str(active_task.get("pinned_provider") or "").strip().lower()
+    if not persisted:
+        return None
+    for key in providers:
+        if str(key).strip().lower() == persisted:
+            return str(key)
+    return None
+
+
+def _suggestion_pinned_provider(
+    state: Mapping[str, Any], providers: Mapping[str, Any]
+) -> str | None:
+    """The provider pinned on this turn's ``suggestion_data``, if any.
+
+    ``metadata.suggestion_data = {provider: "bridgers"}`` (optionally carrying
+    ``intent: "swap"``) lets the App drive the channel. The intent check is
+    intentionally loose — the App sometimes echoes only ``provider`` — but a
+    strong non-swap intent (e.g. ``transfer``) never pins through this path.
+    """
+    request = _mapping(state.get("request"))
+    metadata = request.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    suggestion = metadata.get("suggestion_data")
+    if not isinstance(suggestion, Mapping):
+        return None
+    pinned = str(suggestion.get("provider") or "").strip().lower()
+    if not pinned:
+        return None
+    intent = str(suggestion.get("intent") or "").strip().lower()
+    if intent and intent not in {"swap", "swap_quote"}:
+        return None
+    for key in providers:
+        if str(key).strip().lower() == pinned:
+            return str(key)
+    return None
+
+
+def _swap_requires_btc_source_selection(
+    draft: Mapping[str, Any] | None, wallet_context: Mapping[str, Any] | None
+) -> list[str] | None:
+    """The BTC addresses to offer when a UTXO-source swap needs an explicit 出金地址.
+
+    A BTC swap's provider-facing fromAddress/userAddr must be a single address
+    the user picked (Lif: “出金的地址只能从中间选一个”). When the draft carries
+    no explicit valid BTC sender yet and the wallet declared more than one BTC
+    address, ask the App which one to use instead of silently picking the first.
+    Returns ``None`` when no address choice is due.
+    """
+    chain = canonical_chain(str((draft or {}).get("source_chain") or ""))
+    if chain not in {"BTC", "BITCOIN"}:
+        return None
+    sender = str((draft or {}).get("sender_address") or "").strip()
+    if sender and is_valid_address(chain, sender):
+        return None
+    addresses = _btc_swap_source_options(wallet_context, chain)
+    if len(addresses) < 2:
+        return None
+    return addresses
+
+
 async def _adapter_balance_rows(adapter: Any, addresses: Sequence[str]) -> list[Any]:
     """Native balance pooled across ``addresses``, plus any token balances.
 
@@ -2614,6 +3840,7 @@ _CLIENT_ACTION_TYPES = (
     "scan_qr",
     "open_amount_keypad",
     "address_input",
+    "select_btc_address",
 )
 
 
@@ -2704,17 +3931,21 @@ def _history_direction(record: Mapping[str, Any], address: str) -> str:
 def _transaction_history_item(record: Any, address: str) -> dict[str, Any]:
     payload = record.model_dump(mode="json") if hasattr(record, "model_dump") else dict(record)
     direction = _history_direction(payload, address)
+    chain = payload.get("chain")
+    symbol = payload.get("symbol")
     if direction == "receive":
         counterparty = payload.get("from_address")
     else:
         counterparty = payload.get("to_address") or payload.get("from_address")
     return {
-        "chain": payload.get("chain"),
+        "chain": chain,
+        "chain_logo_url": chain_logo_url(chain) if chain else None,
         "tx_hash": payload.get("tx_hash"),
         "status": payload.get("status"),
         "direction": direction,
-        "symbol": payload.get("symbol"),
+        "symbol": symbol,
         "decimals": payload.get("decimals"),
+        "logo_url": payload.get("logo_url") or token_logo_url(chain, symbol),
         "amount_raw": payload.get("value"),
         # OKX history rows carry no decimals; say so instead of letting the
         # model invent a scale for the raw integer.
@@ -2735,13 +3966,17 @@ def _transaction_history_payload(
 ) -> dict[str, Any]:
     """Shape the fetched records into the v1.6.9 history card."""
     wanted = str(direction or "").strip().lower()
-    counts: dict[str, int] = {}
-    for item in items:
-        key = str(item.get("direction") or "unknown")
-        counts[key] = counts.get(key, 0) + 1
     visible = [item for item in items if not wanted or item.get("direction") == wanted]
     visible = sorted(visible, key=lambda item: str(item.get("occurred_at") or ""), reverse=True)
     selected = [dict(item) for item in visible[: max(1, limit)]]
+    # The bubble's counts must describe exactly the rows the card shows
+    # (``selected``), never the whole fetched set, or "最近 20 笔" fights the
+    # "38 转出 + 90 入账" summary (App-side report). The fetched total is still
+    # exposed as ``fetched`` and mentioned in the prose when it is larger.
+    counts: dict[str, int] = {}
+    for item in selected:
+        key = str(item.get("direction") or "unknown")
+        counts[key] = counts.get(key, 0) + 1
     summary = "、".join(
         part
         for part in (
@@ -2769,9 +4004,10 @@ def _transaction_history_payload(
         return payload
     confirmed = all(str(item.get("status") or "") == "confirmed" for item in selected)
     tail = "都是已确认状态。" if confirmed else "其中包含未确认的交易。"
+    total_note = f"，共 {len(visible)} 笔" if len(visible) > len(selected) else ""
     payload["message"] = (
         f"最近 {len(selected)} 笔记录拉出来了 👆"
-        + (f" 其中 {summary}，" if summary else "，")
+        + (f" 其中 {summary}{total_note}，" if summary else f" {total_note.lstrip('，')}，")
         + tail
         + "想看某笔详情或者筛选只看支出，跟我说一声。"
     )
@@ -2788,6 +4024,13 @@ _CHAIN_DISPLAY_NAMES = {
     "BTC": "Bitcoin",
     "TRON": "TRON",
     "SOLANA": "Solana",
+    # Also on the design's receive card; Robinhood has no Trust Wallet entry, so
+    # it stays a label with a null logo.
+    "AVALANCHE": "Avalanche",
+    "AVAX": "Avalanche",
+    "CELO": "Celo",
+    "MEGAETH": "MegaETH",
+    "ROBINHOOD": "Robinhood",
 }
 
 
@@ -2847,6 +4090,9 @@ def _receive_address_payload(wallet_context: Mapping[str, Any] | None) -> dict[s
         "address": groups[0]["address"] if groups else None,
         "supported_chains": supported,
         "display_chains": [_CHAIN_DISPLAY_NAMES.get(chain, chain) for chain in supported],
+        # The v1.6.9 card labels these chains as plain chips; the lookup lets the
+        # App draw a badge for any of them without its own chain table.
+        "chain_logo_urls": {chain: chain_logo_url(chain) for chain in supported},
     }
     if not groups:
         payload["code"] = "RECEIVE_ADDRESS_UNAVAILABLE"
@@ -3078,13 +4324,24 @@ async def _transaction_preflight(
     fee = None
     if hasattr(adapter, "estimate_fee"):
         try:
+            display = dict(getattr(transaction, "display", None) or {})
+            fee_kwargs: dict[str, Any] = {
+                "to": transaction.to,
+                "data": transaction.data,
+                "from_address": sender or None,
+                "value": getattr(transaction, "value", None),
+            }
+            # Account-model chains (TRON) carry the token contract and the EVM
+            # calldata for a smart-contract call in the transaction display, not
+            # in ``to``/``data`` (which hold the recipient and the node-built
+            # signing payload). Pass them so the adapter can simulate the call
+            # and price its energy instead of reporting the native-transfer fee.
+            if display.get("contract"):
+                fee_kwargs["contract"] = str(display["contract"])
+            if display.get("calldata"):
+                fee_kwargs["calldata"] = str(display["calldata"])
             try:
-                fee = await adapter.estimate_fee(
-                    to=transaction.to,
-                    data=transaction.data,
-                    from_address=sender or None,
-                    value=getattr(transaction, "value", None),
-                )
+                fee = await adapter.estimate_fee(**fee_kwargs)
             except TypeError:
                 fee = await adapter.estimate_fee(to=transaction.to, data=transaction.data)
             add("network_fee", "passed", "已获取网络手续费估算。")
@@ -3116,9 +4373,11 @@ async def _transaction_preflight(
         "okx": None,
         "simulation": None,
     }
-    # Bitcoin/UTXO transactions carry a PSBT rather than EVM calldata, so OKX's
-    # gas-limit and simulation endpoints do not apply and are reported as such.
-    evm_style = getattr(adapter, "transaction_model", "evm") != "utxo"
+    # Only EVM chains carry EVM calldata that OKX's gas-limit and simulation
+    # endpoints can interpret. Bitcoin/UTXO transactions carry a PSBT and the
+    # account-model chains (TRON, Solana) carry node-built protobuf payloads, so
+    # those endpoints do not apply and are reported as unsupported.
+    evm_style = getattr(adapter, "transaction_model", "evm") == "evm"
     simulation = None
     if not evm_style:
         gas_sources["okx"] = "unsupported"
@@ -3129,10 +4388,18 @@ async def _transaction_preflight(
         if not hasattr(wallet_provider, "simulate_transaction"):
             gas_sources["simulation"] = "unavailable"
     if wallet_provider is not None and evm_style:
+        # OKX's pre-transaction endpoints interpret ``toAddress`` as the
+        # contract being called (or the payee for a native transfer). That is
+        # the unsigned transaction's ``to`` — e.g. the ERC-20 token contract
+        # for a token transfer — not the human-facing ``recipient`` (which for
+        # a provider deposit is a separate platform contract that would revert
+        # against arbitrary token calldata and produce a false preflight
+        # failure).
+        tx_to = str(getattr(transaction, "to", "") or recipient)
         tx_context = TransactionContext(
             chain=chain,
             from_address=sender,
-            to_address=recipient,
+            to_address=tx_to,
             native_amount=_transaction_native_amount(getattr(transaction, "value", "0")),
             calldata=str(getattr(transaction, "data", "0x")),
         )
@@ -3145,7 +4412,7 @@ async def _transaction_preflight(
                 add(
                     "okx_gas",
                     "warning",
-                    "OKX gas-limit 预检查暂时不可用。",
+                    "Gas 预检查暂时不可用。",
                     code="OKX_GAS_UNAVAILABLE",
                 )
         if hasattr(wallet_provider, "simulate_transaction"):
@@ -3154,7 +4421,7 @@ async def _transaction_preflight(
                 if simulation.gas_used is not None:
                     gas_sources["simulation"] = str(simulation.gas_used)
                 if simulation.success:
-                    add("simulation", "passed", "OKX 交易模拟通过。")
+                    add("simulation", "passed", "交易模拟通过。")
                 else:
                     failure_reason = simulation.failure_reason or ""
                     if "insufficient funds" in failure_reason.lower():
@@ -3177,7 +4444,7 @@ async def _transaction_preflight(
                 add(
                     "simulation",
                     "warning",
-                    "OKX 交易模拟暂时不可用，签名前请在钱包中确认。",
+                    "交易模拟暂时不可用，签名前请在钱包中确认。",
                     code="SIMULATION_UNAVAILABLE",
                 )
     if fee is not None and any(
@@ -3614,6 +4881,9 @@ async def _resolve_swap_assets(
                     "symbol": asset.symbol,
                     "address": asset.address,
                     "decimals": asset.decimals,
+                    # The same-name-token picker shows one row per candidate, so
+                    # each row carries its own icon and chain badge.
+                    **asset_logo_fields(asset.chain, asset.symbol, asset.logo_url),
                 }
                 for asset in unique.values()
             )
@@ -3768,6 +5038,30 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             except Exception:
                 return None
         return runtime.chains.get(str(chain).upper())
+
+    async def _btc_source_address_options(
+        addresses: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """Per-address entries for the select_btc_address surface.
+
+        Balances are best-effort per-address reads; the surface still works when
+        a read fails or the adapter is unavailable (the App also holds its own
+        per-address balances).
+        """
+        options: list[dict[str, Any]] = []
+        adapter = execution_adapter("BTC")
+        for address in addresses:
+            entry: dict[str, Any] = {"address": str(address)}
+            if adapter is not None and hasattr(adapter, "get_native_balance"):
+                try:
+                    balance = await adapter.get_native_balance(str(address))
+                    entry["balance_raw"] = str(balance.amount_raw)
+                    if balance.amount is not None:
+                        entry["balance"] = str(balance.amount)
+                except Exception:
+                    pass
+            options.append(entry)
+        return options
 
     def canonical_state(state: Mapping[str, Any]) -> dict[str, Any]:
         result = dict(state)
@@ -4139,6 +5433,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         )
         symbol = draft.get("transfer_symbol") or draft.get("symbol")
         amount = draft.get("transfer_amount") or draft.get("amount")
+        if symbol is not None and not _looks_like_asset_symbol(symbol):
+            # A mistyped amount ("0") can leak into the transfer draft as the
+            # symbol. Treat it as unknown so the coin card drives the step
+            # instead of an amount card anchored to a "0" coin.
+            symbol = None
         base_data = {
             key: value
             for key, value in {
@@ -4219,6 +5518,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         ),
                         "type": "token",
                         "value": asset.get("address"),
+                        # The coin card's asset line renders the logo next to the
+                        # symbol; the wallet's own asset is the best source, and
+                        # a native coin falls back to its chain logo.
+                        **asset_logo_fields(asset_chain, asset_symbol, asset.get("logo_url")),
                         "data": {
                             **base_data,
                             "chain": asset_chain,
@@ -4237,6 +5540,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             ordered_chains = _order_supported_chains(
                 facts.get("supported_chains", []), context.get("chain")
             )
+            recipient = draft.get("transfer_recipient") or draft.get("recipient")
+            if recipient:
+                # Only offer chains the collected recipient is actually valid
+                # on (full per-chain address rules). A TRON recipient must not
+                # be offered EVM networks, or the transfer would fail or land
+                # on the wrong chain.
+                ordered_chains = [
+                    chain
+                    for chain in ordered_chains
+                    if is_valid_address(chain, str(recipient))
+                ]
             for supported_chain in ordered_chains:
                 if len(suggestions) >= 4:
                     break
@@ -4254,6 +5568,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         ),
                         "type": "chain",
                         "value": supported_chain,
+                        "chain_logo_url": chain_logo_url(supported_chain),
                         "data": {**base_data, "chain": supported_chain},
                     }
                 )
@@ -4263,25 +5578,77 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             and "transfer_recipient" not in missing
             and "transfer_chain" not in missing
         ):
-            # The amount card in the design offers 25/50/75/100% of the balance;
-            # the App converts the percentage using the balance it already shows.
-            # Carry the asset identity so the App can pin the exact token on the
-            # card's asset-and-balance line.
-            asset_data = dict(base_data)
-            asset = _transfer_wallet_asset(context, chain, symbol)
-            if asset is not None:
-                asset_data["token_address"] = asset.get("address")
-                asset_data["decimals"] = asset.get("decimals")
-            for percent in ("25%", "50%", "75%", "100%"):
-                suggestions.append(
-                    {
-                        "label": f"用余额的 {percent}",
-                        "message": f"用余额的 {percent} 转这笔。",
-                        "type": "amount",
-                        "value": percent,
-                        "data": asset_data,
+            if not symbol:
+                # The coin is still unknown, so a percentage-of-balance amount
+                # card has no balance to anchor to. Ask for the coin first
+                # (address → chain → coin → amount) with the chain's native
+                # coin plus the wallet's tokens on that chain.
+                for coin in _transfer_coin_choices(context, chain):
+                    if len(suggestions) >= 4:
+                        break
+                    coin_data = {
+                        **base_data,
+                        "chain": chain,
+                        "symbol": coin["symbol"],
                     }
+                    if coin.get("token_address"):
+                        coin_data["token_address"] = coin["token_address"]
+                    if coin.get("decimals") is not None:
+                        coin_data["decimals"] = coin["decimals"]
+                    suggestions.append(
+                        {
+                            "label": (
+                                f"转 {coin['symbol']}"
+                                if language == "zh"
+                                else f"Transfer {coin['symbol']}"
+                            ),
+                            "message": (
+                                f"转 {coin['symbol']}。"
+                                if language == "zh"
+                                else f"Transfer {coin['symbol']}."
+                            ),
+                            "type": "symbol",
+                            "value": coin["symbol"],
+                            **asset_logo_fields(
+                                chain, coin["symbol"], coin.get("logo_url")
+                            ),
+                            "data": coin_data,
+                        }
+                    )
+            else:
+                # The amount card in the design offers 25/50/75/100% of the
+                # balance; the App converts the percentage using the balance it
+                # already shows. Carry the asset identity so the App can pin the
+                # exact token on the card's asset-and-balance line.
+                asset_data = dict(base_data)
+                asset = _transfer_wallet_asset(context, chain, symbol)
+                token_address = (
+                    draft.get("transfer_token_address")
+                    or draft.get("token_address")
+                    or (asset.get("address") if asset else None)
                 )
+                decimals = draft.get("transfer_decimals")
+                if decimals is None and asset is not None:
+                    decimals = asset.get("decimals")
+                if token_address and decimals is not None:
+                    asset_data["token_address"] = token_address
+                    asset_data["decimals"] = decimals
+                for percent in ("25%", "50%", "75%", "100%"):
+                    suggestions.append(
+                        {
+                            "label": f"用余额的 {percent}",
+                            "message": f"用余额的 {percent} 转这笔。",
+                            "type": "amount",
+                            "value": percent,
+                            # The amount card's 资产与余额 line shows the icon.
+                            **asset_logo_fields(
+                                chain,
+                                symbol,
+                                (asset or {}).get("logo_url") if asset else None,
+                            ),
+                            "data": asset_data,
+                        }
+                    )
 
         return _sanitize_response_suggestions(
             suggestions, intent="transfer", facts=facts
@@ -4456,7 +5823,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             try:
                 balances = await runtime.wallet_provider.get_token_balances(address, indexes)
-                assets = [_dump(item) for item in balances]
+                assets = [_balance_row_with_chain_logo(_dump(item)) for item in balances]
                 requested_symbol = canonical_symbol(str(symbol or ""))
                 assets = _filter_balance_assets(
                     assets,
@@ -4498,14 +5865,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         if adapter is None or not hasattr(adapter, "get_native_balance"):
             return {
                 "ok": False,
-                "error": "OKX 钱包数据服务暂不可用。",
+                "error": "钱包数据服务暂不可用。",
                 "code": "OKX_CAPABILITY_UNAVAILABLE",
             }
         try:
             balances = await _adapter_balance_rows(adapter, [address])
         except Exception as exc:
             return {"ok": False, "error": str(exc), "code": "WALLET_QUERY_FAILED"}
-        assets = [_dump(item) for item in balances]
+        assets = [_balance_row_with_chain_logo(_dump(item)) for item in balances]
         requested_symbol = canonical_symbol(str(symbol or ""))
         assets = _filter_balance_assets(assets, requested_symbol or None)
         native = next(
@@ -4580,7 +5947,27 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 detail = await explorer.get_transaction_detail(chain, tx_hash)
                 value = getattr(detail.status, "value", str(detail.status))
                 if value == "unknown" and local is not None:
-                    return {"ok": True, "transaction": local}
+                    return {
+                        "ok": True,
+                        "transaction": {
+                            **local,
+                            **asset_logo_fields(local.get("chain")),
+                        },
+                    }
+                # An ERC20/TRC20 transfer carries its real value in the token
+                # layer; the native value is 0. Expose the moved asset up top so
+                # the App status card can render amount + symbol directly, and
+                # keep the full detail for the token_transfers[] row.
+                token_transfers = list(getattr(detail, "token_transfers", None) or [])
+                primary = token_transfers[0] if token_transfers else None
+                if primary is not None and primary.amount not in (None, ""):
+                    amount = primary.amount
+                    symbol = primary.symbol or getattr(detail, "symbol", None)
+                    logo_url = primary.logo_url or getattr(detail, "logo_url", None)
+                else:
+                    amount = getattr(detail, "value", None)
+                    symbol = getattr(detail, "symbol", None)
+                    logo_url = getattr(detail, "logo_url", None)
                 return {
                     "ok": True,
                     "transaction": {
@@ -4596,19 +5983,39 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         # Top-level "why" / ETA for the design's detail page.
                         "failure_reason": getattr(detail, "failure_reason", None),
                         "eta": getattr(detail, "eta", None),
+                        # The moved amount + symbol (token layer first, then the
+                        # native coin) so the App card never shows "-" or "0".
+                        "amount": amount,
+                        "symbol": symbol,
                         "detail": _dump(detail),
+                        # The detail card's header shows the chain badge and the
+                        # moved token's icon.
+                        **asset_logo_fields(
+                            str(chain).upper(),
+                            symbol,
+                            logo_url,
+                        ),
                     },
                 }
             except Exception as exc:
                 if local is not None:
-                    return {"ok": True, "transaction": local}
+                    return {
+                        "ok": True,
+                        "transaction": {
+                            **local,
+                            **asset_logo_fields(local.get("chain")),
+                        },
+                    }
                 return {"ok": False, "code": "TRANSACTION_STATUS_FAILED", "error": str(exc)}
         if local is not None:
-            return {"ok": True, "transaction": local}
+            return {
+                "ok": True,
+                "transaction": {**local, **asset_logo_fields(local.get("chain"))},
+            }
         return {
             "ok": False,
             "code": "OKX_CAPABILITY_UNAVAILABLE",
-            "error": "OKX 交易查询服务暂不可用。",
+            "error": "交易查询服务暂不可用。",
         }
 
     async def gas_estimate_tool(
@@ -4654,6 +6061,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         if balance_raw >= fee_raw
                         else "当前原生币余额不足以支付预计网络手续费。"
                     ),
+                    # The gas row shows the native coin, whose icon is the chain
+                    # logo.
+                    **asset_logo_fields(str(chain).upper(), native.asset.symbol),
                 },
             }
         except Exception as exc:
@@ -4719,7 +6129,15 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 str(asset.address or "").lower(),
             )
             merged[key] = asset
-        serialized_assets = [_dump(asset) for asset in merged.values()]
+        serialized_assets = [
+            {
+                **_dump(asset),
+                # Discovery rows are shown as a token list, so each one carries
+                # the chain badge next to its icon.
+                "chain_logo_url": chain_logo_url(asset.chain),
+            }
+            for asset in merged.values()
+        ]
         if cache is not None and not provider_errors:
             cache.set(cache_key, serialized_assets)
         return {
@@ -5258,7 +6676,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "error": "价格服务暂不可用。",
                 }
             prices = await runtime.price_provider.get_prices([asset])
-            return {"ok": True, "prices": [_dump(item) for item in prices]}
+            return {"ok": True, "prices": [_price_with_logos(item) for item in prices]}
 
         async def wallet_balance(args: dict[str, Any]) -> dict[str, Any]:
             """Read wallet balances."""
@@ -5374,7 +6792,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             try:
                 details = await method([asset])
-                return {"ok": True, "details": [_dump(item) for item in details]}
+                return {"ok": True, "details": [_price_with_logos(item) for item in details]}
             except Exception:
                 return {"ok": False, "code": "MARKET_DETAILS_FAILED", "error": "行情详情暂不可用。"}
 
@@ -5398,7 +6816,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     period=str(args.get("period") or "1h"),
                     limit=int(args.get("limit") or 24),
                 )
-                return {"ok": True, "history": _dump(page)}
+                # A history page has no asset field of its own, so the resolved
+                # identity travels next to it for the card's header icon.
+                return {
+                    "ok": True,
+                    "history": _dump(page),
+                    "asset": _asset_with_logo(asset.model_dump(mode="json")),
+                    "chain_logo_url": chain_logo_url(asset.chain),
+                }
             except Exception:
                 return {"ok": False, "code": "PRICE_HISTORY_FAILED", "error": "历史价格暂不可用。"}
 
@@ -6417,6 +7842,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "swap_gas_estimate": gas_estimate,
             "response": {
                 "kind": "confirmation_required",
+                "message": "请确认是否继续这笔兑换。",
                 "confirmation": confirmation,
                 "quote": selected,
                 "gas_estimate": gas_estimate,
@@ -6684,7 +8110,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             message=f"{name} 报价请求完成。",
             provider=str(name),
         )
-        return {"quote_candidates": [payload["quote"]]}
+        return {"quote_candidates": [_quote_with_chain_logos(payload["quote"])]}
 
     async def intent(state: dict[str, Any]) -> dict[str, Any]:
         existing = state.get("forced_intent")
@@ -6875,12 +8301,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     swap_gas_estimate=None,
                     errors=[{"__clear__": True}],
                 )
+            task_recreated = False
             if (
                 not active_task
                 or active_task.get("kind") != task_kind
                 or active_task.get("status") in {"completed", "cancelled"}
             ):
                 active_task = new_active_task(task_kind)
+                task_recreated = True
             patch_source: Any = parsed
             if hasattr(runtime.model, "extract"):
                 extraction_request = dict(request)
@@ -7059,6 +8487,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "active_task": active_task,
                 **merged.invalidation,
             }
+            # Persist the App-pinned swap channel on the active task. The App
+            # sends suggestion_data.provider once (the coin-selection turn) and
+            # later amount/quote turns may omit it; keeping the pin on the task
+            # makes the whole swap flow quote through the chosen provider. A
+            # brand-new task that carries no provider must not inherit a pin
+            # from a previous, unrelated swap.
+            if task_kind == "swap":
+                pinned = _suggestion_pinned_provider(state, runtime.providers)
+                if pinned is not None:
+                    if active_task.get("pinned_provider") != pinned:
+                        active_task = {**active_task, "pinned_provider": pinned}
+                        task_update["active_task"] = active_task
+                elif task_recreated:
+                    active_task = {**active_task, "pinned_provider": None}
+                    task_update["active_task"] = active_task
             if task_kind == "transfer" and any(
                 state.get(field) is not None
                 for field in (
@@ -7073,6 +8516,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     broadcast_status=None,
                     transaction_query=None,
                     transaction_status_snapshot=None,
+                    # The previous transfer was already broadcast (or its status
+                    # context is being cleared), so its unsigned prepared
+                    # transaction and preflight are stale and must not be
+                    # projected as a confirmation card for this new transfer.
+                    pending_transaction=None,
+                    preflight=None,
                 )
             wallet_event(
                 "slot_merge",
@@ -7129,6 +8578,24 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             )
             if not draft and state.get("swap_request"):
                 draft = _swap_draft_from_request(state.get("swap_request"))
+            # The App returns the user-picked BTC 出金地址 through
+            # suggestion_data; pin it deterministically so the swap is quoted
+            # from that exact address instead of relying on model extraction.
+            request_meta = state.get("request") or {}
+            suggestion = (
+                request_meta.get("metadata")
+                if isinstance(request_meta, Mapping)
+                else None
+            )
+            if isinstance(suggestion, Mapping):
+                suggestion = suggestion.get("suggestion_data")
+            if (
+                isinstance(suggestion, Mapping)
+                and str(suggestion.get("intent") or "").strip().lower() == "swap"
+                and str(suggestion.get("sender_address") or "").strip()
+                and is_valid_address("BTC", str(suggestion["sender_address"]))
+            ):
+                draft["sender_address"] = str(suggestion["sender_address"]).strip()
             draft, token_candidates, resolution_errors = await _resolve_swap_assets(
                 draft, runtime.providers
             )
@@ -7236,6 +8703,56 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                             f"{'；'.join(descriptions)}。"
                         ),
                         "token_candidates": token_candidates,
+                    },
+                }
+            # A BTC-source swap must name one 出金 address before quoting: the
+            # provider-facing fromAddress/userAddr is a single address (Lif:
+            # “出金的地址只能从中间选一个”), and the App shows each BTC address
+            # separately. When no explicit sender was chosen yet and the wallet
+            # declared several BTC addresses, ask the App to select one instead
+            # of silently picking the first account.
+            btc_source_addresses = _swap_requires_btc_source_selection(
+                draft, state.get("wallet_context")
+            )
+            if btc_source_addresses:
+                active_task = _task_progress(
+                    active_task,
+                    slots=draft,
+                    status="collecting",
+                    stage="selecting_btc_address",
+                    missing_fields=[],
+                )
+                address_options = await _btc_source_address_options(
+                    btc_source_addresses
+                )
+                return {
+                    "intent": "clarification",
+                    "route": "clarification",
+                    "swap_draft": draft,
+                    **task_update,
+                    "active_task": active_task,
+                    "missing_fields": [],
+                    **_task_update(
+                        state.get("conversation_state"),
+                        goal="swap",
+                        stage="selecting_btc_address",
+                        slots=draft,
+                        missing_fields=[],
+                    ),
+                    "max_poll_attempts": runtime.max_poll_attempts,
+                    "response": {
+                        "kind": "clarification",
+                        "message": "BTC 兑换需要确认出金地址，请在下面选择一个地址。",
+                        "missing_fields": [],
+                        "client_action": {
+                            "type": "select_btc_address",
+                            "reason": "BTC 兑换需要指定出金地址",
+                            "slots": {
+                                "chain": "BTC",
+                                "symbol": "BTC",
+                                "addresses": address_options,
+                            },
+                        },
                     },
                 }
             request_model, missing = _swap_draft_request(draft, state.get("wallet_context"))
@@ -7794,7 +9311,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             )
         selected = state.get("selected_quote")
-        if state.get("intent") == "swap_quote" and not runtime.providers:
+        # The App can pin a single channel via suggestion_data.provider (Lif:
+        # 测试 Bridgers 完整流程需要能指定渠道). Restrict the fan-out to that
+        # provider so only it is quoted and can be selected/prepared.
+        available_providers = list(runtime.providers)
+        pinned_provider = _pinned_swap_provider(state, runtime.providers)
+        if pinned_provider is not None:
+            available_providers = [pinned_provider]
+        if state.get("intent") == "swap_quote" and not available_providers:
             return {
                 "swap_request": request_payload,
                 "available_providers": [],
@@ -7803,14 +9327,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "errors": [
                     _error(
                         "PROVIDER_UNAVAILABLE",
-                        "没有可用的兑换 Provider。",
+                        "没有可用的兑换 Provider，或指定的渠道不可用。",
                         details={"capability": "quote"},
                     )
                 ],
             }
         return {
             "swap_request": request_payload,
-            "available_providers": list(runtime.providers),
+            "available_providers": available_providers,
             "selected_quote": selected,
             "response": None,
             "errors": [{"__clear__": True}],
@@ -7929,9 +9453,40 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 quotes = enriched
             except Exception:
                 pass
+        # Fee/rate/ETA display enrichment always runs (independent of the price
+        # provider). reference_rate prefers the market price ratio and falls
+        # back to the quoted output/input; total_payment is the source asset
+        # the user pays including provider + network fees; eta is a documented
+        # per-provider estimate unless the provider discloses a real one.
+        enriched_display: list[dict[str, Any]] = []
+        for item in quotes:
+            q = dict(item)
+            input_amount = Decimal(str(q.get("input_amount") or 0))
+            output = Decimal(str(q.get("expected_output") or 0))
+            network_fee = Decimal(str(q.get("network_fee") or 0))
+            provider_fee = Decimal(str(q.get("provider_fee") or 0))
+            reference_rate: Decimal | None = None
+            snapshots = q.get("price_snapshots") or []
+            source = q.get("source_asset") or {}
+            destination = q.get("destination_asset") or {}
+            src_price = _snapshot_price(snapshots, source)
+            dst_price = _snapshot_price(snapshots, destination)
+            if src_price is not None and dst_price:
+                reference_rate = src_price / dst_price
+            elif input_amount:
+                reference_rate = output / input_amount
+            if reference_rate is not None:
+                q["reference_rate"] = str(reference_rate)
+            q["total_payment"] = str(input_amount + network_fee + provider_fee)
+            q["eta"] = q.get("eta") or _provider_eta_estimate(q.get("provider"))
+            enriched_display.append(q)
+        if enriched_display:
+            quotes = enriched_display
         # Select only after enrichment so confirmation/session projection keep
-        # USD values and price snapshots. Multiple candidates still require an
-        # explicit user choice.
+        # USD values and price snapshots. Once the swap is complete the design
+        # defaults to one channel (App-side report): when the user has no prior
+        # selection, pick the best quote deterministically instead of making the
+        # App render a channel picker. An explicit prior selection still wins.
         if len(quotes) == 1:
             selected = quotes[0]
         elif previous_reference:
@@ -7944,7 +9499,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 previous_selected,
             )
         else:
-            selected = None
+            selected = _default_quote(quotes, state.get("swap_request"))
         provider_errors = [
             item
             for item in state.get("errors", [])
@@ -7964,7 +9519,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     for part in ("chain", "chain_id", "symbol", "address")
                 )
                 snapshot_map[key] = snap
-        stage = "selecting_quote" if len(quotes) > 1 else "ready_for_prepare"
+        stage = (
+            "selecting_quote"
+            if len(quotes) > 1 and selected is None
+            else "ready_for_prepare"
+        )
         task_update = _task_update(
             state.get("conversation_state"),
             goal="swap",
@@ -8089,6 +9648,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     },
                 }
             tx = _apply_fee_estimate(tx, preflight.get("fee_estimate"))
+            # The unsigned-transaction card shows what moves next to the signing
+            # payload, so keep the asset identity (with its icon) outside the
+            # transaction the wallet signs.
+            transfer_asset = (
+                _asset_with_logo(req.token.model_dump(mode="json"))
+                if req.token is not None
+                else _asset_with_logo(
+                    {
+                        "chain": canonical_chain(req.chain),
+                        "symbol": native_symbol(req.chain) or req.chain,
+                        "decimals": native_decimals(req.chain),
+                        "address": None,
+                    }
+                )
+            )
             return {
                 "preflight": preflight,
                 "pending_transaction": tx.model_dump(mode="json"),
@@ -8096,6 +9670,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "kind": "transfer_prepare",
                     "pending_transaction": tx.model_dump(mode="json"),
                     "preflight": preflight,
+                    "asset": transfer_asset,
+                    "chain_logo_url": chain_logo_url(req.chain),
                 },
             }
         except Exception as exc:
@@ -8120,6 +9696,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     kind="swap_status",
                     status=stage,
                     message=messages.get(stage, "兑换授权状态已更新。"),
+                    **_swap_status_logo_context(state),
                 )
             return response
 
@@ -8230,6 +9807,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "response": authorization_response(
                     "swap_ready",
                     pending_transaction=dumped,
+                    asset=_asset_with_logo(source_asset),
+                    chain_logo_url=chain_logo_url(source_chain),
                     **({"preflight": preflight} if preflight is not None else {}),
                 ),
             }
@@ -8269,6 +9848,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 owner=requirement.owner,
                 spender=requirement.spender,
                 amount_raw=requirement.required_amount_raw,
+                chain_logo_url=chain_logo_url(requirement.token.chain),
             )
             approval_transaction = approval_model.model_dump(mode="json")
             answer = interrupt(
@@ -8389,6 +9969,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "response": authorization_response(
                     "swap_ready",
                     pending_transaction=dumped,
+                    asset=_asset_with_logo(source_asset),
+                    chain_logo_url=chain_logo_url(source_chain),
                     **({"preflight": preflight} if preflight is not None else {}),
                 ),
             }
@@ -8653,6 +10235,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "shortfall_raw": str(shortfall_raw),
                 "warnings": warnings,
                 "message": message,
+                **asset_logo_fields(chain, native.asset.symbol),
             }
             return {
                 "gas_snapshot": snapshot,
@@ -8780,7 +10363,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             return {
                 "response": await naturalize_read_response(
                     state,
-                    {"kind": "price_query", "prices": [_dump(item) for item in prices]},
+                    {
+                        "kind": "price_query",
+                        "prices": [_price_with_logos(item) for item in prices],
+                    },
                 )
             }
         except Exception as exc:
@@ -8854,7 +10440,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "errors": [
                     _error(
                         "OKX_CAPABILITY_UNAVAILABLE",
-                        "OKX transaction explorer unavailable.",
+                        "Transaction explorer unavailable.",
                         details={"chain": chain, "tx_hash": tx_hash},
                     )
                 ],
@@ -8973,6 +10559,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "response": {
                     "kind": "swap_prepare",
                     "transaction": _dump(prepared),
+                    # The unsigned-transaction card shows what is swapped out.
+                    "asset": _asset_with_logo(quote.source_asset.model_dump(mode="json")),
+                    "chain_logo_url": chain_logo_url(quote.source_asset.chain),
                     **({"preflight": preflight} if preflight is not None else {}),
                 },
             }
@@ -9007,6 +10596,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "Source-chain transaction propagation is not confirmed yet; "
                     "provider order polling has not started."
                 ),
+                **_swap_status_logo_context(state),
             }
             return {
                 "response": await naturalize_read_response(state, response_payload)
@@ -9030,7 +10620,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 if isinstance(pending, Mapping)
                 else getattr(pending, "provider_reference", None)
             ) or selected.get("provider_reference", "")
-            order = await provider.register_broadcast(str(provider_reference), tx_hash)
+            # Pass the persisted quote so the provider can rebuild its full
+            # registration payload when the in-memory quote cache is cold
+            # (process restart / another provider instance), instead of sending
+            # a minimal fallback that Bridgers rejects with resCode 101.
+            order = await provider.register_broadcast(
+                str(provider_reference), tx_hash, quote=selected or None
+            )
             value = _dump(order)
             pending_payload = (
                 _mapping(pending).get("provider_payload") if pending is not None else {}
@@ -9079,6 +10675,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "Source-chain transaction propagation is not confirmed yet; "
                     "provider order polling has not started."
                 ),
+                **_swap_status_logo_context(state),
             }
             return {
                 "response": await naturalize_read_response(state, response_payload),
@@ -9092,6 +10689,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "status": "swap_ready",
                     "message": "兑换交易已准备好，正在等待钱包签名并广播。",
                     "pending_transaction": state["pending_transaction"],
+                    **_swap_status_logo_context(state),
                 }
                 return {
                     "response": await naturalize_read_response(state, response_payload)
@@ -9100,6 +10698,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "kind": "swap_status",
                 "status": "unknown",
                 "message": status_messages["unknown"],
+                **_swap_status_logo_context(state),
             }
             return {
                 "response": await naturalize_read_response(state, response_payload),
@@ -9160,6 +10759,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "failure_reason": dumped.get("failure_reason"),
                 "eta": dumped.get("eta"),
                 "message": message,
+                **_swap_status_logo_context(state),
             }
             return {
                 "status_snapshot": dumped,
@@ -9368,13 +10968,26 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         )
 
     async def react_transaction_status(
-        tx_hash: str,
+        tx_hash: str = "",
         chain: str | None = None,
         *,
         state: Annotated[dict[str, Any], InjectedState],
     ) -> dict[str, Any]:
+        # The App can open this from a transaction or swap order detail page
+        # with the chain/hash carried in the entry context; fall back to it so
+        # the model does not need to restate (or guess) the chain.
+        query = state.get("swap_query") or state.get("transaction_query") or {}
+        resolved_hash = str(tx_hash or query.get("tx_hash") or query.get("hash") or "")
+        resolved_chain = str(
+            chain
+            or query.get("chain")
+            or state.get("wallet_context", {}).get("chain")
+            or ""
+        )
         return await _react_read_observation(
-            "transaction_status", {"tx_hash": tx_hash, "chain": chain}, state
+            "transaction_status",
+            {"tx_hash": resolved_hash, "chain": resolved_chain},
+            state,
         )
 
     async def react_get_swap_quote(
@@ -9426,6 +11039,29 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "recipient_address": recipient_address,
             "slippage_bps": slippage_bps,
         }
+        # The App returns the user-picked BTC 出金地址 through suggestion_data;
+        # carry it so the quote is sent from that exact address instead of the
+        # first declared account (Lif: “出金的地址只能从中间选一个”).
+        request_meta = state.get("request") or {}
+        suggestion = (
+            request_meta.get("metadata") if isinstance(request_meta, Mapping) else None
+        )
+        if isinstance(suggestion, Mapping):
+            suggestion = suggestion.get("suggestion_data")
+        if (
+            isinstance(suggestion, Mapping)
+            and str(suggestion.get("intent") or "").strip().lower() == "swap"
+            and str(suggestion.get("sender_address") or "").strip()
+            and is_valid_address("BTC", str(suggestion["sender_address"]))
+        ):
+            values["sender_address"] = str(suggestion["sender_address"]).strip()
+        # The App can pin a single channel via suggestion_data.provider; quote
+        # through only that provider so it can be selected and prepared (Lif:
+        # 测试 Bridgers 完整授权流程需要能指定渠道). The App selection wins over
+        # whatever the model guessed for provider_name.
+        pinned_provider = _pinned_swap_provider(state, runtime.providers)
+        if pinned_provider is not None:
+            provider_name = pinned_provider
         # Preserve the user's fiat-target semantics when the model calls the
         # tool directly. The lifecycle path performs this conversion later,
         # but ReAct must not reinterpret “10u” as an input token amount.
@@ -9445,6 +11081,19 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "message": "请先确认目标资产所在的网络，才能按 10 USD 计算到账数量。",
             }
         draft.setdefault("source_chain", context.get("chain"))
+        # The user's own words name the source/destination chain; a model guess
+        # that contradicts them must not win. In a cross-chain swap such as
+        # “用eth的usdt换trx” the model sometimes mirrors the target chain back
+        # onto the source (TRON USDT as source) and reports ASSET_NOT_FOUND.
+        # Lif's real session 20e62b6a hit exactly that transient 报价不存在.
+        message_hints = swap_direction_hints(
+            str((current.get("request") or {}).get("message") or "")
+        )
+        for chain_key in ("source_chain", "destination_chain"):
+            hinted = message_hints.get(chain_key)
+            if hinted and draft.get(chain_key):
+                if canonical_chain(str(draft[chain_key])) != hinted:
+                    draft[chain_key] = hinted
         if not draft.get("destination_chain"):
             return {
                 "ok": False,
@@ -9459,6 +11108,28 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             return {"ok": False, "code": "ASSET_AMBIGUOUS", "candidates": candidates}
         if errors:
             return {"ok": False, "code": "ASSET_RESOLUTION_FAILED", "errors": errors}
+        # A BTC-source swap must name one 出金 address before quoting. Ask the
+        # App to pick one when the wallet declared several BTC addresses and
+        # none was explicitly chosen, instead of silently quoting from the
+        # first account.
+        btc_source_addresses = _swap_requires_btc_source_selection(resolved, context)
+        if btc_source_addresses:
+            address_options = await _btc_source_address_options(btc_source_addresses)
+            return {
+                "ok": False,
+                "code": "BTC_SOURCE_ADDRESS_REQUIRED",
+                "error": "BTC 兑换需要确认出金地址。",
+                "missing_fields": ["sender_address"],
+                "client_action": {
+                    "type": "select_btc_address",
+                    "reason": "BTC 兑换需要指定出金地址",
+                    "slots": {
+                        "chain": "BTC",
+                        "symbol": "BTC",
+                        "addresses": address_options,
+                    },
+                },
+            }
         request_model, missing = _swap_draft_request(resolved, context)
         if request_model is None:
             return {
@@ -9659,6 +11330,23 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "suggestions": suggestions,
         }
 
+    async def react_swap_quick_replies(
+        *,
+        state: Annotated[dict[str, Any], InjectedState],
+    ) -> dict[str, Any]:
+        """Standard quick replies for the swap card's pair selection."""
+        language = _message_language(
+            str((state.get("request") or {}).get("message") or "")
+        )
+        suggestions = await _react_swap_pair_suggestions(
+            wallet_provider=runtime.wallet_provider,
+            wallet_context=state.get("wallet_context") or {},
+            tool_payloads=_react_turn_tool_payloads(state),
+            read_facts=state.get("read_facts"),
+            language=language,
+        )
+        return {"ok": True, "missing_fields": [], "suggestions": suggestions}
+
     async def react_transaction_history(
         chain: str | None = None,
         direction: str | None = None,
@@ -9836,6 +11524,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             description="根据来源/目标资产和数量获取兑换报价；自动发现合约和 decimals。",
         ),
         StructuredTool.from_function(
+            coroutine=react_swap_quick_replies,
+            name="swap_quick_replies",
+            description=(
+                "生成兑换意图的标准快捷选项：根据用户余额推荐交易对，以及"
+                "“其他币对”“跨链换”入口。当用户表达兑换意图但还没有指定"
+                "卖出的币种和买入的币种时先调用它，再把返回的选项连同你的"
+                "提问一起给用户；已经明确币对时不要调用，直接用 get_swap_quote。"
+            ),
+        ),
+        StructuredTool.from_function(
             coroutine=react_transaction_history,
             name="transaction_history",
             description=(
@@ -9852,6 +11550,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "生成转账参数收集用的标准快捷选项（收款地址／转给联系人／先看看余额、"
                 "网络、Token、金额）。当你需要向用户补充转账信息时先调用它，"
                 "再把返回的选项连同你的提问一起给用户；不要自己编造选项。"
+                "用户提供收款地址后，必须把该地址作为 recipient 再次调用本工具，"
+                "以取得下一步的网络选择卡（type:\"chain\"）选项并展示；"
+                "不要用文字罗列可选网络。"
             ),
         ),
         StructuredTool.from_function(
@@ -9861,7 +11562,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "请求 App 弹出它自己的界面并把结果回填给这一轮对话。"
                 "action 取值：open_contacts（通讯录选联系人）、scan_qr（扫收款码）、"
                 "open_amount_keypad（数字键盘输入金额）、"
-                "address_input（弹出地址输入框让用户粘贴收款地址）。"
+                "address_input（弹出地址输入框让用户粘贴收款地址）、"
+                "select_btc_address（BTC 兑换时让用户在多个 BTC 地址中选择出金地址）。"
                 "用户说“从联系人选/转给朋友”“扫一扫”“输入金额”，"
                 "或需要用户提供收款地址时调用它，"
                 "不要用文字向用户索要通讯录、二维码或键盘里的数据，也不要自己编造联系人。"
@@ -10083,8 +11785,20 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "缺少转账参数时先调用 transfer_quick_replies 取得标准快捷选项，再提问；"
                 "逐步收集（先地址、再网络、再金额），网络未明确时给链选择卡，"
                 "不要默认使用钱包当前网络。"
-                "需要通讯录、扫码、金额键盘或地址输入时调用 request_client_action 请求 App 弹出，"
+                "用户提供收款地址后，立即用该地址调用 transfer_quick_replies"
+                "（recipient=该地址）取得网络选择卡并展示给用户；"
+                "禁止用文字罗列可选网络。"
+                "用户表达兑换意图但还没指定币对时，先调用 swap_quick_replies"
+                "根据余额推荐交易对，再把返回的选项连同你的提问一起给用户；"
+                "已经明确币对时直接用 get_swap_quote，不要重复推荐。"
+                "需要通讯录、扫码、金额键盘、地址输入或 BTC 出金地址选择时"
+                "调用 request_client_action 请求 App 弹出，"
                 "自己不要收集这些界面里的数据。"
+                "回复保持纯文本短句：禁止使用 Markdown 图片（如 ![ETH](url)）和表格，"
+                "禁止用 <suggestions>、JSON 或任何标签把选项写进文案；"
+                "币种与链的图标只通过结构化字段下发，由 App 渲染，不要写进文案；"
+                "选项会由系统自动附带在结构化 suggestions 字段里，"
+                "文案不要重复罗列网络、币种或金额选项。"
                 "短追问要结合历史理解；工具失败时说明真实原因并提出最小澄清；不要编造事实或描述内部推理。"
             )
         )
@@ -10123,6 +11837,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 or ""
             ).strip()
             tx_hash = str(swap_context.get("tx_hash") or "").strip()
+            swap_chain = str(
+                swap_context.get("chain") or swap_context.get("swap_chain") or ""
+            ).strip().upper()
             if order_id or tx_hash:
                 system = SystemMessage(
                     content=str(system.content)
@@ -10131,10 +11848,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         if order_id
                         else "当前兑换订单上下文。"
                     )
+                    + (f"订单链 {swap_chain}。" if swap_chain else "")
                     + ("广播哈希 " + tx_hash + "。" if tx_hash else "")
                     + "用户多半是从兑换详情页进来的，要解释它的状态、失败原因或为什么还在处理中；"
                     "先用 query_swap_status / transaction_status 查证再回答，"
                     "来源没给失败原因时就说明没有提供，不要编造。"
+                    "这是订单详情分析，不要调用 transaction_history 拉取最近交易流水，"
+                    "也不要重新开始一笔新的兑换。"
                 )
 
         if not existing or not any(isinstance(item, SystemMessage) for item in existing):
@@ -10243,6 +11963,15 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             }
         request_model_id = str((state.get("request") or {}).get("model_id") or "") or None
         invoke_react = runtime.model.invoke_react
+        tools = react_tools
+        if state.get("swap_query"):
+            # Swap order detail analysis: the recent-transaction history card
+            # must not project over the order's status explanation. Keep the
+            # tool (the conversation may return to general questions) but hide
+            # it from this order-scoped turn.
+            tools = [
+                tool for tool in react_tools if getattr(tool, "name", "") != "transaction_history"
+            ]
         parameters = inspect.signature(invoke_react).parameters.values()
         accepts_model_id = any(
             parameter.name == "model_id"
@@ -10250,9 +11979,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             for parameter in parameters
         )
         if accepts_model_id:
-            result = await invoke_react(messages, react_tools, model_id=request_model_id)
+            result = await invoke_react(messages, tools, model_id=request_model_id)
         else:
-            result = await invoke_react(messages, react_tools)
+            result = await invoke_react(messages, tools)
         calls = list(getattr(result, "tool_calls", None) or [])
         prior = list(state.get("react_tool_signatures") or [])
         signatures = [
@@ -10281,9 +12010,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         messages = list(state.get("messages") or [])
         last = messages[-1] if messages else None
         content = str(getattr(last, "content", "") or "").strip()
+        # The App renders message as a short plain-text sentence. Deterministic
+        # safety net behind the prompt constraint: drop Markdown images/tables
+        # the model may still emit so the client never has to render them.
+        content = _plain_text_message(content)
         if not content:
             content = "我暂时无法生成有效回复，请换一种方式描述你的需求。"
-        tool_payloads: list[tuple[str, dict[str, Any]]] = []
         current_user_index = max(
             (
                 index
@@ -10292,16 +12024,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             ),
             default=-1,
         )
-        turn_messages = messages[current_user_index + 1 :] if current_user_index >= 0 else messages
-        for message in turn_messages:
-            if not isinstance(message, ToolMessage):
-                continue
-            try:
-                payload = json.loads(str(message.content))
-            except (TypeError, ValueError):
-                continue
-            if isinstance(payload, Mapping):
-                tool_payloads.append((str(message.name or ""), dict(payload)))
+        tool_payloads = _react_turn_tool_payloads(state)
         react_results = [
             {"tool": name, "result": payload} for name, payload in tool_payloads
         ]
@@ -10325,34 +12048,291 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "route_mode": state.get("route_mode") or "react",
             "route_reason": state.get("route_reason") or "model_answer",
         }
-        if quick_replies:
-            response["suggestions"] = quick_replies
+        # A BTC swap must name its 出金 address before the amount step, so a
+        # select_btc_address surface outranks the amount keypad when the model
+        # requested both in one turn.
         client_action = next(
             (
                 dict(payload["client_action"])
-                for _, payload in reversed(tool_payloads)
+                for _, payload in tool_payloads
                 if isinstance(payload.get("client_action"), Mapping)
+                and str(payload["client_action"].get("type") or "") == "select_btc_address"
             ),
             None,
         )
+        if client_action is None:
+            client_action = next(
+                (
+                    dict(payload["client_action"])
+                    for _, payload in reversed(tool_payloads)
+                    if isinstance(payload.get("client_action"), Mapping)
+                ),
+                None,
+            )
+        current_message = str(
+            (state.get("request") or {}).get("message") or state.get("message") or ""
+        ).strip()
+        # A swap intent covers both the explicit swap tokens and a message that
+        # names a full pair ("USDT 兑 ETH", "用 USDT 换 ETH", "swap USDT to ETH").
+        # Those pair messages carry no "兑换/换成" token, and treating them as a
+        # transfer would drop the swap amount keypad (App-side report: keypad
+        # only appeared in react_results, never top-level).
+        swap_intent = (
+            (
+                any(
+                    token in current_message.lower()
+                    for token in ("swap", "exchange", "兑换", "换成")
+                )
+                or _react_swap_pair_from_message(current_message) is not None
+            )
+            and not _looks_like_transfer_message(current_message)
+        )
+        swap_keypad_slots = None
+        if client_action and str(client_action.get("type") or "") == "open_amount_keypad":
+            swap_keypad_slots = _react_swap_keypad_slots(
+                dict(client_action.get("slots") or {}), state, swap_intent
+            )
+            if swap_keypad_slots is not None:
+                client_action = {**client_action, "slots": swap_keypad_slots}
+        # The model can pin the coin via request_client_action (keypad
+        # slots.symbol) and also call transfer_quick_replies whose draft has no
+        # symbol yet, surfacing an amount keypad and a coin chip in the same
+        # round. Reconcile them so the App renders one consistent amount step.
+        # The keypad's symbol only counts when the user actually chose it; the
+        # model defaulting to the chain's native coin must not skip the
+        # coin-selection step, or the user gets locked to that coin.
+        if (
+            swap_keypad_slots is None
+            and client_action
+            and str(client_action.get("type") or "") == "open_amount_keypad"
+        ):
+            keypad_slots = dict(client_action.get("slots") or {})
+            keypad_symbol = str(keypad_slots.get("symbol") or "").strip()
+            if keypad_symbol and _react_transfer_user_symbol(state):
+                if "decimals" not in keypad_slots:
+                    decimals = next(
+                        (
+                            (item.get("data") or {}).get("decimals")
+                            for item in (quick_replies or [])
+                            if (item.get("data") or {}).get("symbol") == keypad_symbol
+                            and (item.get("data") or {}).get("decimals") is not None
+                        ),
+                        None,
+                    )
+                    if decimals is None:
+                        asset = _transfer_wallet_asset(
+                            state.get("wallet_context") or {},
+                            str(keypad_slots.get("chain") or ""),
+                            keypad_symbol,
+                        )
+                        if asset is not None:
+                            decimals = asset.get("decimals")
+                    if decimals is None:
+                        decimals = _NATIVE_ASSET_DECIMALS.get(
+                            canonical_chain(str(keypad_slots.get("chain") or ""))
+                        )
+                    if decimals is not None:
+                        keypad_slots["decimals"] = decimals
+                        client_action = {**client_action, "slots": keypad_slots}
+                if quick_replies:
+                    quick_replies = [
+                        item
+                        for item in quick_replies
+                        if str(item.get("type") or "") not in {"symbol", "token"}
+                    ]
+            else:
+                # The coin was not user-chosen (unknown, or the model defaulted
+                # the native coin): a keypad cannot anchor a raw amount, so drop
+                # it and let the coin card drive the step.
+                client_action = None
+        # The model can anchor on an unfinished transfer task and call
+        # transfer_quick_replies even when the user asked to swap (e.g. "我要兑换"
+        # right after a BTC transfer). Rendering the transfer receive-address card
+        # over a swap clarification contradicts the Figma swap card, so for a clear
+        # swap request that produced no swap quote this turn, drop the transfer
+        # suggestions instead of projecting the wrong card.
+        swap_quote_missing = swap_intent and _best_react_quote_result(tool_payloads) is None
+        if swap_quote_missing:
+            # The model may already have called swap_quick_replies to recommend
+            # pairs; keep those. Only transfer-collection suggestions would
+            # project the wrong receive-address card, so drop just those.
+            swap_tool_suggestions = next(
+                (
+                    list(payload.get("suggestions") or [])
+                    for name, payload in reversed(tool_payloads)
+                    if name != "transfer_quick_replies"
+                    and isinstance(payload.get("suggestions"), list)
+                    and payload["suggestions"]
+                ),
+                None,
+            )
+            quick_replies = swap_tool_suggestions if swap_tool_suggestions else None
+        transfer_collection = any(
+            name == "transfer_quick_replies" for name, _ in tool_payloads
+        )
+        if quick_replies:
+            response["suggestions"] = quick_replies
+        elif client_action is None and current_user_index >= 0 and not swap_intent:
+            # The model answered a transfer-collection step with prose instead
+            # of calling transfer_quick_replies. The App renders cards from
+            # suggestions, not prose, so deterministically attach the card for
+            # the next missing slot (chain → coin → amount) to keep the flow
+            # intact regardless of model behavior.
+            transfer_card = _react_transfer_collection(state)
+            if transfer_card is not None:
+                transfer_collection = True
+                missing, draft = transfer_card
+                card_suggestions = await transfer_suggestions(
+                    {**dict(state), "transfer_draft": draft}, missing
+                )
+                if card_suggestions:
+                    response["suggestions"] = card_suggestions
+        # A pair can come from the current message ("把 ETH 换成 USDT") or, for a
+        # bare "兑换" confirmation, from an earlier turn that already named it.
+        # Reusing the established pair keeps the swap on track instead of
+        # bouncing back to the recommended-pair card (App-side report: after
+        # "USDT 换 ETH" a bare "兑换" re-showed the recommendation card).
+        current_pair = _react_swap_pair_from_message(current_message)
+        established_pair = (
+            _react_established_swap_pair(state)
+            if _react_swap_continuation(current_message)
+            else None
+        )
+        active_pair = current_pair or established_pair
+        # Figma swap-intent card ("好的，想换什么？"): when the user expresses
+        # an open-ended swap request and the model produced only prose (no quote,
+        # no client surface, no suggestions), deterministically recommend pairs
+        # from the user's balance so the App never renders an empty bubble.
+        if (
+            swap_quote_missing
+            and client_action is None
+            and not response.get("suggestions")
+            and active_pair is None
+        ):
+            swap_rows = _swap_balance_rows(
+                state.get("wallet_context") or {}, tool_payloads, state.get("read_facts")
+            )
+            if _swap_recommendation_desired(current_message, swap_rows):
+                swap_suggestions = await _react_swap_pair_suggestions(
+                    wallet_provider=runtime.wallet_provider,
+                    wallet_context=state.get("wallet_context") or {},
+                    tool_payloads=tool_payloads,
+                    read_facts=state.get("read_facts"),
+                    language=_message_language(current_message),
+                )
+                if swap_suggestions:
+                    response["suggestions"] = swap_suggestions
+        # Swap source coin held on several networks (Figma 33715:134430): when
+        # the user names an explicit pair ("用 USDT 换 ETH") but the source coin
+        # lives on multiple networks and the model only asked in prose, offer the
+        # structured chain-selection card instead of making the user type a
+        # network name. Each chip pins chain + symbol + token metadata so the
+        # next turn can go straight to the quote.
+        if (
+            client_action is None
+            and _best_react_quote_result(tool_payloads) is None
+            and not response.get("suggestions")
+        ):
+            if (
+                active_pair is not None
+                and _react_swap_pinned_chain(state) is None
+                and not _looks_like_transfer_message(current_message)
+            ):
+                source_symbol, destination_symbol = active_pair
+                chain_rows = _swap_source_chain_rows(
+                    state.get("wallet_context") or {},
+                    tool_payloads,
+                    state.get("read_facts"),
+                    source_symbol,
+                )
+                if len(chain_rows) >= 2:
+                    ordered_chains = _order_supported_chains(
+                        list(chain_rows), (state.get("wallet_context") or {}).get("chain")
+                    )
+                    language = _message_language(current_message)
+                    chain_suggestions: list[dict[str, Any]] = []
+                    for chain in ordered_chains:
+                        descriptor = chain_rows[chain]
+                        symbol = descriptor["symbol"]
+                        data: dict[str, Any] = {
+                            "intent": "swap",
+                            "chain": chain,
+                            "symbol": symbol,
+                        }
+                        if descriptor.get("token_address"):
+                            data["token_address"] = descriptor["token_address"]
+                        if descriptor.get("decimals") is not None:
+                            data["decimals"] = descriptor["decimals"]
+                        chain_suggestions.append(
+                            {
+                                "label": (
+                                    f"使用 {chain} 网络的 {symbol}"
+                                    if language != "en"
+                                    else f"Use {symbol} on {chain}"
+                                ),
+                                "message": (
+                                    f"用 {chain} 网络的 {symbol} 换 {destination_symbol}"
+                                    if language != "en"
+                                    else f"Swap {symbol} on {chain} to {destination_symbol}"
+                                ),
+                                "type": "chain",
+                                "value": chain,
+                                "chain_logo_url": chain_logo_url(chain),
+                                "data": data,
+                            }
+                        )
+                    if chain_suggestions:
+                        response["suggestions"] = chain_suggestions
         if client_action:
             response["client_action"] = client_action
         update: dict[str, Any] = {"response": response, "react_active": False}
+        # Persist an App-pinned swap channel across ReAct turns. The App sends
+        # suggestion_data.provider on the coin-selection turn and may omit it on
+        # later amount/quote turns; storing it on the active task keeps the whole
+        # swap flow quoting/preparing through the chosen provider. A completed or
+        # cancelled task (or a non-swap task) never keeps a stale pin, so a new
+        # unpinned swap does not inherit the previous one.
+        pinned_provider = _suggestion_pinned_provider(state, runtime.providers)
+        if pinned_provider is not None:
+            active_task = state.get("active_task")
+            if (
+                not isinstance(active_task, Mapping)
+                or str(active_task.get("kind") or "") != "swap"
+                or active_task.get("status") in {"completed", "cancelled"}
+            ):
+                active_task = new_active_task("swap")
+            if active_task.get("pinned_provider") != pinned_provider:
+                active_task = {**active_task, "pinned_provider": pinned_provider}
+                update["active_task"] = active_task
         portfolio_result = next((payload.get("portfolio") for _, payload in reversed(tool_payloads)
                                  if isinstance(payload.get("portfolio"), Mapping)), None)
-        if portfolio_result is not None:
+        # A transfer amount step drives a client surface (amount keypad /
+        # address input / contacts / scanner) via client_action. Elevating a
+        # wallet_balance observation to a top-level portfolio card in the same
+        # round would make the App render an asset-overview card next to the
+        # keypad in one bubble, so only a balance question without a client
+        # action projects a portfolio card.
+        if portfolio_result is not None and client_action is None:
             response["portfolio"] = dict(portfolio_result)
         quote_result = _best_react_quote_result(tool_payloads)
         if quote_result is not None:
-            # These are tool observations, not a code-inferred intent. Project
-            # them only so the existing explicit quote-selection endpoint can
-            # continue the user-approved lifecycle.
+            # The design defaults to one channel and renders the confirmation
+            # card directly once coin/amount/chain are complete (App-side
+            # report), instead of making the user compare providers. Keep the
+            # candidates projectable for audit, but also pick the deterministic
+            # best quote so the API can continue straight into confirmation.
             update["quote_candidates"] = [
                 {"__clear__": True},
                 *[dict(item) for item in quote_result["quotes"] if isinstance(item, Mapping)],
             ]
             if isinstance(quote_result.get("request"), Mapping):
                 update["swap_request"] = dict(quote_result["request"])
+            default_quote = _default_quote(
+                [item for item in quote_result["quotes"] if isinstance(item, Mapping)],
+                quote_result.get("request"),
+            )
+            if default_quote is not None:
+                update["selected_quote"] = default_quote
         transfer_result = next(
             (
                 payload
@@ -10367,6 +12347,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             update["pending_transaction"] = dict(transfer_result["pending_transaction"])
             if isinstance(transfer_result.get("preflight"), Mapping):
                 update["preflight"] = dict(transfer_result["preflight"])
+        elif state.get("pending_transaction") is not None:
+            # A prepared unsigned transaction is only actionable while it is
+            # still awaiting signature. Once it has been broadcast, or this
+            # react turn is collecting parameters for a NEW transfer (quick
+            # replies / client surface / transfer card, with no fresh prepare),
+            # the old unsigned transaction no longer matches what the user is
+            # doing. Drop it here so the App stops rendering the stale
+            # confirmation card next to the current turn's card.
+            transfer_collection = (
+                transfer_collection
+                or client_action is not None
+            )
+            if state.get("broadcast_tx_hash") or transfer_collection:
+                update["pending_transaction"] = None
+                update["preflight"] = None
         return update
 
     return locals()

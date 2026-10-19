@@ -5,7 +5,7 @@ import pytest
 
 from wallet_agent.domain.models import Asset, AssetQuery, ProviderOrder, SwapQuoteRequest
 from wallet_agent.providers.http import ProviderResponseError
-from wallet_agent.providers.omnibridge import OmniBridgeProvider
+from wallet_agent.providers.omnibridge import OmniBridgeProvider, _coin_code
 
 
 class FakeTransport:
@@ -187,7 +187,7 @@ async def test_omnibridge_800_quote_normalizes_amounts_and_preserves_source_flag
 @pytest.mark.parametrize("chain", ["BTC", "bitcoin"])
 async def test_omnibridge_quote_uses_the_bare_native_coin_code(chain: str):
     """Omni rejects ``BTC(BTC)`` with resCode 913: its catalog code is ``BTC``."""
-    transport = FakeTransport(quote_response())
+    transport = FakeTransport(quote_response(depositMin="0.000001", depositMax="14"))
     provider = OmniBridgeProvider.from_transport(transport, source_flag="wallet-agent")
     request = SwapQuoteRequest(
         source_asset=Asset(chain=chain, symbol="BTC", decimals=8),
@@ -208,6 +208,37 @@ async def test_omnibridge_quote_uses_the_bare_native_coin_code(chain: str):
 
     assert transport.calls[0]["payload"]["depositCoinCode"] == "BTC"
     assert transport.calls[0]["payload"]["receiveCoinCode"] == "USDT(ERC20)"
+
+
+@pytest.mark.asyncio
+async def test_omnibridge_quote_uses_bare_trx_coin_code_for_tron_native():
+    """Omni's TRX coin code is bare ``TRX`` (coinCodeShow ``TRX(TRON)``);
+    deriving ``TRX(TRON)`` is rejected as “接收货币币种不存在” (Lif: ETH USDT →
+    TRX 报价失败)."""
+    trx = Asset(chain="TRON", symbol="TRX", decimals=6)
+    assert _coin_code(trx) == "TRX"
+
+    transport = FakeTransport(quote_response(depositMin="8", depositMax="285000"))
+    provider = OmniBridgeProvider.from_transport(transport, source_flag="wallet-agent")
+    request = SwapQuoteRequest(
+        source_asset=Asset(
+            chain="ETH",
+            chain_id=1,
+            symbol="USDT(ERC20)",
+            decimals=6,
+            address="0x0000000000000000000000000000000000000022",
+        ),
+        destination_asset=trx,
+        input_amount=Decimal("10"),
+        input_amount_raw="10000000",
+        sender_address="0x1234567890abcdef1234567890abcdef12345678",
+        recipient_address="TGHF8oHDwsuKU8WX82so9GCYe8iJNtit5q",
+    )
+
+    await provider.quote(request)
+
+    assert transport.calls[0]["payload"]["depositCoinCode"] == "USDT(ERC20)"
+    assert transport.calls[0]["payload"]["receiveCoinCode"] == "TRX"
 
 
 @pytest.mark.asyncio
@@ -255,7 +286,7 @@ async def test_omnibridge_quote_truncates_deposit_amount_to_eight_places():
 
 @pytest.mark.asyncio
 async def test_omnibridge_prepare_rejects_stale_high_precision_quote_before_api_call():
-    transport = FakeTransport(quote_response())
+    transport = FakeTransport(quote_response(depositMin="0.001", depositMax="14"))
     provider = OmniBridgeProvider.from_transport(transport)
     quote = await provider.quote(valid_quote_request("0.013677590544728694"))
     stale_quote = quote.model_copy(
@@ -270,6 +301,33 @@ async def test_omnibridge_prepare_rejects_stale_high_precision_quote_before_api_
 
     assert exc_info.value.code == "919"
     assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_omnibridge_quote_rejects_amount_below_deposit_minimum():
+    """A deposit under Omni's minimum fails at quote time with a clear code.
+
+    Regression for the App-side report where 0.003 ETH (min 0.003302) passed
+    the quote and only failed on /confirm as PROVIDER_PREPARE_FAILED with no
+    pending transaction.
+    """
+    transport = FakeTransport(quote_response(depositMin="0.003302", depositMax="14"))
+    provider = OmniBridgeProvider.from_transport(transport)
+    with pytest.raises(ProviderResponseError) as exc_info:
+        await provider.quote(valid_quote_request("0.003"))
+    assert exc_info.value.code == "BELOW_MIN_DEPOSIT"
+    assert "0.003302" in exc_info.value.message
+    assert exc_info.value.category == "client"
+
+
+@pytest.mark.asyncio
+async def test_omnibridge_quote_rejects_amount_above_deposit_maximum():
+    transport = FakeTransport(quote_response(depositMin="0.001", depositMax="0.05"))
+    provider = OmniBridgeProvider.from_transport(transport)
+    with pytest.raises(ProviderResponseError) as exc_info:
+        await provider.quote(valid_quote_request("1.5"))
+    assert exc_info.value.code == "ABOVE_MAX_DEPOSIT"
+    assert exc_info.value.category == "client"
 
 
 @pytest.mark.asyncio
@@ -359,12 +417,19 @@ async def test_omnibridge_ethereum_erc20_quote_exposes_allowance_requirement():
 async def test_omnibridge_validates_amount_bounds_before_order_creation(
     amount: str, minimum: str, maximum: str
 ):
+    """prepare() keeps the deposit bounds as a safety net for stale/forged quotes.
+
+    A normal quote is now rejected at quote time (BELOW_MIN_DEPOSIT /
+    ABOVE_MAX_DEPOSIT); this test forges an out-of-bounds quote past that gate
+    to confirm prepare() still refuses it before hitting the provider API.
+    """
     transport = FakeTransport(quote_response(depositMin=minimum, depositMax=maximum))
     provider = OmniBridgeProvider.from_transport(transport, source_flag="wallet-agent")
-    quote = await provider.quote(valid_quote_request(amount))
+    quote = await provider.quote(valid_quote_request("1"))
+    forged = quote.model_copy(update={"input_amount": Decimal(amount)})
 
     with pytest.raises(ValueError, match="deposit amount"):
-        await provider.prepare(quote)
+        await provider.prepare(forged)
 
     assert len(transport.calls) == 1
 

@@ -377,11 +377,11 @@ SCENARIOS = {
         expected_wallet_sends=1,
         expected_register_attempts=1,
         driver_actions=("broadcast",),
-        expected_route="swap_quote",
-        expected_intent="swap_quote",
-        expected_task_stage="selecting_quote",
-        expected_response_kind="swap_quote",
-        expected_assistant_history_count=1,
+        expected_route="swap_prepare",
+        expected_intent="swap_prepare",
+        expected_task_stage="awaiting_confirmation",
+        expected_response_kind="confirmation_required",
+        expected_assistant_history_count=2,
         expected_candidate_providers=("bridgers", "omnibridge"),
         dimensions=("wallet_api_contract", "broadcast_and_confirmation", "safety"),
     ),
@@ -777,7 +777,9 @@ class RecordingProvider:
             raise RuntimeError(outcome.message or "provider prepare failed")
         raise RuntimeError(outcome.message or outcome.kind)
 
-    async def register_broadcast(self, provider_reference: str, tx_hash: str) -> ProviderOrder:
+    async def register_broadcast(
+        self, provider_reference: str, tx_hash: str, **kwargs
+    ) -> ProviderOrder:
         outcome = self._register.next()
         provider_order_id = (
             str(outcome.value or "order") if outcome.kind == "success" else None
@@ -901,7 +903,7 @@ _SAFE_PUBLIC_HEADER_VALUES = {
     "host",
     "useragent",
 }
-_MAX_PUBLIC_EVIDENCE_DEPTH = 16
+_MAX_PUBLIC_EVIDENCE_DEPTH = 24
 _MAX_JSON_STRING_DEPTH = 8
 _MAX_PUBLIC_STRING_BYTES = 65_536
 _MAX_PUBLIC_BODY_BYTES = 65_536

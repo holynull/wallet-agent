@@ -685,6 +685,13 @@ async def test_transaction_status_uses_local_not_propagated_broadcast_before_exp
         "broadcast_status": "not_propagated",
         "source": "local",
         "message": "交易哈希暂时还没有在源链上出现，请稍后重试。",
+        # The detail card badges the chain even when only the local broadcast
+        # status is known (no explorer logo to reuse).
+        "chain_logo_url": (
+            "https://raw.githubusercontent.com/trustwallet/assets/master"
+            "/blockchains/ethereum/info/logo.png"
+        ),
+        "logo_url": None,
     }
 
 
@@ -1301,6 +1308,13 @@ async def test_swap_suggests_known_source_chain_instead_of_different_wallet_chai
         "message": "目标也在 ETH 链",
         "type": "chain",
         "value": "ETH",
+        # The chain chip carries its badge; the coin icon is only known for a
+        # native coin, so USDC stays null for the App's placeholder.
+        "logo_url": None,
+        "chain_logo_url": (
+            "https://raw.githubusercontent.com/trustwallet/assets/master"
+            "/blockchains/ethereum/info/logo.png"
+        ),
         "data": {
             "intent": "swap_quote",
             "source_chain": "ETH",

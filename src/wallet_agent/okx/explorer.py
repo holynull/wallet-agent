@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
+from wallet_agent.domain.chains import asset_logo_url
 from wallet_agent.domain.models import (
     TokenTransfer,
     TransactionDetail,
@@ -93,13 +94,13 @@ class OkxExplorerAdapter:
                     break
             if not rows_present:
                 raise OkxExplorerError(
-                    "OKX_MALFORMED_RESPONSE", "OKX transaction history is malformed"
+                    "OKX_MALFORMED_RESPONSE", "Transaction history is malformed"
                 )
             if rows is None:
                 rows = []
             if not isinstance(rows, list):
                 raise OkxExplorerError(
-                    "OKX_MALFORMED_RESPONSE", "OKX transaction history is malformed"
+                    "OKX_MALFORMED_RESPONSE", "Transaction history is malformed"
                 )
             transactions = [
                 self._record(row, history_kind="full", self_address=address)
@@ -131,13 +132,17 @@ class OkxExplorerAdapter:
                 history_kind="full",
                 fallback_tx_hash=tx_hash,
             )
-            token_transfers = item.get("tokenTransfers", item.get("tokenTransfer", []))
+            token_transfers = item.get(
+                "tokenTransferDetails",
+                item.get("tokenTransfers", item.get("tokenTransfer", [])),
+            )
             if token_transfers is None:
                 token_transfers = []
             if not isinstance(token_transfers, list):
                 raise OkxExplorerError(
-                    "OKX_MALFORMED_RESPONSE", "OKX token transfers are malformed"
+                    "OKX_MALFORMED_RESPONSE", "Token transfers are malformed"
                 )
+            chain_name = record.chain
             return TransactionDetail(
                 **record.model_dump(mode="python"),
                 gas_limit=self._optional_string(item.get("gasLimit", item.get("gas_limit"))),
@@ -149,7 +154,31 @@ class OkxExplorerAdapter:
                 block_hash=self._optional_string(item.get("blockHash")),
                 fee=self._optional_string(item.get("txFee", item.get("fee"))),
                 token_transfers=[
-                    TokenTransfer.model_validate(entry)
+                    TokenTransfer(
+                        token=(
+                            entry.get("tokenContractAddress")
+                            or entry.get("token")
+                            or entry.get("contractAddress")
+                        ),
+                        symbol=entry.get("symbol") or entry.get("tokenSymbol"),
+                        amount=entry.get("amount") or entry.get("value"),
+                        from_address=(
+                            entry.get("from")
+                            or entry.get("fromAddress")
+                            or entry.get("from_address")
+                        ),
+                        to_address=(
+                            entry.get("to")
+                            or entry.get("toAddress")
+                            or entry.get("to_address")
+                        ),
+                        logo_url=asset_logo_url(
+                            chain_name,
+                            entry.get("tokenContractAddress")
+                            or entry.get("token")
+                            or entry.get("contractAddress"),
+                        ),
+                    )
                     for entry in token_transfers
                     if isinstance(entry, dict)
                 ],
@@ -177,7 +206,7 @@ class OkxExplorerAdapter:
         payload = await self._request(self._chains_path)
         data = payload.get("data")
         if not isinstance(data, list):
-            raise OkxExplorerError("OKX_MALFORMED_RESPONSE", "OKX supported chains are malformed")
+            raise OkxExplorerError("OKX_MALFORMED_RESPONSE", "Supported chains are malformed")
         result: dict[str, set[str]] = {}
         for entry in data:
             if not isinstance(entry, dict):
@@ -191,7 +220,7 @@ class OkxExplorerAdapter:
             elif index:
                 result.setdefault(index, set()).add(index)
         if not result:
-            raise OkxExplorerError("OKX_MALFORMED_RESPONSE", "OKX supported chains are empty")
+            raise OkxExplorerError("OKX_MALFORMED_RESPONSE", "Supported chains are empty")
         self._supported_chains = result
         return {key: set(value) for key, value in result.items()}
 
@@ -201,15 +230,15 @@ class OkxExplorerAdapter:
         except OkxClientError as exc:
             raise OkxExplorerError(
                 "OKX_PROVIDER_ERROR",
-                "OKX explorer provider is unavailable.",
+                "Transaction explorer provider is unavailable.",
                 retryable=exc.retryable,
             ) from exc
         except Exception as exc:
             raise OkxExplorerError(
-                "OKX_PROVIDER_ERROR", "OKX explorer provider is unavailable."
+                "OKX_PROVIDER_ERROR", "Transaction explorer provider is unavailable."
             ) from exc
         if not isinstance(payload, dict) or str(payload.get("code")) != "0":
-            raise OkxExplorerError("OKX_MALFORMED_RESPONSE", "OKX explorer response is malformed")
+            raise OkxExplorerError("OKX_MALFORMED_RESPONSE", "Explorer response is malformed")
         return payload
 
     def _chain_index(self, chain: str) -> str:
@@ -220,7 +249,7 @@ class OkxExplorerAdapter:
         if index is None:
             raise OkxExplorerError(
                 "OKX_CHAIN_UNSUPPORTED",
-                "The requested chain is not supported by OKX.",
+                "The requested chain is not supported.",
             )
         return index
 
@@ -235,7 +264,7 @@ class OkxExplorerAdapter:
         data = payload.get("data")
         item = data[0] if isinstance(data, list) and data else data
         if not isinstance(item, dict) or not item:
-            raise OkxExplorerError("OKX_MALFORMED_RESPONSE", f"OKX {kind} is empty or malformed")
+            raise OkxExplorerError("OKX_MALFORMED_RESPONSE", f"{kind} is empty or malformed")
         return item
 
     def _record(
@@ -253,7 +282,7 @@ class OkxExplorerAdapter:
             or fallback_tx_hash
         )
         if not tx_hash:
-            raise OkxExplorerError("OKX_MALFORMED_RESPONSE", "OKX transaction hash is missing")
+            raise OkxExplorerError("OKX_MALFORMED_RESPONSE", "Transaction hash is missing")
         status = self._status(item.get("txStatus", item.get("status")))
         timestamp = self._timestamp(item.get("txTime", item.get("timestamp")))
         block_number = self._number(item.get("blockHeight", item.get("blockNumber")))
@@ -268,8 +297,10 @@ class OkxExplorerAdapter:
             )
         )
         from_address, to_address = self._sides(
-            item.get("from", item.get("fromAddress")),
-            item.get("to", item.get("toAddress")),
+            item.get(
+                "from", item.get("fromAddress", item.get("fromDetails"))
+            ),
+            item.get("to", item.get("toAddress", item.get("toDetails"))),
             self_address,
         )
         return TransactionRecord(
@@ -290,6 +321,9 @@ class OkxExplorerAdapter:
             decimals=int(decimals) if decimals is not None else None,
             occurred_at=timestamp,
             failure_reason=failure_reason,
+            logo_url=self._optional_string(
+                item.get("logoUrl", item.get("tokenLogoUrl", item.get("logo")))
+            ),
         )
 
     @staticmethod

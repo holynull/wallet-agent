@@ -172,10 +172,13 @@ async def test_sse_final_response_is_retained_in_history():
     assert report.status == "passed"
     turn = next(step for step in report.steps if step.operation == "turn")
     assert turn.evidence["stream_event_count"] > 1
-    assert turn.evidence["response_kind"] == "swap_quote"
+    # A complete swap request now defaults to one channel and auto-continues
+    # into the confirmation card, so the turn's final response is the
+    # confirmation prompt — and it must be retained in the assistant history.
+    assert turn.evidence["response_kind"] == "confirmation_required"
     assert turn.evidence["assistant_message"]
-    assert turn.evidence["assistant_message"] != "swap_quote"
-    assert turn.evidence["assistant_history_count"] == 1
+    assert turn.evidence["assistant_message"] != "confirmation_required"
+    assert turn.evidence["assistant_history_count"] == 2
 
 
 @pytest.mark.asyncio

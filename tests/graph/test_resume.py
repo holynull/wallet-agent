@@ -40,7 +40,7 @@ class BroadcastProvider:
         self.broadcast_calls = 0
         self.status_calls = 0
 
-    async def register_broadcast(self, provider_reference, tx_hash):
+    async def register_broadcast(self, provider_reference, tx_hash, **kwargs):
         self.broadcast_calls += 1
         return ProviderOrder(
             provider="bridgers",

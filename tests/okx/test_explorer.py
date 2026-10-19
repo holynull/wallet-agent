@@ -68,6 +68,41 @@ async def test_history_maps_okx_transaction_list_and_cursor():
 
 
 @pytest.mark.asyncio
+async def test_history_carries_token_logo_and_symbol():
+    client = FakeClient(
+        {
+            "/api/v6/dex/post-transaction/transactions-by-address": {
+                "code": "0",
+                "data": [
+                    {
+                        "cursor": "",
+                        "transactionList": [
+                            {
+                                "chainIndex": "1",
+                                "txHash": TX_HASH,
+                                "txStatus": "2",
+                                "from": ADDRESS,
+                                "to": "0x" + "2" * 40,
+                                "amount": "10",
+                                "symbol": "USDC",
+                                "tokenLogoUrl": "https://static.okx.com/usdc.png",
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+    )
+    adapter = OkxExplorerAdapter(client, {"ETH": "1"})
+
+    page = await adapter.get_transaction_history(ADDRESS, "ETH", limit=1)
+
+    record = page.transactions[0]
+    assert record.symbol == "USDC"
+    assert record.logo_url == "https://static.okx.com/usdc.png"
+
+
+@pytest.mark.asyncio
 async def test_history_accepts_okx_address_lists_and_keeps_our_own_side():
     """OKX sends from/to as [{address, amount}]; a 500 here used to hide all EVM history."""
     other = "0x" + "2" * 40
@@ -199,6 +234,65 @@ async def test_detail_maps_status_and_transaction_fields():
         "/api/v6/dex/post-transaction/transaction-detail-by-txhash",
         {"txHash": TX_HASH, "chainIndex": "1"},
         None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_detail_parses_okx_token_transfer_details_and_address_lists():
+    """OKX detail uses tokenTransferDetails + fromDetails/toDetails (not
+    tokenTransfers/from/to). A prior parser read the wrong keys, so ERC20
+    transfers surfaced value=0, empty token_transfers, and null sides."""
+    usdt = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+    sender = "0x" + "1" * 40
+    recipient = "0x" + "2" * 40
+    client = FakeClient(
+        {
+            "/api/v6/dex/post-transaction/transaction-detail-by-txhash": {
+                "code": "0",
+                "data": [
+                    {
+                        "chainIndex": "1",
+                        "txHash": TX_HASH,
+                        "txStatus": "2",
+                        "amount": "0",
+                        "symbol": "ETH",
+                        "methodId": "0xa9059cbb",
+                        "fromDetails": [{"address": sender, "isContract": False, "amount": ""}],
+                        "toDetails": [{"address": recipient, "isContract": True, "amount": ""}],
+                        "tokenTransferDetails": [
+                            {
+                                "from": sender,
+                                "to": recipient,
+                                "isFromContract": False,
+                                "isToContract": True,
+                                "tokenContractAddress": usdt,
+                                "symbol": "USDT",
+                                "amount": "10",
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+    )
+    adapter = OkxExplorerAdapter(client, {"ETH": "1"})
+
+    detail = await adapter.get_transaction_detail("ETH", TX_HASH)
+
+    assert detail.value == "0"
+    assert detail.symbol == "ETH"
+    assert detail.from_address == sender
+    assert detail.to_address == recipient
+    assert len(detail.token_transfers) == 1
+    transfer = detail.token_transfers[0]
+    assert transfer.token == usdt
+    assert transfer.symbol == "USDT"
+    assert transfer.amount == "10"
+    assert transfer.from_address == sender
+    assert transfer.to_address == recipient
+    assert transfer.logo_url == (
+        "https://raw.githubusercontent.com/trustwallet/assets/master/"
+        f"blockchains/ethereum/assets/{usdt}/logo.png"
     )
 
 

@@ -81,6 +81,41 @@ async def test_bridgers_list_assets_normalizes_chain_and_filters_search():
 
 
 @pytest.mark.asyncio
+async def test_bridgers_list_assets_uses_trx_filter_for_tron():
+    """Bridgers' getToken filter spells TRON as ``TRX`` (catalog entries still
+    report ``chain: TRON``). Sending ``TRON`` returns zero tokens and made an
+    ETH USDT → TRX swap fail to resolve its token address (Lif report)."""
+    transport = FakeTransport(
+        {
+            "resCode": "100",
+            "data": {
+                "tokens": [
+                    {
+                        "chain": "TRON",
+                        "symbol": "TRX",
+                        "decimals": 6,
+                        "address": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    },
+                    {
+                        "chain": "TRON",
+                        "symbol": "USDT(TRON)",
+                        "decimals": 6,
+                        "address": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+                    },
+                ]
+            },
+        }
+    )
+    provider = BridgersProvider.from_transport(transport)
+
+    assets = await provider.list_assets(AssetQuery(chain="TRON", search="TRX"))
+
+    assert transport.calls[0]["payload"] == {"chain": "TRX"}
+    assert [asset.symbol for asset in assets] == ["TRX"]
+    assert [asset.chain for asset in assets] == ["TRON"]
+
+
+@pytest.mark.asyncio
 async def test_http_transport_bounds_retries_for_transport_failures():
     attempts = 0
 
@@ -430,6 +465,29 @@ async def test_bridgers_ethereum_erc20_quote_exposes_allowance_requirement():
 
 
 @pytest.mark.asyncio
+async def test_bridgers_tron_erc20_quote_exposes_allowance_requirement():
+    owner = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    tron_contract = "TFutBMkB47rYtn5EwECfnfDgDmkUP361Sy"
+    transport = FakeTransport(quote_response(contractAddress=tron_contract))
+    provider = BridgersProvider.from_transport(transport, source_flag="wallet-agent")
+    request = valid_quote_request().model_copy(
+        update={
+            "source_asset": Asset(
+                chain="TRON", symbol="USDT", decimals=6, address=owner
+            ),
+            "sender_address": owner,
+            "recipient_address": owner,
+        }
+    )
+
+    quote = await provider.quote(request)
+
+    assert quote.allowance_requirement is not None
+    assert quote.allowance_requirement.spender == tron_contract
+    assert quote.allowance_requirement.owner == owner
+
+
+@pytest.mark.asyncio
 async def test_bridgers_quote_payload_contains_only_normalized_resume_metadata():
     transport = FakeTransport(
         quote_response(),
@@ -554,6 +612,51 @@ async def test_bridgers_upload_uses_idempotency_key_and_tracks_real_order_id():
     assert order.tx_hash == "0xdeposit"
     assert transport.calls[1]["idempotency_key"]
     assert transport.calls[1]["payload"]["hash"] == "0xdeposit"
+
+
+@pytest.mark.asyncio
+async def test_bridgers_register_broadcast_rebuilds_full_request_from_persisted_quote():
+    """When the in-memory quote cache is cold, register_broadcast must rebuild
+    the full Bridgers payload from the persisted session quote (dict form, as
+    the graph state carries it) instead of sending the minimal fallback that
+    Bridgers rejects with resCode 101."""
+    transport = FakeTransport(
+        quote_response(),
+        {
+            "resCode": 100,
+            "resMsg": "success",
+            "data": {"orderId": "bridgers-order-77"},
+        },
+    )
+    provider = BridgersProvider.from_transport(transport, source_flag="wallet-agent")
+    quote = await provider.quote(valid_quote_request())
+
+    # Simulate a cold cache: build a fresh provider instance (no _quotes) and
+    # pass the persisted quote as a JSON dict, exactly what the graph stores.
+    cold = BridgersProvider.from_transport(transport, source_flag="wallet-agent")
+    order = await cold.register_broadcast(
+        quote.provider_reference, "0xdeposit", quote=quote.model_dump(mode="json")
+    )
+
+    assert order.provider_order_id == "bridgers-order-77"
+    payload = transport.calls[-1]["payload"]
+    assert payload["hash"] == "0xdeposit"
+    for required in (
+        "equipmentNo",
+        "sourceFlag",
+        "fromTokenAddress",
+        "toTokenAddress",
+        "fromTokenAmount",
+        "fromTokenChain",
+        "toTokenChain",
+        "userAddr",
+        "fromCoinCode",
+        "toCoinCode",
+        "fromAddress",
+        "toAddress",
+        "amountOutMin",
+    ):
+        assert payload.get(required), f"rebuilt payload is missing {required}"
 
 
 @pytest.mark.asyncio

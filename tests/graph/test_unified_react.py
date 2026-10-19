@@ -123,6 +123,7 @@ async def test_unified_react_uses_balance_and_price_from_full_context():
         "transaction_status",
         "receive_address",
         "get_swap_quote",
+        "swap_quick_replies",
         "transaction_history",
         "transfer_quick_replies",
         "request_client_action",
@@ -288,7 +289,7 @@ def test_react_state_uses_add_messages_reducer():
 
 
 @pytest.mark.asyncio
-async def test_unified_react_keeps_swap_quotes_available_to_explicit_lifecycle_ui():
+async def test_unified_react_defaults_swap_quote_for_lifecycle_confirmation():
     from wallet_agent.graph.build import build_graph
 
     source = Asset(chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x1")
@@ -357,7 +358,10 @@ async def test_unified_react_keeps_swap_quotes_available_to_explicit_lifecycle_u
     ]
     assert result["quote_candidates"][0]["provider_reference"] == "quote-1"
     assert result["swap_request"]["source_asset"]["symbol"] == "USDC"
-    assert result["selected_quote"] is None
+    # The design defaults to one channel once the swap is complete: the react
+    # turn auto-selects the best quote so the API continues into confirmation
+    # without the channel picker.
+    assert result["selected_quote"]["provider_reference"] == "quote-1"
 
 
 @pytest.mark.asyncio
@@ -677,3 +681,112 @@ async def test_unified_react_sanitizes_provider_exception_details_before_toolmes
     assert tool_messages
     assert "never-expose" not in tool_messages[0].content
     assert "never-expose" not in str(result["response"]["react_results"])
+
+
+def test_plain_text_message_strips_markdown_images_and_tables():
+    from wallet_agent.graph.nodes import _plain_text_message
+
+    assert (
+        _plain_text_message(
+            "你的 ETH 余额是 ![ETH](https://cdn.example/eth/logo.png) 1.2。"
+        )
+        == "你的 ETH 余额是 ETH 1.2。"
+    )
+    assert (
+        _plain_text_message(
+            "支持的网络：\n"
+            "| 链 | 网络 |\n"
+            "|---|---|\n"
+            "| EVM | Ethereum、BSC |\n"
+            "| TRON | 波场 |"
+        )
+        == "支持的网络：\n链，网络\nEVM，Ethereum、BSC\nTRON，波场"
+    )
+    # Plain text, lists, and code blocks are untouched.
+    assert _plain_text_message("普通文本，没有 markdown。") == "普通文本，没有 markdown。"
+    assert (
+        _plain_text_message("地址：\n```\n0x123\n```\n- A\n- B")
+        == "地址：\n```\n0x123\n```\n- A\n- B"
+    )
+
+
+def test_plain_text_message_strips_embedded_suggestions_blocks():
+    from wallet_agent.graph.nodes import _plain_text_message
+
+    assert (
+        _plain_text_message(
+            "收款地址已收到：TPtbB3MT4o7rQ7vpEMW8BWquwfJvoAkHia\n"
+            "\n"
+            "请选择转账网络。\n"
+            "\n"
+            "<suggestions>\n"
+            '[{"label": "Use TRON", "type": "chain", "value": "TRON",'
+            ' "chain_logo_url": "https://…/tron/info/logo.png",'
+            ' "data": {"intent": "transfer", "chain": "TRON"}}]\n'
+            "</suggestions>"
+        )
+        == "收款地址已收到：TPtbB3MT4o7rQ7vpEMW8BWquwfJvoAkHia\n\n请选择转账网络。"
+    )
+    assert _plain_text_message("先选网络\n<options>a、b</options>\n继续") == "先选网络\n\n继续"
+
+
+@pytest.mark.asyncio
+async def test_unified_react_message_is_plain_text_even_when_model_embeds_markdown():
+    from wallet_agent.graph.build import build_graph
+
+    LOGO = "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/ethereum/info/logo.png"
+
+    class MarkdownModel(ReActModel):
+        async def invoke_react(self, messages, tools):
+            self.calls.append((list(messages), [tool.name for tool in tools]))
+            return AIMessage(
+                content=(
+                    "你的 ETH 余额是 0.5，按 768 美元计算，持仓价值约 384 美元。\n"
+                    f"![ETH]({LOGO}) 详情：\n"
+                    "| 资产 | 价值 |\n"
+                    "|---|---|\n"
+                    "| BNB | 384 美元 |"
+                )
+            )
+
+    result = await build_graph(model=MarkdownModel()).ainvoke(
+        {"request": {"message": "我的 BNB 价值多少"}},
+        config={"configurable": {"thread_id": "react-plain-text"}},
+    )
+
+    message = result["response"]["message"]
+    assert LOGO not in message
+    assert "![" not in message
+    assert "|---|---|" not in message
+    assert "384 美元" in message
+
+
+@pytest.mark.asyncio
+async def test_unified_react_message_strips_embedded_suggestions_json():
+    from wallet_agent.graph.build import build_graph
+
+    class SuggestionsModel(ReActModel):
+        async def invoke_react(self, messages, tools):
+            self.calls.append((list(messages), [tool.name for tool in tools]))
+            return AIMessage(
+                content=(
+                    "收款地址已收到：TPtbB3MT4o7rQ7vpEMW8BWquwfJvoAkHia\n"
+                    "\n"
+                    "请选择转账网络。\n"
+                    "\n"
+                    "<suggestions>\n"
+                    '[{"label": "Use TRON", "type": "chain", "value": "TRON"}]\n'
+                    "</suggestions>"
+                )
+            )
+
+    result = await build_graph(model=SuggestionsModel()).ainvoke(
+        {"request": {"message": "转给 TPtbB3MT4o7rQ7vpEMW8BWquwfJvoAkHia"}},
+        config={"configurable": {"thread_id": "react-no-suggestions-in-message"}},
+    )
+
+    message = result["response"]["message"]
+    assert "<suggestions>" not in message
+    assert "</suggestions>" not in message
+    assert '"type"' not in message
+    assert "请选择转账网络" in message

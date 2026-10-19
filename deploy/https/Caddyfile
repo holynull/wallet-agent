@@ -1,0 +1,36 @@
+# Local HTTPS for the Wallet Agent demo + API.
+#
+# One HTTPS origin terminates TLS and routes:
+#   /health, /ready, /v1/*  -> wallet-agent (FastAPI, container port 8000)
+#   everything else         -> demo-next (Next.js, container port 3000)
+#
+# Certificates are issued by Caddy's internal, locally-trusted CA
+# (`tls internal`). To clear the browser warning, trust the root CA first:
+#   docker compose -f docker-compose.yml -f docker-compose.https.yml \
+#     exec caddy cat /data/caddy/pki/authorities/local/root.crt
+# ...and install that certificate into the OS/browser trust store (see
+# deploy/https/README.md).
+
+# HTTPS_PORT is injected by docker-compose.https.yml (default 8443).
+https://localhost:{$HTTPS_PORT} {
+	tls internal
+
+	handle /health {
+		reverse_proxy wallet-agent:8000
+	}
+
+	handle /ready {
+		reverse_proxy wallet-agent:8000
+	}
+
+	handle /v1/* {
+		# The agent streams SSE (text/event-stream); never buffer it.
+		reverse_proxy wallet-agent:8000 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy demo-next:3000
+	}
+}

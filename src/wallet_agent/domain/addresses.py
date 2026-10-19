@@ -7,7 +7,22 @@ import re
 
 from .normalization import canonical_chain
 
-EVM_NETWORKS = ("ETH", "BSC", "BASE", "POLYGON", "ARBITRUM", "OPTIMISM")
+# EVM-compatible networks share one wallet address (0x…). Keep this aligned
+# with the App's supported EVM networks so they collapse into one EVM group in
+# the receive-address payload instead of each becoming its own family.
+EVM_NETWORKS = (
+    "ETH",
+    "BSC",
+    "BASE",
+    "POLYGON",
+    "ARBITRUM",
+    "OPTIMISM",
+    "AVAXC",
+    "ROBINHOOD",
+    "MEGAETH",
+    "CELO",
+    "ARC",
+)
 EVM_ALIASES = frozenset((*EVM_NETWORKS, "EVM"))
 SUPPORTED_FAMILIES = frozenset((*EVM_ALIASES, "BTC", "TRON", "SOLANA"))
 

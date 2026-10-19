@@ -1140,6 +1140,54 @@ async def test_turn_accepts_explicit_transaction_query():
 
 
 @pytest.mark.asyncio
+async def test_turn_accepts_explicit_swap_query_without_forcing_swap_intent():
+    """metadata.swap_query (order detail entry) must surface into graph state so
+    the ReAct entry can scope prompt + toolset, but must NOT force the swap
+    lifecycle intent (that would restart slot collection over an existing order)."""
+
+    class CapturingGraph:
+        def __init__(self):
+            self.input = None
+
+        async def astream(self, value, *, config, stream_mode):
+            self.input = value
+            yield {"response": {"kind": "react"}}
+
+        def get_state(self, _config):
+            class Snapshot:
+                values = {"response": {"kind": "react"}}
+                tasks = ()
+                next = ()
+
+            return Snapshot()
+
+    graph = CapturingGraph()
+    app, client = await client_for(graph=graph)
+    async with client:
+        response = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "message": "分析这笔订单的详情？",
+                "metadata": {
+                    "swap_query": {
+                        "provider_order_id": "order-789",
+                        "tx_hash": "0x" + "b" * 64,
+                        "chain": "BSC",
+                    }
+                },
+            },
+        )
+        await app.state.runs[response.json()["run_id"]]["task"]
+    assert response.status_code == 200
+    assert graph.input["swap_query"]["provider_order_id"] == "order-789"
+    assert graph.input["swap_query"]["chain"] == "BSC"
+    # No forced lifecycle intent: the order analysis stays on the ReAct path.
+    assert graph.input.get("forced_intent") is None
+    assert graph.input.get("intent") is None
+
+
+@pytest.mark.asyncio
 async def test_turn_accepts_only_supported_agent_test_intents():
     class CapturingGraph:
         def __init__(self):

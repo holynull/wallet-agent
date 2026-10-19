@@ -92,6 +92,11 @@ async def test_app_portfolio_queries_btc_and_keeps_other_networks_when_base_fail
     assert portfolio["complete"] is False
     assert portfolio["total_usd_value"] == "600.000025"
     assert [item["asset"]["chain"] for item in portfolio["assets"]] == ["BTC", "ETH"]
+    by_chain_logo = {
+        item["asset"]["chain"]: item["chain_logo_url"] for item in portfolio["assets"]
+    }
+    assert "bitcoin/info/logo.png" in by_chain_logo["BTC"]
+    assert "ethereum/info/logo.png" in by_chain_logo["ETH"]
     assert {item["chain"]: item["status"] for item in portfolio["network_status"]} == {
         "ETH": "success",
         "BASE": "failed",

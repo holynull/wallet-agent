@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pytest
 
 from wallet_agent.chains.tron import TronChainAdapter
@@ -93,6 +95,7 @@ async def test_tron_build_erc20_transfer_encodes_trc20_calldata():
     assert tx.data == "0a02beef"
     assert tx.display["action"] == "trc20_transfer"
     assert tx.display["contract"] == OWNER
+    assert tx.display["calldata"] == "0x" + "a9059cbb" + RECIPIENT_WORD + AMOUNT_WORD
 
 
 async def test_tron_build_erc20_approve_encodes_spender():
@@ -115,6 +118,174 @@ async def test_tron_get_allowance_reads_constant_result():
     adapter = TronChainAdapter(transport)
 
     assert await adapter.get_allowance(USDT, OWNER, RECIPIENT) == "15"
+
+
+class EstimateHttpFake:
+    """Simulates the TRON node for fee estimation (chain params + contract sim)."""
+
+    def __init__(self, trigger_body=None) -> None:
+        self.trigger_body = trigger_body or {
+            "result": {"result": True},
+            "transaction": {"txID": "bb" * 32, "raw_data_hex": "0a02beef"},
+            "energy_used": 100000,
+            "energy_penalty": 11065,
+            "energy_used_total": 111065,
+            "net_used": 345,
+            "net_fee": 345000,
+            "energy_fee": 42000000,
+            "energy_fee_total": 46647300,
+        }
+        self.trigger_calls = 0
+
+    async def get(self, path, **kwargs):
+        return {
+            "chainParameter": [
+                {"key": "getTransactionFee", "value": 1000},
+                {"key": "getEnergyFee", "value": 420},
+            ]
+        }
+
+    async def post(self, path, **kwargs):
+        if path.endswith("/triggersmartcontract"):
+            self.trigger_calls += 1
+            return self.trigger_body
+        return {}
+
+
+async def test_tron_estimate_fee_native_uses_bandwidth_fee_only():
+    transport = EstimateHttpFake()
+    adapter = TronChainAdapter(transport)
+
+    fee = await adapter.estimate_fee()
+    assert fee.amount_raw == "1000"
+    assert fee.amount == Decimal("0.001")
+    assert transport.trigger_calls == 0
+
+
+async def test_tron_estimate_fee_trc20_prices_energy_not_bandwidth():
+    transport = EstimateHttpFake()
+    adapter = TronChainAdapter(transport)
+    calldata = "0xa9059cbb" + RECIPIENT_WORD + AMOUNT_WORD
+
+    fee = await adapter.estimate_fee(
+        to=RECIPIENT,
+        data="a9059cbb" + RECIPIENT_WORD + AMOUNT_WORD,
+        from_address=OWNER,
+        contract=OWNER,
+        calldata=calldata,
+    )
+
+    # energy_fee_total(46,647,300) + net_fee(345,000) = 46,992,300 sun (~46.99 TRX).
+    assert fee.amount_raw == "46992300"
+    assert fee.amount == Decimal("46.9923")
+    assert transport.trigger_calls == 1
+
+
+async def test_tron_estimate_fee_trc20_falls_back_to_floor_when_node_silent():
+    transport = EstimateHttpFake(trigger_body={"result": {"result": True}})
+    adapter = TronChainAdapter(transport)
+    calldata = "0xa9059cbb" + RECIPIENT_WORD + AMOUNT_WORD
+
+    fee = await adapter.estimate_fee(
+        from_address=OWNER,
+        contract=OWNER,
+        calldata=calldata,
+    )
+
+    assert fee.amount_raw == "12000000"
+
+
+async def test_tron_build_smart_contract_call_wraps_calldata_as_protobuf():
+    transport = WriteHttpFake()
+    adapter = TronChainAdapter(transport)
+
+    tx = await adapter.build_smart_contract_call(
+        from_address=OWNER,
+        contract_address=RECIPIENT,
+        calldata="0x" + "a9059cbb" + RECIPIENT_WORD + AMOUNT_WORD,
+        value_raw="0x0",
+    )
+
+    path, payload = transport.calls[0]
+    assert path.endswith("/wallet/triggersmartcontract")
+    assert payload == {
+        "owner_address": OWNER,
+        "contract_address": RECIPIENT,
+        "data": "a9059cbb" + RECIPIENT_WORD + AMOUNT_WORD,
+        "call_value": 0,
+        "fee_limit": 100_000_000,
+        "visible": True,
+    }
+    assert tx.chain == "TRON"
+    assert tx.to == RECIPIENT
+    assert tx.data == "0a02beef"
+    assert tx.value == "0"
+    assert tx.display["action"] == "contract_call"
+    assert tx.display["calldata"] == "0x" + "a9059cbb" + RECIPIENT_WORD + AMOUNT_WORD
+
+
+async def test_tron_build_smart_contract_call_accepts_hex_value():
+    transport = WriteHttpFake()
+    adapter = TronChainAdapter(transport)
+
+    tx = await adapter.build_smart_contract_call(
+        from_address=OWNER,
+        contract_address=RECIPIENT,
+        calldata="0xdeadbeef",
+        value_raw="0x1d4c0",
+    )
+
+    _path, payload = transport.calls[0]
+    assert payload["call_value"] == 120000
+    assert tx.value == "120000"
+
+
+async def test_tron_build_smart_contract_call_rejects_missing_calldata():
+    adapter = TronChainAdapter(WriteHttpFake())
+    with pytest.raises(ValueError):
+        await adapter.build_smart_contract_call(
+            from_address=OWNER,
+            contract_address=RECIPIENT,
+            calldata="0x",
+            value_raw="0",
+        )
+
+
+class ReceiptFake:
+    """Returns a configurable transaction-by-id body for receipt mapping."""
+
+    def __init__(self, body) -> None:
+        self.body = body
+
+    async def get(self, path, **kwargs):
+        return self.body
+
+
+async def test_tron_get_transaction_receipt_maps_confirmed_failed_pending():
+    confirmed = TronChainAdapter(ReceiptFake({"ret": [{"contractRet": "SUCCESS"}]}))
+    receipt = await confirmed.get_transaction_receipt("hash")
+    assert receipt == {"status": "0x1", "contractRet": "SUCCESS"}
+
+    failed = TronChainAdapter(ReceiptFake({"ret": [{"contractRet": "REVERT"}]}))
+    receipt = await failed.get_transaction_receipt("hash")
+    assert receipt == {"status": "0x0", "contractRet": "REVERT"}
+
+    pending = TronChainAdapter(ReceiptFake({}))
+    assert await pending.get_transaction_receipt("hash") is None
+
+
+async def test_tron_get_transaction_status_uses_receipt_mapping():
+    confirmed = TronChainAdapter(ReceiptFake({"ret": [{"contractRet": "SUCCESS"}]}))
+    assert await confirmed.get_transaction_status("hash") == TransactionStatus.CONFIRMED
+
+    failed = TronChainAdapter(ReceiptFake({"ret": [{"contractRet": "FAILED"}]}))
+    assert await failed.get_transaction_status("hash") == TransactionStatus.FAILED
+
+    unknown = TronChainAdapter(ReceiptFake(None))
+    assert await unknown.get_transaction_status("hash") == TransactionStatus.UNKNOWN
+
+    pending = TronChainAdapter(ReceiptFake({"ret": []}))
+    assert await pending.get_transaction_status("hash") == TransactionStatus.PENDING
 
 
 async def test_tron_build_rejects_invalid_addresses_and_missing_payloads():

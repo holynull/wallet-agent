@@ -282,6 +282,34 @@ def test_allowance_requirement_is_serializable_in_normalized_quote():
     assert quote.model_dump(mode="json")["allowance_requirement"]["spender"] == "0x" + "4" * 40
 
 
+def test_allowance_requirement_accepts_non_evm_chain_addresses():
+    owner = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    spender = "TFutBMkB47rYtn5EwECfnfDgDmkUP361Sy"
+    token = Asset(chain="TRON", symbol="USDT", decimals=6, address=owner)
+
+    requirement = AllowanceRequirement(
+        token=token,
+        owner=owner,
+        spender=spender,
+        required_amount_raw="1000000",
+        current_allowance_raw="0",
+    )
+    approval = ApprovalTransaction(
+        chain="TRON",
+        to=owner,
+        data="0a02cafe",
+        value="0",
+        token=token,
+        owner=owner,
+        spender=spender,
+        amount_raw="1000000",
+    )
+
+    assert requirement.spender == spender
+    assert approval.owner == owner
+    assert approval.to == owner
+
+
 def test_price_and_authorization_contracts_serialize_nested_wallet_actions():
     token = Asset(chain="BASE", symbol="USDC", decimals=6, address="0x" + "3" * 40)
     requirement = AllowanceRequirement(

@@ -53,6 +53,13 @@ def test_unambiguous_amount_with_unit_preserves_token_semantics():
     assert mentioned_fiat_value("用 10 USDT 换 ETH") is None
 
 
+def test_amount_parsers_ignore_hex_addresses():
+    address = "0x1F6E4FD185ce8C8171b4BDd2A64667BC69Aff11A"
+    assert unambiguous_amount_with_unit(address) is None
+    assert mentioned_amount_with_unit(f"转 {address} 给朋友") is None
+    assert mentioned_amount_with_unit("转 0x…") is None
+
+
 def test_swap_direction_hints_understand_explicit_chinese_swap_grammar():
     assert swap_direction_hints("我要兑换一些usdt") == {"destination_symbol": "USDT"}
     assert swap_direction_hints("换一些以太上的 USDT") == {
@@ -84,6 +91,30 @@ def test_swap_direction_hints_understand_explicit_chinese_swap_grammar():
         "destination_chain": "ETH",
         "destination_symbol": "ETH",
         "source_symbol": "BNB",
+    }
+    # Possessive 的 binds the chain to the source coin even without 上
+    # (“用eth的usdt换trx”). This is the phrasing Lif hit in the real session
+    # where the model wrongly mirrored TRON onto the source and reported
+    # ASSET_NOT_FOUND.
+    assert swap_direction_hints("用eth的usdt换trx") == {
+        "source_chain": "ETH",
+        "source_symbol": "USDT",
+        "destination_symbol": "TRX",
+    }
+    assert swap_direction_hints("用eth链的usdt换trx") == {
+        "source_chain": "ETH",
+        "source_symbol": "USDT",
+        "destination_symbol": "TRX",
+    }
+    assert swap_direction_hints("用ETH的USDT换成TRX") == {
+        "source_chain": "ETH",
+        "source_symbol": "USDT",
+        "destination_symbol": "TRX",
+    }
+    assert swap_direction_hints("用bsc的bnb换usdt") == {
+        "source_chain": "BSC",
+        "source_symbol": "BNB",
+        "destination_symbol": "USDT",
     }
 
 

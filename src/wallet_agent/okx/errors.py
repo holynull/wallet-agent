@@ -9,7 +9,7 @@ class OkxClientError(Exception):
     def __init__(
         self,
         code: str,
-        message: str = "OKX request failed",
+        message: str = "Request failed",
         *,
         retryable: bool = False,
         status_code: int | None = None,
@@ -19,4 +19,4 @@ class OkxClientError(Exception):
         self.retryable = retryable
         self.status_code = status_code
         detail = f" ({status_code})" if status_code is not None else ""
-        super().__init__(f"OKX request {self.code}{detail}: {self.message}")
+        super().__init__(f"Request {self.code}{detail}: {self.message}")

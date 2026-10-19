@@ -30,6 +30,7 @@ OrderState = Literal[
 ]
 RawInteger = Annotated[str, Field(pattern=r"^[0-9]+$")]
 EVMAddress = Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{40}$")]
+ChainAddress = Annotated[str, Field(min_length=1, max_length=64)]
 
 _SENSITIVE_METADATA_KEYS = frozenset(
     {
@@ -211,8 +212,8 @@ class AllowanceRequirement(DomainModel):
     """On-chain allowance needed before a provider swap can be prepared."""
 
     token: Asset
-    owner: EVMAddress
-    spender: EVMAddress
+    owner: ChainAddress
+    spender: ChainAddress
     required_amount_raw: RawInteger
     current_allowance_raw: RawInteger
 
@@ -222,13 +223,16 @@ class ApprovalTransaction(DomainModel):
 
     chain: str
     chain_id: int | str | None = None
-    to: EVMAddress
+    to: ChainAddress
     data: str
     value: RawInteger = "0"
     token: Asset
-    owner: EVMAddress
-    spender: EVMAddress
+    owner: ChainAddress
+    spender: ChainAddress
     amount_raw: RawInteger
+    #: Display-only chain badge for the approval card; the token's own icon rides
+    #: on ``token.logo_url``.
+    chain_logo_url: str | None = None
     expires_at: datetime | None = None
 
 
@@ -280,11 +284,28 @@ class NormalizedQuote(DomainModel):
     provider_payload: dict[str, JsonValue] = Field(default_factory=dict)
     usd_input_value: Decimal | None = Field(default=None, ge=0)
     usd_expected_output: Decimal | None = Field(default=None, ge=0)
+    #: Display-only chain badges the quote card renders next to each asset. Kept
+    #: on the model so the projected session quote keeps them instead of failing
+    #: validation (DomainModel forbids extra fields).
+    source_chain_logo_url: str | None = None
+    destination_chain_logo_url: str | None = None
     # Providers may return either an ordered list or an identity-keyed mapping;
     # the graph normalizes both forms for the app response.
     price_snapshots: list[TokenPrice] | dict[str, Any] = Field(default_factory=list)
     allowance_requirement: AllowanceRequirement | None = None
     slippage_bps: int = Field(default=100, ge=0, le=10_000)
+    #: Display-derived values the swap confirmation card renders directly.
+    #: Filled by the graph's quote enrichment (never by providers); null when
+    #: the source data is unavailable so the App can fall back gracefully.
+    #: ``reference_rate`` is how many destination units one source unit buys
+    #: (price-based when available, else the quoted output/input ratio).
+    #: ``total_payment`` is the source asset the user pays including provider
+    #: and network fees (best effort; provider fee semantics vary by provider).
+    #: ``eta`` is the provider's estimated landing time, or a documented
+    #: per-provider display estimate when the provider does not disclose one.
+    reference_rate: Decimal | None = Field(default=None, ge=0)
+    total_payment: Decimal | None = Field(default=None, ge=0)
+    eta: str | None = None
 
 
 class UnsignedTransaction(DomainModel):
@@ -472,6 +493,7 @@ class TransactionRecord(DomainModel):
     direction: Literal["send", "receive", "swap", "unknown"] | None = None
     symbol: str | None = None
     decimals: int | None = Field(default=None, ge=0)
+    logo_url: str | None = None
     counterparty: str | None = None
     occurred_at: datetime | None = None
     # "Why did it fail" for the design's default question; None means the
@@ -496,6 +518,7 @@ class TokenTransfer(DomainModel):
     amount: str | None = None
     from_address: str | None = None
     to_address: str | None = None
+    logo_url: str | None = None
 
 
 class TransactionDetail(TransactionRecord):

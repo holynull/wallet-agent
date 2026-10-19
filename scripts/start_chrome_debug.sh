@@ -13,6 +13,10 @@ Environment overrides:
   CHROME_DEBUG_PORT       DevTools port (default: 9222)
   CHROME_PROFILE_DIR      Profile directory (default: /tmp/wallet-agent-chrome)
   CHROME_START_URL        URL (default: http://localhost:3000)
+
+An https:// URL is opened with --ignore-certificate-errors so a locally-trusted
+HTTPS stack (e.g. the Caddy overlay at https://localhost:8443) can be browsed
+without installing its root CA first.
 EOF
 }
 
@@ -52,7 +56,15 @@ echo "Starting Chrome with DevTools at http://127.0.0.1:${debug_port}"
 echo "Profile: ${profile_dir}"
 echo "URL: ${start_url}"
 
-exec "${chrome_bin}" \
-  --remote-debugging-port="${debug_port}" \
-  --user-data-dir="${profile_dir}" \
-  "${start_url}"
+chrome_args=(
+  --remote-debugging-port="${debug_port}"
+  --user-data-dir="${profile_dir}"
+)
+
+# This is a dedicated throwaway debug profile; skipping cert validation here is
+# safe and lets HTTPS demos open without pre-trusting the local CA.
+case "${start_url}" in
+  [hH][tT][tT][pP][sS]://*) chrome_args+=(--ignore-certificate-errors) ;;
+esac
+
+exec "${chrome_bin}" "${chrome_args[@]}" "${start_url}"

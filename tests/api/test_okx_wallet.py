@@ -141,3 +141,47 @@ async def test_balances_and_history_use_okx_providers():
     assert history.status_code == 200
     assert history.json()["history_kind"] == "full"
     assert history.json()["transactions"][0]["source"] == "okx"
+
+
+ETH_LOGO = (
+    "https://raw.githubusercontent.com/trustwallet/assets/master"
+    "/blockchains/ethereum/info/logo.png"
+)
+
+
+@pytest.mark.asyncio
+async def test_rest_portfolio_rows_match_the_card_logo_convention():
+    """The REST portfolio must not be a logo-less twin of the SSE card."""
+    app = create_app(wallet_provider=WalletProvider())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/v1/wallet/0x1111111111111111111111111111111111111111/portfolio",
+            params={"chain": "ETH"},
+        )
+
+    body = response.json()
+    assert response.status_code == 200
+    row = body["assets"][0]
+    assert row["chain_logo_url"] == ETH_LOGO
+    # ETH is the native coin, so its icon falls back to the chain logo.
+    assert row["asset"]["logo_url"] == ETH_LOGO
+    assert body["has_assets"] is True
+
+
+@pytest.mark.asyncio
+async def test_rest_total_value_names_the_requested_chains_with_logos():
+    app = create_app(wallet_provider=WalletProvider())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/v1/wallet/0x1111111111111111111111111111111111111111/total-value",
+            params={"chains": "ETH,BSC"},
+        )
+
+    body = response.json()
+    assert body["chains"] == ["ETH", "BSC"]
+    assert body["chain_logo_urls"]["ETH"] == ETH_LOGO
+    assert body["chain_logo_urls"]["BSC"].endswith("/blockchains/binance/info/logo.png")

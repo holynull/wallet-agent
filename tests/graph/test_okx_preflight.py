@@ -14,6 +14,7 @@ from wallet_agent.graph.nodes import _transaction_preflight
 
 OWNER = "0x" + "1" * 40
 RECIPIENT = "0x" + "2" * 40
+TOKEN = "0x" + "3" * 40
 
 
 class Adapter:
@@ -87,6 +88,44 @@ async def test_preflight_converts_hex_transaction_value_for_okx():
 
     assert result["ok"] is True
     assert observed == ["12783"]
+
+
+@pytest.mark.asyncio
+async def test_preflight_simulates_against_transaction_to_not_token_recipient():
+    """OKX pre-transaction endpoints must target the contract being called.
+
+    For an ERC-20 deposit transfer the transaction's ``to`` is the token
+    contract, while ``recipient`` is the provider's separate deposit address
+    (often a contract). Simulating against the deposit address with token
+    calldata reverts and blocks a valid swap/transfer.
+    """
+    observed = []
+
+    class CapturingOkx(Okx):
+        async def simulate_transaction(self, transaction):
+            observed.append((transaction.to_address, transaction.calldata))
+            return await super().simulate_transaction(transaction)
+
+    tx = UnsignedTransaction(
+        chain="BASE",
+        to=TOKEN,
+        data="0xa9059cbb" + "0" * 24 + RECIPIENT[2:] + "0" * 63 + "1",
+        value="0",
+    )
+    result = await _transaction_preflight(
+        adapter=Adapter(),
+        chain="BASE",
+        sender=OWNER,
+        recipient=RECIPIENT,
+        amount_raw="1",
+        token=Asset(chain="BASE", symbol="USDT", decimals=6, address=TOKEN),
+        transaction=tx,
+        wallet_context={"address": OWNER, "chain": "BASE"},
+        wallet_provider=CapturingOkx(),
+    )
+
+    assert result["ok"] is True
+    assert observed == [(TOKEN, tx.data)]
 
 
 @pytest.mark.asyncio

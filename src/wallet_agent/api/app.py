@@ -22,6 +22,12 @@ from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wallet_agent.chains._common import receipt_success
+from wallet_agent.domain.chains import (
+    asset_logo_fields,
+    chain_logo_url,
+    native_symbol,
+    token_logo_url,
+)
 from wallet_agent.domain.errors import ChainCapabilityUnavailable
 from wallet_agent.domain.models import (
     AgentError,
@@ -220,6 +226,79 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     return value
+
+
+def _balance_logo_item(value: Any) -> dict[str, Any]:
+    """Balance row with the chain logo next to its asset (whose own logo lives
+    on ``asset.logo_url`` when the provider supplied one)."""
+    dumped = _jsonable(value)
+    if not isinstance(dumped, Mapping):
+        return dumped
+    asset = dumped.get("asset")
+    chain = asset.get("chain") if isinstance(asset, Mapping) else None
+    if chain:
+        dumped["chain_logo_url"] = chain_logo_url(chain)
+        # Native coins have no provider logo, so fall back to the chain logo
+        # rather than leaving the App to combine two fields itself.
+        dumped["asset"] = {
+            **asset,
+            "logo_url": token_logo_url(
+                str(chain), str(asset.get("symbol") or ""), fallback=asset.get("logo_url")
+            ),
+        }
+    return dumped
+
+
+def _history_logo_item(value: Any) -> dict[str, Any]:
+    """Transaction row with the chain logo and a token logo (provider logo, else
+    the native coin's chain logo)."""
+    dumped = _jsonable(value)
+    if not isinstance(dumped, Mapping):
+        return dumped
+    chain = dumped.get("chain")
+    if chain:
+        dumped["chain_logo_url"] = chain_logo_url(chain)
+        dumped["logo_url"] = dumped.get("logo_url") or token_logo_url(
+            chain, dumped.get("symbol")
+        )
+    return dumped
+
+
+def _price_logo_item(value: Any) -> dict[str, Any]:
+    """Price/market row with the asset's icon and the chain badge."""
+    dumped = _jsonable(value)
+    if not isinstance(dumped, Mapping):
+        return dumped
+    asset = dumped.get("asset")
+    if not isinstance(asset, Mapping) or not asset.get("chain"):
+        return dumped
+    chain = str(asset["chain"])
+    return {
+        **dumped,
+        "asset": {
+            **asset,
+            "logo_url": token_logo_url(
+                chain, str(asset.get("symbol") or ""), fallback=asset.get("logo_url")
+            ),
+        },
+        "chain_logo_url": chain_logo_url(chain),
+    }
+
+
+def _asset_logo_item(value: Any) -> dict[str, Any]:
+    """Asset metadata row (discovery/catalog) with its icons attached."""
+    dumped = _jsonable(value)
+    if not isinstance(dumped, Mapping) or not dumped.get("chain"):
+        return dumped
+    return {
+        **dumped,
+        "logo_url": token_logo_url(
+            str(dumped["chain"]),
+            str(dumped.get("symbol") or ""),
+            fallback=dumped.get("logo_url"),
+        ),
+        "chain_logo_url": chain_logo_url(str(dumped["chain"])),
+    }
 
 
 def _conversation_title(message: Any, *, limit: int = 40) -> str | None:
@@ -703,7 +782,7 @@ def _okx_chain_indexes(chains: str) -> list[str]:
         if index is None:
             raise OkxWalletError(
                 "OKX_CHAIN_UNSUPPORTED",
-                "The requested chain is not supported by OKX.",
+                "The requested chain is not supported.",
                 details={"chain": value},
             )
         if index not in indexes:
@@ -1125,6 +1204,8 @@ def create_app(
                 preflight=None,
                 confirmation_state=None,
                 gas_estimate=None,
+                asset=None,
+                chain_logo_url=None,
                 last_error=None,
             )
         effective_broadcast_tx_hash = (
@@ -1256,12 +1337,24 @@ def create_app(
                 allowance_requirement=None,
                 confirmation_state=None,
                 gas_estimate=None,
+                asset=None,
+                chain_logo_url=None,
             )
         for field in ("approval_transaction", "approval_tx_hash", "allowance_requirement"):
             if state.get(field) is not None:
                 changes[field] = state[field]
         if state.get("preflight") is not None:
             changes["preflight"] = state["preflight"]
+        # The unsigned-transaction / swap-status cards show the moved asset; keep
+        # its identity (icon included) on the session so the REST clients get the
+        # same row the SSE frame carried. Gated on a pending transaction so a
+        # read-only price answer cannot overwrite the operation's asset.
+        if changes.get("pending_transaction") is not None:
+            response_asset = response.get("asset")
+            if isinstance(response_asset, Mapping):
+                changes["asset"] = _jsonable(response_asset)
+            if response.get("chain_logo_url") is not None:
+                changes["chain_logo_url"] = response["chain_logo_url"]
         if state.get("confirmation_state") is not None:
             changes["confirmation_state"] = _jsonable(state["confirmation_state"])
         if state.get("swap_gas_estimate") is not None:
@@ -1278,6 +1371,8 @@ def create_app(
                 allowance_requirement=None,
                 confirmation_state=None,
                 gas_estimate=None,
+                asset=None,
+                chain_logo_url=None,
                 stage="failed",
             )
             errors = response.get("errors") or []
@@ -1322,6 +1417,10 @@ def create_app(
             spender=requirement.spender,
             amount_raw=requirement.required_amount_raw,
         )
+        # EVM adapters build approvals synchronously; account-model chains
+        # (TRON) build them over the node and return a coroutine.
+        if hasattr(tx, "__await__"):
+            tx = await tx
         approval = {
             "chain": requirement.token.chain,
             "chain_id": requirement.token.chain_id,
@@ -1498,11 +1597,16 @@ def create_app(
                 # A swap turn owns a business session. Once quotes are available,
                 # continue the same thread into the confirmation interrupt so the
                 # mobile client has one stable session_id for the full lifecycle.
+                # The lifecycle path selects a quote explicitly; the ReAct path
+                # defaults to the best quote (design: one channel straight to the
+                # confirmation card), so both continue here automatically.
+                response_kind = (result.get("response") or {}).get("kind")
                 if (
                     session_id
-                    and result.get("response", {}).get("kind") == "swap_quote"
                     and result.get("selected_quote")
+                    and result.get("quote_candidates")
                     and not result.get("pending_transaction")
+                    and response_kind in {"swap_quote", "react"}
                 ):
                     await project_session(session_id, result, status="quoted", run_id=run_id)
                     # The quote and its cards are a completed user-facing step.
@@ -1708,6 +1812,9 @@ def create_app(
         raw_transaction_query = payload.metadata.get("transaction_query") or payload.metadata.get(
             "transaction"
         )
+        raw_swap_query = payload.metadata.get("swap_query") or payload.metadata.get(
+            "swap_order"
+        )
         raw_portfolio_query = payload.metadata.get("portfolio_query") or payload.metadata.get(
             "portfolio"
         )
@@ -1837,6 +1944,15 @@ def create_app(
             input_state["forced_intent"] = "transaction_status"
             input_state["intent"] = "transaction_status"
             input_state["transaction_query"] = raw_transaction_query
+        if raw_swap_query is not None:
+            # The App opened the assistant from a swap order detail page with
+            # (order_id, tx_hash, chain). Surface it into state so the ReAct
+            # entry can scope the prompt and toolset (no recent-transaction
+            # history card over an order-detail analysis). Unlike
+            # transaction_query we do NOT force a lifecycle intent: starting a
+            # fresh swap collection over an existing order is exactly the
+            # misrouting the swap context exists to prevent.
+            input_state["swap_query"] = raw_swap_query
         if raw_portfolio_query is not None:
             input_state["forced_intent"] = "portfolio_query"
             input_state["intent"] = "portfolio_query"
@@ -2148,7 +2264,9 @@ def create_app(
                 if transaction_reference:
                     reference = str(transaction_reference)
             try:
-                order = await provider.register_broadcast(reference, payload.tx_hash)
+                order = await provider.register_broadcast(
+                    reference, payload.tx_hash, quote=session.quote
+                )
                 order = _provider_order_with_persisted_metadata(
                     order,
                     session.pending_transaction,
@@ -2477,6 +2595,13 @@ def create_app(
                     "failure_reason": detail.failure_reason,
                     "eta": detail.eta,
                     "transaction": _jsonable(detail),
+                    # Top-level chain badge and the moved token's icon, mirroring
+                    # the SSE transaction_status card.
+                    **asset_logo_fields(
+                        chain.upper(),
+                        getattr(detail, "symbol", None),
+                        getattr(detail, "logo_url", None),
+                    ),
                 }
                 return result
             except OkxExplorerError as exc:
@@ -2493,14 +2618,14 @@ def create_app(
                 status_code=503,
                 detail={
                     "code": "OKX_CAPABILITY_UNAVAILABLE",
-                    "message": "OKX transaction explorer unavailable.",
+                    "message": "Transaction explorer unavailable.",
                 },
             )
         raise HTTPException(
             status_code=503,
             detail={
                 "code": "OKX_CAPABILITY_UNAVAILABLE",
-                "message": "OKX transaction explorer unavailable.",
+                "message": "Transaction explorer unavailable.",
             },
         )
 
@@ -2519,7 +2644,7 @@ def create_app(
         try:
             asset = Asset(chain=chain, symbol=symbol, decimals=decimals, address=address)
             prices = await provider.get_prices([asset])
-            return {"prices": [_jsonable(item) for item in prices]}
+            return {"prices": [_price_logo_item(item) for item in prices]}
         except Exception as exc:
             raise HTTPException(
                 status_code=502, detail={"code": "PRICE_QUERY_FAILED", "message": str(exc)}
@@ -2558,7 +2683,10 @@ def create_app(
             if method is None:
                 raise PriceProviderError("Detailed market prices are unavailable.")
             details = await method([asset])
-            return {"asset": _jsonable(asset), "details": [_jsonable(item) for item in details]}
+            return {
+                "asset": _asset_logo_item(asset),
+                "details": [_price_logo_item(item) for item in details],
+            }
         except PriceProviderError as exc:
             raise HTTPException(
                 status_code=422 if exc.code == "OKX_INVALID_ARGUMENT" else 502,
@@ -2613,7 +2741,13 @@ def create_app(
             page = await provider.get_historical_prices(
                 asset, period=period, begin_ms=begin, end_ms=end, cursor=cursor, limit=limit
             )
-            return _jsonable(page)
+            # The page itself carries no asset, so pair it with the resolved
+            # identity for the card's header icon.
+            return {
+                **_jsonable(page),
+                "asset": _asset_logo_item(asset),
+                "chain_logo_url": chain_logo_url(asset.chain),
+            }
         except PriceProviderError as exc:
             raise HTTPException(
                 status_code=422 if exc.code == "OKX_INVALID_ARGUMENT" else 502,
@@ -2663,7 +2797,11 @@ def create_app(
             candles = await provider.get_candles(
                 asset, bar=bar, before_ms=before, after_ms=after, limit=limit
             )
-            return {"candles": [_jsonable(item) for item in candles]}
+            return {
+                "candles": [_jsonable(item) for item in candles],
+                "asset": _asset_logo_item(asset),
+                "chain_logo_url": chain_logo_url(asset.chain),
+            }
         except PriceProviderError as exc:
             raise HTTPException(
                 status_code=422 if exc.code == "OKX_INVALID_ARGUMENT" else 502,
@@ -2698,8 +2836,8 @@ def create_app(
                 native = [item for item in balances if item.asset.address is None]
                 tokens = [item for item in balances if item.asset.address is not None]
                 return {
-                    "native": _jsonable(native[0]) if native else None,
-                    "tokens": _jsonable(tokens),
+                    "native": _balance_logo_item(native[0]) if native else None,
+                    "tokens": [_balance_logo_item(item) for item in tokens],
                     "source": "okx",
                 }
             except OkxWalletError as exc:
@@ -2719,7 +2857,8 @@ def create_app(
                     "source": "okx",
                     "history_kind": "full",
                     "cursor": page.next_cursor,
-                    **_jsonable(page),
+                    "next_cursor": page.next_cursor,
+                    "transactions": [_history_logo_item(item) for item in page.transactions],
                 }
             except OkxExplorerError as exc:
                 raise HTTPException(
@@ -2751,20 +2890,27 @@ def create_app(
                             },
                         ) from exc
                     return {
-                        "native": _jsonable(native),
-                        "tokens": _jsonable(tokens),
+                        "native": _balance_logo_item(native),
+                        "tokens": [_balance_logo_item(item) for item in tokens],
                         "source": "chain",
                     }
             raise HTTPException(
                 status_code=503,
                 detail={
                     "code": "OKX_CAPABILITY_UNAVAILABLE",
-                    "message": "OKX wallet data provider unavailable.",
+                    "message": "Wallet data provider unavailable.",
                 },
             )
         try:
             adapter = execution_adapter(chain)
-            return _jsonable(await adapter.estimate_fee())
+            fee = _jsonable(await adapter.estimate_fee())
+            # The fee is paid in the chain's native coin; say which chain so the
+            # App can show the badge without re-deriving it from the request.
+            return {
+                **(fee if isinstance(fee, Mapping) else {"fee_estimate": fee}),
+                "chain": chain.upper(),
+                **asset_logo_fields(chain.upper(), native_symbol(chain)),
+            }
         except ChainCapabilityUnavailable as exc:
             raise HTTPException(
                 status_code=422,
@@ -2814,7 +2960,9 @@ def create_app(
                 total_usd = 0
                 has_value = False
                 for balance in balances:
-                    item = _jsonable(balance)
+                    # Same row shape as the SSE portfolio card: chain badge plus
+                    # the asset icon (native coins reuse the chain logo).
+                    item = _balance_logo_item(balance)
                     key = (
                         str(balance.asset.chain).upper(),
                         str(balance.asset.symbol).upper(),
@@ -2824,6 +2972,7 @@ def create_app(
                     if price is not None:
                         usd_value = balance.amount * price.usd_price
                         item["usd_value"] = str(usd_value)
+                        item["unit_price"] = str(price.usd_price)
                         total_usd += usd_value
                         has_value = True
                     assets.append(item)
@@ -2832,8 +2981,9 @@ def create_app(
                     "chain": chain.upper(),
                     "assets": assets,
                     "total_usd_value": str(total_usd) if has_value else None,
+                    "has_assets": bool(assets),
                     "price_status": "available" if prices else "unavailable",
-                    "price_snapshots": [_jsonable(price) for price in prices],
+                    "price_snapshots": [_price_logo_item(price) for price in prices],
                     "source": "okx",
                 }
             except OkxWalletError as exc:
@@ -2847,7 +2997,7 @@ def create_app(
             status_code=503,
             detail={
                 "code": "OKX_CAPABILITY_UNAVAILABLE",
-                "message": "OKX wallet data provider unavailable.",
+                "message": "Wallet data provider unavailable.",
             },
         )
 
@@ -2891,6 +3041,14 @@ def create_app(
                 **_jsonable(value),
                 "source": "okx",
                 "observed_at": _jsonable(value.observed_at),
+                # Name the requested chains so the App can badge the total
+                # without mapping OKX chain indexes itself.
+                "chains": [item.upper() for item in str(chains).split(",") if item.strip()],
+                "chain_logo_urls": {
+                    item.upper(): chain_logo_url(item)
+                    for item in str(chains).split(",")
+                    if item.strip()
+                },
             }
         except OkxWalletError as exc:
             raise HTTPException(
@@ -2906,7 +3064,7 @@ def create_app(
                 status_code=502,
                 detail={
                     "code": "OKX_WALLET_UNAVAILABLE",
-                    "message": "OKX wallet provider unavailable.",
+                    "message": "Wallet provider unavailable.",
                 },
             ) from exc
 
@@ -2925,7 +3083,7 @@ def create_app(
                 status_code=503,
                 detail={
                     "code": "OKX_CAPABILITY_UNAVAILABLE",
-                    "message": "OKX wallet data provider unavailable.",
+                    "message": "Wallet data provider unavailable.",
                 },
             )
         try:
@@ -2940,7 +3098,7 @@ def create_app(
             native = next((item for item in balances if item.asset.address is None), None)
             if native is None:
                 raise OkxWalletError(
-                    "OKX_MALFORMED_RESPONSE", "OKX native balance is unavailable."
+                    "OKX_MALFORMED_RESPONSE", "Native balance is unavailable."
                 )
             fee_raw = int(fee.amount_raw)
             balance_raw = int(native.amount_raw)
@@ -2949,7 +3107,7 @@ def create_app(
                 "address": address,
                 "chain": chain.upper(),
                 "fee_estimate": _jsonable(fee),
-                "native_balance": _jsonable(native),
+                "native_balance": _balance_logo_item(native),
                 "sufficient": sufficient,
                 "shortfall_raw": str(max(fee_raw - balance_raw, 0)),
                 "message": (
@@ -2957,6 +3115,9 @@ def create_app(
                     if sufficient
                     else "当前原生币余额不足以支付预计网络手续费。"
                 ),
+                # The gas row is about the native coin, whose icon is the chain
+                # logo.
+                **asset_logo_fields(chain.upper(), native.asset.symbol),
             }
         except ChainCapabilityUnavailable as exc:
             raise HTTPException(
@@ -3011,7 +3172,7 @@ def create_app(
                 )
         return {
             "query": _jsonable(query),
-            "assets": [_jsonable(asset) for asset in result.values()],
+            "assets": [_asset_logo_item(asset) for asset in result.values()],
             "provider_errors": errors,
         }
 

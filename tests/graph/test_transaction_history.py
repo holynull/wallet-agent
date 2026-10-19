@@ -1,5 +1,7 @@
 """Design v1.6.9 history card: recent transactions, direction filter and summary."""
 
+import re
+
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
@@ -75,12 +77,23 @@ def test_item_exposes_the_fields_the_card_renders():
     assert item["symbol"] == "BNB"
     assert item["amount_raw"] == "120300000000000000"
     assert item["occurred_at"] == "2025-07-17T09:35:01Z"
+    # Native coin (BNB) reuses its chain logo; the chain logo is always exposed.
+    assert "binance/info/logo.png" in item["chain_logo_url"]
+    assert item["logo_url"] == item["chain_logo_url"]
 
     received = _transaction_history_item(
         _record(tx_hash="0xbb", to_address=EVM, from_address="0xfeed"), EVM
     )
     assert received["direction"] == "receive"
     assert received["counterparty"] == "0xfeed"
+
+
+def test_item_keeps_a_provider_logo_for_non_native_tokens():
+    item = _transaction_history_item(
+        _record(symbol="USDC", logo_url="https://static.okx.com/usdc.png"), EVM
+    )
+    assert item["logo_url"] == "https://static.okx.com/usdc.png"
+    assert "binance/info/logo.png" in item["chain_logo_url"]
 
 
 def test_payload_sorts_by_time_and_summarises_each_direction():
@@ -106,6 +119,8 @@ def test_payload_sorts_by_time_and_summarises_each_direction():
     assert payload["total"] == 3
     assert payload["summary"] == "1 笔转出、1 笔入账、1 笔兑换"
     assert "3 笔记录拉出来了" in payload["message"]
+    # All fetched rows are shown, so no "(共 N 笔)" disambiguation is needed.
+    assert "共" not in payload["message"]
     assert "筛选只看支出" in payload["message"]
 
 
@@ -122,7 +137,33 @@ def test_payload_direction_filter_keeps_the_other_counts():
     assert payload["total"] == 1
     assert [item["tx_hash"] for item in payload["items"]] == ["0xaa"]
     assert payload["filter"]["direction"] == "send"
-    assert payload["summary"] == "1 笔转出、1 笔入账"
+    # Under a direction filter the summary counts the rows the card shows.
+    assert payload["summary"] == "1 笔转出"
+
+
+def test_payload_summary_and_prose_do_not_contradict_the_page_size():
+    """Regression: "最近 20 笔" must not sit next to an all-128 summary."""
+    items = []
+    for index in range(60):
+        items.append(
+            _transaction_history_item(
+                _record(
+                    tx_hash=f"0x{index:02x}" * 4,
+                    direction="send" if index % 2 else "receive",
+                    occurred_at=f"2025-07-{1 + (index % 28):02d}T09:35:01Z",
+                ),
+                EVM,
+            )
+        )
+
+    payload = _transaction_history_payload(items, limit=20)
+
+    assert payload["total"] == 20
+    assert payload["fetched"] == 60
+    summary_counts = [int(part) for part in re.findall(r"(\d+) 笔", payload["summary"])]
+    assert sum(summary_counts) == 20, "summary must count only the 20 shown rows"
+    assert "共 60 笔" in payload["message"]
+    assert "最近 20 笔" in payload["message"]
 
 
 def test_payload_handles_an_empty_history():

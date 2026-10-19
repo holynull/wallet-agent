@@ -71,7 +71,14 @@ async def test_transfer_prepare_returns_unsigned_transaction():
     ) as client:
         response = await client.post("/v1/transfer/s1/prepare", json=payload)
     assert response.status_code == 200
-    assert response.json()["pending_transaction"]["value"] == "100"
+    body = response.json()
+    assert body["pending_transaction"]["value"] == "100"
+    # The unsigned-transaction card shows what moves: the asset identity (with
+    # its icon) rides next to the payload the wallet signs, never inside it, and
+    # the REST session projection carries the same row as the SSE frame.
+    assert body["asset"]["symbol"] == "ETH"
+    assert body["asset"]["logo_url"].endswith("/blockchains/base/info/logo.png")
+    assert body["chain_logo_url"].endswith("/blockchains/base/info/logo.png")
 
 
 @pytest.mark.asyncio

@@ -77,20 +77,27 @@ App 只依赖 `complete`（或 `action_required`）帧里的 `state.response` �
 | --- | --- |
 | `label` | 胶囊显示文案 |
 | `message` | 点按后作为**用户消息**回传的文本 |
-| `type` | `chain` / `symbol` / `amount` / `address` / `token` / `action` |
+| `type` | `chain` / `symbol` / `amount` / `address` / `token` / `swap_pair` / `action` |
 | `value` | 回填值；`action` 类型时为动作名 |
 | `data` | 槽位数据，建议点按后**原样**放进 `metadata.suggestion_data` 回传 |
 
 - `type:"action"` 的胶囊是动作，不要当参数提交；`value`：`input_address` /
-  `pick_contact` / `show_balance` / `input_amount`（如返回）。
+  `pick_contact` / `show_balance` / `input_amount` / `swap_custom` / `swap_cross_chain`
+  （如返回）。
 - `type:"amount"` 的 `value` 可能是 `25%` 比例，App 用**自己持有的余额**换算出数量再提交；
   `data` 带 `chain` / `symbol` / `token_address` / `decimals` 用于定位资产。
 - `type:"chain"` 的 `value` 即链名，`data.chain` 相同；第一个胶囊是**钱包当前网络**。
+- `type:"swap_pair"` 是兑换意图卡（设计 [`33715:134319`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33715-134319)）
+  的推荐交易对胶囊：`label` 如 `ETH → USDT`，`data.source` / `data.destination` 各带
+  `chain` / `symbol`（余额来源时含 `address` / `decimals` / `logo_url`）。点按把
+  `message`（如 `把 ETH 换成 USDT`）作为下一轮用户消息回传即可继续兑换。
+- 需要画图标的胶囊（链 / 币 / 金额）额外带顶层 `logo_url`（币图标）与
+  `chain_logo_url`（链角标），约定见 §2.5；这两个字段不要在点按时回传。
 
 ### 2.4 客户端动作 `response.client_action`
 
 ```jsonc
-{ "type": "open_contacts | scan_qr | open_amount_keypad | address_input",
+{ "type": "open_contacts | scan_qr | open_amount_keypad | address_input | select_btc_address",
   "reason": "可选",
   "slots": { "chain": "...", "symbol": "..." } }
 ```
@@ -98,6 +105,56 @@ App 只依赖 `complete`（或 `action_required`）帧里的 `state.response` �
 App 收到后弹出自己的界面；用户完成后的结果作为**下一轮** `turn` 输入回传
 （文本，或 `metadata.suggestion_data`）。未知 `type` 服务端不会下发
 （白名单校验，非法取值返回 `CLIENT_ACTION_UNSUPPORTED`）。
+
+兑换金额卡（Figma [`33715:134548`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33715-134548)）
+的 `open_amount_keypad` 额外带 `slots.intent:"swap"`（转账不带）；点按推荐币对后
+再弹键盘时，`slots` 还会带上来源币的 `token_address` / `decimals`（从被点币对的
+`source` 复制），供 App 精确定位资产。App 只消费**顶层** `client_action`。
+
+**BTC 兑换出金地址**：`select_btc_address`（`slots.chain:"BTC"`、`slots.symbol:"BTC"`，
+后端会尽量带 `slots.addresses:[{address, balance?, balance_raw?}]`）。BTC 作为兑换
+来源链且未明确出金地址时，后端会先下发它让用户在多个 BTC 地址中选一个（出金
+地址只能选一个，provider 的 fromAddress 是单个地址）；选中后把该地址回传
+`metadata.suggestion_data = { intent:"swap", sender_address:"bc1..." }`。`sender_address`
+未下发时不会进入模型提示词白名单，避免模型把它当普通槽位猜值。
+
+### 2.5 币 / 链 logo 字段约定
+
+所有带资产的响应都遵循同一套字段，App 不需要自己拼链名、也不需要内置链表：
+
+| 字段 | 含义 |
+| --- | --- |
+| `asset.logo_url` | **币图标**。provider（OKX / Bridgers / OmniBridge）给的就用它；原生币没有 provider 图，回落成链 logo；两者都没有时为 `null`，App 画占位。 |
+| `chain_logo_url` | **链角标**，与所在行/对象同级。未知链为 `null`。 |
+| 行级 `logo_url` | 交易流水行的便捷字段，等于该行的币图标（与 `asset.logo_url` 同值），只为少一层嵌套。 |
+
+覆盖位置：
+
+| 出口 | 携带位置 |
+| --- | --- |
+| `wallet_query` / `portfolio_query` / `GET /v1/wallet/{address}/balances` / `/portfolio` | 资产行 `asset.logo_url` + `chain_logo_url` |
+| `transaction_history` / `GET /v1/wallet/{address}/transactions` | 行级 `logo_url` + `chain_logo_url` |
+| `swap_quote` 报价、`confirmation_required` 的 `summary` | `source_asset.logo_url` / `destination_asset.logo_url` + `source_chain_logo_url` / `destination_chain_logo_url` |
+| `approval_required` | `approval_transaction.token.logo_url` + `chain_logo_url` |
+| `transfer_prepare` / `swap_prepare`（含 `POST /v1/transfer/{session_id}/prepare`、`GET /v1/swap/{session_id}`） | `asset`（被转/被换出的资产，带 `logo_url`）+ `chain_logo_url`，在 `pending_transaction` **之外** |
+| `swap_status`（含广播后轮询返回的每一帧） | `chain` + `chain_logo_url` + `asset` / `destination_asset` |
+| `transaction_status` / `GET /v1/transactions/{chain}/{tx_hash}` | 顶层 `logo_url` + `chain_logo_url` |
+| `gas_check` / `GET /v1/wallet/{address}/gas`、`/v1/wallet/{address}/fees` | 原生币 `logo_url` + `chain_logo_url` |
+| `price_query` / `market_details` / `asset_value` / `GET /v1/prices/*` | 价格行 `asset.logo_url` + `chain_logo_url`；`/prices/history`、`/candles` 用同级 `asset` + `chain_logo_url` 说明标的是谁 |
+| `asset_discovery` / `GET /v1/assets` | 资产行自带 `logo_url` + `chain_logo_url` |
+| `receive_address` | `chain_logo_urls`（`{链名: url}`）对应 `supported_chains`；设计稿这里是文字 chip，做图标版时可直接取 |
+| `response.suggestions[]`（转账链/币/金额胶囊） | 胶囊顶层 `logo_url` + `chain_logo_url` |
+| `response.token_candidates[]`（同名 Token 选择卡） | 每个候选自带 `logo_url` + `chain_logo_url` |
+
+链 logo 来自 Trust Wallet assets 的 CDN（`raw.githubusercontent.com/trustwallet/assets`），
+因此**不占用我方带宽、也不需要 App 内置映射**。已知链覆盖 ETH / BSC / Base / Arbitrum /
+Optimism / Polygon / TRON / BTC / Solana / Celo / Avalanche（slug `avalanchec`）/ MegaETH。
+设计稿收款卡还列了 Robinhood，但该链在 Trust Wallet 没有条目，服务端返回 `null`，
+App 需按占位处理（不要用别的链 logo 顶替）。
+
+这些字段都是**展示用**：服务端不校验 App 是否使用，App 也不要把它们回填进
+`metadata.suggestion_data` 当作槽位（回传了会被忽略）。签名材料、私钥、seed
+仍然只留在客户端。
 
 ## 3. 每张卡片的 App 接入
 
@@ -112,7 +169,8 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 
 - 触发：查某链/某币余额，或「所有链总余额」。
 - 数据：`response.wallet`，资产行
-  `asset{chain,symbol,decimals,address} / amount / amount_raw / usd_value / addresses`，
+  `asset{chain,symbol,decimals,address,logo_url} / chain_logo_url / amount / amount_raw /
+  usd_value / addresses`，
   附 `network_status` 说明查询范围与缺失。
 - 渲染：逐行「币图标 + 符号 + 数量 + USD 估值」；极小非零余额显示 `<0.01`；
   未查询的链不能当零余额展示。
@@ -138,8 +196,8 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 
 - 触发：「我最近有哪些交易？」、筛选只看支出。
 - 数据：`items[]`（`direction` send/receive/swap、`counterparty`、`amount_raw` +
-  `decimals` + `symbol`、`chain`、`status`、`occurred_at`）、`total`、`summary`、
-  `filter`、`partial_errors`。
+  `decimals` + `symbol`、`chain`、`status`、`occurred_at`、行级 `logo_url` +
+  `chain_logo_url`）、`total`、`summary`、`filter`、`partial_errors`。
 - 渲染：标题「最近交易记录 共 N 笔」；逐行 方向/对手方/金额/链/状态/时间；
   `raw_only` 为 true 的条目金额是代币最小单位，**原样展示不要换算**。
 - 对齐：✅（`data-card-kind="history"` 已实现）。
@@ -150,6 +208,8 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 - 数据：`response` = `{chain, tx_hash, status(pending/confirmed/failed/unknown),
   message, source, failure_reason, eta, transaction(详情)}`；REST 版
   `GET /v1/transactions/{chain}/{tx_hash}` 同样返回顶层 `failure_reason` / `eta`。
+- logo：顶层另有 `logo_url`（该笔交易代币的图标，原生币回落链 logo）+
+  `chain_logo_url`，REST 版一致，见 §2.5。
 - App 接入要点：从详情页进入对话时，把 `tx_hash` 和链放进
   **`metadata.transaction_query`**（服务端已支持，模型会先查证再回答）。
 - ✅ 对齐：`failure_reason`（来源给出时）与 `eta`（来源给出时）已透出；
@@ -160,6 +220,8 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 - 触发：「获取我的收款地址」、追问「你还支持哪些链？」。
 - 数据：`groups[]`（EVM 全链合并一张卡 + `label` + `address` + `chains[]` +
   多于 1 个地址时 `addresses[]`；BTC/TRON 各自成组）、`supported_chains`、`message`。
+- logo：`chain_logo_urls`（`{链名: url}`）与 `supported_chains` 一一对应；v1.6.9
+  这里是文字 chip，做图标版时用它。
 - 渲染：120×120 二维码（App 按地址生成）+ 地址 + 复制按钮 + 支持链标签。
 - 对齐：✅（`data-card-kind="receive"` 已实现；二维码客户端生成）。
 
@@ -188,6 +250,8 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 - 设计节点：[`33692:37984`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33692-37984)。
 - 数据：`suggestions` 为 `type:"amount"` 的 `25%`/`50%`/`75%`/`100%`；
   `data` 带 `chain` / `symbol` / `token_address` / `decimals`（钱包可定位资产时）。
+- 数据：胶囊顶层另有 `logo_url` / `chain_logo_url`，画「资产与余额」行的图标用；
+  选币胶囊（`type:"symbol"`）同理，见 §2.5。
 - App 接入：
   - 卡片包含「资产与余额」行 + 金额输入框 + 25/50/75/100% + 余额不足 NoticeBar +
     取消/确认；余额由 **App 持有**，百分比用余额换算。
@@ -206,9 +270,23 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 ### 3.12 报价列表卡（`swap_quote`）
 
 - 触发：「我要兑换」→ 模型调 `get_swap_quote`。
+- 前置：用户只表达兑换意图、还没指定币对时，服务端先回**兑换意图推荐卡**
+  （设计 [`33715:134319`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33715-134319)）：
+  `response.suggestions[]` 里带 `type:"swap_pair"` 的推荐交易对胶囊（按余额推荐）
+  与 `type:"action"` 的 `swap_custom`（其他币对）/ `swap_cross_chain`（跨链换）入口；
+  用户点按后把 `message` 回传，模型再用 `get_swap_quote` 出报价。
+- 前置：用户已明确币对（如「用 USDT 换 ETH」）但**卖出币分布在多条网络**、来源链有歧义时，
+  服务端先回**兑换链选择卡**（设计 [`33715:134430`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33715-134430)）：
+  `response.suggestions[]` 里带 `type:"chain"` 的链胶囊，每个 `data` 为
+  `{intent:"swap", chain, symbol, token_address, decimals}`（与转账 §3.9 选链卡同款、
+  但带 `intent:"swap"`）。用户点按后把 `message`（如 `用 ETH 网络的 USDT 换 ETH`）
+  回传，App 会把该胶囊的 `data` 原样放进 `metadata.suggestion_data`（含已定链），
+  服务端不再重复出选链卡，直接进报价。
 - 数据：`react_results` 里 `tool=="get_swap_quote"` 且 `result.ok==true` 的
   `result.quotes[]`，每项含 `provider` / `provider_reference` / `input_amount` /
   `expected_output` / `source_asset{symbol}` / `destination_asset{symbol}` 等。
+- logo：每个报价带 `source_chain_logo_url` / `destination_chain_logo_url`，
+  资产图标在 `source_asset.logo_url` / `destination_asset.logo_url`，见 §2.5。
 - App 接入：渲染报价行；点「选择此报价」调 `POST /v1/swap/{session_id}/select-quote`
   （body 带 `provider_reference`）；`selected_quote` 回显。
 - 对齐：✅。
@@ -218,6 +296,8 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 - 数据：`confirmation_state` = `{action, status:"requested", requested_at, expires_at,
   summary{input_amount, source_asset, expected_output, destination_asset,
   recipient_address, provider}, reason, task_id, task_revision, payload_hash}`。
+- logo：`summary.source_asset.logo_url` / `summary.destination_asset.logo_url` +
+  `summary.source_chain_logo_url` / `summary.destination_chain_logo_url`，见 §2.5。
 - App 接入：确认/取消按钮 → `POST /v1/swap/{session_id}/confirm`
   （body `{approved: true|false}`）；`expires_at` 过期则刷新状态。
 - 对齐：✅（`data-card-kind="confirmation"`）。
@@ -225,6 +305,8 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 ### 3.14 授权卡（`approval_required`）
 
 - 数据：`approval_transaction`（EVM `{chain, from, to, data, value, gas...}`）+ `stage:"approval_required"`。
+- logo：`approval_transaction.token.logo_url`（被授权代币的图标）+
+  `approval_transaction.chain_logo_url`（链角标），见 §2.5。
 - App 接入：把 `approval_transaction` 交给钱包签名，回传
   `POST /v1/swap/{session_id}/approve-broadcast`（body `{approve_tx_hash, chain, user_id}`）。
 - 对齐：✅（`data-card-kind="approval"`）。
@@ -232,7 +314,11 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 ### 3.15 未签名交易卡（`transfer_prepare` / `swap_prepare`）
 
 - 数据：`pending_transaction`（未签名交易：`chain` / `from` / `to` / `value` / `data` /
-  `asset` 等，BTC 为 PSBT 材料）+ `preflight`。
+  `display` 等，BTC 为 PSBT 材料、TRON 为 `raw_data_hex`）+ `preflight`。
+- logo：**不在** `pending_transaction` 里。响应顶层另给 `asset`（转账=被转资产、
+  兑换=换出的来源资产，带 `logo_url`）与 `chain_logo_url`；`POST
+  /v1/transfer/{session_id}/prepare`、`GET /v1/swap/{session_id}` 的会话投影里
+  也有同样两个字段，见 §2.5。
 - App 接入：展示待签名交易/PSBT → 钱包签名 → 回传
   `POST /v1/transfer/{session_id}/broadcast` 或 `POST /v1/swap/{session_id}/broadcast`
   （body `{tx_hash, chain, user_id}`）。服务端只收 hash + chain，绝不收签名材料。
@@ -243,6 +329,8 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 - 数据：`broadcast_status`（`broadcast_pending` / `confirmed` / `failed` 等）+
   `tx_hash` + `message` + 顶层 `failure_reason` / `eta`（订单状态里的字段）；
   `GET /v1/swap/{session_id}` 的 `order_status` 里同样可读。
+- logo：顶层 `chain` + `chain_logo_url` + `asset` / `destination_asset`（带
+  `logo_url`），订单状态卡的币图标从这里取，见 §2.5。
 - App 接入：广播后轮询展示「交易中…／完成／失败」。
 - 对齐：✅（`data-card-kind="status"`）。
 
@@ -267,6 +355,12 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
    `metadata.swap_query`。
 3. **语音输入**：先定 STT 归属（客户端转写 vs 服务端识别），再谈接法。
 4. **版本确认**：v1.6.9 与 v1.7.0 设计页以哪版为准（涉及卡片字段增减）。
+5. **非原生 Token 的图标来源**：目前只有 OKX / Bridgers / OmniBridge 三家 provider
+   会带 `logo_url`；价格 provider 与 App 自己声明的余额没有图标，这些位置
+   `asset.logo_url` 为 `null`。要全量图标需接入一个 token logo 数据源
+   （例如 Trust Wallet assets 的合约路径），否则由 App 占位。
+6. **Robinhood 链**：设计稿收款卡列了它，但 Trust Wallet 无该条目，服务端只能给
+   `null`。若产品要求出图标，需要另找来源或让 App 内置。
 
 ## 5. 参考实现
 
