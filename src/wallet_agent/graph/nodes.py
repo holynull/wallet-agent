@@ -11441,16 +11441,98 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 payload["message"] += "（部分地址本轮未返回。）"
         return payload
 
+    _SWAP_STATUS_MESSAGES = {
+        "pending": "兑换订单已提交，Provider 仍在处理中。",
+        "processing": "兑换服务仍在处理中，目标链资产尚未到账。",
+        "completed": "兑换已完成，可以到目标链查看到账资产。",
+        "failed": "兑换没有成功完成，请检查订单详情或稍后重试。",
+        "refunded": "兑换已退款，请检查原资产是否已退回。",
+        "timed_out": "Provider 暂时没有返回最终结果，建议稍后重新查询订单状态。",
+        "kyc_required": "订单需要补充 KYC 后才能继续处理。",
+        "unknown": "暂时拿不到兑换订单的最新状态，建议稍后重新查询。",
+    }
+
+    def _swap_status_observation(status: Any, state: dict[str, Any]) -> dict[str, Any]:
+        dumped = _dump(status)
+        provider_status = str(dumped.get("status") or "unknown")
+        return {
+            "ok": True,
+            "kind": "swap_status",
+            "provider": dumped.get("provider"),
+            "provider_order_id": dumped.get("provider_order_id"),
+            "status": provider_status,
+            "tx_hash": dumped.get("tx_hash"),
+            "failure_reason": dumped.get("failure_reason"),
+            "eta": dumped.get("eta"),
+            "refund_tx_hash": dumped.get("refund_tx_hash"),
+            "message": _SWAP_STATUS_MESSAGES.get(
+                provider_status, "兑换订单状态已更新，建议稍后重新查询。"
+            ),
+        }
+
+    async def _swap_status_by_order_id(
+        order_id: str, state: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        # Prefer an order already registered in this conversation's state (the
+        # swap lifecycle records provider_orders once the hash is broadcast).
+        orders = state.get("provider_orders") or {}
+        for provider_name, raw_order in orders.items():
+            if not isinstance(raw_order, Mapping):
+                continue
+            if str(raw_order.get("provider_order_id") or "") != order_id:
+                continue
+            provider = (runtime.providers or {}).get(str(provider_name))
+            if provider is None:
+                continue
+            try:
+                status = await provider.get_status(ProviderOrder.model_validate(raw_order))
+            except Exception:
+                continue
+            return _swap_status_observation(status, state)
+        # The App can open the assistant straight from an order detail page with
+        # only swap_query.order_id and no loaded session; reconstruct the order
+        # and probe the registered providers. Bridgers' status endpoint needs
+        # only the order id, while OmniBridge additionally needs its
+        # equipment_no, so a provider that does not own the order errors out and
+        # is skipped (bounded to the few configured providers).
+        for provider_name, provider in (runtime.providers or {}).items():
+            try:
+                status = await provider.get_status(
+                    ProviderOrder(
+                        provider=str(provider_name),
+                        provider_order_id=order_id,
+                        provider_reference=order_id,
+                    )
+                )
+            except Exception:
+                continue
+            return _swap_status_observation(status, state)
+        return None
+
     async def react_query_swap_status(
+        order_id: str | None = None,
         tx_hash: str | None = None,
         chain: str | None = None,
         *,
         state: Annotated[dict[str, Any], InjectedState],
     ) -> dict[str, Any]:
-        # Fall back to either the transaction or the swap-order entry context so
-        # a "为什么还在处理中？" opened from the order detail page can be
-        # answered without the user restating the hash.
+        # The App opens this from a swap order detail page carrying
+        # swap_query.order_id; prefer the provider order status so the answer
+        # reflects the actual order (a chain transaction lookup for the source
+        # hash alone is not the order and fails).
         query = state.get("swap_query") or state.get("transaction_query") or {}
+        resolved_order_id = str(
+            order_id
+            or query.get("provider_order_id")
+            or query.get("order_id")
+            or query.get("session_id")
+            or ""
+        ).strip()
+        if resolved_order_id:
+            observation = await _swap_status_by_order_id(resolved_order_id, state)
+            if observation is not None:
+                return observation
+        # Fall back to the transaction-status context when no order resolves.
         return await transaction_status_tool(
             str(chain or query.get("chain") or state.get("wallet_context", {}).get("chain") or ""),
             str(tx_hash or query.get("tx_hash") or query.get("hash") or ""),
@@ -11577,7 +11659,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         StructuredTool.from_function(
             coroutine=react_query_swap_status,
             name="query_swap_status",
-            description="查询兑换或交易的当前状态。",
+            description=(
+                "查询兑换订单的当前状态（按 order_id 查 Provider 订单；"
+                "没有订单时可用 tx_hash+chain 查链上交易状态）。"
+                "订单详情页的场景要优先传/使用订单上下文里的 order_id，"
+                "不要只用来源链交易哈希去猜。"
+            ),
         ),
     ]
 

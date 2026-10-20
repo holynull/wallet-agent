@@ -1,8 +1,9 @@
 """The App can open the assistant from a transaction detail screen with a default question."""
 
 import pytest
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
+from wallet_agent.domain.models import NormalizedOrderStatus
 from wallet_agent.graph.build import build_graph
 
 EVM = "0x3f847a21bcfbba535a5e2a1611bb4d545541d2a5"
@@ -12,6 +13,46 @@ TX_HASH = "0x" + "a" * 64
 class QuietModel:
     async def invoke_react(self, messages, tools):
         return AIMessage(content="好的。")
+
+
+class SwapStatusProvider:
+    provider_name = "bridgers"
+
+    def __init__(self):
+        self.status_order_ids = []
+
+    async def get_status(self, order):
+        self.status_order_ids.append(str(order.provider_order_id))
+        return NormalizedOrderStatus(
+            provider="bridgers",
+            provider_order_id=str(order.provider_order_id),
+            provider_reference=str(order.provider_reference),
+            status="completed",
+            tx_hash="0x" + "d" * 64,
+        )
+
+
+class QuerySwapStatusReactModel:
+    """Calls query_swap_status without args, trusting the swap_query context."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def invoke_react(self, messages, tools):
+        self.calls.append([tool.name for tool in tools])
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "qs-1",
+                        "name": "query_swap_status",
+                        "args": {},
+                    }
+                ],
+            )
+        return AIMessage(content="这笔兑换订单已完成，可以到目标链查看到账资产。")
 
 
 @pytest.mark.asyncio
@@ -132,4 +173,44 @@ async def test_swap_order_context_hides_transaction_history_and_carries_chain():
     assert "不要调用 transaction_history" in str(system.content)
     # The model never sees the recent-transaction tool in this order-scoped turn.
     assert model.calls and "transaction_history" not in model.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_query_swap_status_uses_swap_query_order_id_for_provider_status():
+    """query_swap_status must resolve swap_query.order_id against the provider
+    order (get_status) instead of falling back to a source-chain transaction
+    lookup that fails with TRANSACTION_STATUS_FAILED."""
+    provider = SwapStatusProvider()
+    model = QuerySwapStatusReactModel()
+    graph = build_graph(model=model, providers={"bridgers": provider})
+    result = await graph.ainvoke(
+        {
+            "request": {
+                "message": "分析这笔订单的详情？",
+                "address": EVM,
+                "chain": "BSC",
+                "swap_query": {
+                    "provider_order_id": "r1wwfxi8_ndgr_qfud_zbt9_0iii2hzmxjx3",
+                    "tx_hash": TX_HASH,
+                    "chain": "BSC",
+                },
+            },
+            "swap_query": {
+                "provider_order_id": "r1wwfxi8_ndgr_qfud_zbt9_0iii2hzmxjx3",
+                "tx_hash": TX_HASH,
+                "chain": "BSC",
+            },
+            "wallet_context": {"address": EVM, "chain": "BSC"},
+            "conversation_history": [],
+        },
+        config={"configurable": {"thread_id": "swap-order-status-by-order-id"}},
+    )
+
+    # The provider order was queried with the order id from swap_query.
+    assert provider.status_order_ids == ["r1wwfxi8_ndgr_qfud_zbt9_0iii2hzmxjx3"]
+    # The model saw a swap_status observation, not a failed transaction lookup.
+    tool_messages = [m for m in result["messages"] if isinstance(m, ToolMessage)]
+    assert tool_messages and '"kind": "swap_status"' in str(tool_messages[0].content)
+    assert '"status": "completed"' in str(tool_messages[0].content)
+    assert "已完成" in result["response"]["message"]
 
