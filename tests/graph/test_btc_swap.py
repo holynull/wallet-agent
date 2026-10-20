@@ -327,5 +327,11 @@ async def test_btc_swap_prepare_returns_a_psbt_paying_the_deposit_address():
     assert transaction["display"]["deposit_address"] == P2TR
     # The provider's routing hint must survive the rebuild into a PSBT.
     assert transaction["display"]["memo"] == BridgersFake.memo
+    # ...and be signed into the transaction as an OP_RETURN output so Bridgers
+    # can match the deposit to the order (a plain transfer is never recognised).
+    memo_hex = BridgersFake.memo.encode().hex()
+    assert ("6a" + hex(len(BridgersFake.memo.encode()))[2:].zfill(2) + memo_hex) in transaction[
+        "display"
+    ]["unsigned_tx_hex"]
     assert transaction["display"]["unsigned_tx_hex"].startswith("0200000001")
     assert base64.b64decode(transaction["data"]).startswith(PSBT_MAGIC)

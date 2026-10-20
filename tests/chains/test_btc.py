@@ -143,6 +143,29 @@ async def test_build_native_transfer_returns_a_witness_psbt():
     assert not any(path.endswith("/hex") for path in transport.paths)
 
 
+async def test_build_native_transfer_embeds_memo_as_op_return_and_charges_for_it():
+    """Bridgers matches a BTC deposit to the order through an OP_RETURN memo
+    (``Brc:to:TRX:...``); without it the deposit is never recognised. The memo
+    becomes a zero-value OP_RETURN output and its bytes count toward the fee."""
+    memo = "Brc:to:TRX:TGHF8oHDwsuKU8WX82so9GCYe8iJNtit5q"
+    adapter = BitcoinChainAdapter(EsploraFake())
+
+    tx = await adapter.build_native_transfer(
+        from_address=P2WPKH, to_address=P2TR, amount_raw="120000", memo=memo
+    )
+    plain = await adapter.build_native_transfer(
+        from_address=P2WPKH, to_address=P2TR, amount_raw="120000"
+    )
+
+    raw_hex = tx.display["unsigned_tx_hex"]
+    # The memo body must be present verbatim, preceded by the OP_RETURN opcode.
+    assert ("6a" + hex(len(memo.encode()))[2:].zfill(2) + memo.encode().hex()) in raw_hex
+    # The memo output is zero-value, so the fee must cover its serialized size.
+    assert int(tx.display["fee_raw"]) > int(plain.display["fee_raw"])
+    # The change output stays the last output (the OP_RETURN slot sits before it).
+    assert tx.display["change_raw"] != "0"
+
+
 async def test_build_native_transfer_attaches_prev_tx_for_legacy_inputs():
     transport = EsploraFake()
     adapter = BitcoinChainAdapter(transport)

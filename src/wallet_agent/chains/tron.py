@@ -314,7 +314,13 @@ class TronChainAdapter:
         )
 
     async def _trigger_smart_contract(
-        self, *, owner: str, contract: str, calldata: str, call_value: str = "0"
+        self,
+        *,
+        owner: str,
+        contract: str,
+        calldata: str,
+        call_value: str = "0",
+        fee_limit: int | None = None,
     ) -> Any:
         return await http_call(
             self.transport,
@@ -325,7 +331,7 @@ class TronChainAdapter:
                 "contract_address": contract,
                 "data": calldata,
                 "call_value": _wei_value(call_value),
-                "fee_limit": self.fee_limit,
+                "fee_limit": fee_limit or self.fee_limit,
                 "visible": True,
             },
         )
@@ -337,13 +343,16 @@ class TronChainAdapter:
         contract_address: str,
         calldata: str,
         value_raw: str = "0",
+        fee_limit: int | None = None,
     ) -> UnsignedTransaction:
         """Wrap arbitrary calldata (e.g. a provider's swap payload) as a TRON tx.
 
         Account-model wallets sign the node-built protobuf (``raw_data_hex``), not
         raw EVM calldata. Providers such as Bridgers return TRON swaps in EVM shape
-        (``{to, data, value}``); this rebuilds that payload through
-        ``/wallet/triggersmartcontract`` so the App receives a signable transaction.
+        (``{to, data, value}``) or TRON shape (``functionName`` + ``parameter``);
+        this rebuilds that payload through ``/wallet/triggersmartcontract`` so the
+        App receives a signable transaction. ``fee_limit`` overrides the adapter
+        default when the provider specifies one (Bridgers sends ``options.feeLimit``).
         """
         owner = validate_address(self.chain, from_address)
         contract = validate_address(self.chain, contract_address)
@@ -355,6 +364,7 @@ class TronChainAdapter:
             contract=contract,
             calldata=calldata,
             call_value=value_raw,
+            fee_limit=fee_limit,
         )
         amount = str(_wei_value(value_raw)) if str(value_raw) else "0"
         return self._unsigned_from_payload(

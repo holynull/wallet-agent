@@ -120,6 +120,45 @@ async def test_resolve_swap_transaction_rebuilds_tron_calldata_as_protobuf():
 
 
 @pytest.mark.asyncio
+async def test_resolve_swap_transaction_forwards_provider_fee_limit():
+    """Bridgers' TRON swap payload carries ``options.feeLimit``; the graph must
+    forward it to ``triggersmartcontract`` so energy pricing uses the provider's
+    limit instead of the adapter default."""
+    adapter = TronChainAdapter(TronNodeFake())
+    prepared = await _resolve_swap_transaction(
+        make_provider_tx(input_amount="100", minimum_output="39.8", fee_limit="100000000"),
+        quote=make_quote(),
+        adapter=adapter,
+        sender=OWNER,
+        chain="TRON",
+    )
+
+    assert prepared.display["fee_limit"] == "100000000"
+    path, payload = adapter.transport.posts[0]
+    assert path.endswith("/wallet/triggersmartcontract")
+    assert payload["fee_limit"] == 100000000
+
+
+@pytest.mark.asyncio
+async def test_resolve_swap_transaction_ignores_malformed_fee_limit():
+    """A non-numeric fee_limit must not break the swap rebuild; fall back to the
+    adapter default rather than raising."""
+    adapter = TronChainAdapter(TronNodeFake())
+    prepared = await _resolve_swap_transaction(
+        make_provider_tx(input_amount="100", minimum_output="39.8", fee_limit="not-a-number"),
+        quote=make_quote(),
+        adapter=adapter,
+        sender=OWNER,
+        chain="TRON",
+    )
+
+    assert isinstance(prepared, UnsignedTransaction)
+    path, payload = adapter.transport.posts[0]
+    assert path.endswith("/wallet/triggersmartcontract")
+    assert payload["fee_limit"] == adapter.fee_limit
+
+
+@pytest.mark.asyncio
 async def test_resolve_swap_transaction_leaves_chain_ready_tron_payload_untouched():
     adapter = TronChainAdapter(TronNodeFake())
     chain_ready = UnsignedTransaction(

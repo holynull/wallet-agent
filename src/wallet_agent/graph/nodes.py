@@ -695,6 +695,11 @@ async def _deposit_order_to_transaction(
         )
         if signing_info:
             native_kwargs["signing_info"] = signing_info
+        if getattr(order, "memo", None):
+            # The provider's routing hint must be signed into the deposit as an
+            # OP_RETURN output or the order can never be matched (Bridgers:
+            # "没有 OP_RETURN").
+            native_kwargs["memo"] = str(order.memo)
         transaction = await _resolve(
             builder(
                 from_address=sender,
@@ -799,12 +804,20 @@ async def _account_contract_swap(
     builder = getattr(adapter, "build_smart_contract_call", None)
     if builder is None or not sender:
         return prepared
+    fee_limit = display.get("fee_limit")
+    kwargs: dict[str, Any] = {}
+    if fee_limit not in (None, ""):
+        try:
+            kwargs["fee_limit"] = int(str(fee_limit))
+        except (TypeError, ValueError):
+            kwargs["fee_limit"] = None
     transaction = await _resolve(
         builder(
             from_address=sender,
             contract_address=prepared.to,
             calldata=calldata,
             value_raw=str(getattr(prepared, "value", "0") or "0"),
+            **kwargs,
         )
     )
     if not isinstance(transaction, UnsignedTransaction):

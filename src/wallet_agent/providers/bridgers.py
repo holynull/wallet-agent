@@ -21,6 +21,7 @@ from wallet_agent.domain.models import (
 )
 from wallet_agent.domain.normalization import canonical_chain, canonical_symbol
 
+from ..abi import encode_swap_calldata
 from .cache import AsyncTTLCache
 from .http import ProviderResponseError
 
@@ -426,6 +427,22 @@ class BridgersProvider:
             raise ProviderResponseError(
                 "100", "Provider returned no deposit address", category="client"
             )
+        # TRON swaps come back in TRON shape (``tronRouterAddrees`` /
+        # ``functionName`` / ``parameter`` / ``options.callValue``), not the EVM
+        # ``{to, data, value}`` every other chain uses. Building a plain native
+        # transfer to the router would skip the ``swapEth`` call and Bridgers
+        # never recognises the deposit ("没调用合约方法"), so encode the real
+        # contract-call calldata here and let the graph rebuild it through the
+        # TRON adapter's ``triggersmartcontract``.
+        function_name = str(tx.get("functionName") or "")
+        parameters = tx.get("parameter")
+        options = tx.get("options") if isinstance(tx.get("options"), Mapping) else {}
+        if function_name and isinstance(parameters, list) and parameters:
+            calldata = encode_swap_calldata(function_name, parameters)
+            call_value = str(options.get("callValue") or "0x0")
+        else:
+            calldata = str(tx.get("data", ""))
+            call_value = str(tx.get("value", "0x0"))
         display = {
             "input_amount": str(quote.input_amount),
             "expected_output": str(quote.expected_output),
@@ -433,6 +450,9 @@ class BridgersProvider:
             if quote.minimum_output is not None
             else "",
         }
+        fee_limit = options.get("feeLimit")
+        if fee_limit not in (None, ""):
+            display["fee_limit"] = str(fee_limit)
         memo = str(tx.get("memo") or "")
         if memo:
             # Bitcoin deposits carry the routing hint the provider uses for the
@@ -442,8 +462,8 @@ class BridgersProvider:
             chain=quote.source_asset.chain,
             chain_id=quote.source_asset.chain_id,
             to=destination,
-            data=str(tx.get("data", "")),
-            value=str(tx.get("value", "0x0")),
+            data=calldata,
+            value=call_value,
             gas_limit=None,
             provider="bridgers",
             provider_reference=quote.provider_reference,

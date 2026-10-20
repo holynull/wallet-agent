@@ -581,6 +581,43 @@ async def test_bridgers_prepare_reads_a_utxo_deposit_address_and_memo():
 
 
 @pytest.mark.asyncio
+async def test_bridgers_prepare_rebuilds_tron_swap_calldata_with_fee_limit():
+    """TRON swaps come back as ``functionName`` + ``parameter`` + ``options``
+    instead of EVM ``{to, data, value}``. The calldata must carry the real
+    ``swapEth`` selector (not a plain transfer to the router) and the provider's
+    ``feeLimit`` must surface so the graph prices energy correctly."""
+    transport = FakeTransport(
+        quote_response(),
+        {
+            "resCode": "100",
+            "resMsg": "success",
+            "data": {
+                "txData": {
+                    "tronRouterAddrees": "4158b8a2f4c954a0c54c8e392feee612ec2dbe1585",
+                    "functionName": "swapEth(string,string,uint256)",
+                    "options": {"feeLimit": 100000000, "callValue": "0x2ebae40"},
+                    "parameter": [
+                        {"type": "string", "value": "BTC|1dcve2|0.01|bridgers|0"},
+                        {"type": "string", "value": "1Nqs6wvbYfZK15GQ43ydsiDU7NDnnWR2tm"},
+                        {"type": "uint256", "value": "0x4844"},
+                    ],
+                    "to": "TJ4KeiGTvTX4wRUgLARiwr8rGLaurmVkdZ",
+                }
+            },
+        },
+    )
+    provider = BridgersProvider.from_transport(transport, source_flag="wallet-agent")
+    quote = await provider.quote(valid_quote_request())
+
+    transaction = await provider.prepare(quote)
+
+    assert transaction.to == "TJ4KeiGTvTX4wRUgLARiwr8rGLaurmVkdZ"
+    assert transaction.data.startswith("0x16b3b4c2")  # swapEth(string,string,uint256)
+    assert transaction.value == "0x2ebae40"
+    assert transaction.display["fee_limit"] == "100000000"
+
+
+@pytest.mark.asyncio
 async def test_bridgers_prepare_rejects_a_payload_without_a_destination():
     transport = FakeTransport(
         quote_response(),

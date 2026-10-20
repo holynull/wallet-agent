@@ -109,6 +109,27 @@ def _varint(value: int) -> bytes:
     return b"\xff" + value.to_bytes(8, "little")
 
 
+def _op_return_script(data: bytes) -> bytes:
+    """``OP_RETURN <push> <data>`` — the routing hint Bridgers needs on deposits."""
+    size = len(data)
+    if size <= 75:
+        push = bytes([size])
+    elif size <= 0xFF:
+        push = b"\x4c" + bytes([size])
+    elif size <= 0xFFFF:
+        push = b"\x4d" + size.to_bytes(2, "little")
+    else:
+        push = b"\x4e" + size.to_bytes(4, "little")
+    return b"\x6a" + push + data
+
+
+def _output_vbytes(script: bytes) -> int:
+    """Serialized size of a transaction output (8-byte value + compact-size length)."""
+    size = len(script)
+    length_size = 1 if size < 0xFD else (3 if size < 0x10000 else 5)
+    return 8 + length_size + size
+
+
 def _outpoint(txid: str, vout: int) -> bytes:
     return bytes.fromhex(txid)[::-1] + vout.to_bytes(4, "little")
 
@@ -424,6 +445,7 @@ class BitcoinChainAdapter:
         amount_raw: str,
         from_addresses: Sequence[str] | None = None,
         signing_info: Mapping[str, Mapping[str, Any]] | None = None,
+        memo: str | None = None,
     ) -> UnsignedTransaction:
         """Build an unsigned PSBT paying ``to_address``.
 
@@ -435,6 +457,10 @@ class BitcoinChainAdapter:
         ``signing_info`` maps an address to the ``pubkey`` / ``derivation_path`` /
         ``master_fingerprint`` the App reported for it. Without it a nested SegWit
         input has no redeem script and no signer can produce a signature.
+
+        ``memo`` (a provider routing hint, e.g. Bridgers' ``Brc:to:TRX:...``) is
+        embedded as a zero-value ``OP_RETURN`` output so the provider can match
+        the deposit to the order; its bytes count toward the network fee.
         """
         if not valid_bitcoin_address(from_address) or not valid_bitcoin_address(to_address):
             raise ValueError("invalid Bitcoin address")
@@ -442,14 +468,25 @@ class BitcoinChainAdapter:
         amount = int(normalize_raw_integer(amount_raw))
         if amount <= 0:
             raise ValueError("transfer amount must be positive")
+        op_return_script = _op_return_script(memo.encode("utf-8")) if memo else None
+        extra_output_vbytes = _output_vbytes(op_return_script) if op_return_script else 0
         utxos = await self._address_utxos(sources)
         if not utxos:
             raise ValueError("no spendable Bitcoin UTXOs for the sender addresses")
         rate = await self._fee_rate_sat_vb()
-        selected, fee, change = self._select(utxos, amount, rate, to_address, from_address)
+        selected, fee, change = self._select(
+            utxos,
+            amount,
+            rate,
+            to_address,
+            from_address,
+            extra_output_vbytes=extra_output_vbytes,
+        )
         if change < DUST_LIMIT:
             change = 0
         outputs: list[tuple[bytes, int]] = [(script_pubkey(to_address), amount)]
+        if op_return_script:
+            outputs.append((op_return_script, 0))
         if change:
             outputs.append((script_pubkey(from_address), change))
         unsigned_tx = serialize_unsigned_transaction(
@@ -462,8 +499,9 @@ class BitcoinChainAdapter:
             address_family(from_address),
             _hex_bytes((signing_info or {}).get(from_address, {}).get("pubkey")) or b"",
         ):
-            # A signer verifies that the change output belongs to this wallet.
-            output_metadata[1] = _derivation_fields(
+            # A signer verifies that the change output (always last) belongs to
+            # this wallet.
+            output_metadata[-1] = _derivation_fields(
                 (signing_info or {}).get(from_address), PSBT_OUT_BIP32_DERIVATION
             )
         psbt = build_psbt(
@@ -570,13 +608,23 @@ class BitcoinChainAdapter:
         rate: Decimal,
         to_address: str,
         change_address: str,
+        *,
+        extra_output_vbytes: int = 0,
     ) -> tuple[list[dict[str, Any]], int, int]:
         selected: list[dict[str, Any]] = []
         total = 0
         for utxo in utxos:
             selected.append(dict(utxo))
             total += int(utxo["value"])
-            fee, change = self._settle(selected, total, amount, rate, to_address, change_address)
+            fee, change = self._settle(
+                selected,
+                total,
+                amount,
+                rate,
+                to_address,
+                change_address,
+                extra_output_vbytes=extra_output_vbytes,
+            )
             if total >= amount + fee:
                 return selected, fee, change
         raise ValueError("insufficient Bitcoin balance for the amount and network fee")
@@ -589,13 +637,25 @@ class BitcoinChainAdapter:
         rate: Decimal,
         to_address: str,
         change_address: str,
+        *,
+        extra_output_vbytes: int = 0,
     ) -> tuple[int, int]:
         """Pick the fee/change pair for the current selection; drop dust change into the fee."""
-        with_change = self._fee_for(inputs, rate, [to_address, change_address])
+        with_change = self._fee_for(
+            inputs,
+            rate,
+            [to_address, change_address],
+            extra_output_vbytes=extra_output_vbytes,
+        )
         change = total - amount - with_change
         if change >= DUST_LIMIT:
             return with_change, change
-        without_change = self._fee_for(inputs, rate, [to_address])
+        without_change = self._fee_for(
+            inputs,
+            rate,
+            [to_address],
+            extra_output_vbytes=extra_output_vbytes,
+        )
         if total - amount - without_change >= 0:
             return without_change, 0
         return with_change, 0
@@ -605,12 +665,15 @@ class BitcoinChainAdapter:
         inputs: Sequence[Mapping[str, Any]],
         rate: Decimal,
         outputs: Sequence[str],
+        *,
+        extra_output_vbytes: int = 0,
     ) -> int:
         size = _TX_OVERHEAD_VBYTES
         for item in inputs:
             family = address_family(str(item.get("address") or ""))
             size += _INPUT_VBYTES.get(family, _INPUT_VBYTES["p2wpkh"])
         size += sum(_OUTPUT_VBYTES.get(address_family(item), 31) for item in outputs if item)
+        size += extra_output_vbytes
         return int(math.ceil(Decimal(size) * rate))
 
     async def _input_metadata(
