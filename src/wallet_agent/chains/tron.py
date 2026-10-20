@@ -214,8 +214,24 @@ class TronChainAdapter:
             amount_raw=str(fee_sun),
         )
 
+    async def _get_transaction_by_id(self, tx_hash: str) -> Any:
+        """Fetch a transaction from the TRON node.
+
+        ``/wallet/gettransactionbyid`` is a POST endpoint that takes the hex
+        txid in the JSON body (``{"value": "<txid>"}``); the node answers 404
+        when the txid is placed in the path via GET, so the receipt/status
+        observers must POST here or every lookup looks like a missing
+        transaction.
+        """
+        return await http_call(
+            self.transport,
+            "post",
+            "/wallet/gettransactionbyid",
+            json={"value": tx_hash},
+        )
+
     async def get_transaction_status(self, tx_hash: str) -> TransactionStatus:
-        data = await http_call(self.transport, "get", f"/wallet/gettransactionbyid/{tx_hash}")
+        data = await self._get_transaction_by_id(tx_hash)
         if not data:
             return TransactionStatus.UNKNOWN
         receipt = self._receipt_from_transaction(data)
@@ -231,13 +247,13 @@ class TronChainAdapter:
     async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
         """Map a TRON node transaction onto an EVM-shaped receipt for the swap gate.
 
-        ``/wallet/gettransactionbyid`` carries the execution outcome in
-        ``ret[0].contractRet`` (``SUCCESS`` / ``FAILED`` / ``REVERT``). Return a
-        ``status``-keyed mapping so ``receipt_success`` and the broadcast observer
-        classify it exactly like an EVM receipt; ``None`` means the transaction
-        is still pending or unknown.
+        ``/wallet/gettransactionbyid`` (POSTed with the hex txid) carries the
+        execution outcome in ``ret[0].contractRet`` (``SUCCESS`` / ``FAILED`` /
+        ``REVERT``). Return a ``status``-keyed mapping so ``receipt_success``
+        and the broadcast observer classify it exactly like an EVM receipt;
+        ``None`` means the transaction is still pending or unknown.
         """
-        data = await http_call(self.transport, "get", f"/wallet/gettransactionbyid/{tx_hash}")
+        data = await self._get_transaction_by_id(tx_hash)
         return self._receipt_from_transaction(data)
 
     @staticmethod

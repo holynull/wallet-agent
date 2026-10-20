@@ -38,8 +38,6 @@ class TronNodeFake:
     async def get(self, path, **kwargs):
         if path.endswith("getchainparameters"):
             return {"chainParameter": [{"key": "getTransactionFee", "value": 1000}]}
-        if path.startswith("/wallet/gettransactionbyid"):
-            return {"ret": [{"contractRet": "SUCCESS"}]}
         if path.startswith("/v1/accounts/"):
             return {"data": [{"balance": self.balance}]}
         return {}
@@ -54,6 +52,8 @@ class TronNodeFake:
                 "result": {"result": True},
                 "transaction": {"txID": "cc" * 32, "raw_data_hex": "0a02cafe"},
             }
+        if path.endswith("/gettransactionbyid"):
+            return {"ret": [{"contractRet": "SUCCESS"}]}
         return {}
 
 

@@ -612,8 +612,6 @@ async def test_tron_swap_approval_gate_reaches_swap_ready_with_raw_data_hex():
             self.posts: list[tuple[str, dict]] = []
 
         async def get(self, path, **kwargs):
-            if path.startswith("/wallet/gettransactionbyid"):
-                return {} if self.receipt is None else {"ret": [{"contractRet": self.receipt}]}
             if path.endswith("getchainparameters"):
                 return {"chainParameter": [{"key": "getTransactionFee", "value": 1000}]}
             if path.startswith("/v1/accounts/"):
@@ -630,6 +628,8 @@ async def test_tron_swap_approval_gate_reaches_swap_ready_with_raw_data_hex():
                 }
             if path.endswith("/triggerconstantcontract"):
                 return {"constant_result": ["0" * 62 + f"{int(self.allowance):x}"]}
+            if path.endswith("/gettransactionbyid"):
+                return {} if self.receipt is None else {"ret": [{"contractRet": self.receipt}]}
             return {}
 
     class TronProvider(Provider):

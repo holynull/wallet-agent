@@ -37,11 +37,14 @@ class HttpFake:
     async def get(self, path, **kwargs):
         if path.endswith("/transactions"):
             return {"data": [{"txID": "abc", "ret": [{"contractRet": "SUCCESS"}]}]}
-        if path.startswith("/wallet/gettransactionbyid"):
-            return {"ret": [{"contractRet": "SUCCESS"}]}
         if path.endswith("getchainparameters"):
             return {"chainParameter": [{"key": "getTransactionFee", "value": 1000}]}
         return {"data": [{"balance": 1_000_000, "trc20": [{"Ttoken": "1000000"}]}]}
+
+    async def post(self, path, **kwargs):
+        if path.startswith("/wallet/gettransactionbyid"):
+            return {"ret": [{"contractRet": "SUCCESS"}]}
+        return {}
 
 
 async def test_tron_read_only_methods():
@@ -258,6 +261,9 @@ class ReceiptFake:
         self.body = body
 
     async def get(self, path, **kwargs):
+        return self.body
+
+    async def post(self, path, **kwargs):
         return self.body
 
 
