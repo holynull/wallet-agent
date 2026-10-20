@@ -2481,6 +2481,31 @@ def _swap_recipient_address(
     return value or None
 
 
+def _swap_preflight_recipient(
+    prepared: Any, request: Mapping[str, Any], chain: str
+) -> str:
+    """The source-chain address a swap preflight should validate as payer.
+
+    A provider deposit transaction pays a source-chain address, exposed as the
+    display ``deposit_address`` or the transaction ``to``. The swap request also
+    carries ``recipient_address``, which on a cross-chain swap is the
+    *destination*-chain payout address (e.g. a BTC address on an ETH-source
+    swap) and must never be fed to the source-chain preflight. It is only used
+    when it is itself a valid source-chain address (a same-chain swap with no
+    deposit concept).
+    """
+    display = dict(getattr(prepared, "display", None) or {})
+    candidates = (
+        str(display.get("deposit_address") or "").strip(),
+        str(getattr(prepared, "to", "") or "").strip(),
+        str(request.get("recipient_address") or "").strip(),
+    )
+    for candidate in candidates:
+        if candidate and is_valid_address(str(chain or ""), candidate):
+            return candidate
+    return ""
+
+
 def _confirmation_stale(state: Mapping[str, Any], confirmation: Mapping[str, Any]) -> bool:
     """Return false for legacy confirmations and strictly validate versioned ones."""
     if not all(key in confirmation for key in ("task_id", "task_revision", "payload_hash")):
@@ -4281,24 +4306,48 @@ async def _transaction_preflight(
     if hasattr(adapter, "validate_address") and sender:
         try:
             sender_valid = await adapter.validate_address(sender)
-            recipient_valid = await adapter.validate_address(recipient) if recipient else True
-            if not sender_valid or not recipient_valid:
+            recipient_on_source = bool(recipient) and is_valid_address(chain, recipient)
+            if not sender_valid:
                 add(
                     "addresses",
                     "failed",
-                    "发送方或收款方地址格式无效。",
+                    "发送方地址格式无效。",
                     code="INVALID_ADDRESS",
-                    details={"sender_valid": sender_valid, "recipient_valid": recipient_valid},
+                    details={"sender_valid": False, "recipient_valid": recipient_on_source},
                 )
-            elif recipient:
-                add("addresses", "passed", "发送方和收款方地址格式有效。")
-            else:
+            elif recipient and not recipient_on_source:
+                # Cross-chain swaps carry a destination-chain payout address
+                # (e.g. a BTC address on an ETH-source swap). The source-chain
+                # adapter cannot validate it; keep the check non-blocking and
+                # let the provider/order carry the destination-address contract.
                 add(
                     "addresses",
                     "warning",
-                    "缺少收款方上下文，仅完成发送方地址校验。",
+                    "发送方地址有效；收款方地址不属于本链，已跳过源链格式校验。",
                     code="CHECK_PARTIAL",
+                    details={"sender_valid": True, "recipient_valid": False, "cross_chain": True},
                 )
+            else:
+                recipient_valid = (
+                    await adapter.validate_address(recipient) if recipient else True
+                )
+                if not recipient_valid:
+                    add(
+                        "addresses",
+                        "failed",
+                        "收款方地址格式无效。",
+                        code="INVALID_ADDRESS",
+                        details={"sender_valid": True, "recipient_valid": False},
+                    )
+                elif recipient:
+                    add("addresses", "passed", "发送方和收款方地址格式有效。")
+                else:
+                    add(
+                        "addresses",
+                        "warning",
+                        "缺少收款方上下文，仅完成发送方地址校验。",
+                        code="CHECK_PARTIAL",
+                    )
         except Exception as exc:
             add("addresses", "failed", str(exc), code="ADDRESS_VALIDATION_FAILED")
     elif not sender:
@@ -9770,10 +9819,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     adapter=adapter,
                     chain=source_chain,
                     sender=str(request.get("sender_address") or ""),
-                    recipient=(
-                        prepared.display.get("deposit_address")
-                        or str(request.get("recipient_address") or "")
-                    ),
+                    recipient=_swap_preflight_recipient(prepared, request, source_chain),
                     amount_raw=str(request.get("input_amount_raw") or "0"),
                     token=(
                         Asset.model_validate(source_asset) if source_asset.get("address") else None
@@ -9931,9 +9977,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 adapter=adapter,
                 chain=source_chain,
                 sender=str(request.get("sender_address") or requirement.owner),
-                recipient=(
-                    prepared.display.get("deposit_address")
-                    or str(request.get("recipient_address") or requirement.owner)
+                recipient=_swap_preflight_recipient(
+                    prepared,
+                    {
+                        **request,
+                        "recipient_address": request.get("recipient_address")
+                        or requirement.owner,
+                    },
+                    source_chain,
                 ),
                 amount_raw=str(request.get("input_amount_raw") or "0"),
                 token=(Asset.model_validate(source_asset) if source_asset.get("address") else None),
@@ -10521,9 +10572,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     adapter=adapter,
                     chain=source_chain,
                     sender=str(request.get("sender_address") or ""),
-                    recipient=(
-                        prepared_transaction.display.get("deposit_address")
-                        or str(request.get("recipient_address") or "")
+                    recipient=_swap_preflight_recipient(
+                        prepared_transaction, request, source_chain
                     ),
                     amount_raw=str(request.get("input_amount_raw") or "0"),
                     token=(
