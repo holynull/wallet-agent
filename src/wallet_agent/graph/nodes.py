@@ -10709,6 +10709,80 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 ]
             }
 
+    async def _recover_stale_broadcast_order(
+        state: Mapping[str, Any], tx_hash: str
+    ) -> dict[str, Any] | None:
+        """Register a provider order for a broadcast that was saved without one.
+
+        When the source-chain observer cannot confirm propagation at broadcast
+        time, the API persists the hash with ``broadcast_status`` unknown /
+        not_propagated and never registers the provider order, leaving the
+        session stuck at "unknown" forever (the order is never submitted and the
+        real order state is never polled). Once the source transaction is
+        confirmed on-chain, register the order so polling can report
+        processing / completed / refunded instead of a permanent stub.
+        """
+        selected = state.get("selected_quote") or {}
+        if not isinstance(selected, Mapping):
+            selected = _dump(selected) or {}
+        source_asset = selected.get("source_asset") or {}
+        if isinstance(source_asset, Mapping):
+            source_asset = _dump(source_asset) or {}
+        source_chain = str(source_asset.get("chain") or "")
+        provider_name = str(selected.get("provider") or "")
+        if not source_chain or not provider_name:
+            return None
+        adapter = execution_adapter(source_chain)
+        if adapter is None:
+            return None
+        try:
+            if not await _source_transaction_confirmed(adapter, tx_hash):
+                return None
+        except Exception:
+            return None
+        provider = runtime.providers.get(provider_name)
+        if provider is None:
+            return None
+        pending = state.get("pending_transaction")
+        provider_reference = (
+            pending.get("provider_reference")
+            if isinstance(pending, Mapping)
+            else getattr(pending, "provider_reference", None)
+        ) or selected.get("provider_reference", "")
+        try:
+            order = await provider.register_broadcast(
+                str(provider_reference), tx_hash, quote=selected or None
+            )
+        except Exception:
+            return None
+        value = _dump(order)
+        pending_payload = _mapping(pending).get("provider_payload") if pending is not None else {}
+        if isinstance(pending_payload, Mapping) and pending_payload:
+            order_payload = _mapping(value.get("provider_payload"))
+            value["provider_payload"] = {
+                **pending_payload,
+                **{
+                    str(key): item
+                    for key, item in order_payload.items()
+                    if item not in (None, "")
+                },
+            }
+        return {provider_name: value}
+
+    async def _source_transaction_confirmed(adapter: Any, tx_hash: str) -> bool:
+        """Best-effort check that the broadcast source transaction is confirmed."""
+        if hasattr(adapter, "get_transaction_receipt"):
+            receipt = await adapter.get_transaction_receipt(tx_hash)
+            if receipt is None:
+                return False
+            return receipt_success(receipt) is True
+        if hasattr(adapter, "get_transaction_status"):
+            status = str(
+                getattr(await adapter.get_transaction_status(tx_hash), "value", None) or ""
+            ).lower()
+            return status == "confirmed"
+        return False
+
     async def status_poll(state: dict[str, Any]) -> dict[str, Any]:
         status_messages = {
             "pending": "兑换订单已提交，Provider 仍在处理中。",
@@ -10719,6 +10793,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "unknown": "暂时拿不到兑换订单的最新状态，建议稍后重新查询。",
         }
         broadcast_status = state.get("broadcast_status")
+        tx_hash = state.get("broadcast_tx_hash")
         provider_visible = {
             "broadcast_seen",
             "broadcast_pending",
@@ -10726,23 +10801,33 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "confirmed",
             None,
         }
-        if state.get("broadcast_tx_hash") and broadcast_status not in provider_visible:
-            response_payload = {
-                "kind": "swap_status",
-                "status": broadcast_status,
-                "broadcast_status": broadcast_status,
-                "tx_hash": state.get("broadcast_tx_hash"),
-                "message": (
-                    "Source-chain transaction propagation is not confirmed yet; "
-                    "provider order polling has not started."
-                ),
-                **_swap_status_logo_context(state),
-            }
-            return {
-                "response": await naturalize_read_response(state, response_payload),
-                "poll_attempts": state.get("poll_attempts", 0),
-            }
+        recovered = None
         orders = state.get("provider_orders", {})
+        if tx_hash and broadcast_status not in provider_visible and not orders:
+            # A broadcast whose source propagation could not be confirmed at
+            # broadcast time never reached the provider, so the session would
+            # stay stuck at unknown with no order to poll. Self-heal once the
+            # source transaction confirms on-chain.
+            recovered = await _recover_stale_broadcast_order(state, tx_hash)
+            if recovered:
+                orders = recovered
+                broadcast_status = "source_confirmed"
+            else:
+                response_payload = {
+                    "kind": "swap_status",
+                    "status": broadcast_status,
+                    "broadcast_status": broadcast_status,
+                    "tx_hash": tx_hash,
+                    "message": (
+                        "Source-chain transaction propagation is not confirmed yet; "
+                        "provider order polling has not started."
+                    ),
+                    **_swap_status_logo_context(state),
+                }
+                return {
+                    "response": await naturalize_read_response(state, response_payload),
+                    "poll_attempts": state.get("poll_attempts", 0),
+                }
         if not orders:
             if state.get("pending_transaction"):
                 response_payload = {
@@ -10833,6 +10918,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             return {
                 "status_snapshot": dumped,
                 "broadcast_status": effective_broadcast_status,
+                **({"provider_orders": orders} if recovered else {}),
                 "poll_attempts": attempts,
                 "response": await naturalize_read_response(state, response_payload),
             }

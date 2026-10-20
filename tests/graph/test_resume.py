@@ -350,6 +350,80 @@ async def test_broadcast_status_not_propagated_skips_provider_registration_and_p
 
 
 @pytest.mark.asyncio
+async def test_status_poll_recovers_stuck_broadcast_once_source_confirms():
+    """A broadcast saved as unknown (no provider order) self-heals once the
+    source transaction confirms on-chain instead of staying stuck forever."""
+
+    class ConfirmingAdapter:
+        async def get_transaction_receipt(self, tx_hash):
+            return {"status": "0x1"}
+
+    provider = BroadcastProvider()
+    graph = build_graph(
+        model=object(),
+        providers=[provider],
+        chains={"BASE": ConfirmingAdapter()},
+    )
+    quote = selected_quote()
+    tx_hash = "0x" + "8" * 64
+
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "recover-stuck-broadcast",
+            "forced_intent": "swap_status",
+            "broadcast_tx_hash": tx_hash,
+            "broadcast_status": "unknown",
+            "selected_quote": quote,
+        },
+        config={"configurable": {"thread_id": "recover-stuck-broadcast"}},
+    )
+
+    assert provider.broadcast_calls == 1
+    assert provider.status_calls == 1
+    assert result["response"]["kind"] == "swap_status"
+    assert result["response"]["provider_status"] == "processing"
+    assert result["response"]["broadcast_status"] == "source_confirmed"
+    order = (result.get("provider_orders") or {}).get("bridgers")
+    assert order is not None
+    assert order["provider_order_id"] == "order-1"
+
+
+@pytest.mark.asyncio
+async def test_status_poll_waits_when_source_transaction_not_confirmed():
+    """Until the source transaction confirms, a stuck broadcast must not
+    register a phantom provider order."""
+
+    class PendingAdapter:
+        async def get_transaction_receipt(self, tx_hash):
+            return None
+
+    provider = BroadcastProvider()
+    graph = build_graph(
+        model=object(),
+        providers=[provider],
+        chains={"BASE": PendingAdapter()},
+    )
+    quote = selected_quote()
+    tx_hash = "0x" + "9" * 64
+
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "still-pending-broadcast",
+            "forced_intent": "swap_status",
+            "broadcast_tx_hash": tx_hash,
+            "broadcast_status": "unknown",
+            "selected_quote": quote,
+        },
+        config={"configurable": {"thread_id": "still-pending-broadcast"}},
+    )
+
+    assert provider.broadcast_calls == 0
+    assert provider.status_calls == 0
+    assert result["response"]["kind"] == "swap_status"
+    assert result["response"]["status"] == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_active_swap_status_followup_polls_existing_provider_order():
     provider = BroadcastProvider()
     graph = build_graph(model=MisclassifiedSwapStatusModel(), providers=[provider])
