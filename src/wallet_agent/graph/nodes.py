@@ -12420,6 +12420,36 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             )
             if default_quote is not None:
                 update["selected_quote"] = default_quote
+                # A fresh quote selection invalidates the previous
+                # confirmation cycle (for example a cancelled/rejected swap).
+                # If the stale ``confirmation_state`` were left in the
+                # checkpoint, the API's automatic swap_prepare continuation
+                # would see it and route_after_intent would short-circuit to
+                # "response", so the client never receives
+                # confirmation_required for the new quote. Only an unexpired
+                # pending confirmation for the SAME quote is kept, so an
+                # incidental re-quote does not drop an in-flight card.
+                previous_confirmation = state.get("confirmation_state") or {}
+                active_task = hydrate_active_task(state)
+                task_slippage = (
+                    ((active_task or {}).get("slots") or {}).get("slippage_bps")
+                )
+                new_quote_hash = confirmation_payload_hash(
+                    _swap_confirmation_summary(
+                        default_quote,
+                        slippage_bps=task_slippage,
+                        recipient_address=_swap_recipient_address(state, active_task),
+                    )
+                )
+                still_valid = (
+                    isinstance(previous_confirmation, Mapping)
+                    and previous_confirmation.get("status") == "requested"
+                    and not _confirmation_expired(previous_confirmation)
+                    and previous_confirmation.get("payload_hash") == new_quote_hash
+                )
+                if not still_valid:
+                    update["confirmation_state"] = None
+                    update["user_confirmation"] = None
         transfer_result = next(
             (
                 payload

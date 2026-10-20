@@ -7,6 +7,7 @@ the best quote (``selected_quote``) so the API continues into confirmation
 instead of surfacing the channel picker.
 """
 
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -239,3 +240,200 @@ async def test_quote_uses_user_named_source_chain_over_model_guess():
         source = candidate.get("source_asset") or {}
         assert source.get("chain") == "ETH"
         assert source.get("symbol") == "USDT"
+
+
+class BscQuoteProvider:
+    """ETH USDT -> BSC BNB provider used to reproduce Lif's re-quote bug."""
+
+    def __init__(self, name, output):
+        self.provider_name = name
+        self.output = output
+
+    async def list_assets(self, query):
+        assert isinstance(query, AssetQuery)
+        if query.search == "USDT":
+            return [
+                Asset(
+                    chain="ETH",
+                    chain_id=1,
+                    symbol="USDT",
+                    decimals=6,
+                    address="0xdac17f958d2ee523a2206206994597c13d831ec7",
+                )
+            ]
+        if query.search == "BNB":
+            return [
+                Asset(
+                    chain="BSC",
+                    chain_id=56,
+                    symbol="BNB",
+                    decimals=18,
+                    address="0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+                )
+            ]
+        return []
+
+    async def quote(self, request):
+        return NormalizedQuote(
+            provider=self.provider_name,
+            source_asset=request.source_asset,
+            destination_asset=request.destination_asset,
+            input_amount=request.input_amount,
+            input_amount_raw=request.input_amount_raw,
+            expected_output=Decimal(self.output),
+            expected_output_raw=str(int(Decimal(self.output) * Decimal(10) ** 6)),
+            provider_reference=f"quote-{self.provider_name}",
+        )
+
+
+class BscRequoteModel:
+    """Model that quotes ETH USDT -> BSC BNB on the first react step."""
+
+    async def invoke_react(self, messages, tools):
+        tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "quote-1",
+                        "name": "get_swap_quote",
+                        "args": {
+                            "source_symbol": "USDT",
+                            "destination_symbol": "BNB",
+                            "input_amount": "100",
+                            "source_chain": "ETH",
+                            "destination_chain": "BSC",
+                        },
+                    }
+                ],
+            )
+        return AIMessage(content="报价已就绪。")
+
+
+def _stale_rejected_confirmation() -> dict:
+    """Confirmation left behind by a cancelled ETH USDT -> TRON USDT swap."""
+    return {
+        "action": "swap",
+        "status": "rejected",
+        "reason": "user_rejected",
+        "requested_at": "2026-10-19T10:00:00+00:00",
+        "expires_at": "2026-10-19T10:05:00+00:00",
+        "summary": {
+            "provider": "bridgers",
+            "provider_reference": "old-tron",
+            "source_asset": {"chain": "ETH", "symbol": "USDT"},
+            "destination_asset": {"chain": "TRON", "symbol": "USDT"},
+            "input_amount": "100",
+            "expected_output": "99",
+        },
+        "task_id": "task-tron",
+        "task_revision": 1,
+        "payload_hash": "old-hash",
+    }
+
+
+@pytest.mark.asyncio
+async def test_requote_after_rejection_reaches_confirmation_required():
+    """Changing the swap target after a cancellation must emit confirmation_required.
+
+    Regression for agent_app_bot: user cancelled ETH USDT -> TRON USDT (leaving a
+    rejected confirmation_state) then said 「换成 bsc 链的 bnb」. The react turn
+    auto-selected the new BSC BNB quote but the stale rejected confirmation_state
+    made the API's swap_prepare continuation short-circuit to ``response``, so the
+    client only got a react quote card and never a confirmation card.
+    """
+    from wallet_agent.graph.build import build_graph
+
+    graph = build_graph(
+        model=BscRequoteModel(), providers=[BscQuoteProvider("bridgers", "1.5")]
+    )
+    config = {"configurable": {"thread_id": "requote-after-rejection"}}
+
+    # Step 1: the react turn re-quotes after a previous cancellation. The stale
+    # rejected confirmation must not survive a fresh quote selection.
+    react = await graph.ainvoke(
+        {
+            "request": {"message": "换成 bsc 链的 bnb"},
+            "wallet_context": {"address": WALLET, "chain": "ETH"},
+            "confirmation_state": _stale_rejected_confirmation(),
+        },
+        config=config,
+    )
+    assert react["response"]["kind"] == "react"
+    assert react["selected_quote"]["provider_reference"] == "quote-bridgers"
+    assert react["confirmation_state"] is None
+    assert react["user_confirmation"] is None
+
+    # Step 2: mirror the API's automatic continuation with forced_intent=swap_prepare.
+    result = await graph.ainvoke(
+        {
+            "request": react.get("request"),
+            "wallet_context": react.get("wallet_context"),
+            "intent": "swap_prepare",
+            "forced_intent": "swap_prepare",
+            "swap_request": react.get("swap_request"),
+            "selected_quote": react.get("selected_quote"),
+        },
+        config=config,
+    )
+    response = result.get("response") or {}
+    assert response.get("kind") == "confirmation_required"
+    assert result.get("task_stage") == "awaiting_confirmation"
+    confirmation = result.get("confirmation_state") or {}
+    assert confirmation.get("status") == "requested"
+    summary = confirmation.get("summary") or {}
+    destination = summary.get("destination_asset") or {}
+    assert destination.get("symbol") == "BNB"
+    assert destination.get("chain") == "BSC"
+    # The new quote, not the cancelled TRON one, is what gets confirmed.
+    assert summary.get("provider_reference") == "quote-bridgers"
+
+
+@pytest.mark.asyncio
+async def test_incidental_requote_keeps_pending_confirmation():
+    """Re-quoting the SAME quote must not drop an in-flight confirmation card."""
+    from wallet_agent.graph.build import build_graph
+    from wallet_agent.graph.nodes import (
+        _swap_confirmation_summary,
+        confirmation_payload_hash,
+    )
+
+    graph = build_graph(
+        model=BscRequoteModel(), providers=[BscQuoteProvider("bridgers", "1.5")]
+    )
+    # Discover the selected quote first so the pending confirmation matches it.
+    seed = await graph.ainvoke(
+        {
+            "request": {"message": "换成 bsc 链的 bnb"},
+            "wallet_context": {"address": WALLET, "chain": "ETH"},
+        },
+        config={"configurable": {"thread_id": "requote-keep-pending"}},
+    )
+    selected = seed["selected_quote"]
+    summary = _swap_confirmation_summary(selected)
+    now = datetime.now(timezone.utc)
+    pending = {
+        "action": "swap",
+        "status": "requested",
+        "reason": None,
+        "requested_at": now.isoformat(),
+        "expires_at": (now + timedelta(minutes=5)).isoformat(),
+        "summary": summary,
+        "task_id": f"legacy:{seed.get('conversation_id') or 'conversation'}:swap",
+        "task_revision": 0,
+        "payload_hash": confirmation_payload_hash(summary),
+    }
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "再看看这个报价"},
+            "wallet_context": {"address": WALLET, "chain": "ETH"},
+            "confirmation_state": pending,
+        },
+        config={"configurable": {"thread_id": "requote-keep-pending"}},
+    )
+    # The still-valid pending confirmation for the same quote is preserved.
+    assert result["response"]["kind"] == "react"
+    kept = result.get("confirmation_state") or {}
+    assert kept.get("status") == "requested"
+    assert kept.get("payload_hash") == confirmation_payload_hash(summary)
