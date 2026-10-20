@@ -104,6 +104,11 @@ BroadcastStatus = Literal[
 _BROADCAST_PROVIDER_VISIBLE: frozenset[BroadcastStatus] = frozenset(
     {"broadcast_seen", "broadcast_pending", "source_confirmed", "confirmed"}
 )
+#: Swap order states that terminate the order lifecycle. Once reached there is
+#: nothing left to poll and the swap is done (success, failure or refund).
+_SWAP_ORDER_TERMINAL_STATES: frozenset[str] = frozenset(
+    {"completed", "failed", "refunded", "timed_out", "kyc_required", "cancelled"}
+)
 
 
 class WalletAccount(BaseModel):
@@ -646,6 +651,63 @@ def _provider_order_with_persisted_metadata(
         }
     )
     return order.model_copy(update={"provider_payload": merged})
+
+
+async def _poll_swap_order_status(
+    session: SwapSessionRecord,
+    providers: Mapping[str, Any],
+    session_store: SessionStore,
+) -> SwapSessionRecord:
+    """Refresh an in-flight swap order's status without a new chat turn.
+
+    The graph's ``status_poll`` node advances ``order_status`` to its terminal
+    state and promotes ``broadcast_status`` to ``confirmed``, but it only runs
+    when the user sends a status message.  The App polls ``GET /v1/swap``
+    passively, so a swap that finished provider-side stayed stuck at
+    ``source_confirmed`` with ``order_status=null`` forever (Lif: “兑换订单已经
+    到账很久了，现在 broadcast_status 还是 source_confirmed”).  Mirror that
+    node's projection here: while an order is still live, query the provider
+    once per read and persist the normalized status.
+    """
+    if session.quote is None or session.provider_order is None:
+        return session
+    if session.status == "cancelled" or session.stage == "cancelled":
+        return session
+    existing = session.order_status
+    if existing is not None and existing.status in _SWAP_ORDER_TERMINAL_STATES:
+        return session
+    provider = providers.get(str(session.quote.provider)) if session.quote else None
+    if provider is None or not hasattr(provider, "get_status"):
+        return session
+    try:
+        status = await provider.get_status(session.provider_order)
+    except Exception:
+        # Polling is best-effort: a provider hiccup must never fail the read.
+        return session
+    if status is None:
+        return session
+    provider_status = str(status.status)
+    if existing is not None and existing.status == provider_status:
+        return session
+    changes: dict[str, Any] = {
+        "order_status": status,
+        "stage": provider_status,
+        "status": provider_status,
+    }
+    if provider_status == "completed":
+        # The source receipt alone is never swap completion; promote the
+        # broadcast status only when the provider order itself completes.
+        changes["broadcast_status"] = "confirmed"
+    try:
+        return await session_store.update(
+            session.session_id,
+            expected_revision=session.revision,
+            **changes,
+        )
+    except SessionRevisionConflict:
+        # A concurrent chat turn or broadcast advanced the projection; return
+        # whatever is current so the client never sees stale data.
+        return await session_store.get(session.session_id) or session
 
 
 def _display_text(record: SwapSessionRecord, *keys: str) -> str | None:
@@ -2846,7 +2908,14 @@ def create_app(
             required=require_auth,
             fallback_user_id=user_id,
         )
-        return _jsonable(await owned_session(session_id, authenticated))
+        session = await owned_session(session_id, authenticated)
+        # The App polls this endpoint passively while a swap is in flight. Auto-
+        # refresh a live provider order so completion (order_status=completed,
+        # broadcast_status=confirmed) surfaces without waiting for a chat turn.
+        session = await _poll_swap_order_status(
+            session, app.state.providers, session_store
+        )
+        return _jsonable(session)
 
     async def wallet_operation(address: str, chain: str, operation: str, limit: int = 20) -> Any:
         wallet_provider = app.state.wallet_provider

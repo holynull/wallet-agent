@@ -37,7 +37,20 @@ _CHAIN_IDS = {
     "POLYGON": 137,
 }
 _SYMBOL_NOISE = re.compile(r"[\s'\-`\u2018\u2019]+")
-_PROVIDER_NETWORK_SUFFIX = re.compile(r"\((?:ERC20|BEP20|TRC20)\)$")
+# Provider catalogs tag a coin with its network both as a token standard
+# (``USDT(ERC20)``, ``USDT(TRC20)``) and as a bare chain label
+# (``USDT(TRON)``, ``TRX(TRON)`` — Bridgers returns both spellings for TRON).
+# Both are network qualifiers, never part of the symbol, so strip them so
+# ``canonical_symbol`` matches the provider catalogs exactly like
+# ``_catalog_symbol_matches`` in the Bridgers provider does.
+_PROVIDER_NETWORK_SUFFIX = re.compile(
+    r"\((?:"
+    r"ERC20|BEP20|TRC20|"
+    r"BTC|BITCOIN|ETH|ETHEREUM|BSC|BASE|ARBITRUM|OPTIMISM|POLYGON|MATIC|"
+    r"TRON|SOLANA"
+    r")\)$",
+    re.IGNORECASE,
+)
 _AMOUNT_WITH_UNIT = re.compile(
     r"^\s*((?:\d+(?:\.\d*)?|\.\d+)(?!x|X))\s*([A-Za-z][A-Za-z0-9()'`\-]*)\s*$"
 )

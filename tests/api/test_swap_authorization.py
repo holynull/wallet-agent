@@ -1012,6 +1012,84 @@ async def test_swap_success_comes_from_order_completion_not_source_confirmation(
 
 
 @pytest.mark.asyncio
+async def test_get_swap_auto_polls_live_order_to_completion_without_chat_turn():
+    """GET /v1/swap must refresh a live provider order itself.
+
+    Regression for Lif: an order that finished provider-side stayed stuck at
+    broadcast_status=source_confirmed with order_status=null because the
+    backend only polled the provider when the user sent a status chat turn,
+    while the App only polls GET /v1/swap passively.
+    """
+    quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=Asset(
+            chain="TRON",
+            symbol="USDT",
+            decimals=6,
+            address="TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+        ),
+        destination_asset=Asset(chain="BTC", symbol="BTC", decimals=8),
+        input_amount=Decimal("1"),
+        input_amount_raw="1000000",
+        expected_output=Decimal("0.00001"),
+        expected_output_raw="1000",
+        provider_reference="ref-autopoll",
+    )
+    order = ProviderOrder(
+        provider="bridgers",
+        provider_order_id="order-autopoll",
+        provider_reference="ref-autopoll",
+        tx_hash="0x" + "b" * 64,
+    )
+
+    class CompletingProvider:
+        provider_name = "bridgers"
+
+        def __init__(self):
+            self.status_calls = 0
+
+        async def get_status(self, order):
+            self.status_calls += 1
+            return NormalizedOrderStatus(
+                provider="bridgers",
+                provider_order_id=order.provider_order_id,
+                provider_reference=order.provider_reference,
+                status="completed",
+                tx_hash="0x" + "c" * 64,
+            )
+
+    provider = CompletingProvider()
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-autopoll",
+            user_id="alice",
+            thread_id="t-autopoll",
+            status="processing",
+            stage="processing",
+            quote=quote,
+            provider_order=order,
+            broadcast_status="source_confirmed",
+            broadcast_tx_hash="0x" + "b" * 64,
+        )
+    )
+    app = create_app(providers={"bridgers": provider}, store=store)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/v1/swap/s-autopoll", params={"user_id": "alice"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert provider.status_calls == 1
+    assert body["order_status"]["status"] == "completed"
+    assert body["broadcast_status"] == "confirmed"
+    assert body["stage"] == "completed"
+    assert body["status"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_broadcast_persists_deposit_metadata_after_provider_restart():
     quote = NormalizedQuote(
         provider="omnibridge",

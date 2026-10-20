@@ -240,7 +240,10 @@ SCENARIOS = {
             provider_register=(FaultOutcome("success", "order-idempotent"),),
         ),
         wallet_hashes=("0x" + "d" * 64,),
-        expected_final_stage="processing",
+        # The provider status falls back to "completed" and GET /v1/swap now
+        # auto-polls a live order, so the final session read reflects the
+        # completed provider order instead of staying at source_confirmed.
+        expected_final_stage="completed",
         expected_wallet_sends=1,
         expected_register_attempts=1,
         driver_actions=("broadcast", "broadcast_same", "broadcast_conflict"),

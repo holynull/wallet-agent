@@ -26,6 +26,20 @@ def test_canonical_symbol_removes_provider_network_suffixes_and_typo_noise():
     assert canonical_symbol("usd-c") == "USDC"
 
 
+def test_canonical_symbol_removes_bare_chain_network_suffixes():
+    """Provider catalogs also tag coins with a bare chain label, e.g. Bridgers
+    returns ``USDT(TRON)`` for TRON USDT. Regression for Lif: TRON USDT → BTC
+    quote failed with ASSET_NOT_FOUND because ``USDT(TRON)`` did not match
+    ``USDT``.
+    """
+    assert canonical_symbol("USDT(TRON)") == "USDT"
+    assert canonical_symbol("TRX(TRON)") == "TRX"
+    assert canonical_symbol("USDT(ETH)") == "USDT"
+    assert canonical_symbol("USDT(BSC)") == "USDT"
+    assert canonical_symbol("USDC(POLYGON)") == "USDC"
+    assert canonical_symbol("USDT(SOLANA)") == "USDT"
+
+
 def test_chain_id_for_uses_canonical_chain_name():
     assert chain_id_for("Ethereum") == 1
     assert chain_id_for("BASE") == 8453
