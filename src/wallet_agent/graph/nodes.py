@@ -10585,7 +10585,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 ]
             }
         broadcast_status = state.get("broadcast_status")
-        provider_visible = {"broadcast_seen", "broadcast_pending", "confirmed"}
+        provider_visible = {
+            "broadcast_seen",
+            "broadcast_pending",
+            "source_confirmed",
+            "confirmed",
+        }
         if broadcast_status and broadcast_status not in provider_visible:
             response_payload = {
                 "kind": "swap_status",
@@ -10664,7 +10669,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "unknown": "暂时拿不到兑换订单的最新状态，建议稍后重新查询。",
         }
         broadcast_status = state.get("broadcast_status")
-        provider_visible = {"broadcast_seen", "broadcast_pending", "confirmed", None}
+        provider_visible = {
+            "broadcast_seen",
+            "broadcast_pending",
+            "source_confirmed",
+            "confirmed",
+            None,
+        }
         if state.get("broadcast_tx_hash") and broadcast_status not in provider_visible:
             response_payload = {
                 "kind": "swap_status",
@@ -10729,11 +10740,19 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             ):
                 dumped = {**dumped, "status": "timed_out"}
             provider_status = dumped.get("status", "unknown")
+            # The source receipt alone is never swap completion. broadcast_status
+            # stays source_confirmed while the order is processing, and is only
+            # promoted to confirmed once the provider order itself completes, so
+            # clients keying success off either field see it at the same moment.
+            effective_broadcast_status = (
+                "confirmed" if provider_status == "completed" else broadcast_status
+            )
             broadcast_message = {
                 "broadcast_seen": "源链已收到交易广播",
                 "broadcast_pending": "源链交易已广播，正在等待链上确认",
+                "source_confirmed": "源链交易已确认",
                 "confirmed": "源链交易已确认",
-            }.get(broadcast_status)
+            }.get(effective_broadcast_status)
             provider_message = status_messages.get(
                 provider_status, "兑换订单状态已更新，建议稍后重新查询。"
             )
@@ -10750,8 +10769,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "kind": "swap_status",
                 "status": dumped,
                 "provider_status": provider_status,
-                "broadcast_status": broadcast_status,
-                "confirmation_status": broadcast_status,
+                "broadcast_status": effective_broadcast_status,
+                "confirmation_status": effective_broadcast_status,
                 "tx_hash": state.get("broadcast_tx_hash"),
                 # The design's 预计耗时 / 解释失败原因 surface on the detail
                 # page: expose them at the top level so the App does not dig
@@ -10763,6 +10782,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             }
             return {
                 "status_snapshot": dumped,
+                "broadcast_status": effective_broadcast_status,
                 "poll_attempts": attempts,
                 "response": await naturalize_read_response(state, response_payload),
             }

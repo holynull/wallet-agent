@@ -91,13 +91,18 @@ BroadcastStatus = Literal[
     "broadcast_seen",
     "broadcast_pending",
     "not_propagated",
+    # Source-chain transaction is confirmed, but the cross-chain swap order is
+    # still being processed (target-chain assets not yet delivered). Clients
+    # must not treat this as swap completion; only order_status / a terminal
+    # swap state may signal "success".
+    "source_confirmed",
     "confirmed",
     "failed",
     "dropped_or_replaced",
     "unknown",
 ]
 _BROADCAST_PROVIDER_VISIBLE: frozenset[BroadcastStatus] = frozenset(
-    {"broadcast_seen", "broadcast_pending", "confirmed"}
+    {"broadcast_seen", "broadcast_pending", "source_confirmed", "confirmed"}
 )
 
 
@@ -609,6 +614,7 @@ def _broadcast_response(
     if message is None and record.provider_order is not None:
         message = {
             "confirmed": "源链交易已确认，兑换服务正在处理，目标链资产尚未确认到账。",
+            "source_confirmed": "源链交易已确认，兑换服务正在处理，目标链资产尚未确认到账。",
             "broadcast_pending": "源链交易已广播，兑换服务正在处理，目标链资产尚未确认到账。",
             "broadcast_seen": "源链已发现这笔交易，兑换服务正在处理，目标链资产尚未确认到账。",
         }.get(str(effective_status), "兑换服务正在处理，目标链资产尚未确认到账。")
@@ -1896,6 +1902,7 @@ def create_app(
                     "broadcast_seen",
                     "broadcast_pending",
                     "not_propagated",
+                    "source_confirmed",
                     "confirmed",
                     "failed",
                     "dropped_or_replaced",
@@ -2211,7 +2218,13 @@ def create_app(
                         "details": {"tx_hash": payload.tx_hash},
                     },
                 )
-            broadcast_status = chain_status
+            # Source-chain confirmation is not swap completion: the order was
+            # just registered and the target-chain assets are not delivered yet.
+            # Persist source_confirmed (not confirmed) so clients do not render
+            # "success" off the source receipt before the order finishes.
+            broadcast_status = (
+                "source_confirmed" if chain_status == "confirmed" else chain_status
+            )
         # Re-check and register under the per-thread lock.  This closes the
         # duplicate-provider-call window when a wallet retries the same hash.
         async with graph_lock(session.thread_id):
@@ -2254,6 +2267,11 @@ def create_app(
                     broadcast_status=broadcast_status,
                     broadcast_tx_hash=payload.tx_hash,
                     provider_order=None,
+                    # The approve is already broadcast at this point; the
+                    # unsigned approval transaction is no longer actionable and
+                    # must not make the client render a signing card.
+                    approval_transaction=None,
+                    allowance_requirement=None,
                 )
                 return _broadcast_response(updated, broadcast_status, message=message)
             reference = session.quote.provider_reference
@@ -2293,6 +2311,11 @@ def create_app(
                 broadcast_status=broadcast_status,
                 broadcast_tx_hash=payload.tx_hash,
                 provider_order=order,
+                # Once the swap is broadcast, the approval step is complete:
+                # drop the stale unsigned approval transaction and allowance
+                # requirement so clients stop rendering authorization cards.
+                approval_transaction=None,
+                allowance_requirement=None,
             )
         return _broadcast_response(updated, broadcast_status)
 

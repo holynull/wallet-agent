@@ -854,23 +854,161 @@ async def test_status_turn_after_broadcast_polls_order_without_reopening_approva
 
     assert broadcast.status_code == 200
     assert broadcast.json()["stage"] == "processing"
-    assert broadcast.json()["broadcast_status"] == "confirmed"
+    # Source-chain confirmation is not swap completion: expose source_confirmed
+    # so clients never render "success" off the source receipt while the order
+    # is still processing.
+    assert broadcast.json()["broadcast_status"] == "source_confirmed"
     assert "目标链资产尚未确认到账" in broadcast.json()["message"]
     assert provider.status_calls == 1
     assert final_state["response"]["kind"] == "swap_status"
     assert final_state["response"]["status"]["status"] == "processing"
-    assert final_state["response"]["broadcast_status"] == "confirmed"
+    assert final_state["response"]["broadcast_status"] == "source_confirmed"
     assert final_state["response"]["tx_hash"] == "0x" + "b" * 64
-    assert final_state["response"]["confirmation_status"] == "confirmed"
+    assert final_state["response"]["confirmation_status"] == "source_confirmed"
     assert "源链交易已确认" in final_state["response"]["message"]
     assert final_state.get("approval_transaction") is None
     assert final_state.get("pending_transaction") is None
     assert session is not None
     assert session.status == "processing"
     assert session.stage == "processing"
-    assert session.broadcast_status == "confirmed"
+    assert session.broadcast_status == "source_confirmed"
     assert session.order_status is not None
     assert session.order_status.status == "processing"
+
+
+@pytest.mark.asyncio
+async def test_swap_success_comes_from_order_completion_not_source_confirmation():
+    """Source-chain confirmation must not expose a success-mappable value.
+
+    Regression for agent_app_bot: after the source chain confirmed, the backend
+    wrote broadcast_status=confirmed and the client rendered "兑换成功" while the
+    cross-chain order was still processing. The backend now exposes
+    source_confirmed for the source receipt and only signals completion through
+    order_status once the provider order finishes.
+    """
+    token = Asset(
+        chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x" + "3" * 40
+    )
+    requirement = AllowanceRequirement(
+        token=token,
+        owner="0x" + "1" * 40,
+        spender="0x" + "4" * 40,
+        required_amount_raw="100",
+        current_allowance_raw="0",
+    )
+    quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=token,
+        destination_asset=Asset(
+            chain="BSC", symbol="USDT", decimals=6, address="0x" + "5" * 40
+        ),
+        input_amount=Decimal("1"),
+        input_amount_raw="100",
+        expected_output=Decimal("1"),
+        expected_output_raw="100",
+        provider_reference="ref-success",
+        allowance_requirement=requirement,
+    )
+
+    class CompletingProvider(Provider):
+        def __init__(self):
+            super().__init__()
+            self.status = "processing"
+
+        async def get_status(self, order):
+            self.status_calls += 1
+            return NormalizedOrderStatus(
+                provider="bridgers",
+                provider_order_id=order.provider_order_id,
+                provider_reference=order.provider_reference,
+                status=self.status,
+                tx_hash=order.tx_hash,
+            )
+
+    class StatusModel(Model):
+        async def ainvoke(self, value):
+            if value.get("message") == "怎么样了？":
+                return {"intent": "swap_status"}
+            return await super().ainvoke(value)
+
+    adapter = Adapter()
+    provider = CompletingProvider()
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-success",
+            user_id="alice",
+            thread_id="t-success",
+            quote_candidates=[quote],
+        )
+    )
+    graph = build_graph(model=StatusModel(), providers=[provider], chains={"BASE": adapter})
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        chain_registry=ChainAdapterRegistry({"BASE": adapter}),
+        store=store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await select_and_confirm(client, "s-success", "ref-success")
+        await client.post(
+            "/v1/swap/s-success/approve-broadcast",
+            json={
+                "user_id": "alice",
+                "chain": "BASE",
+                "approve_tx_hash": "0x" + "a" * 64,
+            },
+        )
+        adapter.allowance = "100"
+        await client.post("/v1/swap/s-success/continue", json={"user_id": "alice"})
+        broadcast = await client.post(
+            "/v1/swap/s-success/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": "0x" + "b" * 64},
+        )
+        # While the order is still processing, the source receipt must not be a
+        # success signal.
+        provider.status = "processing"
+        processing_turn = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "conversation_id": "t-success",
+                "session_id": "s-success",
+                "message": "怎么样了？",
+            },
+        )
+        await app.state.runs[processing_turn.json()["run_id"]]["task"]
+        processing_session = await store.get("s-success")
+        # The order completes.
+        provider.status = "completed"
+        completed_turn = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "conversation_id": "t-success",
+                "session_id": "s-success",
+                "message": "怎么样了？",
+            },
+        )
+        await app.state.runs[completed_turn.json()["run_id"]]["task"]
+        completed_session = await store.get("s-success")
+
+    assert broadcast.status_code == 200
+    assert broadcast.json()["broadcast_status"] == "source_confirmed"
+    assert processing_session is not None
+    assert processing_session.broadcast_status == "source_confirmed"
+    assert processing_session.order_status is not None
+    assert processing_session.order_status.status == "processing"
+    assert completed_session is not None
+    # Completion is carried by order_status and broadcast_status is promoted to
+    # confirmed at the same moment, so clients keying success off either field
+    # see the swap finish only after the order itself completes.
+    assert completed_session.order_status is not None
+    assert completed_session.order_status.status == "completed"
+    assert completed_session.broadcast_status == "confirmed"
 
 
 @pytest.mark.asyncio
