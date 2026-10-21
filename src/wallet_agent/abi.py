@@ -15,6 +15,8 @@ from typing import Any
 
 from eth_hash.auto import keccak as _keccak  # type: ignore[import-untyped]
 
+from wallet_agent.domain.addresses import base58check_payload, valid_evm_address
+
 _WORD = 32
 
 
@@ -67,6 +69,15 @@ def _encode_static(arg_type: str, value: Any) -> bytes:
         return _as_int(value).to_bytes(32, "big", signed=True)
     if arg_type == "address":
         raw = str(value).strip()
+        if valid_evm_address(raw):
+            return bytes.fromhex(raw[2:]).rjust(32, b"\x00")
+        # Bridgers sends TRON token/router addresses in Base58Check form
+        # (``T...``) for TRON-source swaps; the contract expects the 20-byte
+        # address (0x41 type byte stripped).
+        payload = base58check_payload(raw, version=0x41)
+        if payload is not None and len(payload) == 21:
+            return payload[1:].rjust(32, b"\x00")
+        # Legacy fallback: treat the text as raw hex (EVM without the 0x prefix).
         hexpart = raw[2:] if raw.lower().startswith("0x") else raw
         return bytes.fromhex(hexpart.zfill(40)).rjust(32, b"\x00")
     if arg_type == "bool":
@@ -106,21 +117,25 @@ def abi_encode_arguments(
     """Encode a list of (type, value) pairs into ``0x``-free ABI calldata."""
     if len(arg_types) != len(values):
         raise ValueError("ABI types and values must have the same length")
-    heads: list[bytes | None] = []
-    tails: list[bytes] = []
+    # Keep each argument's static head and (optional) dynamic tail aligned by
+    # argument position: dynamic tails are indexed by the argument slot, not by
+    # a separate counter, or offsets break whenever a static type (e.g. an
+    # ``address``) precedes a dynamic one.
+    slots: list[tuple[bytes | None, bytes | None]] = []
     for arg_type, value in zip(arg_types, values):
         if _is_dynamic(arg_type):
-            heads.append(None)
-            tails.append(_encode_tail(arg_type, value))
+            slots.append((None, _encode_tail(arg_type, value)))
         else:
-            heads.append(_encode_static(arg_type, value))
+            slots.append((_encode_static(arg_type, value), None))
     head_size = _WORD * len(arg_types)
     cursor = head_size
     encoded_head = bytearray()
-    for index, head in enumerate(heads):
+    tails: list[bytes] = []
+    for head, tail in slots:
         if head is None:
             encoded_head += cursor.to_bytes(32, "big")
-            cursor += len(tails[index])
+            cursor += len(tail)
+            tails.append(tail)
         else:
             encoded_head += head
     return (bytes(encoded_head) + b"".join(tails)).hex()
