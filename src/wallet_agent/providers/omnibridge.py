@@ -444,7 +444,13 @@ class OmniBridgeProvider:
             },
         )
 
-    async def register_broadcast(self, provider_reference: str, tx_hash: str) -> ProviderOrder:
+    async def register_broadcast(
+        self,
+        provider_reference: str,
+        tx_hash: str,
+        *,
+        quote: Any | None = None,
+    ) -> ProviderOrder:
         _success(
             await self.transport.post(
                 "/api/v2/modifyTxId",
