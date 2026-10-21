@@ -433,6 +433,11 @@ class OmniBridgeProvider:
             recipient_address=meta.get("destination_addr"),
             refund_address=meta.get("refund_addr"),
             provider_reference=str(order_id),
+            # Omni returns the routing hint for UTXO deposits as ``btcMemo``
+            # (e.g. ``to:BNB(BSC):0x...``). Without it the BTC PSBT has no
+            # OP_RETURN output and the deposit can never be matched to the
+            # order. Non-UTXO deposits leave it null, so no OP_RETURN is added.
+            memo=str(data.get("btcMemo") or "") or None,
             provider_payload={
                 "equipment_no": meta.get("equipment_no", ""),
                 "source_type": meta.get("source_type", self.source_type),

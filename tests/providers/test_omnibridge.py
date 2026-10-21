@@ -480,6 +480,69 @@ async def test_omnibridge_prepare_creates_deposit_order_from_platform_address():
 
 
 @pytest.mark.asyncio
+async def test_omnibridge_prepare_carries_btc_memo_into_the_deposit_order():
+    """Omni returns ``btcMemo`` on the accountExchange response for UTXO
+    deposits. The order must surface it so the Bitcoin PSBT gets an OP_RETURN
+    output — a plain transfer is never matched (Lif report)."""
+    transport = FakeTransport(
+        quote_response(),
+        {
+            "resCode": 800,
+            "resMsg": "Success",
+            "data": {
+                "orderId": "omni-btc-order",
+                "platformAddr": "14HwBypSEn5HXFvDGDX6nt1UtnhfDiXcjs",
+                "depositCoinCode": "BTC",
+                "receiveCoinCode": "BNB(BSC)",
+                "depositCoinAmt": "0.0002",
+                "receiveCoinAmt": "0.022225",
+                "btcMemo": "to:BNB(BSC):0x13c68429D80F56E72C02122652852a1DAfA60AE0",
+                "detailState": "wait_deposit_send",
+            },
+        },
+    )
+    provider = OmniBridgeProvider.from_transport(
+        transport, source_flag="wallet-agent", source_type="IOS"
+    )
+    quote = await provider.quote(valid_quote_request())
+
+    order = await provider.prepare(quote)
+
+    assert order.memo == "to:BNB(BSC):0x13c68429D80F56E72C02122652852a1DAfA60AE0"
+    assert order.provider == "omnibridge"
+    assert order.provider_order_id == "omni-btc-order"
+
+
+@pytest.mark.asyncio
+async def test_omnibridge_prepare_leaves_memo_none_when_absent():
+    """Non-UTXO deposits have no ``btcMemo``; the order must not invent one."""
+    transport = FakeTransport(
+        quote_response(),
+        {
+            "resCode": 800,
+            "resMsg": "Success",
+            "data": {
+                "orderId": "omni-eth-order",
+                "platformAddr": "0x0000000000000000000000000000000000000099",
+                "depositCoinCode": "ETH",
+                "receiveCoinCode": "BNB(BSC)",
+                "depositCoinAmt": "1.5",
+                "receiveCoinAmt": "10.29",
+                "detailState": "wait_deposit_send",
+            },
+        },
+    )
+    provider = OmniBridgeProvider.from_transport(
+        transport, source_flag="wallet-agent", source_type="IOS"
+    )
+    quote = await provider.quote(valid_quote_request())
+
+    order = await provider.prepare(quote)
+
+    assert order.memo is None
+
+
+@pytest.mark.asyncio
 async def test_omnibridge_register_broadcast_calls_modify_tx_id_idempotently():
     transport = FakeTransport(
         quote_response(),
