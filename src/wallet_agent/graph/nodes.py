@@ -108,7 +108,21 @@ _RESPONSE_DATA_KEYS = {
         # so the backend quotes and prepares through only that provider.
         "provider",
     },
-    "transfer": {"intent", "chain", "symbol", "token_address", "decimals", "amount", "recipient"},
+    "transfer": {
+        "intent",
+        "chain",
+        "symbol",
+        "token_address",
+        "decimals",
+        "amount",
+        "recipient",
+        # The selected chain's available balance that the App's amount card
+        # anchors 25/50/75/100% to (V169-IOS-018: never another chain's
+        # same-symbol balance).
+        "balance",
+        "balance_raw",
+        "balance_usd",
+    },
 }
 
 
@@ -5704,6 +5718,67 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             return next(iter(unique.values()))
         return None
 
+    async def _transfer_available_balance(
+        state: Mapping[str, Any],
+        chain: Any,
+        symbol: Any,
+        token_address: Any = None,
+    ) -> dict[str, Any] | None:
+        """Best-effort available balance for the transfer's exact chain+symbol.
+
+        The App's amount card anchors 25/50/75/100% to the selected chain's
+        balance; when the App's local asset DB lacks the chain (e.g. an
+        ARBITRUM ETH row), it must not fall back to another chain's same-symbol
+        balance (V169-IOS-018). Query the wallet provider for the exact
+        (chain, symbol) pair and return a human balance row so the card renders
+        the true amount. ``None`` when unavailable (caller keeps App fallback).
+        """
+        context = state.get("wallet_context") or {}
+        address = str(context.get("address") or "")
+        if not address or not chain or not symbol:
+            return None
+        provider = runtime.wallet_provider
+        if provider is None or not hasattr(provider, "get_token_balances"):
+            return None
+        normalized_chain = canonical_chain(str(chain))
+        chain_index_by_name = dict(
+            getattr(provider, "chain_index_by_name", {}) or {}
+        )
+        index = chain_index_by_name.get(normalized_chain) or okx_chain_index(
+            normalized_chain
+        )
+        if not index:
+            return None
+        try:
+            balances = await provider.get_token_balances(address, [str(index)])
+        except Exception:
+            return None
+        requested_symbol = canonical_symbol(str(symbol))
+        wanted_address = str(token_address).strip().lower() if token_address else None
+        for item in balances:
+            asset = getattr(item, "asset", None)
+            if asset is None:
+                continue
+            if canonical_chain(str(getattr(asset, "chain", "") or "")) != normalized_chain:
+                continue
+            if requested_symbol and canonical_symbol(
+                str(getattr(asset, "symbol", "") or "")
+            ) != requested_symbol:
+                continue
+            asset_address = str(getattr(asset, "address", "") or "").lower()
+            if wanted_address and asset_address and asset_address != wanted_address:
+                continue
+            usd_value = getattr(item, "usd_value", None)
+            return {
+                "amount": str(getattr(item, "amount", "") or ""),
+                "amount_raw": str(getattr(item, "amount_raw", "") or ""),
+                "usd_value": str(usd_value) if usd_value is not None else None,
+                "decimals": getattr(asset, "decimals", None),
+                "address": getattr(asset, "address", None),
+                "symbol": getattr(asset, "symbol", None),
+            }
+        return None
+
     async def transfer_suggestions(
         state: Mapping[str, Any], missing: list[str]
     ) -> list[dict[str, Any]]:
@@ -5919,9 +5994,29 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 decimals = draft.get("transfer_decimals")
                 if decimals is None and asset is not None:
                     decimals = asset.get("decimals")
+                # Best-effort on-chain balance for the selected chain+symbol so
+                # the amount card anchors 25/50/75/100% to the right chain
+                # (V169-IOS-018: ARBITRUM ETH must not fall back to mainnet).
+                balance = await _transfer_available_balance(
+                    state, chain, symbol, token_address
+                )
+                if balance is not None:
+                    if not token_address and balance.get("address"):
+                        token_address = balance["address"]
+                    if decimals is None and balance.get("decimals") is not None:
+                        decimals = balance["decimals"]
                 if token_address and decimals is not None:
                     asset_data["token_address"] = token_address
                     asset_data["decimals"] = decimals
+                elif decimals is not None:
+                    # A native coin has no contract; still carry the precision
+                    # so the App can render the balance line correctly.
+                    asset_data["decimals"] = decimals
+                if balance is not None:
+                    asset_data["balance"] = balance["amount"]
+                    asset_data["balance_raw"] = balance["amount_raw"]
+                    if balance.get("usd_value") not in (None, ""):
+                        asset_data["balance_usd"] = balance["usd_value"]
                 for percent in ("25%", "50%", "75%", "100%"):
                     suggestions.append(
                         {

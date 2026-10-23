@@ -926,3 +926,68 @@ async def test_coin_chips_keep_the_wallet_asset_icon():
     assert suggestions["ETH"]["chain_logo_url"] == _chain_logo("base")
     assert suggestions["USDC"]["logo_url"] == logo
     assert suggestions["USDC"]["chain_logo_url"] == _chain_logo("base")
+
+
+@pytest.mark.asyncio
+async def test_missing_amount_carries_selected_chain_balance_not_fallback():
+    """V169-IOS-018: the amount card must anchor 25/50/75/100% to the selected
+    chain's balance (ARBITRUM ETH), never fall back to another chain's
+    same-symbol balance (mainnet ETH)."""
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+
+    class ArbWallet:
+        chain_index_by_name = {"ETH": "1", "ARBITRUM": "42161"}
+
+        async def get_token_balances(self, address, indexes):
+            assert len(indexes) == 1
+            if indexes[0] == "1":
+                return [
+                    TokenBalance(
+                        asset=Asset(chain="ETH", symbol="ETH", decimals=18),
+                        amount=Decimal("0.015512539042017515"),
+                        amount_raw="15512539042017515000",
+                        usd_value=Decimal("40"),
+                    )
+                ]
+            assert indexes[0] == "42161"
+            return [
+                TokenBalance(
+                    asset=Asset(chain="ARBITRUM", symbol="ETH", decimals=18),
+                    amount=Decimal("0.000030467544104"),
+                    amount_raw="30467544104000",
+                    usd_value=Decimal("0.08"),
+                )
+            ]
+
+    graph = build_graph(model=FakeModel(), wallet_provider=ArbWallet())
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "转 0x…", "address": EVM, "chain": "ARBITRUM"},
+            "intent": "transfer",
+            "transfer_draft": {
+                "chain": "ARBITRUM",
+                "symbol": "ETH",
+                "recipient": "0x" + "2" * 40,
+            },
+            "wallet_context": {
+                "address": EVM,
+                "chain": "ARBITRUM",
+                "wallet_accounts": [{"chain": "ARBITRUM", "address": EVM}],
+            },
+            "conversation_history": [],
+        },
+        config={"configurable": {"thread_id": "transfer-amount-arb-balance"}},
+    )
+
+    response = result["response"]
+    assert response["kind"] == "clarification"
+    assert response["missing_fields"] == ["transfer_amount"]
+    amounts = [item for item in response["suggestions"] if item["type"] == "amount"]
+    assert [(item["value"]) for item in amounts] == ["25%", "50%", "75%", "100%"]
+    # The card anchors to the ARBITRUM balance, not the mainnet ETH balance.
+    assert amounts[0]["data"]["chain"] == "ARBITRUM"
+    assert amounts[0]["data"]["symbol"] == "ETH"
+    assert amounts[0]["data"]["balance"] == "0.000030467544104"
+    assert amounts[0]["data"]["balance_usd"] == "0.08"

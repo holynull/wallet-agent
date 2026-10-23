@@ -249,12 +249,15 @@ App 需按占位处理（不要用别的链 logo 顶替）。
 
 - 设计节点：[`33692:37984`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33692-37984)。
 - 数据：`suggestions` 为 `type:"amount"` 的 `25%`/`50%`/`75%`/`100%`；
-  `data` 带 `chain` / `symbol` / `token_address` / `decimals`（钱包可定位资产时）。
+  `data` 带 `chain` / `symbol` / `token_address` / `decimals`（钱包可定位资产时），
+  以及后端同回合查询到的所选链可用余额 `balance` / `balance_raw` / `balance_usd`
+  （v1.6.9 起，V169-IOS-018：金额卡百分比一律锚定**所选链**的余额，禁止用同
+  symbol 的其他链余额兜底，如 ARBITRUM ETH 不得用主网 ETH）。
 - 数据：胶囊顶层另有 `logo_url` / `chain_logo_url`，画「资产与余额」行的图标用；
   选币胶囊（`type:"symbol"`）同理，见 §2.5。
 - App 接入：
   - 卡片包含「资产与余额」行 + 金额输入框 + 25/50/75/100% + 余额不足 NoticeBar +
-    取消/确认；余额由 **App 持有**，百分比用余额换算。
+    取消/确认；余额优先用后端下发的 `data.balance`（无则 App 本地持有），百分比用该链余额换算。
   - 用户点百分比或输入金额后回传 `metadata.suggestion_data`（含 `amount`）。
   - 若后端下发 `client_action.open_amount_keypad`，弹金额键盘输入。
 - 对齐：✅（资产身份已随 `data` 下发）。
