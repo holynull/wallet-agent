@@ -1088,6 +1088,58 @@ async def test_transaction_status_failed_transfer_falls_back_to_session_asset():
 
 
 @pytest.mark.asyncio
+async def test_transaction_status_confirmed_token_transfer_falls_back_to_session_asset():
+    """A confirmed token transfer with no token layer in the explorer (e.g. a
+    DAI self-transfer) must render the session's intended moved asset instead
+    of the native "0 ETH" row on the success card."""
+    from wallet_agent.domain.models import TransactionDetail, TransactionStatus
+
+    class Explorer:
+        async def get_transaction_detail(self, chain, tx_hash):
+            return TransactionDetail(
+                chain=chain,
+                chain_id="1",
+                tx_hash=tx_hash,
+                status=TransactionStatus.CONFIRMED,
+                source="okx",
+                history_kind="full",
+                value="0",
+                symbol="ETH",
+                method_id="0xa9059cbb",
+            )
+
+    tx_hash = "0x" + "a" * 64
+    session_store = InMemorySessionStore()
+    await session_store.save(
+        SwapSessionRecord(
+            session_id="session-confirmed-dai-self",
+            user_id="alice",
+            thread_id="conversation-confirmed-dai-self",
+            broadcast_tx_hash=tx_hash,
+            broadcast_status="confirmed",
+            asset={
+                "chain": "ETH",
+                "symbol": "DAI",
+                "address": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "decimals": 18,
+                "amount": "10.755859901486159764",
+            },
+        )
+    )
+
+    _app, client = await client_for(explorer_provider=Explorer(), store=session_store)
+    async with client:
+        response = await client.get(
+            f"/v1/transactions/ETH/{tx_hash}", params={"user_id": "alice"}
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "confirmed"
+    assert body["amount"] == "10.755859901486159764"
+    assert body["symbol"] == "DAI"
+
+
+@pytest.mark.asyncio
 async def test_transaction_status_endpoint_rejects_invalid_hash():
     _app, client = await client_for()
     async with client:

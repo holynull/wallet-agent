@@ -1445,6 +1445,110 @@ async def test_transaction_status_failed_transfer_falls_back_to_draft_asset():
 
 
 @pytest.mark.asyncio
+async def test_transaction_status_confirmed_token_transfer_falls_back_to_draft_asset():
+    """A confirmed token transfer whose explorer response has no token layer
+    (e.g. a DAI self-transfer, native value 0) must surface the intended moved
+    asset from the session's draft instead of the native "0 ETH" row on the
+    success card."""
+    from wallet_agent.domain.models import TransactionDetail, TransactionStatus
+
+    class Explorer:
+        async def get_transaction_detail(self, chain, tx_hash):
+            return TransactionDetail(
+                chain=chain,
+                chain_id="1",
+                tx_hash=tx_hash,
+                status=TransactionStatus.CONFIRMED,
+                source="okx",
+                history_kind="full",
+                value="0",
+                symbol="ETH",
+                method_id="0xa9059cbb",
+            )
+
+    graph = build_graph(
+        model=FakeModel(),
+        chains={"ETH": TransferAdapter()},
+        explorer_provider=Explorer(),
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "tx-confirmed-dai-self",
+            "user_id": "u1",
+            "intent": "transaction_status",
+            "transaction_query": {
+                "chain": "ETH",
+                "tx_hash": "0x" + "a" * 64,
+            },
+            "transfer_draft": {
+                "chain": "ETH",
+                "symbol": "DAI",
+                "amount": "10.755859901486159764",
+                "token_address": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "decimals": 18,
+            },
+        },
+        config={"configurable": {"thread_id": "tx-confirmed-dai-self"}},
+    )
+
+    snapshot = result["transaction_status_snapshot"]
+    assert snapshot["status"] == "confirmed"
+    assert snapshot["amount"] == "10.755859901486159764"
+    assert snapshot["symbol"] == "DAI"
+
+
+@pytest.mark.asyncio
+async def test_transaction_status_confirmed_native_keeps_explorer_amount():
+    """A confirmed native transfer the explorer surfaced with a real nonzero
+    value must keep that value — the session draft must not override it."""
+    from wallet_agent.domain.models import TransactionDetail, TransactionStatus
+
+    class Explorer:
+        async def get_transaction_detail(self, chain, tx_hash):
+            return TransactionDetail(
+                chain=chain,
+                chain_id="1",
+                tx_hash=tx_hash,
+                status=TransactionStatus.CONFIRMED,
+                source="okx",
+                history_kind="full",
+                value="0.5",
+                symbol="ETH",
+                method_id="0x",
+            )
+
+    graph = build_graph(
+        model=FakeModel(),
+        chains={"ETH": TransferAdapter()},
+        explorer_provider=Explorer(),
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "tx-confirmed-native",
+            "user_id": "u1",
+            "intent": "transaction_status",
+            "transaction_query": {
+                "chain": "ETH",
+                "tx_hash": "0x" + "a" * 64,
+            },
+            # A stale draft amount must never override the explorer's real
+            # on-chain native amount.
+            "transfer_draft": {
+                "chain": "ETH",
+                "symbol": "ETH",
+                "amount": "0.4",
+            },
+        },
+        config={"configurable": {"thread_id": "tx-confirmed-native"}},
+    )
+
+    snapshot = result["transaction_status_snapshot"]
+    assert snapshot["status"] == "confirmed"
+    assert snapshot["amount"] == "0.5"
+    assert snapshot["symbol"] == "ETH"
+
+
+@pytest.mark.asyncio
 async def test_transfer_preflight_blocks_when_native_amount_and_fee_exceed_balance():
     graph = build_graph(
         model=FakeModel(),

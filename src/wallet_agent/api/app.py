@@ -2769,10 +2769,12 @@ def create_app(
                     amount = getattr(detail, "value", None)
                     symbol = getattr(detail, "symbol", None)
                     logo_url = getattr(detail, "logo_url", None)
-                # A failed token transfer usually carries no token layer; fall
-                # back to the session's intended moved asset so the card shows
-                # the real amount/symbol instead of the native "0 ETH" row.
-                if status_value == "failed" and (
+                # A token transfer whose explorer response has no token layer
+                # (failed, or confirmed but not indexed — e.g. a DAI
+                # self-transfer) would otherwise render the native "0 ETH" row.
+                # Fall back to the session's intended moved asset so the card
+                # shows the real amount/symbol.
+                if (
                     amount in (None, "", "0", 0)
                     or not symbol
                     or canonical_symbol(str(symbol))
@@ -2782,19 +2784,31 @@ def create_app(
                         app.state.session_store, str(user_id or ""), chain, tx_hash
                     )
                     if fallback:
-                        fallback_symbol = str(fallback.get("symbol") or "")
-                        if fallback_symbol:
-                            symbol = fallback_symbol
-                        fallback_amount = fallback.get("amount")
-                        if fallback_amount not in (None, ""):
-                            amount = str(fallback_amount)
-                        token_address = fallback.get("address") or fallback.get(
-                            "token_address"
-                        )
-                        if token_address:
-                            logo_url = asset_logo_url(chain.upper(), str(token_address))
-                        elif fallback.get("logo_url"):
-                            logo_url = str(fallback["logo_url"])
+                        # Keep the explorer's real native amount for a confirmed
+                        # native transfer (it already surfaced a nonzero value);
+                        # the draft only stands in when the explorer gave
+                        # nothing or the moved asset is a token.
+                        if (
+                            amount in (None, "", "0", 0)
+                            or not symbol
+                            or fallback.get("address")
+                            or fallback.get("token_address")
+                        ):
+                            fallback_symbol = str(fallback.get("symbol") or "")
+                            if fallback_symbol:
+                                symbol = fallback_symbol
+                            fallback_amount = fallback.get("amount")
+                            if fallback_amount not in (None, ""):
+                                amount = str(fallback_amount)
+                            token_address = fallback.get("address") or fallback.get(
+                                "token_address"
+                            )
+                            if token_address:
+                                logo_url = asset_logo_url(
+                                    chain.upper(), str(token_address)
+                                )
+                            elif fallback.get("logo_url"):
+                                logo_url = str(fallback["logo_url"])
                 result: dict[str, Any] = {
                     "chain": chain.upper(),
                     "tx_hash": tx_hash,

@@ -6388,20 +6388,26 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     amount = getattr(detail, "value", None)
                     symbol = getattr(detail, "symbol", None)
                     logo_url = getattr(detail, "logo_url", None)
-                # A failed token transfer usually has no token layer in the
-                # explorer (the native value is 0), so the App card would show
-                # "0 ETH" instead of the real moved asset. Fall back to the
-                # intended transfer asset from the session's draft so the
-                # failed card shows what actually moved.
+                # A token transfer whose explorer response has no token layer
+                # (native value 0 / native symbol — failed transfers, or
+                # confirmed ones the explorer didn't index, e.g. a DAI
+                # self-transfer) would otherwise render "0 ETH". Fall back to
+                # the intended transfer asset from the session's draft so the
+                # card shows what actually moved.
                 if (
-                    value == "failed"
-                    and fallback_asset
+                    fallback_asset
                     and (
                         amount in (None, "", "0", 0)
                         or not symbol
-                        or canonical_symbol(str(symbol))
-                        == canonical_symbol(
-                            str(native_symbol(str(chain).upper()) or "")
+                        or (
+                            # A known token transfer must never render as its
+                            # chain's native coin even when the explorer only
+                            # returned the native row.
+                            fallback_asset.get("token_address")
+                            and canonical_symbol(str(symbol))
+                            == canonical_symbol(
+                                str(native_symbol(str(chain).upper()) or "")
+                            )
                         )
                     )
                 ):
