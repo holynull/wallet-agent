@@ -803,14 +803,32 @@ async def _session_transfer_asset_fallback(
     its icon) on ``record.asset``; return it so the card shows what actually
     moved. ``None`` when no matching session or asset exists.
     """
+    normalized = tx_hash.strip().lower()
+    chain_text = str(chain or "").upper()
     if not user_id or user_id == "anonymous":
-        return None
+        # No session scoping without a user identity. The broadcast hash is a
+        # public on-chain identifier and the moved asset is public on-chain
+        # data too, so annotating it from any session is safe — this is what
+        # lets clients that do not send ``user_id`` (the demo, and App calls
+        # without a Bearer token on AUTH_REQUIRED=false deployments) still
+        # render the real amount/symbol instead of "0 ETH".
+        try:
+            session = await session_store.find_by_broadcast_tx_hash(normalized)
+        except Exception:
+            return None
+        if session is None:
+            return None
+        asset = session.asset
+        if not isinstance(asset, Mapping):
+            return None
+        session_chain = str(asset.get("chain") or "")
+        if session_chain and session_chain.upper() != chain_text:
+            return None
+        return dict(asset)
     try:
         sessions = await session_store.list_for_user(user_id, limit=100)
     except Exception:
         return None
-    normalized = tx_hash.strip().lower()
-    chain_text = str(chain or "").upper()
     for session in sessions:
         if not session.broadcast_tx_hash:
             continue

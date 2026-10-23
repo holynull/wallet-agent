@@ -101,6 +101,7 @@ def filter_sessions(
 class SessionStore(Protocol):
     async def save(self, session: SwapSessionRecord) -> SwapSessionRecord: ...
     async def get(self, session_id: str) -> SwapSessionRecord | None: ...
+    async def find_by_broadcast_tx_hash(self, tx_hash: str) -> SwapSessionRecord | None: ...
     async def list_for_user(
         self,
         user_id: str,
@@ -135,6 +136,17 @@ class InMemorySessionStore:
         async with self._lock:
             session = self._sessions.get(session_id)
             return session.model_copy(deep=True) if session is not None else None
+
+    async def find_by_broadcast_tx_hash(self, tx_hash: str) -> SwapSessionRecord | None:
+        needle = tx_hash.strip().lower()
+        async with self._lock:
+            for session in self._sessions.values():
+                if (
+                    session.broadcast_tx_hash
+                    and session.broadcast_tx_hash.strip().lower() == needle
+                ):
+                    return session.model_copy(deep=True)
+        return None
 
     async def list_for_user(
         self,
@@ -266,6 +278,32 @@ class SqlSessionStore:
         async with self.session_factory() as db:
             row = await db.get(self.row_model, session_id)
             return SwapSessionRecord.model_validate_json(row.payload) if row else None
+
+    async def find_by_broadcast_tx_hash(self, tx_hash: str) -> SwapSessionRecord | None:
+        from sqlalchemy import select
+
+        await self._ensure_init()
+        # ``broadcast_tx_hash`` lives inside the JSON payload projection. The
+        # hash is a public on-chain identifier, so a substring match over the
+        # payload is a cheap, unique-enough lookup; the Python-side filter below
+        # guarantees the exact session-level value before returning it.
+        pattern = f"%{tx_hash.strip().lower()}%"
+        async with self.session_factory() as db:
+            rows = await db.execute(
+                select(self.row_model).where(self.row_model.payload.like(pattern))
+            )
+            sessions = [
+                SwapSessionRecord.model_validate_json(row.payload)
+                for row in rows.scalars()
+            ]
+        needle = tx_hash.strip().lower()
+        for session in sessions:
+            if (
+                session.broadcast_tx_hash
+                and session.broadcast_tx_hash.strip().lower() == needle
+            ):
+                return session
+        return None
 
     async def list_for_user(
         self,

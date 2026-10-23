@@ -1140,6 +1140,87 @@ async def test_transaction_status_confirmed_token_transfer_falls_back_to_session
 
 
 @pytest.mark.asyncio
+async def test_transaction_status_failed_transfer_falls_back_without_user_id():
+    """A client that queries GET /v1/transactions without ``user_id`` (the
+    demo, and App calls without a Bearer token on AUTH_REQUIRED=false) must
+    still get the session's moved asset on a failed token transfer instead of
+    the native "0 ETH" row."""
+    from wallet_agent.domain.models import TransactionDetail, TransactionStatus
+
+    class Explorer:
+        async def get_transaction_detail(self, chain, tx_hash):
+            return TransactionDetail(
+                chain=chain,
+                chain_id="1",
+                tx_hash=tx_hash,
+                status=TransactionStatus.FAILED,
+                source="okx",
+                history_kind="full",
+                value="0",
+                symbol="ETH",
+                method_id="0xa9059cbb",
+            )
+
+    tx_hash = "0x" + "b" * 64
+    session_store = InMemorySessionStore()
+    await session_store.save(
+        SwapSessionRecord(
+            session_id="session-failed-usdt",
+            user_id="bob",
+            thread_id="conversation-failed-usdt",
+            broadcast_tx_hash=tx_hash,
+            broadcast_status="failed",
+            asset={
+                "chain": "ETH",
+                "symbol": "USDT",
+                "address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+                "decimals": 6,
+                "amount": "31.105638",
+            },
+        )
+    )
+
+    _app, client = await client_for(explorer_provider=Explorer(), store=session_store)
+    async with client:
+        # No user_id query param — the handler falls back to anonymous.
+        response = await client.get(f"/v1/transactions/ETH/{tx_hash}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["amount"] == "31.105638"
+    assert body["symbol"] == "USDT"
+
+
+@pytest.mark.asyncio
+async def test_transaction_status_no_match_without_user_id_returns_native_row():
+    """Anonymous lookups only annotate a known broadcast hash; an unknown hash
+    still renders the explorer's native row (value 0 / native symbol)."""
+    from wallet_agent.domain.models import TransactionDetail, TransactionStatus
+
+    class Explorer:
+        async def get_transaction_detail(self, chain, tx_hash):
+            return TransactionDetail(
+                chain=chain,
+                chain_id="1",
+                tx_hash=tx_hash,
+                status=TransactionStatus.FAILED,
+                source="okx",
+                history_kind="full",
+                value="0",
+                symbol="ETH",
+            )
+
+    _app, client = await client_for(explorer_provider=Explorer())
+    async with client:
+        response = await client.get(f"/v1/transactions/ETH/{'0x' + 'c' * 64}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["amount"] == "0"
+    assert body["symbol"] == "ETH"
+
+
+@pytest.mark.asyncio
 async def test_transaction_status_endpoint_rejects_invalid_hash():
     _app, client = await client_for()
     async with client:

@@ -64,3 +64,48 @@ async def test_sql_session_history_is_sorted_by_updated_at_descending(tmp_path):
     await store.aclose()
 
     assert [session.session_id for session in sessions] == ["newer", "older"]
+
+
+@pytest.mark.asyncio
+async def test_find_by_broadcast_tx_hash_in_memory():
+    store = InMemorySessionStore()
+    tx_hash = "0x" + "d" * 64
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-1",
+            user_id="u",
+            thread_id="t-1",
+            broadcast_tx_hash=tx_hash,
+        )
+    )
+    await store.save(
+        SwapSessionRecord(session_id="s-2", user_id="u", thread_id="t-2")
+    )
+
+    found = await store.find_by_broadcast_tx_hash(tx_hash)
+    assert found is not None and found.session_id == "s-1"
+    # Case-insensitive on the hash.
+    assert (await store.find_by_broadcast_tx_hash(tx_hash.upper())).session_id == "s-1"
+    assert await store.find_by_broadcast_tx_hash("0x" + "e" * 64) is None
+
+
+@pytest.mark.asyncio
+async def test_find_by_broadcast_tx_hash_sql(tmp_path):
+    store = SqlSessionStore(f"sqlite+aiosqlite:///{tmp_path / 'sessions.db'}")
+    tx_hash = "0x" + "f" * 64
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-1",
+            user_id="u",
+            thread_id="t-1",
+            broadcast_tx_hash=tx_hash,
+        )
+    )
+    await store.save(
+        SwapSessionRecord(session_id="s-2", user_id="u", thread_id="t-2")
+    )
+
+    found = await store.find_by_broadcast_tx_hash(tx_hash)
+    await store.aclose()
+
+    assert found is not None and found.session_id == "s-1"
