@@ -12,8 +12,24 @@ import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 
+def _render_decision(**overrides):
+    """A model-owned render decision; the graph only executes on it."""
+    decision = {
+        "intent": "swap",
+        "source_symbol": None,
+        "destination_symbol": None,
+        "recommend_swap_pairs": False,
+        "reason": "test",
+    }
+    decision.update(overrides)
+    return decision
+
+
 class SwapMisrouteReactModel:
     """Calls ``transfer_quick_replies`` for a swap message, then answers in prose."""
+
+    def __init__(self, decision=None):
+        self.decision = decision or _render_decision(recommend_swap_pairs=True)
 
     async def invoke_react(self, messages, tools):
         tool_messages = [message for message in messages if isinstance(message, ToolMessage)]
@@ -30,12 +46,21 @@ class SwapMisrouteReactModel:
             )
         return AIMessage(content="你想用哪个币种兑换、换成什么？")
 
+    async def decide_render(self, request):
+        return dict(self.decision)
+
 
 class ProseReactModel:
     """Answers every ReAct turn in prose without calling any tool."""
 
+    def __init__(self, decision=None):
+        self.decision = decision or _render_decision()
+
     async def invoke_react(self, messages, tools):
         return AIMessage(content="你想用哪个币种兑换、换成什么？")
+
+    async def decide_render(self, request):
+        return dict(self.decision)
 
 
 def _transfer_chips(suggestions):
@@ -51,7 +76,7 @@ def _transfer_chips(suggestions):
 async def test_react_swap_message_projects_swap_card_not_transfer_card():
     from wallet_agent.graph.build import build_graph
 
-    model = SwapMisrouteReactModel()
+    model = SwapMisrouteReactModel(_render_decision(recommend_swap_pairs=True))
     graph = build_graph(model=model)
     result = await graph.ainvoke(
         {"request": {"message": "我要兑换"}, "conversation_history": []},
@@ -74,7 +99,9 @@ async def test_react_open_swap_intent_projects_swap_pair_card_from_defaults():
     """An open "我要兑换" answered in prose must still get a pair card."""
     from wallet_agent.graph.build import build_graph
 
-    graph = build_graph(model=ProseReactModel())
+    graph = build_graph(
+        model=ProseReactModel(_render_decision(recommend_swap_pairs=True))
+    )
     result = await graph.ainvoke(
         {"request": {"message": "我要兑换"}, "conversation_history": []},
         config={"configurable": {"thread_id": "react-open-swap-card"}},
@@ -123,7 +150,9 @@ async def test_react_swap_uses_wallet_balances_for_recommendations():
             },
         ],
     }
-    graph = build_graph(model=ProseReactModel())
+    graph = build_graph(
+        model=ProseReactModel(_render_decision(recommend_swap_pairs=True))
+    )
     result = await graph.ainvoke(
         {
             "request": {"message": "我要兑换"},
@@ -155,7 +184,11 @@ async def test_react_named_swap_pair_keeps_prose_without_recommendation_card():
     """A message that already names the pair must not get a recommendation card."""
     from wallet_agent.graph.build import build_graph
 
-    graph = build_graph(model=ProseReactModel())
+    graph = build_graph(
+        model=ProseReactModel(
+            _render_decision(source_symbol="ETH", destination_symbol="USDT")
+        )
+    )
     result = await graph.ainvoke(
         {"request": {"message": "把 ETH 换成 USDT"}, "conversation_history": []},
         config={"configurable": {"thread_id": "react-named-swap-card"}},
@@ -202,7 +235,11 @@ async def test_swap_multi_chain_source_projects_chain_card():
     """A named pair whose source lives on several networks gets a chain card."""
     from wallet_agent.graph.build import build_graph
 
-    graph = build_graph(model=ProseReactModel())
+    graph = build_graph(
+        model=ProseReactModel(
+            _render_decision(source_symbol="USDT", destination_symbol="ETH")
+        )
+    )
     result = await graph.ainvoke(
         {
             "request": {"message": "用 USDT 换 ETH"},
@@ -238,7 +275,11 @@ async def test_swap_single_chain_source_no_chain_card():
 
     context = _multi_chain_usdt_context()
     context["token_balances"] = context["token_balances"][:1]
-    graph = build_graph(model=ProseReactModel())
+    graph = build_graph(
+        model=ProseReactModel(
+            _render_decision(source_symbol="USDT", destination_symbol="ETH")
+        )
+    )
     result = await graph.ainvoke(
         {
             "request": {"message": "用 USDT 换 ETH"},
@@ -257,7 +298,11 @@ async def test_swap_pinned_chain_no_chain_card():
     """A tapped chain chip already resolves the ambiguity; do not re-offer it."""
     from wallet_agent.graph.build import build_graph
 
-    graph = build_graph(model=ProseReactModel())
+    graph = build_graph(
+        model=ProseReactModel(
+            _render_decision(source_symbol="USDT", destination_symbol="ETH")
+        )
+    )
     result = await graph.ainvoke(
         {
             "request": {
@@ -287,7 +332,12 @@ async def test_swap_bare_confirmation_keeps_established_pair():
     """After "USDT 换 ETH", a bare "兑换" must keep the pair, not re-recommend."""
     from wallet_agent.graph.build import build_graph
 
-    graph = build_graph(model=ProseReactModel())
+    # The model decides the bare "兑换" continues the established pair.
+    graph = build_graph(
+        model=ProseReactModel(
+            _render_decision(source_symbol="USDT", destination_symbol="ETH")
+        )
+    )
     result = await graph.ainvoke(
         {
             "request": {"message": "兑换"},
@@ -313,7 +363,9 @@ async def test_swap_fresh_intent_still_recommends_pairs():
     """A fresh "我要兑换" opens a new swap even after an earlier pair."""
     from wallet_agent.graph.build import build_graph
 
-    graph = build_graph(model=ProseReactModel())
+    graph = build_graph(
+        model=ProseReactModel(_render_decision(recommend_swap_pairs=True))
+    )
     result = await graph.ainvoke(
         {
             "request": {"message": "我要兑换"},

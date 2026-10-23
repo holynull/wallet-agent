@@ -518,8 +518,10 @@ async def test_swap_status_followup_uses_previous_operation_history_after_transf
                 tx_hash=old_order.tx_hash,
             )
 
+    # The model routes the arrival follow-up to swap_status; the graph does not
+    # regex-rescue it anymore (the old semantic fallback was removed).
     graph = build_graph(
-        model=UnderstandingModel(["clarification"]),
+        model=UnderstandingModel(["swap_status"]),
         providers={"bridgers": StatusProvider()},
     )
     result = await graph.ainvoke(
@@ -578,8 +580,10 @@ async def test_bare_arrival_followup_uses_previous_swap_operation_history():
                 tx_hash=old_order.tx_hash,
             )
 
+    # The model routes the arrival follow-up to swap_status; the graph does not
+    # regex-rescue it anymore (the old semantic fallback was removed).
     graph = build_graph(
-        model=UnderstandingModel(["clarification"]),
+        model=UnderstandingModel(["swap_status"]),
         providers={"bridgers": StatusProvider()},
     )
     result = await graph.ainvoke(

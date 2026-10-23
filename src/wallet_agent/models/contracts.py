@@ -128,6 +128,35 @@ class RouteDecision(UnderstandingModel):
         return value
 
 
+class ReactRenderDecision(UnderstandingModel):
+    """What a prose ReAct turn should render, decided by the model.
+
+    The App renders cards from structured suggestions, not prose. When the
+    ReAct model answers without a self-labeled structured surface (no quote,
+    no labeled client action, no quick replies), this decision replaces the
+    former keyword rules (``_swap_recommendation_desired``,
+    ``_react_swap_pair_from_message``, ``_react_swap_continuation``,
+    ``_react_established_swap_pair``, ``_looks_like_transfer_message``) so the
+    model -- not regex -- decides what the App renders. The graph only executes
+    mechanically on the validated decision.
+    """
+
+    intent: Literal["swap", "transfer", "balance", "status", "price", "other"]
+    source_symbol: str | None = Field(
+        default=None,
+        description="兑换来源币种 symbol；仅当用户点名或延续完整币对时填写",
+    )
+    destination_symbol: str | None = Field(
+        default=None,
+        description="兑换目标币种 symbol；仅当用户点名或延续完整币对时填写",
+    )
+    recommend_swap_pairs: bool = Field(
+        default=False,
+        description="是否为开放式兑换请求（未指定币对）弹出推荐币对卡片",
+    )
+    reason: str | None = Field(default=None, description="决策依据，便于排查")
+
+
 class TransferSlotPatch(UnderstandingModel):
     """Transfer fields explicitly stated in the current user message."""
 

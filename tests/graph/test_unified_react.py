@@ -1076,12 +1076,71 @@ def test_looks_like_balance_only_query_separates_read_from_transfer_steps():
     assert _looks_like_balance_only_query("转 0.5 ETH 给小明") is False
 
 
-def test_swap_recommendation_skips_arrival_status_followups():
-    from wallet_agent.graph.nodes import _swap_recommendation_desired
+def _render_decision(**overrides):
+    decision = {
+        "intent": "swap",
+        "source_symbol": None,
+        "destination_symbol": None,
+        "recommend_swap_pairs": False,
+        "reason": "test",
+    }
+    decision.update(overrides)
+    return decision
 
-    assert _swap_recommendation_desired("到账了没有", []) is False
-    assert _swap_recommendation_desired("我是说兑换到账了没有", []) is False
-    assert _swap_recommendation_desired("帮我兑换", []) is True
+
+class ProseDecisionModel:
+    """Answers in prose and owns the render decision via ``decide_render``."""
+
+    def __init__(self, decision):
+        self.decision = dict(decision)
+        self.last_decision_request = None
+
+    async def invoke_react(self, messages, tools):
+        return AIMessage(content="好的。")
+
+    async def decide_render(self, request):
+        self.last_decision_request = request
+        return dict(self.decision)
+
+
+@pytest.mark.asyncio
+async def test_arrival_status_followup_does_not_render_swap_recommendation():
+    """A swap-arrival follow-up must never pop the "好的，想换什么？" card.
+
+    The card decision is the model's: for a status follow-up the model opts out
+    of ``recommend_swap_pairs``, so the graph renders prose only (the old
+    keyword rule ``_swap_recommendation_desired`` missed phrasings like
+    "到账了没有" and popped the wrong card).
+    """
+    from wallet_agent.graph.build import build_graph
+
+    model = ProseDecisionModel(_render_decision(intent="status"))
+    graph = build_graph(model=model)
+    result = await graph.ainvoke(
+        {"request": {"message": "到账了没有？"}, "conversation_history": []},
+        config={"configurable": {"thread_id": "react-status-no-recommend"}},
+    )
+
+    assert model.last_decision_request is not None
+    assert model.last_decision_request["message"] == "到账了没有？"
+    suggestions = result["response"].get("suggestions") or []
+    assert not any(str(item.get("type") or "") == "swap_pair" for item in suggestions)
+
+
+@pytest.mark.asyncio
+async def test_open_swap_intent_renders_swap_recommendation_via_model_decision():
+    """An open-ended "帮我兑换" opts the model into the recommendation card."""
+    from wallet_agent.graph.build import build_graph
+
+    model = ProseDecisionModel(_render_decision(recommend_swap_pairs=True))
+    graph = build_graph(model=model)
+    result = await graph.ainvoke(
+        {"request": {"message": "帮我兑换"}, "conversation_history": []},
+        config={"configurable": {"thread_id": "react-open-swap-recommend"}},
+    )
+
+    suggestions = result["response"].get("suggestions") or []
+    assert any(str(item.get("type") or "") == "swap_pair" for item in suggestions)
 
 
 class SymbolScopedBalanceModel:

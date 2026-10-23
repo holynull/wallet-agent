@@ -1,6 +1,7 @@
 from .contracts import (
     AgentResponseDraft,
     PriceSlotPatch,
+    ReactRenderDecision,
     ReadToolPlan,
     ResponseSuggestion,
     RouteDecision,
@@ -17,6 +18,7 @@ __all__ = [
     "ReadToolPlan",
     "PriceSlotPatch",
     "RouteDecision",
+    "ReactRenderDecision",
     "ResponseSuggestion",
     "SwapSlotPatch",
     "TransactionStatusSlotPatch",

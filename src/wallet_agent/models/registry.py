@@ -13,6 +13,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from .contracts import (
     AgentResponseDraft,
     PriceSlotPatch,
+    ReactRenderDecision,
     ReadToolPlan,
     RouteDecision,
     SwapSlotPatch,
@@ -54,6 +55,32 @@ def _model_input(request: Mapping[str, Any]) -> list[Any]:
     return _instruction_messages(
         instructions,
         "请求 JSON（conversation_history 包含当前 thread 的完整公开对话历史）：",
+        payload,
+    )
+
+
+def _render_decision_input(request: Mapping[str, Any]) -> list[Any]:
+    """Adapt the compact render-decision request to model input."""
+    payload = json.dumps(dict(request), ensure_ascii=False, default=str)
+    instructions = (
+        "你是 Wallet Agent 的卡片渲染决策器。根据用户最新消息、最近对话和本轮工具调用，"
+        "决定这条回复应该渲染成哪类卡片，并只返回合法 JSON，使用结构化输出中允许的字段。"
+        "不要输出 Markdown、解释文字或代码块。"
+        "intent 表示本轮用户请求类型：swap=兑换，transfer=转账，balance=余额/资产查询，"
+        "status=到账/进度/状态/交易记录查询，price=价格/估值，other=其他。"
+        "仅当 intent 为 swap 时才填写 source_symbol 和 destination_symbol："
+        "如果用户在本轮消息中明确写出完整币对（如“把 ETH 换成 USDT”“用 USDT 换 ETH”），"
+        "或者消息是“兑换”“继续”等延续此前已确认的币对（参考 recent_turns 里之前的币对），"
+        "必须填出这两个币种符号；否则两者都为 null。"
+        "recommend_swap_pairs 只在用户表达了开放式兑换意图（如“我要兑换”“帮我兑换”“想换点币”）"
+        "且没有任何指定币对时填 true，表示应弹出推荐币对卡片；"
+        "如果用户是在追问兑换是否到账（“到账了没有”“到了没”“收到没”“进度如何”）、"
+        "询问费率/手续费/支持币对/滑点，或已经点名完整币对，一律填 false。"
+        "当前用户消息优先于历史；历史只用于理解代词、延续关系和未完成任务。"
+    )
+    return _instruction_messages(
+        instructions,
+        "渲染决策请求 JSON（recent_turns 为最近对话摘要，tool_calls 为本轮工具调用）：",
         payload,
     )
 
@@ -552,6 +579,34 @@ class ModelRouter:
             model=model, request=model_request,
         )
         return result if isinstance(result, RouteDecision) else RouteDecision.model_validate(result)
+
+    async def decide_render(self, request: Mapping[str, Any]) -> ReactRenderDecision:
+        """Decide what a prose ReAct turn should render (bounded, strict schema).
+
+        Only called by ``finalize_response`` when the ReAct model answered
+        without a self-labeled structured surface. The decision replaces the
+        former keyword render rules so intent is fully model-owned.
+        """
+        model_id = str(request.get("model_id") or self.registry.classifier_model_id)
+        raw_model = self.registry.get_raw(model_id)
+        binder = getattr(raw_model, "with_structured_output", None)
+        if callable(binder):
+            try:
+                model = binder(ReactRenderDecision, method="json_mode")
+            except Exception:
+                model = raw_model
+        else:
+            model = raw_model
+        model_request = _render_decision_input(request)
+        result = await self._invoke(
+            role="render_decider", model_id=model_id, stage="卡片渲染决策",
+            model=model, request=model_request,
+        )
+        return (
+            result
+            if isinstance(result, ReactRenderDecision)
+            else ReactRenderDecision.model_validate(result)
+        )
 
     async def extract(
         self, task_kind: str, request: Mapping[str, Any]

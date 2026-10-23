@@ -17,8 +17,25 @@ from langchain_core.messages import AIMessage, ToolMessage
 from wallet_agent.graph.build import build_graph
 
 
+def _render_decision(**overrides):
+    decision = {
+        "intent": "swap",
+        "source_symbol": None,
+        "destination_symbol": None,
+        "recommend_swap_pairs": False,
+        "reason": "test",
+    }
+    decision.update(overrides)
+    return decision
+
+
 class SwapKeypadModel:
     """Calls ``request_client_action(open_amount_keypad)`` then answers in prose."""
+
+    def __init__(self, decision=None):
+        self.decision = decision or _render_decision(
+            source_symbol="ETH", destination_symbol="USDT"
+        )
 
     async def invoke_react(self, messages, tools):
         tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
@@ -39,6 +56,9 @@ class SwapKeypadModel:
                 ],
             )
         return AIMessage(content="请输入要兑换的 ETH 数量。")
+
+    async def decide_render(self, request):
+        return dict(self.decision)
 
 
 def _swap_request(metadata=None, message="把 ETH 换成 USDT"):
@@ -110,6 +130,11 @@ async def test_dui_pair_keypad_kept_top_level():
     """
 
     class DuiKeypadModel:
+        def __init__(self, decision=None):
+            self.decision = decision or _render_decision(
+                source_symbol="USDT", destination_symbol="ETH"
+            )
+
         async def invoke_react(self, messages, tools):
             tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
             if not tool_messages:
@@ -129,6 +154,9 @@ async def test_dui_pair_keypad_kept_top_level():
                     ],
                 )
             return AIMessage(content="请输入要兑换的 USDT 数量。")
+
+        async def decide_render(self, request):
+            return dict(self.decision)
 
     graph = build_graph(model=DuiKeypadModel())
     for message in ("USDT 兑 ETH", "用 USDT 换 ETH"):
@@ -150,6 +178,9 @@ async def test_transfer_keypad_without_chosen_coin_still_dropped():
     """Regression: a transfer keypad with no user-chosen coin is still dropped."""
 
     class TransferNoCoinModel:
+        def __init__(self, decision=None):
+            self.decision = decision or _render_decision(intent="transfer")
+
         async def invoke_react(self, messages, tools):
             tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
             if not tool_messages:
@@ -169,6 +200,9 @@ async def test_transfer_keypad_without_chosen_coin_still_dropped():
                     ],
                 )
             return AIMessage(content="请选择要转账的币种。")
+
+        async def decide_render(self, request):
+            return dict(self.decision)
 
     graph = build_graph(model=TransferNoCoinModel())
     result = await graph.ainvoke(

@@ -1195,11 +1195,6 @@ _SWAP_DEFAULT_PAIRS = (
     ({"chain": "ETH", "symbol": "ETH"}, {"chain": "ETH", "symbol": "USDT"}),
     ({"chain": "ETH", "symbol": "USDC"}, {"chain": "ETH", "symbol": "ETH"}),
 )
-_COMMON_ASSET_SYMBOLS = {
-    "BTC", "ETH", "BNB", "TRX", "SOL", "USDT", "USDC", "DAI", "LTC", "DOGE",
-    "XRP", "ADA", "AVAX", "MATIC", "POL", "ARB", "OP", "TON", "BUSD", "FDUSD",
-    "WBTC", "WETH", "SHIB", "PEPE", "DOT", "LINK", "UNI", "AAVE", "SUI", "APT",
-}
 
 
 def _swap_row_usd(row: Mapping[str, Any]) -> Decimal:
@@ -1470,42 +1465,56 @@ def _swap_context_has_accounts(wallet_context: Mapping[str, Any]) -> bool:
     return bool(context.get("wallet_accounts") or context.get("address"))
 
 
-def _swap_recommendation_desired(
-    message: str, rows: list[Mapping[str, Any]]
-) -> bool:
-    """The swap-intent card only fires for an open-ended swap request.
+_RENDER_DECISION_TIMEOUT_SECONDS = 5.0
 
-    A question about swap (fees, supported pairs, slippage) or a message that
-    already names a full pair should not be answered with a recommendation
-    card; the model keeps driving those.
+
+async def _react_render_decision(
+    model: Any,
+    state: Mapping[str, Any],
+    current_message: str,
+    tool_payloads: list[tuple[str, dict[str, Any]]],
+    client_action: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """One bounded LLM decision for a prose/ambiguous ReAct turn.
+
+    Replaces the former keyword heuristics (``_swap_recommendation_desired``,
+    ``_react_swap_pair_from_message``, ``_react_swap_continuation``,
+    ``_react_established_swap_pair``, ``_looks_like_transfer_message``): the
+    model -- not regex -- decides the rendered surface. ``None`` means "render
+    prose only" (a safe, card-free default) on failure or an unsupported model.
     """
-    text = "".join(str(message or "").lower().split())
-    if not text:
-        return False
-    if any(
-        marker in text
-        for marker in (
-            "?", "？", "多少", "哪些", "怎么", "如何", "吗", "支持",
-            "费率", "手续费", "滑点", "是什么",
-            # Arrival/status follow-ups on an existing swap are not open-ended
-            # swap requests. Without this, a clarification like
-            # "我是说兑换到账了没有" was answered with the "好的，想换什么？"
-            # recommendation card instead of the swap status.
-            "到账", "到没到", "进展", "进度", "状态",
-            "arrived", "status", "progress", "processed",
+    decide = getattr(model, "decide_render", None)
+    if not callable(decide):
+        return None
+    recent: list[dict[str, Any]] = []
+    for message in list(state.get("messages") or [])[-6:]:
+        role = "user" if isinstance(message, HumanMessage) else "assistant"
+        text = str(getattr(message, "content", "") or "").strip()
+        if text:
+            recent.append({"role": role, "content": text[:400]})
+    tool_summary = [
+        {"tool": name, "ok": bool(payload.get("ok", True))}
+        for name, payload in tool_payloads
+    ]
+    request = {
+        "message": current_message,
+        "recent_turns": recent,
+        "tool_calls": tool_summary,
+        "client_action_type": (client_action or {}).get("type"),
+    }
+    try:
+        decision = await asyncio.wait_for(
+            decide(request), timeout=_RENDER_DECISION_TIMEOUT_SECONDS
         )
-    ):
-        return False
-    symbols = set(_COMMON_ASSET_SYMBOLS)
-    for item in rows:
-        asset = item.get("asset") if isinstance(item, Mapping) else None
-        if isinstance(asset, Mapping):
-            symbol = canonical_symbol(str(asset.get("symbol") or "")).upper()
-            if symbol:
-                symbols.add(symbol)
-    upper = text.upper()
-    found = {symbol for symbol in symbols if symbol in upper}
-    return len(found) < 2
+    except Exception:
+        return None
+    if decision is None:
+        return None
+    if hasattr(decision, "model_dump"):
+        decision = decision.model_dump(mode="json")
+    if not isinstance(decision, Mapping):
+        return None
+    return dict(decision)
 
 
 async def _react_swap_pair_suggestions(
@@ -1762,37 +1771,6 @@ def _react_swap_keypad_slots(
     return slots
 
 
-def _react_swap_pair_from_message(message: str) -> tuple[str, str] | None:
-    """Extract (source_symbol, destination_symbol) from an explicit swap request.
-
-    Understands the phrasing the swap card and users emit — “把 X 换成 Y”,
-    “用 X 换 Y”, “X 兑 Y”, “swap X for/to Y”, “exchange X to Y” — and returns
-    canonical symbols, or ``None`` when no explicit pair is named.
-    """
-    compact = "".join(str(message or "").split()).lower()
-    if not compact:
-        return None
-    match = re.search(
-        r"(?:把|将|用|拿)?([a-z][a-z0-9]{1,10})"
-        r"(?:换成|换为|兑成|兑换成|兑换|换|兑)"
-        r"([a-z][a-z0-9]{1,10})",
-        compact,
-    )
-    if match:
-        source, destination = match.group(1), match.group(2)
-        if source != destination:
-            return canonical_symbol(source), canonical_symbol(destination)
-    match = re.search(
-        r"(?:swap|exchange)\s+([a-z][a-z0-9]{1,10})\s+(?:to|for)\s+([a-z][a-z0-9]{1,10})",
-        str(message or "").lower(),
-    )
-    if match:
-        source, destination = match.group(1), match.group(2)
-        if source != destination:
-            return canonical_symbol(source), canonical_symbol(destination)
-    return None
-
-
 def _react_swap_pinned_chain(state: Mapping[str, Any]) -> str | None:
     """The source chain the user pinned by tapping a chain chip, if any.
 
@@ -1815,52 +1793,6 @@ def _react_swap_pinned_chain(state: Mapping[str, Any]) -> str | None:
         chain = suggestion.get("chain")
         if chain:
             return canonical_chain(str(chain))
-    return None
-
-
-def _react_swap_continuation(message: str) -> bool:
-    """Whether a bare message confirms an in-progress swap pair.
-
-    “兑换” / “继续兑换” / “换” / “继续” continue the pair already named earlier in
-    the conversation; “我要兑换” / “我想换成什么” open a NEW swap and must not reuse
-    an old pair. A message that names a symbol carries its own pair, so it is not
-    a continuation by itself.
-    """
-    text = "".join(str(message or "").lower().split())
-    if not text:
-        return False
-    if re.search(r"[a-z][a-z0-9]{1,10}", text):
-        return False
-    if any(
-        marker in text
-        for marker in (
-            "我要", "我想", "想兑换", "想换", "帮我", "准备", "打算",
-            "怎么", "如何", "可以", "吗", "？", "?", "什么",
-        )
-    ):
-        return False
-    return any(token in text for token in ("兑换", "换", "swap", "exchange", "继续"))
-
-
-def _react_established_swap_pair(state: Mapping[str, Any]) -> tuple[str, str] | None:
-    """The swap pair named in an earlier turn, before the current request.
-
-    Lets a bare “兑换” confirmation keep the pair the user already picked instead
-    of bouncing back to the recommended-pair card. Only pairs from prior user
-    turns count; the current request's own message is excluded.
-    """
-    current = str(
-        (state.get("request") or {}).get("message") or state.get("message") or ""
-    ).strip()
-    for message in reversed(list(state.get("messages") or [])):
-        if not isinstance(message, HumanMessage):
-            continue
-        text = str(message.content or "").strip()
-        if not text or text == current:
-            continue
-        pair = _react_swap_pair_from_message(text)
-        if pair is not None:
-            return pair
     return None
 
 
@@ -7924,9 +7856,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 }
             else:
                 decision = {**decision, "source": "model"}
-            # Deterministic parsers are a bounded fallback for an invalid or
-            # non-committal model answer. They never override a valid model
-            # route for a new business request.
+            # A non-committal model answer stays as the model decided. The only
+            # fallbacks left resume an explicit, already-structured reference
+            # (an active task, the previous read result, a dialogue/quote
+            # reference) -- never a regex re-classification of free text, which
+            # used to override the model and kept missing new phrasings.
             decision_error = decision.get("error")
             decision_error_code = (
                 decision_error.get("code")
@@ -7938,17 +7872,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 and decision_error_code != "SUPERVISOR_OUTPUT_INVALID"
             ):
                 fallback: dict[str, Any] | None = None
-                if explicit_transfer and not _looks_like_cancel_message(message):
-                    fallback = {"intent": "transfer", "source": "semantic_fallback"}
-                elif _looks_like_asset_value_query(message):
-                    fallback = {"intent": "price_query", "source": "semantic_fallback"}
-                elif historical_swap and _looks_like_swap_status_message(message):
-                    fallback = {
-                        "intent": "swap_status",
-                        "source": "operation_history",
-                        "operation_reference_task_id": historical_swap.get("task_id"),
-                    }
-                elif followup_intent in _VALID_INTENTS:
+                if followup_intent in _VALID_INTENTS:
                     fallback = {"intent": followup_intent, "source": "active_task"}
                 elif history_followup_intent in _VALID_INTENTS:
                     fallback = {"intent": history_followup_intent, "source": "history_fallback"}
@@ -8019,7 +7943,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "portfolio_query",
             }
         )
-        if decision.get("source") == "operation_history" and historical_swap is not None:
+        # A model-routed swap_status (or the old operation-history route) must
+        # be able to poll the order the user is asking about. When no active
+        # order is already in state, hydrate the latest historical swap's order
+        # context so the status node queries it instead of answering "unknown".
+        # This is mechanical state hydration, not intent classification.
+        if (
+            decision.get("intent") == "swap_status"
+            and historical_swap is not None
+            and not state.get("provider_orders")
+            and not state.get("broadcast_tx_hash")
+        ):
             update.update(
                 operation_reference="history",
                 operation_reference_task_id=historical_swap.get("task_id"),
@@ -12665,7 +12599,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "已经明确币对时直接用 get_swap_quote，不要重复推荐。"
                 "需要通讯录、扫码、金额键盘、地址输入或 BTC 出金地址选择时"
                 "调用 request_client_action 请求 App 弹出，"
-                "自己不要收集这些界面里的数据。"
+                "自己不要收集这些界面里的数据；"
+                "请求金额键盘时必须在 slots.intent 里标注 swap 或 transfer，"
+                "不要省略，渲染决策以你的标注为准。"
                 "回复保持纯文本短句：禁止使用 Markdown 图片（如 ![ETH](url)）和表格，"
                 "禁止用 <suggestions>、JSON 或任何标签把选项写进文案；"
                 "币种与链的图标只通过结构化字段下发，由 App 渲染，不要写进文案；"
@@ -12994,20 +12930,63 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         current_message = str(
             (state.get("request") or {}).get("message") or state.get("message") or ""
         ).strip()
-        # A swap intent covers both the explicit swap tokens and a message that
-        # names a full pair ("USDT 兑 ETH", "用 USDT 换 ETH", "swap USDT to ETH").
-        # Those pair messages carry no "兑换/换成" token, and treating them as a
-        # transfer would drop the swap amount keypad (App-side report: keypad
-        # only appeared in react_results, never top-level).
-        swap_intent = (
+        quote_result = _best_react_quote_result(tool_payloads)
+        transfer_result = next(
             (
-                any(
-                    token in current_message.lower()
-                    for token in ("swap", "exchange", "兑换", "换成")
+                payload
+                for name, payload in reversed(tool_payloads)
+                if name == "prepare_transfer"
+                and payload.get("ok")
+                and isinstance(payload.get("pending_transaction"), Mapping)
+            ),
+            None,
+        )
+        portfolio_result = next(
+            (
+                payload.get("portfolio")
+                for _, payload in reversed(tool_payloads)
+                if isinstance(payload.get("portfolio"), Mapping)
+            ),
+            None,
+        )
+        # Intent and the rendered card are the model's call. Only when the turn
+        # produced no self-labeled structured surface (no quote, no labeled
+        # client action, no quick replies, no portfolio/transfer card) do we
+        # ask one bounded decision step. This replaces the former keyword rules
+        # (_swap_recommendation_desired, _react_swap_pair_from_message,
+        # _react_swap_continuation, _react_established_swap_pair,
+        # _looks_like_transfer_message) whose whack-a-mole patches kept missing
+        # new phrasings.
+        render_decision: dict[str, Any] | None = None
+        needs_render_decision = (
+            quote_result is None
+            and transfer_result is None
+            and portfolio_result is None
+            and (
+                (client_action is None and not quick_replies)
+                or any(name == "transfer_quick_replies" for name, _ in tool_payloads)
+                or (
+                    client_action is not None
+                    and str(client_action.get("type") or "") == "open_amount_keypad"
+                    and not str(
+                        (client_action.get("slots") or {}).get("intent") or ""
+                    ).strip()
                 )
-                or _react_swap_pair_from_message(current_message) is not None
             )
-            and not _looks_like_transfer_message(current_message)
+        )
+        if needs_render_decision:
+            render_decision = await _react_render_decision(
+                runtime.model, state, current_message, tool_payloads, client_action
+            )
+        tool_names = {name for name, _ in tool_payloads}
+        slot_intent = ""
+        if client_action is not None and isinstance(client_action.get("slots"), Mapping):
+            slot_intent = str(client_action["slots"].get("intent") or "").strip().lower()
+        swap_intent = bool(
+            quote_result is not None
+            or "swap_quick_replies" in tool_names
+            or slot_intent == "swap"
+            or (render_decision is not None and render_decision.get("intent") == "swap")
         )
         swap_keypad_slots = None
         if client_action and str(client_action.get("type") or "") == "open_amount_keypad":
@@ -13073,7 +13052,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         # over a swap clarification contradicts the Figma swap card, so for a clear
         # swap request that produced no swap quote this turn, drop the transfer
         # suggestions instead of projecting the wrong card.
-        swap_quote_missing = swap_intent and _best_react_quote_result(tool_payloads) is None
+        swap_quote_missing = swap_intent and quote_result is None
         if swap_quote_missing:
             # The model may already have called swap_quick_replies to recommend
             # pairs; keep those. Only transfer-collection suggestions would
@@ -13109,41 +13088,45 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 )
                 if card_suggestions:
                     response["suggestions"] = card_suggestions
-        # A pair can come from the current message ("把 ETH 换成 USDT") or, for a
-        # bare "兑换" confirmation, from an earlier turn that already named it.
-        # Reusing the established pair keeps the swap on track instead of
-        # bouncing back to the recommended-pair card (App-side report: after
-        # "USDT 换 ETH" a bare "兑换" re-showed the recommendation card).
-        current_pair = _react_swap_pair_from_message(current_message)
-        established_pair = (
-            _react_established_swap_pair(state)
-            if _react_swap_continuation(current_message)
-            else None
-        )
-        active_pair = current_pair or established_pair
+        # The active pair comes from the model's render decision: the user's
+        # current message names it ("把 ETH 换成 USDT") or a bare "兑换"/"继续"
+        # continues the pair established in an earlier turn. The model -- not a
+        # regex over message history -- decides both cases.
+        active_pair = None
+        if render_decision is not None:
+            decision_source = canonical_symbol(
+                str(render_decision.get("source_symbol") or "")
+            )
+            decision_destination = canonical_symbol(
+                str(render_decision.get("destination_symbol") or "")
+            )
+            if (
+                decision_source
+                and decision_destination
+                and decision_source != decision_destination
+            ):
+                active_pair = (decision_source, decision_destination)
         # Figma swap-intent card ("好的，想换什么？"): when the user expresses
         # an open-ended swap request and the model produced only prose (no quote,
-        # no client surface, no suggestions), deterministically recommend pairs
-        # from the user's balance so the App never renders an empty bubble.
+        # no client surface, no suggestions), the model's decision opts into the
+        # recommendation card so the App never renders an empty bubble.
         if (
             swap_quote_missing
             and client_action is None
             and not response.get("suggestions")
             and active_pair is None
+            and render_decision is not None
+            and render_decision.get("recommend_swap_pairs")
         ):
-            swap_rows = _swap_balance_rows(
-                state.get("wallet_context") or {}, tool_payloads, state.get("read_facts")
+            swap_suggestions = await _react_swap_pair_suggestions(
+                wallet_provider=runtime.wallet_provider,
+                wallet_context=state.get("wallet_context") or {},
+                tool_payloads=tool_payloads,
+                read_facts=state.get("read_facts"),
+                language=_message_language(current_message),
             )
-            if _swap_recommendation_desired(current_message, swap_rows):
-                swap_suggestions = await _react_swap_pair_suggestions(
-                    wallet_provider=runtime.wallet_provider,
-                    wallet_context=state.get("wallet_context") or {},
-                    tool_payloads=tool_payloads,
-                    read_facts=state.get("read_facts"),
-                    language=_message_language(current_message),
-                )
-                if swap_suggestions:
-                    response["suggestions"] = swap_suggestions
+            if swap_suggestions:
+                response["suggestions"] = swap_suggestions
         # Swap source coin held on several networks (Figma 33715:134430): when
         # the user names an explicit pair ("用 USDT 换 ETH") but the source coin
         # lives on multiple networks and the model only asked in prose, offer the
@@ -13152,13 +13135,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         # next turn can go straight to the quote.
         if (
             client_action is None
-            and _best_react_quote_result(tool_payloads) is None
+            and quote_result is None
             and not response.get("suggestions")
         ):
             if (
                 active_pair is not None
                 and _react_swap_pinned_chain(state) is None
-                and not _looks_like_transfer_message(current_message)
+                and swap_intent
             ):
                 source_symbol, destination_symbol = active_pair
                 chain_rows = _swap_source_chain_rows(
@@ -13226,18 +13209,6 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             if active_task.get("pinned_provider") != pinned_provider:
                 active_task = {**active_task, "pinned_provider": pinned_provider}
                 update["active_task"] = active_task
-        transfer_result = next(
-            (
-                payload
-                for name, payload in reversed(tool_payloads)
-                if name == "prepare_transfer"
-                and payload.get("ok")
-                and isinstance(payload.get("pending_transaction"), Mapping)
-            ),
-            None,
-        )
-        portfolio_result = next((payload.get("portfolio") for _, payload in reversed(tool_payloads)
-                                 if isinstance(payload.get("portfolio"), Mapping)), None)
         # A balance lookup scoped to one symbol (for example "USDC 余额" while
         # checking whether a swap arrived) returns an empty/asset-scoped
         # portfolio. Projecting it as the top-level "资产总览" card renders
