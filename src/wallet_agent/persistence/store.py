@@ -55,6 +55,9 @@ class SwapSessionRecord(DomainModel):
     last_error: dict | None = None
     # First user utterance of the conversation; the App shows it as the row title.
     title: str | None = None
+    # Resolved UI language ("zh" / "en") for status cards; the broadcast and
+    # status endpoints localize their messages from this instead of guessing.
+    language: str = "zh"
     pinned: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

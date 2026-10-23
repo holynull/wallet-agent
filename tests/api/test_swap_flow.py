@@ -428,8 +428,47 @@ async def test_broadcast_records_hash_missing_from_chain_without_provider_pollin
     assert broadcast.json()["status"] == "not_propagated"
     assert broadcast.json()["broadcast_status"] == "not_propagated"
     assert broadcast.json()["broadcast_tx_hash"] == tx_hash
-    assert "源链暂时还没有查到这笔交易" in broadcast.json()["message"]
+    assert "has not found this transaction yet" in broadcast.json()["message"]
     assert provider.broadcast_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_broadcast_not_propagated_localizes_to_chinese_for_zh_session():
+    class BroadcastAdapter:
+        async def get_transaction_receipt(self, _tx_hash):
+            return None
+
+        async def get_transaction(self, _tx_hash):
+            return None
+
+    app, client, provider = await make_client()
+    app.state.chain_registry = None
+    app.state.execution_observer = ExecutionObserver(
+        ChainAdapterRegistry({"BASE": BroadcastAdapter()})
+    )
+    async with client:
+        response = await client.post("/v1/agent/turn", json=request_payload())
+        body = response.json()
+        await app.state.runs[body["run_id"]]["task"]
+        session_id = body["session_id"]
+        session = await app.state.session_store.get(session_id)
+        await app.state.session_store.update(
+            session_id,
+            expected_revision=session.revision,
+            language="zh",
+        )
+        await client.post(
+            f"/v1/swap/{session_id}/confirm", json={"user_id": "alice", "approved": True}
+        )
+        tx_hash = "0x" + "d" * 64
+        broadcast = await client.post(
+            f"/v1/swap/{session_id}/broadcast",
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": tx_hash},
+        )
+
+    assert broadcast.status_code == 200
+    assert broadcast.json()["broadcast_status"] == "not_propagated"
+    assert "源链暂时还没有查到这笔交易" in broadcast.json()["message"]
 
 
 @pytest.mark.asyncio
@@ -626,6 +665,62 @@ async def test_status_turn_preserves_not_propagated_broadcast_state_without_prov
     assert complete["response"]["chain_logo_url"].endswith("/blockchains/base/info/logo.png")
     assert complete["response"]["asset"]["symbol"] == "USDC"
     assert complete["response"]["destination_asset"]["symbol"] == "USDT"
+    assert provider.broadcast_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_status_turn_localizes_not_propagated_card_to_english():
+    provider = FakeProvider()
+    quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=Asset(
+            chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x" + "1" * 40
+        ),
+        destination_asset=Asset(
+            chain="BSC", chain_id=56, symbol="USDT", decimals=6, address="0x" + "2" * 40
+        ),
+        input_amount=Decimal("10"),
+        input_amount_raw="10000000",
+        expected_output=Decimal("9"),
+        expected_output_raw="9000000",
+        provider_reference="quote-not-propagated-en",
+    )
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-not-propagated-turn-en",
+            user_id="alice",
+            thread_id="t-not-propagated-turn-en",
+            quote=quote,
+            broadcast_tx_hash="0x" + "f" * 64,
+            status="not_propagated",
+            stage="not_propagated",
+        )
+    )
+    graph = build_graph(model=FakeModel(), providers=[provider])
+    app = create_app(graph=graph, providers={"bridgers": provider}, store=store)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/agent/turn",
+            json={
+                "conversation_id": "t-not-propagated-turn-en",
+                "session_id": "s-not-propagated-turn-en",
+                "user_id": "alice",
+                "message": "What is the swap status?",
+                "metadata": {"agent_test_intent": "swap_status"},
+            },
+        )
+        await app.state.runs[response.json()["run_id"]]["task"]
+        events = app.state.runs[response.json()["run_id"]]["events"]
+
+    complete = next(event["state"] for event in reversed(events) if event["event"] == "complete")
+    assert response.status_code == 200
+    assert complete["response"]["status"] == "not_propagated"
+    assert complete["response"]["broadcast_status"] == "not_propagated"
+    assert "provider polling has not started" in complete["response"]["message"]
     assert provider.broadcast_calls == 0
 
 

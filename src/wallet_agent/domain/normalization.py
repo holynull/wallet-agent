@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from typing import Any
 
 _CHAIN_ALIASES = {
     "BITCOIN": "BTC",
@@ -303,3 +305,39 @@ def swap_direction_hints(value: str) -> dict[str, str]:
             hints["destination_symbol"] = canonical_symbol(target_match.group(1))
             break
     return hints
+
+
+_CJK_CHARS = re.compile(r"[\u3400-\u9fff]")
+
+
+def detect_message_language(message: str) -> str | None:
+    """Guess a message's UI language from its characters.
+
+    CJK characters mean Chinese; otherwise a word-length run of letters means
+    English.  Numeric amounts and bare wallet addresses carry no signal and
+    return ``None`` so callers can fall back to conversation history.
+    """
+    if _CJK_CHARS.search(message):
+        return "zh"
+    text = re.sub(r"0x[0-9a-fA-F]+", "", message)
+    return "en" if re.search(r"[A-Za-z]{2,}", text) else None
+
+
+def resolve_response_language(
+    message: str, history: list[Any] | None = None
+) -> str:
+    """Resolve the language for a response, defaulting to English.
+
+    Prefers the current message; falls back to the most recent message in
+    ``history`` that carries a language signal; otherwise English.
+    """
+    current = detect_message_language(message)
+    if current:
+        return current
+    for item in reversed(history or []):
+        if not isinstance(item, Mapping):
+            continue
+        language = detect_message_language(str(item.get("content") or ""))
+        if language:
+            return language
+    return "en"

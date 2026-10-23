@@ -53,6 +53,7 @@ from wallet_agent.domain.normalization import (
     canonical_chain,
     canonical_symbol,
     chain_id_for,
+    detect_message_language,
     mentioned_amount_with_unit,
     mentioned_fiat_value,
     swap_direction_hints,
@@ -254,6 +255,81 @@ def _response_language(message: str, history: Any = None) -> str:
         if language:
             return language
     return "en"
+
+
+def _status_language(state: Mapping[str, Any]) -> str:
+    """Language for status-card copy, defaulting to the Chinese product default.
+
+    ``_response_language`` defaults to English when no signal is found; status
+    cards (swap order, broadcast) follow the conversation instead, so a
+    Chinese session that only ever typed amounts must not flip to English.
+    """
+    request = state.get("request")
+    message = ""
+    if isinstance(request, Mapping):
+        message = str(request.get("message") or "")
+    if not message:
+        message = str(state.get("message") or "")
+    language = detect_message_language(message)
+    if language:
+        return language
+    history = state.get("conversation_history")
+    for item in reversed(history or []):
+        if not isinstance(item, Mapping):
+            continue
+        language = detect_message_language(str(item.get("content") or ""))
+        if language:
+            return language
+    return "zh"
+
+
+def _swap_status_copy(language: str) -> dict[str, str]:
+    """Localized copy for the swap order / broadcast status card."""
+    if language == "en":
+        return {
+            "pending": "The swap order is submitted; the provider is processing.",
+            "completed": (
+                "Swap completed; check the delivered assets on the destination chain."
+            ),
+            "failed": "The swap did not complete. Check the order details or retry later.",
+            "refunded": "The swap was refunded; check whether the assets were returned.",
+            "timed_out": "The provider returned no final result yet; retry the order status later.",
+            "unknown": "The latest swap order status is unavailable; retry later.",
+            "processing": (
+                "The swap provider is still processing; the target-chain assets "
+                "are not delivered yet."
+            ),
+            "provider_fallback": "The swap order status has updated; retry later.",
+            "propagation_unconfirmed": (
+                "The source-chain broadcast status is not confirmed yet; "
+                "provider polling has not started. Retry later."
+            ),
+            "swap_ready": (
+                "The swap transaction is ready; waiting for wallet signing and broadcast."
+            ),
+            "broadcast_seen": "The source chain has received the broadcast",
+            "broadcast_pending": (
+                "Source-chain transaction broadcast; waiting for on-chain confirmation"
+            ),
+            "source_confirmed": "Source-chain transaction confirmed",
+            "confirmed": "Source-chain transaction confirmed",
+        }
+    return {
+        "pending": "兑换订单已提交，Provider 仍在处理中。",
+        "completed": "兑换已完成，可以到目标链查看到账资产。",
+        "failed": "兑换没有成功完成，请检查订单详情或稍后重试。",
+        "refunded": "兑换已退款，请检查原资产是否已退回。",
+        "timed_out": "Provider 暂时没有返回最终结果，建议稍后重新查询订单状态。",
+        "unknown": "暂时拿不到兑换订单的最新状态，建议稍后重新查询。",
+        "processing": "兑换服务仍在处理中，目标链资产尚未到账。",
+        "provider_fallback": "兑换订单状态已更新，建议稍后重新查询。",
+        "propagation_unconfirmed": "源链广播状态尚未确认，兑换服务轮询还未开始，请稍后重新查询。",
+        "swap_ready": "兑换交易已准备好，正在等待钱包签名并广播。",
+        "broadcast_seen": "源链已收到交易广播",
+        "broadcast_pending": "源链交易已广播，正在等待链上确认",
+        "source_confirmed": "源链交易已确认",
+        "confirmed": "源链交易已确认",
+    }
 
 
 def _response_fallback(intent: str, missing: list[str], language: str) -> str:
@@ -10649,7 +10725,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             return {
                 "response": {
                     "kind": "clarification",
-                    "message": "缺少报价信息，暂时无法准备交易，请重新获取报价。",
+                    "message": (
+                        "缺少报价信息，暂时无法准备交易，请重新获取报价。"
+                        if _status_language(state) == "zh"
+                        else "A quote is required before preparation; please fetch a quote again."
+                    ),
                 }
             }
         if state.get("pending_transaction"):
@@ -10680,7 +10760,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         if not confirmation.get("approved", False):
             return {
                 "user_confirmation": confirmation,
-                "response": {"kind": "cancelled", "message": "已取消该笔兑换。"},
+                "response": {
+                    "kind": "cancelled",
+                    "message": (
+                        "已取消该笔兑换。"
+                        if _status_language(state) == "zh"
+                        else "Swap cancelled."
+                    ),
+                },
             }
         provider_name = str(selected.get("provider"))
         provider = runtime.providers.get(provider_name)
@@ -10792,9 +10879,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "status": broadcast_status,
                 "broadcast_status": broadcast_status,
                 "tx_hash": tx_hash,
-                "message": (
-                    "源链广播状态尚未确认，兑换服务轮询还未开始，请稍后重新查询。"
-                ),
+                "message": _swap_status_copy(_status_language(state))[
+                    "propagation_unconfirmed"
+                ],
                 **_swap_status_logo_context(state),
             }
             return {
@@ -10928,14 +11015,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         return False
 
     async def status_poll(state: dict[str, Any]) -> dict[str, Any]:
-        status_messages = {
-            "pending": "兑换订单已提交，Provider 仍在处理中。",
-            "completed": "兑换已完成，可以到目标链查看到账资产。",
-            "failed": "兑换没有成功完成，请检查订单详情或稍后重试。",
-            "refunded": "兑换已退款，请检查原资产是否已退回。",
-            "timed_out": "Provider 暂时没有返回最终结果，建议稍后重新查询订单状态。",
-            "unknown": "暂时拿不到兑换订单的最新状态，建议稍后重新查询。",
-        }
+        status_copy = _swap_status_copy(_status_language(state))
+        status_messages = status_copy
         broadcast_status = state.get("broadcast_status")
         tx_hash = state.get("broadcast_tx_hash")
         provider_visible = {
@@ -10962,9 +11043,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "status": broadcast_status,
                     "broadcast_status": broadcast_status,
                     "tx_hash": tx_hash,
-                    "message": (
-                        "源链广播状态尚未确认，兑换服务轮询还未开始，请稍后重新查询。"
-                    ),
+                    "message": status_copy["propagation_unconfirmed"],
                     **_swap_status_logo_context(state),
                 }
                 return {
@@ -10976,7 +11055,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 response_payload = {
                     "kind": "swap_status",
                     "status": "swap_ready",
-                    "message": "兑换交易已准备好，正在等待钱包签名并广播。",
+                    "message": status_copy["swap_ready"],
                     "pending_transaction": state["pending_transaction"],
                     **_swap_status_logo_context(state),
                 }
@@ -11025,19 +11104,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             effective_broadcast_status = (
                 "confirmed" if provider_status == "completed" else broadcast_status
             )
-            broadcast_message = {
-                "broadcast_seen": "源链已收到交易广播",
-                "broadcast_pending": "源链交易已广播，正在等待链上确认",
-                "source_confirmed": "源链交易已确认",
-                "confirmed": "源链交易已确认",
-            }.get(effective_broadcast_status)
+            broadcast_message = status_copy.get(effective_broadcast_status)
             provider_message = status_messages.get(
-                provider_status, "兑换订单状态已更新，建议稍后重新查询。"
+                provider_status, status_copy["provider_fallback"]
             )
             if provider_status == "processing":
-                provider_message = "兑换服务仍在处理中，目标链资产尚未到账。"
+                provider_message = status_copy["processing"]
             elif provider_status == "pending":
-                provider_message = "兑换订单已提交，目标链资产尚未到账，Provider 仍在处理中。"
+                provider_message = status_copy["pending"]
             message = (
                 f"{broadcast_message}；{provider_message}"
                 if broadcast_message

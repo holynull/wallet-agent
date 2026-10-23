@@ -38,6 +38,7 @@ from wallet_agent.domain.models import (
     ProviderOrder,
     UnsignedTransaction,
 )
+from wallet_agent.domain.normalization import detect_message_language
 from wallet_agent.okx import (
     OKX_CHAIN_INDEX_BY_NAME,
     OkxExplorerError,
@@ -603,6 +604,63 @@ def _model_trace_for_state(
     return []
 
 
+def _broadcast_status_messages(language: str) -> dict[str, str]:
+    """Localized broadcast/swap-status card messages.
+
+    ``language`` comes from the persisted session (``SwapSessionRecord.
+    language``), resolved from the conversation at turn time, so the App's
+    status cards never mix languages the way a hard-coded string could.
+    """
+    if language == "en":
+        return {
+            "confirmed": (
+                "Source-chain transaction confirmed; the swap provider is "
+                "processing and the target-chain assets are not delivered yet."
+            ),
+            "source_confirmed": (
+                "Source-chain transaction confirmed; the swap provider is "
+                "processing and the target-chain assets are not delivered yet."
+            ),
+            "broadcast_pending": (
+                "Source-chain transaction broadcast; waiting for on-chain "
+                "confirmation."
+            ),
+            "broadcast_seen": (
+                "The source chain observed this transaction; the swap provider "
+                "is processing and the target-chain assets are not delivered yet."
+            ),
+            "not_propagated": (
+                "The source chain has not found this transaction yet; the hash "
+                "was saved. Refresh the broadcast status later (on-chain data "
+                "sync may lag)."
+            ),
+            "unknown": (
+                "The source-chain broadcast status could not be confirmed; the "
+                "hash was saved. Please retry later."
+            ),
+            "dropped_or_replaced": (
+                "The source-account nonce advanced without this transaction "
+                "being found; it may have been replaced or dropped. Check your "
+                "wallet and broadcast again."
+            ),
+        }
+    return {
+        "confirmed": "源链交易已确认，兑换服务正在处理，目标链资产尚未确认到账。",
+        "source_confirmed": "源链交易已确认，兑换服务正在处理，目标链资产尚未确认到账。",
+        "broadcast_pending": "源链交易已广播，兑换服务正在处理，目标链资产尚未确认到账。",
+        "broadcast_seen": "源链已发现这笔交易，兑换服务正在处理，目标链资产尚未确认到账。",
+        "not_propagated": (
+            "源链暂时还没有查到这笔交易，哈希已保存，"
+            "请稍后刷新广播状态（链上数据同步有延迟）。"
+        ),
+        "unknown": "暂时无法确认源链广播状态，哈希已保存，请稍后重试。",
+        "dropped_or_replaced": (
+            "源账户 nonce 已推进但未查到该交易，"
+            "交易可能已被替换或丢弃，请检查钱包重新广播。"
+        ),
+    }
+
+
 def _broadcast_response(
     record: SwapSessionRecord,
     broadcast_status: BroadcastStatus | str | None = None,
@@ -617,12 +675,10 @@ def _broadcast_response(
         # business stage, which remains processing until provider completion.
         payload["status"] = effective_status
     if message is None and record.provider_order is not None:
-        message = {
-            "confirmed": "源链交易已确认，兑换服务正在处理，目标链资产尚未确认到账。",
-            "source_confirmed": "源链交易已确认，兑换服务正在处理，目标链资产尚未确认到账。",
-            "broadcast_pending": "源链交易已广播，兑换服务正在处理，目标链资产尚未确认到账。",
-            "broadcast_seen": "源链已发现这笔交易，兑换服务正在处理，目标链资产尚未确认到账。",
-        }.get(str(effective_status), "兑换服务正在处理，目标链资产尚未确认到账。")
+        message = _broadcast_status_messages(record.language).get(
+            str(effective_status),
+            "兑换服务正在处理，目标链资产尚未确认到账。",
+        )
     if message is not None:
         payload["message"] = message
     return payload
@@ -1901,6 +1957,9 @@ def create_app(
                         user_id=user_id,
                         thread_id=conversation_id,
                         title=_conversation_title(payload.message),
+                        # Keep the Chinese product default when the first
+                        # message carries no language signal (amounts, hashes).
+                        language=detect_message_language(payload.message) or "zh",
                     )
                 )
             elif existing_session.thread_id != conversation_id:
@@ -2307,19 +2366,12 @@ def create_app(
             if provider is None or session.quote is None:
                 raise HTTPException(status_code=409, detail="swap provider or quote unavailable")
             if broadcast_status not in _BROADCAST_PROVIDER_VISIBLE:
-                message = {
-                    "not_propagated": (
-                        "源链暂时还没有查到这笔交易，哈希已保存，"
-                        "请稍后刷新广播状态（链上数据同步有延迟）。"
-                    ),
-                    "unknown": (
-                        "暂时无法确认源链广播状态，哈希已保存，请稍后重试。"
-                    ),
-                    "dropped_or_replaced": (
-                        "源账户 nonce 已推进但未查到该交易，交易可能已被替换或丢弃，"
-                        "请检查钱包重新广播。"
-                    ),
-                }.get(broadcast_status, "交易暂时无法登记，请稍后重试。")
+                message = _broadcast_status_messages(session.language).get(
+                    broadcast_status,
+                    "交易暂时无法登记，请稍后重试。"
+                    if session.language != "en"
+                    else "The transaction is not ready for provider polling yet.",
+                )
                 updated = await session_store.update(
                     session_id,
                     expected_revision=session.revision,
