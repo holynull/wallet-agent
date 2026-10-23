@@ -978,3 +978,69 @@ async def test_react_arrival_followup_returns_swap_order_not_transaction_history
         item["tool"] == "transaction_history"
         for item in result["response"]["react_results"]
     )
+
+
+def test_looks_like_balance_only_query_separates_read_from_transfer_steps():
+    from wallet_agent.graph.nodes import _looks_like_balance_only_query
+
+    assert _looks_like_balance_only_query("查一下余额") is True
+    assert _looks_like_balance_only_query("我的资产总览") is True
+    assert _looks_like_balance_only_query("看看 BNB 持仓价值") is True
+    assert _looks_like_balance_only_query("用余额的 25% 转这笔") is False
+    assert _looks_like_balance_only_query("继续转账 0.5 ETH") is False
+    assert _looks_like_balance_only_query("转 0.5 ETH 给小明") is False
+
+
+class BalanceQueryPrepModel:
+    def __init__(self):
+        self.observation = None
+
+    async def invoke_react(self, messages, tools):
+        tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "prep-1",
+                        "name": "prepare_transfer",
+                        "args": {
+                            "chain": "ARBITRUM",
+                            "symbol": "ETH",
+                            "amount": "0.00775626",
+                            "recipient": WALLET,
+                        },
+                    }
+                ],
+            )
+        self.observation = json.loads(tool_messages[0].content)
+        return AIMessage(content="你的余额已展示在卡片里。")
+
+
+@pytest.mark.asyncio
+async def test_react_balance_query_does_not_prepare_stale_transfer():
+    from wallet_agent.graph.build import build_graph
+
+    model = BalanceQueryPrepModel()
+    result = await build_graph(model=model).ainvoke(
+        {
+            "request": {"message": "查一下余额"},
+            "wallet_context": {"address": WALLET, "chain": "ARBITRUM"},
+            "conversation_history": [
+                {"role": "user", "content": "转 0.00775626 ETH 给自己"},
+                {"role": "assistant", "content": "收款地址已记录，请选网络。"},
+            ],
+            "transfer_draft": {
+                "chain": "ARBITRUM",
+                "symbol": "ETH",
+                "amount": "0.00775626",
+                "recipient": WALLET,
+            },
+        },
+        config={"configurable": {"thread_id": "react-balance-no-prepare"}},
+    )
+
+    assert result["response"]["kind"] == "react"
+    assert model.observation is not None
+    assert model.observation["ok"] is False
+    assert model.observation["code"] == "TRANSFER_NOT_REQUESTED"

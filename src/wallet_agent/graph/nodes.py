@@ -2683,6 +2683,22 @@ def _looks_like_transfer_message(message: str) -> bool:
     )
 
 
+def _looks_like_balance_only_query(message: str) -> bool:
+    """Whether the message is a pure balance/asset read with no transfer signal.
+
+    Used to keep a balance follow-up ("查余额") from re-preparing a stale
+    in-progress transfer. Any transfer verb or continuation ("转", "继续",
+    "send", "收款") makes the message a transfer step, not a read query.
+    """
+    text = "".join(str(message).lower().split())
+    if any(token in text for token in ("转", "继续", "send", "transfer", "发送", "收款")):
+        return False
+    return any(
+        token in text
+        for token in ("余额", "资产", "持仓", "总览", "总值", "balance", "portfolio")
+    )
+
+
 def _looks_like_other_chain_balance_request(message: str) -> bool:
     text = "".join(str(message).lower().split())
     return (
@@ -11617,6 +11633,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         state: Annotated[dict[str, Any], InjectedState],
     ) -> dict[str, Any]:
         current = state
+        current_message = str(
+            (state.get("request") or {}).get("message") or state.get("message") or ""
+        )
+        if _looks_like_balance_only_query(current_message):
+            # A balance follow-up while a transfer draft is pending must not
+            # re-prepare the stale transfer. Return a benign skip so the model
+            # answers the balance and keeps the draft for an explicit follow-up.
+            return {
+                "ok": False,
+                "code": "TRANSFER_NOT_REQUESTED",
+                "message": "当前消息只是查询余额，没有转账意图，已跳过转账准备。",
+            }
         context = current.get("wallet_context") or {}
         draft = {
             "chain": chain or context.get("chain"),
@@ -12327,6 +12355,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "依据 network_status 说明查询范围和缺失/失败，"
                 "不能把未查询当零余额，不能把部分余额称全部。"
                 "保留极小但非零的美元余额，显示 <0.01；总值使用工具中同一份明细的 total_usd_value。"
+                "用户只查询余额/资产/持仓时，只调用 wallet_balance 或 portfolio_snapshot；"
+                "即使对话里有未完成的转账草稿或之前的转账上下文，只要当前消息没有转账意图"
+                "（例如只说了“查余额/看资产”），就不要调用 prepare_transfer 或继续转账流程，"
+                "等用户明确说要继续转账再继续。"
                 "BTC 余额仅覆盖 App 提供的地址；未提供 BTC 地址时请提示 App 补充公共地址。"
                 "用户索要自己的收款地址或收款码时调用 receive_address 工具，不要反问用户要地址；"
                 "所有 EVM 网络共用一个收款地址，BTC/TRON 等各自独立，并说明支持的链。"
