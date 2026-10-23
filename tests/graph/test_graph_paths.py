@@ -562,6 +562,64 @@ def test_swap_draft_request_resolves_each_side_against_its_own_chain(connected_a
     assert request.recipient_address == EVM_ACCOUNT
 
 
+def test_swap_draft_request_clamps_rounded_amount_to_balance_within_display_precision():
+    """V169-IOS-023: the App computes “100% 余额” at 8-decimal display precision
+    and rounds half-up, overshooting the real on-chain balance by sub-display
+    dust. The quote must use the exact balance or the deterministic preflight
+    fails INSUFFICIENT_BALANCE on an amount the user asked to spend entirely.
+    """
+    balance_raw = "16146673157546163876"  # ≈ 16.146673157546… USDT (18 decimals)
+    request, missing = _swap_draft_request(
+        {
+            "source_chain": "BSC",
+            "source_symbol": "USDT",
+            "source_token_address": "0x55d398326f99059ff775485246999027b3197955",
+            "source_decimals": 18,
+            "destination_chain": "BSC",
+            "destination_symbol": "BNB",
+            "destination_decimals": 18,
+            "input_amount": "16.14667316",
+            "sender_address": EVM_ACCOUNT,
+            "recipient_address": EVM_ACCOUNT,
+        },
+        {"address": EVM_ACCOUNT, "chain": "BSC"},
+        max_amount_raw=balance_raw,
+    )
+
+    assert missing == []
+    assert request is not None
+    # The rounded 16.14667316 * 1e18 would exceed the balance; the clamp floors
+    # it to the exact balance so the preflight balance check passes.
+    assert request.input_amount_raw == balance_raw
+    assert Decimal(request.input_amount) <= Decimal("16.14667316")
+
+
+def test_swap_draft_request_does_not_clamp_a_real_overdraft():
+    """A genuinely larger amount (beyond one display unit) is not clamped; the
+    preflight should still surface INSUFFICIENT_BALANCE for it."""
+    balance_raw = "16146673157546163876"
+    request, missing = _swap_draft_request(
+        {
+            "source_chain": "BSC",
+            "source_symbol": "USDT",
+            "source_token_address": "0x55d398326f99059ff775485246999027b3197955",
+            "source_decimals": 18,
+            "destination_chain": "BSC",
+            "destination_symbol": "BNB",
+            "destination_decimals": 18,
+            "input_amount": "20",
+            "sender_address": EVM_ACCOUNT,
+            "recipient_address": EVM_ACCOUNT,
+        },
+        {"address": EVM_ACCOUNT, "chain": "BSC"},
+        max_amount_raw=balance_raw,
+    )
+
+    assert missing == []
+    assert request is not None
+    assert request.input_amount_raw == str(Decimal("20") * Decimal(10) ** 18)
+
+
 @pytest.mark.asyncio
 async def test_swap_asset_resolution_accepts_native_source_without_contract_address():
     resolved, candidates, errors = await _resolve_swap_assets(

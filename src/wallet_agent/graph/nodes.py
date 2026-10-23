@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from time import perf_counter
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from langchain_core.messages import (
     AIMessage,
@@ -457,6 +457,30 @@ def _sanitize_response_suggestions(
         output.append({**dict(item), "data": clean})
     return output
 
+
+
+def _react_tool_validation_code(exc: Exception) -> str | None:
+    """Map a tool-schema validation failure to a deterministic error code.
+
+    ``get_swap_quote`` advertises ``amount_mode`` as an exact_in/exact_out enum
+    in its tool schema; when a model still passes ``"input"``/``"output"``, the
+    schema rejects it before the function body runs. Return the same
+    INVALID_AMOUNT_MODE code the function-level guard would, so the model gets
+    a corrective, non-generic signal instead of a bare tool failure.
+    """
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return None
+    try:
+        items = errors()
+    except Exception:
+        return None
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if "amount_mode" in (item.get("loc") or ()):
+            return "INVALID_AMOUNT_MODE"
+    return None
 
 
 @dataclass(frozen=True)
@@ -3975,6 +3999,16 @@ def _transaction_history_item(record: Any, address: str) -> dict[str, Any]:
         counterparty = payload.get("from_address")
     else:
         counterparty = payload.get("to_address") or payload.get("from_address")
+    decimals = payload.get("decimals")
+    is_native = bool(chain) and bool(symbol) and (
+        _native_symbol(str(chain), None) == canonical_symbol(str(symbol))
+    )
+    if decimals is None and is_native:
+        # OKX history rows omit decimals for native coins; fill them from the
+        # chain so the model can convert the raw integer instead of reporting
+        # “最小单位/数量未返回” (Lif's history-card feedback).
+        decimals = native_decimals(str(chain))
+    raw_only = decimals is None
     return {
         "chain": chain,
         "chain_logo_url": chain_logo_url(chain) if chain else None,
@@ -3982,12 +4016,12 @@ def _transaction_history_item(record: Any, address: str) -> dict[str, Any]:
         "status": payload.get("status"),
         "direction": direction,
         "symbol": symbol,
-        "decimals": payload.get("decimals"),
+        "decimals": decimals,
         "logo_url": payload.get("logo_url") or token_logo_url(chain, symbol),
         "amount_raw": payload.get("value"),
-        # OKX history rows carry no decimals; say so instead of letting the
-        # model invent a scale for the raw integer.
-        "raw_only": payload.get("decimals") is None,
+        # Token rows that still lack decimals stay raw_only so the model does
+        # not invent a scale for the raw integer.
+        "raw_only": raw_only,
         "counterparty": counterparty,
         "occurred_at": payload.get("occurred_at") or payload.get("confirmed_at"),
         "failure_reason": payload.get("failure_reason"),
@@ -4042,7 +4076,11 @@ def _transaction_history_payload(
         return payload
     confirmed = all(str(item.get("status") or "") == "confirmed" for item in selected)
     tail = "都是已确认状态。" if confirmed else "其中包含未确认的交易。"
-    total_note = f"，共 {len(visible)} 笔" if len(visible) > len(selected) else ""
+    # The card shows exactly ``selected`` rows, so any “共 N 笔” note must
+    # describe those rows, never the larger fetched set, or the prose fights
+    # the card (“最近 10 笔” next to “共 74 笔” — Lif's report). The fetched
+    # total is still exposed as ``fetched``.
+    total_note = f"，共 {len(selected)} 笔" if len(visible) > len(selected) else ""
     payload["message"] = (
         f"最近 {len(selected)} 笔记录拉出来了 👆"
         + (f" 其中 {summary}{total_note}，" if summary else f" {total_note.lstrip('，')}，")
@@ -4643,8 +4681,51 @@ async def _transaction_preflight(
     }
 
 
+def _clamp_swap_input_to_balance(
+    normalized: dict[str, Any], max_amount_raw: str | None
+) -> None:
+    """Clamp ``input_amount_raw`` to the wallet balance when it overshoots by
+    no more than one display unit.
+
+    The App computes “100% 余额 / 最大额度” at 8-decimal display precision and
+    rounds half-up, which can overshoot the real on-chain balance by
+    sub-display-unit dust (e.g. 16.14667316 vs a real 16.1466731575… USDT).
+    Quoting that rounded value makes the deterministic preflight fail with
+    INSUFFICIENT_BALANCE on a balance the user asked to spend entirely. When
+    the rounded raw amount is within one display unit of the balance, floor it
+    to the exact balance so the swap goes through.
+    """
+    if not max_amount_raw:
+        return
+    try:
+        raw = int(normalized["input_amount_raw"])
+        cap = int(max_amount_raw)
+    except (KeyError, TypeError, ValueError):
+        return
+    if raw <= cap:
+        return
+    try:
+        decimals = int(normalized.get("source_decimals") or 18)
+    except (TypeError, ValueError):
+        return
+    # One unit at the App's 8-decimal display precision.
+    tolerance = 10 ** max(decimals - 8, 0)
+    if raw - cap > tolerance:
+        return
+    normalized["input_amount_raw"] = str(cap)
+    try:
+        normalized["input_amount"] = format(
+            Decimal(cap) / (Decimal(10) ** decimals), "f"
+        )
+    except (ArithmeticError, TypeError, ValueError):
+        pass
+
+
 def _swap_draft_request(
-    draft: dict[str, Any], wallet_context: dict[str, Any] | None
+    draft: dict[str, Any],
+    wallet_context: dict[str, Any] | None,
+    *,
+    max_amount_raw: str | None = None,
 ) -> tuple[SwapQuoteRequest | None, list[str]]:
     context = wallet_context or {}
     normalized = dict(draft)
@@ -4713,6 +4794,8 @@ def _swap_draft_request(
             normalized["input_amount_raw"] = str(int(raw))
         except Exception:
             return None, ["input_amount_raw"]
+    if not exact_out:
+        _clamp_swap_input_to_balance(normalized, max_amount_raw)
     source_address = _explicit_token_address(normalized.get("source_token_address"))
     destination_address = _explicit_token_address(normalized.get("destination_token_address"))
     source_native = None
@@ -5100,6 +5183,51 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             except Exception:
                 return None
         return runtime.chains.get(str(chain).upper())
+
+    async def _swap_source_balance_raw(
+        draft: Mapping[str, Any], wallet_context: Mapping[str, Any] | None
+    ) -> str | None:
+        """Best-effort source-token/native balance (raw) for the sender.
+
+        Returns ``None`` when the balance cannot be read; callers then skip the
+        dust clamp rather than failing the quote. UTXO chains pool every
+        declared address in the preflight, but the App's 100%-balance shortcut
+        is computed against one 出金 address, so reading the sender alone is a
+        safe lower bound for the clamp.
+        """
+        context = wallet_context or {}
+        chain = str(draft.get("source_chain") or context.get("chain") or "")
+        canonical = canonical_chain(chain)
+        if not canonical:
+            return None
+        sender = _swap_address_for_chain(
+            context, chain, draft.get("sender_address")
+        )
+        if not sender or not is_valid_address(canonical, sender):
+            return None
+        adapter = execution_adapter(chain)
+        if adapter is None:
+            return None
+        token_address = _explicit_token_address(draft.get("source_token_address"))
+        try:
+            if token_address:
+                if not hasattr(adapter, "get_token_balance"):
+                    return None
+                asset = Asset(
+                    chain=canonical,
+                    symbol=str(draft.get("source_symbol") or ""),
+                    decimals=int(draft.get("source_decimals") or 18),
+                    address=token_address,
+                )
+                balance = await adapter.get_token_balance(asset, sender)
+            else:
+                if not hasattr(adapter, "get_native_balance"):
+                    return None
+                balance = await adapter.get_native_balance(sender)
+        except Exception:
+            return None
+        raw = str(getattr(balance, "amount_raw", "") or "").strip()
+        return raw or None
 
     async def _btc_source_address_options(
         addresses: Sequence[str],
@@ -8817,7 +8945,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         },
                     },
                 }
-            request_model, missing = _swap_draft_request(draft, state.get("wallet_context"))
+            wallet_context = state.get("wallet_context")
+            max_amount_raw = await _swap_source_balance_raw(draft, wallet_context)
+            request_model, missing = _swap_draft_request(
+                draft, wallet_context, max_amount_raw=max_amount_raw
+            )
             if request_model is None:
                 if missing == ["source_equals_destination"]:
                     return {
@@ -11164,7 +11296,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         destination_symbol: str | None = None,
         input_amount: str | None = None,
         output_amount: str | None = None,
-        amount_mode: str | None = None,
+        amount_mode: Literal["exact_in", "exact_out"] | None = None,
         source_chain: str | None = None,
         destination_chain: str | None = None,
         source_token_address: str | None = None,
@@ -11181,6 +11313,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         asset should land (an exchange address, a different account, or the
         target-chain address of a cross-chain swap).
         """
+        # The App may send an empty string for a mode it did not pick; treat it
+        # as "not stated" instead of an invalid value.
+        if amount_mode == "":
+            amount_mode = None
         if amount_mode not in (None, "exact_in", "exact_out"):
             return {
                 "ok": False,
@@ -11208,6 +11344,43 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "recipient_address": recipient_address,
             "slippage_bps": slippage_bps,
         }
+        # A carried-over amount belongs to the pair it was captured for. When
+        # the source asset changes (e.g. the user pivots from “ETH 换 USDC” to
+        # “用 USDT 换 ETH”) and the model does not state a fresh amount this
+        # turn, drop the stale input/output amounts so they cannot silently
+        # quote a different asset than the user asked for (Lif's session:
+        # a prior 0.00874115 ETH reused as the USDT input amount).
+        prior_source = (
+            canonical_chain(str(task_slots.get("source_chain") or "")),
+            canonical_symbol(str(task_slots.get("source_symbol") or "")),
+            str(task_slots.get("source_token_address") or "").strip().lower(),
+        )
+        next_source = (
+            canonical_chain(str(source_chain or task_slots.get("source_chain") or "")),
+            canonical_symbol(
+                str(source_symbol or task_slots.get("source_symbol") or "")
+            ),
+            str(
+                source_token_address or task_slots.get("source_token_address") or ""
+            ).strip().lower(),
+        )
+        if (
+            prior_source != next_source
+            and input_amount in (None, "")
+            and output_amount in (None, "")
+        ):
+            for key in (
+                "input_amount",
+                "input_amount_raw",
+                "output_amount",
+                "output_amount_raw",
+                "amount_mode",
+                "target_value_amount",
+                "target_value_currency",
+                "target_value_price_usd",
+                "target_value_observed_at",
+            ):
+                values.pop(key, None)
         # The App returns the user-picked BTC 出金地址 through suggestion_data;
         # carry it so the quote is sent from that exact address instead of the
         # first declared account (Lif: “出金的地址只能从中间选一个”).
@@ -11299,7 +11472,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     },
                 },
             }
-        request_model, missing = _swap_draft_request(resolved, context)
+        max_amount_raw = await _swap_source_balance_raw(resolved, context)
+        request_model, missing = _swap_draft_request(
+            resolved, context, max_amount_raw=max_amount_raw
+        )
         if request_model is None:
             return {
                 "ok": False,
@@ -11331,12 +11507,25 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 if isinstance(item, Mapping) and _quote_is_usable(item)
             )
             provider_errors.extend(result.get("errors") or [])
+        if not quotes:
+            # A fixed NO_VALID_QUOTES copy keeps the model from inventing
+            # channel rules ("至少 8 USDT") or leaking provider internals; the
+            # sanitized provider_errors still ride along for the model to
+            # relay generically.
+            return {
+                "ok": False,
+                "quotes": [],
+                "provider_errors": provider_errors,
+                "request": _dump(raw_request),
+                "code": "NO_VALID_QUOTES",
+                "message": "暂时没有可用的兑换报价。请稍后重试，或更换兑换数量/币对。",
+            }
         return {
-            "ok": bool(quotes),
+            "ok": True,
             "quotes": quotes,
             "provider_errors": provider_errors,
             "request": _dump(raw_request),
-            "code": None if quotes else "NO_VALID_QUOTES",
+            "code": None,
         }
 
     async def react_prepare_transfer(
@@ -11876,9 +12065,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 )
                 for call in calls
             ]
-        except Exception:
+        except Exception as exc:
             status = "error"
-            error_code = "REACT_TOOL_FAILED"
+            error_code = _react_tool_validation_code(exc) or "REACT_TOOL_FAILED"
             # Avoid returning exception strings that may contain provider
             # URLs, request payloads, or credentials to the model/transcript.
             tool_messages = [
@@ -11887,7 +12076,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         {
                             "ok": False,
                             "code": error_code,
-                            "error": "工具执行失败，请基于此结果向用户说明暂时无法完成。",
+                            "error": (
+                                "amount_mode 只能是 exact_in 或 exact_out；"
+                                "请用 exact_in 指定换出数量、exact_out 指定换入数量后重试。"
+                                if error_code == "INVALID_AMOUNT_MODE"
+                                else "工具执行失败，请基于此结果向用户说明暂时无法完成。"
+                            ),
                         },
                         ensure_ascii=False,
                     ),

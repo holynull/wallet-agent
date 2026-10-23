@@ -59,6 +59,67 @@ def test_identical_patch_does_not_increment_revision():
     assert result.invalidation == {}
 
 
+def test_swap_source_asset_switch_clears_carried_over_amounts():
+    """V169-IOS-022: when the source asset is replaced (ETH 换 USDC → 用 USDT
+   换 ETH) without a restated quantity, the old amount must not ride along —
+    a prior ETH quantity was reused as the USDT input and fell below the
+    channel minimum, producing NO_VALID_QUOTES."""
+    task = merge_task_patch(
+        new_active_task("swap", task_id="swap-switch"),
+        {
+            "source_chain": "BSC",
+            "source_symbol": "ETH",
+            "destination_symbol": "USDC",
+            "input_amount": "0.00874115",
+            "amount_mode": "exact_in",
+        },
+    ).task
+
+    switched = merge_task_patch(
+        task,
+        {"source_symbol": "USDT", "destination_symbol": "ETH"},
+    ).task
+
+    assert switched["slots"]["source_symbol"] == "USDT"
+    assert "input_amount" not in switched["slots"]
+    assert "input_amount_raw" not in switched["slots"]
+    assert "output_amount" not in switched["slots"]
+    assert "amount_mode" not in switched["slots"]
+
+
+def test_swap_adding_a_missing_chain_keeps_the_captured_amount():
+    """Filling in a previously-missing chain for the same source asset must not
+    discard the amount (e.g. “用 1 USDC 换 USDT” then “都在 Base 链”)."""
+    task = merge_task_patch(
+        new_active_task("swap", task_id="swap-chain-followup"),
+        {"source_symbol": "USDC", "destination_symbol": "USDT", "input_amount": "1"},
+    ).task
+
+    follow_up = merge_task_patch(
+        task, {"source_chain": "BASE", "destination_chain": "BASE"}
+    ).task
+
+    assert follow_up["slots"]["input_amount"] == "1"
+    assert follow_up["slots"]["source_symbol"] == "USDC"
+    assert follow_up["slots"]["source_chain"] == "BASE"
+
+
+def test_swap_source_asset_switch_keeps_a_fresh_amount():
+    """A quantity restated on the switched pair survives the clear."""
+    task = merge_task_patch(
+        new_active_task("swap", task_id="swap-switch-fresh"),
+        {"source_symbol": "ETH", "destination_symbol": "USDC", "input_amount": "0.5"},
+    ).task
+
+    switched = merge_task_patch(
+        task,
+        {"source_symbol": "USDT", "destination_symbol": "ETH", "input_amount": "8"},
+    ).task
+
+    assert switched["slots"]["input_amount"] == "8"
+    assert switched["slots"]["source_symbol"] == "USDT"
+
+
 def test_explicit_none_patch_clears_stale_transfer_amount():
     task = merge_task_patch(
         new_active_task("transfer", task_id="transfer-1"),

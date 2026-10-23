@@ -1,3 +1,4 @@
+import json
 from decimal import Decimal
 
 import pytest
@@ -790,3 +791,77 @@ async def test_unified_react_message_strips_embedded_suggestions_json():
     assert "</suggestions>" not in message
     assert '"type"' not in message
     assert "请选择转账网络" in message
+
+
+class EmptyQuoteProvider:
+    """A provider whose quote resolves to an unusable (zero-output) quote, so
+    get_swap_quote returns NO_VALID_QUOTES with a deterministic message."""
+
+    provider_name = "empty"
+
+    async def list_assets(self, query):
+        if query.search == "USDC":
+            return [
+                Asset(chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x1")
+            ]
+        if query.search == "USDT":
+            return [
+                Asset(chain="BASE", chain_id=8453, symbol="USDT", decimals=6, address="0x2")
+            ]
+        return []
+
+    async def quote(self, request):
+        return NormalizedQuote(
+            provider="empty",
+            source_asset=request.source_asset,
+            destination_asset=request.destination_asset,
+            input_amount=request.input_amount,
+            input_amount_raw=request.input_amount_raw,
+            expected_output=Decimal("0"),
+            expected_output_raw="0",
+            provider_reference="empty",
+        )
+
+
+class NoQuoteModel:
+    async def invoke_react(self, messages, tools):
+        tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "nq-1",
+                        "name": "get_swap_quote",
+                        "args": {
+                            "source_symbol": "USDC",
+                            "destination_symbol": "USDT",
+                            "input_amount": "1",
+                            "source_chain": "BASE",
+                            "destination_chain": "BASE",
+                        },
+                    }
+                ],
+            )
+        payload = json.loads(tool_messages[0].content)
+        assert payload["ok"] is False
+        assert payload["code"] == "NO_VALID_QUOTES"
+        assert "暂时没有可用的兑换报价" in payload["message"]
+        return AIMessage(content="暂时没有可用的兑换报价。")
+
+
+@pytest.mark.asyncio
+async def test_react_swap_no_valid_quotes_carries_a_deterministic_message():
+    from wallet_agent.graph.build import build_graph
+
+    result = await build_graph(
+        model=NoQuoteModel(), providers=[EmptyQuoteProvider()]
+    ).ainvoke(
+        {
+            "request": {"message": "在 Base 把 1 USDC 换成 USDT"},
+            "wallet_context": {"address": WALLET, "chain": "BASE"},
+        },
+        config={"configurable": {"thread_id": "react-no-valid-quotes"}},
+    )
+
+    assert "暂时没有可用的兑换报价" in result["response"]["message"]

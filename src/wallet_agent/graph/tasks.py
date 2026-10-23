@@ -104,10 +104,11 @@ def merge_task_patch(
     if not changed:
         return TaskMergeResult(updated, changed, {})
 
+    slots_before = dict(slots)
     for key in cleared:
         slots.pop(key, None)
     slots.update({key: value for key, value in normalized.items() if key in changed})
-    _clear_derived_slots(updated["kind"], slots, changed, normalized)
+    _clear_derived_slots(updated["kind"], slots, changed, normalized, prior=slots_before)
     sources = dict(updated.get("slot_sources") or {})
     sources.update({key: source for key in changed if key in normalized})
     for key in tuple(sources):
@@ -195,6 +196,8 @@ def _clear_derived_slots(
     slots: dict[str, Any],
     changed: frozenset[str],
     patch: Mapping[str, Any],
+    *,
+    prior: Mapping[str, Any] | None = None,
 ) -> None:
     if kind == "transfer":
         if changed & {"chain", "symbol"}:
@@ -222,6 +225,44 @@ def _clear_derived_slots(
                 slots.pop(f"{side}_chain_id", None)
         elif f"{side}_token_address" in changed and f"{side}_decimals" not in patch:
             slots.pop(f"{side}_decimals", None)
+    # A captured amount belongs to the source asset it was entered for. When the
+    # source asset is replaced (e.g. “ETH 换 USDC” → “用 USDT 换 ETH”) and the
+    # user does not restate a quantity this turn, the old input/output amounts
+    # must not ride along onto the new pair (Lif's session: a prior ETH quantity
+    # was reused as the USDT input amount, far below the channel minimum).
+    # Filling in a previously-missing chain/symbol for the *same* asset (e.g.
+    # “用 1 USDC 换 USDT” then “都在 Base 链”) must keep the amount.
+    prior = prior or {}
+    prior_symbol = canonical_symbol(str(prior.get("source_symbol") or ""))
+    prior_token = str(prior.get("source_token_address") or "").strip().lower()
+    prior_chain = canonical_chain(str(prior.get("source_chain") or ""))
+    source_asset_switched = bool(
+        (
+            prior_symbol
+            and canonical_symbol(str(slots.get("source_symbol") or "")) != prior_symbol
+        )
+        or (
+            prior_token
+            and str(slots.get("source_token_address") or "").strip().lower() != prior_token
+        )
+        or (
+            prior_chain
+            and canonical_chain(str(slots.get("source_chain") or "")) != prior_chain
+        )
+    )
+    if source_asset_switched:
+        if "input_amount" not in patch:
+            slots.pop("input_amount", None)
+            slots.pop("input_amount_raw", None)
+        if "output_amount" not in patch:
+            slots.pop("output_amount", None)
+            slots.pop("output_amount_raw", None)
+        if "input_amount" not in patch and "output_amount" not in patch:
+            slots.pop("amount_mode", None)
+            slots.pop("target_value_amount", None)
+            slots.pop("target_value_currency", None)
+            slots.pop("target_value_price_usd", None)
+            slots.pop("target_value_observed_at", None)
     if "input_amount" in changed and "input_amount_raw" not in patch:
         slots.pop("input_amount_raw", None)
     if "output_amount" in changed and "output_amount_raw" not in patch:

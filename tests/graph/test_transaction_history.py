@@ -162,8 +162,38 @@ def test_payload_summary_and_prose_do_not_contradict_the_page_size():
     assert payload["fetched"] == 60
     summary_counts = [int(part) for part in re.findall(r"(\d+) 笔", payload["summary"])]
     assert sum(summary_counts) == 20, "summary must count only the 20 shown rows"
-    assert "共 60 笔" in payload["message"]
+    # The “共 N 笔” note must describe the shown rows (20), never the larger
+    # fetched set (60), or it fights the card the user actually sees.
+    assert "共 20 笔" in payload["message"]
+    assert "共 60 笔" not in payload["message"]
     assert "最近 20 笔" in payload["message"]
+
+
+def test_native_rows_without_decimals_inherit_the_chain_scale():
+    """OKX history rows omit decimals for native coins; fill them from the
+    chain so the model can convert the raw amount (Lif's history-card report:
+    BTC/TRX rows showed “数量未返回/最小单位”)."""
+    btc = _transaction_history_item(
+        _record(chain="BTC", symbol="BTC", decimals=None, value="123000000"), BTC
+    )
+    assert btc["decimals"] == 8
+    assert btc["raw_only"] is False
+
+    tron = _transaction_history_item(
+        _record(chain="TRON", symbol="TRX", decimals=None, value="1500000"), TRON
+    )
+    assert tron["decimals"] == 6
+    assert tron["raw_only"] is False
+
+
+def test_non_native_token_without_decimals_stays_raw_only():
+    item = _transaction_history_item(
+        _record(chain="BSC", symbol="USDC", decimals=None), EVM
+    )
+    # Without a decimals hint we must not guess a scale (USDC is 18 on BSC but
+    # the model must not assume it), so it stays raw_only.
+    assert item["decimals"] is None
+    assert item["raw_only"] is True
 
 
 def test_payload_handles_an_empty_history():
