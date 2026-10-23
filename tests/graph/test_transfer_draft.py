@@ -5,7 +5,10 @@ EVM chain must resolve the BTC chain and the BTC sender from ``wallet_accounts``
 instead of falling back to the EVM context address.
 """
 
-from wallet_agent.graph.nodes import _transfer_draft_request
+from wallet_agent.graph.nodes import (
+    _normalize_evm_address_typos,
+    _transfer_draft_request,
+)
 
 EVM_ADDRESS = "0x3f847a21bcfbba535a5e2a1611bb4d545541d2a5"
 BTC_SEGWIT = "bc1qdqahz8x62rsyfmlkv0m5e5rc234zr7vyl690d5"
@@ -40,6 +43,42 @@ def test_btc_transfer_infers_chain_without_explicit_chain():
     assert request.recipient == BTC_SEGWIT
     assert request.amount_raw == "1000"
     assert request.token is None
+
+
+def test_evm_ox_prefix_recipient_is_normalized_to_zero():
+    """A "Ox3F84…" recipient (letter O) must be canonicalized to "0x3F84…" in
+    the prepared transfer request so the adapter gets a valid address."""
+    mistyped = "Ox3F847a21bcfbba535a5e2a1611bb4d545541d2a5"
+    canonical = "0x" + mistyped[2:]
+    request, missing = _transfer_draft_request(
+        {
+            "chain": "ETH",
+            "symbol": "USDC",
+            "amount": "10.464071",
+            "recipient": mistyped,
+            "token_address": USDC_BASE,
+            "decimals": 6,
+        },
+        MULTICHAIN_CONTEXT,
+    )
+    assert missing == []
+    assert request is not None
+    assert request.recipient == canonical
+    assert request.chain == "ETH"
+
+
+def test_evm_ox_prefix_is_fixed_in_user_message():
+    """The message-level normalizer rewrites a leading "Ox"+40hex to "0x" so
+    the model sees a valid address and prepares the transfer directly."""
+    message = "把以太坊上的全部 USDC 全部转到\nOx3F847a21bcfbba535a5e2a1611bb4d545541d2a5"
+    normalized = _normalize_evm_address_typos(message)
+    assert "0x3F847a21bcfbba535a5e2a1611bb4d545541d2a5" in normalized
+    assert "Ox" not in normalized
+    # A legitimate 0x address and unrelated text are untouched.
+    assert _normalize_evm_address_typos("转 1 ETH 到 " + EVM_ADDRESS) == (
+        "转 1 ETH 到 " + EVM_ADDRESS
+    )
+    assert _normalize_evm_address_typos("Oxfam 公益") == "Oxfam 公益"
 
 
 def test_btc_transfer_uses_btc_sender_when_chain_given():

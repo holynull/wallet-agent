@@ -2,7 +2,9 @@ import pytest
 
 from wallet_agent.domain.addresses import (
     is_valid_address,
+    normalize_evm_address,
     valid_bitcoin_address,
+    valid_evm_address,
     valid_tron_address,
     validate_address,
 )
@@ -58,6 +60,19 @@ def test_unknown_chains_keep_the_evm_contract():
     assert is_valid_address("ARB", EVM_ADDRESS) is True
     assert is_valid_address("SOMECHAIN", "not-an-address") is False
     assert is_valid_address("SOLANA", SOLANA_ADDRESS) is True
+
+
+def test_evm_ox_prefix_typo_is_normalized_and_valid():
+    """A user-typed leading letter O ("Ox3F84…") is a typo for "0x" and must
+    not block an otherwise complete EVM transfer from being prepared."""
+    mistyped = "Ox" + "3" * 40
+    canonical = "0x" + "3" * 40
+    assert normalize_evm_address(mistyped) == canonical
+    assert normalize_evm_address("ox" + "4" * 40) == "0x" + "4" * 40
+    assert normalize_evm_address(canonical) == canonical
+    assert valid_evm_address(mistyped) is True
+    assert is_valid_address("ETH", mistyped) is True
+    assert validate_address("ETH", mistyped) == canonical
 
 
 def test_validate_address_raises_for_the_wrong_family():

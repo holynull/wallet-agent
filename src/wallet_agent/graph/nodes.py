@@ -28,7 +28,7 @@ from langgraph.prebuilt import InjectedState, ToolNode
 from langgraph.types import interrupt
 
 from wallet_agent.chains._common import receipt_success
-from wallet_agent.domain.addresses import EVM_ALIASES, is_valid_address
+from wallet_agent.domain.addresses import EVM_ALIASES, is_valid_address, normalize_evm_address
 from wallet_agent.domain.chains import (
     asset_logo_fields,
     asset_logo_url,
@@ -1947,6 +1947,21 @@ def _plain_text_message(content: str) -> str:
     return "\n".join(flattened).strip()
 
 
+def _normalize_evm_address_typos(content: str) -> str:
+    """Fix a user-typed ``Ox3F84…`` (letter O) prefix to ``0x3F84…`` in text.
+
+    EVM addresses are hex and never contain the letter O, so a leading
+    ``ox``/``Ox``/``oX``/``OX`` followed by 40 hex chars can only be a typo for
+    ``0x``. Normalize it before the model reads the message so a complete
+    transfer intent is not blocked by the obvious typo (App report: a "全部
+    USDC 转到 Ox3F84…" request asked again instead of preparing the transfer
+    card).
+    """
+    if not content:
+        return content
+    return _EVM_OX_PREFIX_TYPO.sub(lambda match: "0x", content)
+
+
 def _model_conversation_history(history: Any, *, limit: int = 12) -> list[dict[str, Any]]:
     """Keep model context bounded while the full history remains checkpointed for the UI."""
     items = [item for item in (history or []) if isinstance(item, Mapping)]
@@ -2744,6 +2759,7 @@ def _looks_like_all_chain_balance_request(message: str) -> bool:
 _BALANCE_SYMBOL = re.compile(
     r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]{1,11})(?![A-Za-z0-9])"
 )
+_EVM_OX_PREFIX_TYPO = re.compile(r"\b[oO]x(?=[0-9a-fA-F]{40}\b)")
 _BALANCE_SYMBOL_STOP_WORDS = frozenset(
     {
         "ALL",
@@ -4328,6 +4344,12 @@ def _transfer_draft_request(
     # fall back to the per-chain account list instead.
     normalized["sender"] = sender or _chain_sender(context, chain)
     normalized.setdefault("recipient", normalized.get("transfer_recipient"))
+    # A user-typed "Ox3F84…" (letter O) is a typo for "0x3F84…"; canonicalize
+    # the recipient so the prepared transaction carries a valid address instead
+    # of failing the adapter's checks downstream.
+    recipient = normalized.get("recipient")
+    if isinstance(recipient, str) and recipient.strip():
+        normalized["recipient"] = normalize_evm_address(recipient)
     normalized.setdefault("amount", normalized.get("transfer_amount"))
     normalized.setdefault("amount_raw", normalized.get("transfer_amount_raw"))
     normalized.setdefault("symbol", normalized.get("transfer_symbol"))
@@ -12516,7 +12538,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
 
     async def react_entry(state: dict[str, Any]) -> dict[str, Any]:
         request = dict(state.get("request") or {})
-        current = str(request.get("message") or state.get("message") or "")
+        current = _normalize_evm_address_typos(
+            str(request.get("message") or state.get("message") or "")
+        )
         existing = list(state.get("messages") or [])
         system = SystemMessage(
             content=(

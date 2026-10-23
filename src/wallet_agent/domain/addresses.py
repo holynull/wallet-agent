@@ -59,7 +59,24 @@ def base58check_payload(value: str, *, version: int | None = None) -> bytes | No
 
 
 def valid_evm_address(address: str) -> bool:
-    return bool(_EVM_ADDRESS.fullmatch(address.strip()))
+    # A user-typed address occasionally starts with the letter O instead of
+    # zero ("Ox3F84…"); hex never contains "O", so a leading ox/Ox/oX/OX can
+    # only be a typo for 0x. Normalize before matching so the obvious mistake
+    # does not block an otherwise complete transfer from being prepared.
+    return bool(_EVM_ADDRESS.fullmatch(normalize_evm_address(address)))
+
+
+def normalize_evm_address(address: str) -> str:
+    """Canonicalize a leading ``ox`` (letter O) prefix to ``0x`` (zero).
+
+    EVM addresses are hex and never contain the letter O, so a leading
+    ``ox``/``Ox``/``oX``/``OX`` is always a typo for ``0x``. Returns the
+    address unchanged when it does not start with the mistyped prefix.
+    """
+    value = str(address or "").strip()
+    if value[:2].lower() == "ox" and not value.lower().startswith("0x"):
+        return "0x" + value[2:]
+    return value
 
 
 def decode_bech32_segwit(address: str) -> tuple[int, bytes] | None:
@@ -147,4 +164,5 @@ def is_valid_address(chain: str, address: str) -> bool:
 def validate_address(chain: str, address: str) -> str:
     if not is_valid_address(chain, address):
         raise ValueError(f"invalid {canonical_chain(chain)} address: {address!r}")
-    return address.strip()
+    normalized = normalize_evm_address(address)
+    return normalized
