@@ -4321,9 +4321,28 @@ def _transfer_draft_request(
 ) -> tuple[TransferRequest | None, list[str]]:
     context = wallet_context or {}
     normalized = dict(draft)
-    normalized.setdefault("chain", normalized.get("transfer_chain") or context.get("chain"))
-    symbol = normalized.get("symbol") or normalized.get("transfer_symbol")
-    token_address = normalized.get("token_address") or normalized.get("transfer_token_address")
+    # Coalesce the ``transfer_*`` slot aliases into the plain keys. A caller
+    # such as react_prepare_transfer passes every key explicitly and leaves the
+    # unresolved ones as None, and ``dict.setdefault`` only fills *missing*
+    # keys — so a token transfer whose draft carries token_address=None and
+    # decimals=None would wrongly report transfer_token_address and
+    # transfer_decimals as missing. Treat an explicit None like an absent key.
+    for key, fallback in (
+        ("chain", "transfer_chain"),
+        ("recipient", "transfer_recipient"),
+        ("amount", "transfer_amount"),
+        ("amount_raw", "transfer_amount_raw"),
+        ("symbol", "transfer_symbol"),
+        ("token_address", "transfer_token_address"),
+        ("decimals", "transfer_decimals"),
+        ("chain_id", "transfer_chain_id"),
+    ):
+        if normalized.get(key) is None:
+            normalized[key] = normalized.get(fallback)
+    if normalized.get("chain") in (None, ""):
+        normalized["chain"] = context.get("chain")
+    symbol = normalized.get("symbol")
+    token_address = normalized.get("token_address")
     inferred_chain = _unique_native_chain(str(symbol or ""), token_address)
     if inferred_chain and canonical_chain(str(normalized.get("chain") or "")) != inferred_chain:
         # A uniquely identifiable native asset (BTC/BNB/TRX/SOL/MATIC) pins its
@@ -4343,18 +4362,12 @@ def _transfer_draft_request(
     # the common case) must never be reused here, even when a caller passed it;
     # fall back to the per-chain account list instead.
     normalized["sender"] = sender or _chain_sender(context, chain)
-    normalized.setdefault("recipient", normalized.get("transfer_recipient"))
     # A user-typed "Ox3F84…" (letter O) is a typo for "0x3F84…"; canonicalize
     # the recipient so the prepared transaction carries a valid address instead
     # of failing the adapter's checks downstream.
     recipient = normalized.get("recipient")
     if isinstance(recipient, str) and recipient.strip():
         normalized["recipient"] = normalize_evm_address(recipient)
-    normalized.setdefault("amount", normalized.get("transfer_amount"))
-    normalized.setdefault("amount_raw", normalized.get("transfer_amount_raw"))
-    normalized.setdefault("symbol", normalized.get("transfer_symbol"))
-    normalized.setdefault("token_address", normalized.get("transfer_token_address"))
-    normalized.setdefault("decimals", normalized.get("transfer_decimals"))
     if normalized.get("chain") and normalized.get("transfer_chain") is None:
         normalized["transfer_chain"] = normalized["chain"]
 
@@ -12568,6 +12581,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "缺少转账参数时先调用 transfer_quick_replies 取得标准快捷选项，再提问；"
                 "逐步收集（先地址、再网络、再金额），网络未明确时给链选择卡，"
                 "不要默认使用钱包当前网络。"
+                "用户已经给出完整转账参数（币种 + 数量/全部 + 收款地址）时，"
+                "直接调用 prepare_transfer 准备转账卡片，不要先调用 wallet_balance "
+                "展示余额卡片，也不要因收款地址是用户自己（SELF_TRANSFER）等风险"
+                "就停下追问确认——这些警告会由转账卡片的 preflight 检查自动展示，"
+                "用户可直接在卡片上决定；转账卡片出现后不要再重复展示余额。"
                 "用户提供收款地址后，立即用该地址调用 transfer_quick_replies"
                 "（recipient=该地址）取得网络选择卡并展示给用户；"
                 "禁止用文字罗列可选网络。"
@@ -13121,6 +13139,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             if active_task.get("pinned_provider") != pinned_provider:
                 active_task = {**active_task, "pinned_provider": pinned_provider}
                 update["active_task"] = active_task
+        transfer_result = next(
+            (
+                payload
+                for name, payload in reversed(tool_payloads)
+                if name == "prepare_transfer"
+                and payload.get("ok")
+                and isinstance(payload.get("pending_transaction"), Mapping)
+            ),
+            None,
+        )
         portfolio_result = next((payload.get("portfolio") for _, payload in reversed(tool_payloads)
                                  if isinstance(payload.get("portfolio"), Mapping)), None)
         # A transfer amount step drives a client surface (amount keypad /
@@ -13128,8 +13156,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         # wallet_balance observation to a top-level portfolio card in the same
         # round would make the App render an asset-overview card next to the
         # keypad in one bubble, so only a balance question without a client
-        # action projects a portfolio card.
-        if portfolio_result is not None and client_action is None:
+        # action projects a portfolio card. A prepared transfer likewise
+        # supersedes the balance card: when the user states a complete transfer
+        # intent (and the model prepared it, possibly after fetching the
+        # balance for "全部"), the App must render the transfer card, not a
+        # balance card beside it (App report: "转 DAI" popped a balance card
+        # and only a further "转账啊" produced the transfer card).
+        if (
+            portfolio_result is not None
+            and client_action is None
+            and transfer_result is None
+        ):
             response["portfolio"] = dict(portfolio_result)
         quote_result = _best_react_quote_result(tool_payloads)
         if quote_result is not None:
@@ -13180,16 +13217,6 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 if not still_valid:
                     update["confirmation_state"] = None
                     update["user_confirmation"] = None
-        transfer_result = next(
-            (
-                payload
-                for name, payload in reversed(tool_payloads)
-                if name == "prepare_transfer"
-                and payload.get("ok")
-                and isinstance(payload.get("pending_transaction"), Mapping)
-            ),
-            None,
-        )
         if transfer_result is not None:
             update["pending_transaction"] = dict(transfer_result["pending_transaction"])
             if isinstance(transfer_result.get("preflight"), Mapping):

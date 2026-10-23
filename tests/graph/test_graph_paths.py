@@ -52,6 +52,58 @@ class ReactPrepareTransferModel:
         return AIMessage(content="交易已准备好。")
 
 
+class ReactBalanceThenPrepareModel:
+    """ReAct model that reads the balance and prepares a transfer in one turn
+    (the shape that produced a balance card next to a complete transfer intent
+    — e.g. "把全部 DAI 转到…" where the model fetched the balance for "全部"
+    and then prepared the transfer)."""
+
+    async def invoke_react(self, messages, tools):
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "bal-1",
+                        "name": "wallet_balance",
+                        "args": {"chain": "BASE"},
+                    },
+                    {
+                        "id": "prep-1",
+                        "name": "prepare_transfer",
+                        "args": {
+                            "chain": "BASE",
+                            "symbol": "USDC",
+                            "amount": "0.5",
+                            "recipient": "0x" + "2" * 40,
+                        },
+                    },
+                ],
+            )
+        return AIMessage(content="交易已准备好。")
+
+
+class BaseUsdcBalanceWallet:
+    chain_index_by_name = {"BASE": "8453"}
+
+    async def get_token_balances(self, _address, indexes):
+        assert len(indexes) == 1
+        return [
+            TokenBalance(
+                asset=Asset(
+                    chain="BASE",
+                    symbol="USDC",
+                    decimals=6,
+                    address="0x" + "3" * 40,
+                ),
+                amount=Decimal("5"),
+                amount_raw="5000000",
+                usd_value=Decimal("5"),
+            )
+        ]
+
+
 class NaturalLanguagePriceModel:
     async def classify(self, _request):
         return {"intent": "price_query"}
@@ -1546,6 +1598,52 @@ async def test_react_transfer_prepare_carries_moved_asset_on_response():
     assert result["response"]["asset"]["symbol"] == "ETH"
     assert result["response"]["asset"]["amount"] == "0.5"
     assert result["pending_transaction"] is not None
+
+
+@pytest.mark.asyncio
+async def test_react_prepared_transfer_supersedes_balance_card():
+    """When the model reads the balance and prepares a complete transfer in
+    the same turn, the response must carry the transfer card (asset +
+    pending_transaction) and must NOT also project the balance/portfolio card —
+    the App otherwise renders a balance card first and the user has to say
+    "转账啊" before the transfer card appears."""
+    graph = build_graph(
+        model=ReactBalanceThenPrepareModel(),
+        chains={"BASE": TransferAdapter()},
+        wallet_provider=BaseUsdcBalanceWallet(),
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "把 BASE 上的全部 USDC 转到 0x2…"},
+            "conversation_id": "react-balance-prep-1",
+            "user_id": "u1",
+            "wallet_context": {
+                "address": "0x" + "1" * 40,
+                "chain": "BASE",
+                "supported_networks": ["BASE"],
+            },
+        },
+        config={"configurable": {"thread_id": "react-balance-prep-1"}},
+    )
+
+    # The wallet_balance tool really produced a portfolio observation this turn.
+    balance_result = next(
+        (
+            item["result"]
+            for item in result["response"]["react_results"]
+            if item.get("tool") == "wallet_balance"
+        ),
+        None,
+    )
+    assert isinstance(balance_result, dict)
+    assert isinstance(balance_result.get("portfolio"), dict)
+
+    # The transfer card wins: asset + pending_transaction present, no portfolio.
+    assert result["response"]["kind"] == "react"
+    assert result["response"]["asset"]["symbol"] == "USDC"
+    assert result["response"]["asset"]["amount"] == "0.5"
+    assert result["pending_transaction"] is not None
+    assert "portfolio" not in result["response"]
 
 
 @pytest.mark.asyncio
