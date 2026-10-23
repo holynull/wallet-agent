@@ -4,7 +4,13 @@ from decimal import Decimal
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from wallet_agent.domain.models import Asset, AssetQuery, NormalizedQuote
+from wallet_agent.domain.models import (
+    Asset,
+    AssetQuery,
+    NormalizedOrderStatus,
+    NormalizedQuote,
+    ProviderOrder,
+)
 
 WALLET = "0x" + "1" * 40
 
@@ -865,3 +871,110 @@ async def test_react_swap_no_valid_quotes_carries_a_deterministic_message():
     )
 
     assert "暂时没有可用的兑换报价" in result["response"]["message"]
+
+
+class SwapArrivalProvider:
+    provider_name = "bridgers"
+
+    async def get_status(self, order):
+        assert order.provider_order_id == "active-swap-order"
+        return NormalizedOrderStatus(
+            provider="bridgers",
+            provider_order_id="active-swap-order",
+            provider_reference="active-ref",
+            status="completed",
+            tx_hash="0x" + "c" * 64,
+            eta="1-2 分钟",
+        )
+
+
+class SwapArrivalModel:
+    """A chat follow-up after a signed swap must be steered to
+    query_swap_status, and the tool must resolve the active order from state
+    even when the model passes no order_id argument."""
+
+    def __init__(self):
+        self.system_snapshot = ""
+
+    async def invoke_react(self, messages, tools):
+        tool_names = [tool.name for tool in tools]
+        assert "query_swap_status" in tool_names
+        assert "transaction_history" in tool_names
+        system = next(
+            (item for item in messages if isinstance(item, SystemMessage)), None
+        )
+        self.system_snapshot = str(system.content) if system else ""
+        tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "swap-status-1",
+                        "name": "query_swap_status",
+                        "args": {},
+                    }
+                ],
+            )
+        payload = json.loads(tool_messages[0].content)
+        assert payload["ok"] is True
+        assert payload["kind"] == "swap_status"
+        assert payload["provider_order_id"] == "active-swap-order"
+        return AIMessage(content="这笔兑换已完成到账，可以到目标链查看到账资产。")
+
+
+@pytest.mark.asyncio
+async def test_react_arrival_followup_returns_swap_order_not_transaction_history():
+    from wallet_agent.graph.build import build_graph
+
+    model = SwapArrivalModel()
+    graph = build_graph(
+        model=model,
+        providers=[SwapArrivalProvider()],
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "到账了没有？"},
+            "wallet_context": {"address": WALLET, "chain": "ETH"},
+            "conversation_history": [
+                {"role": "user", "content": "USDC 全部换成 ETH"},
+                {"role": "assistant", "content": "兑换已确认广播，正在等待到账。"},
+            ],
+            "provider_order_ids": {"bridgers": "active-swap-order"},
+            "provider_orders": {
+                "bridgers": ProviderOrder(
+                    provider="bridgers",
+                    provider_order_id="active-swap-order",
+                    provider_reference="active-ref",
+                    tx_hash="0x" + "c" * 64,
+                ).model_dump(mode="json")
+            },
+            "broadcast_tx_hash": "0x" + "c" * 64,
+            "broadcast_status": "source_confirmed",
+        },
+        config={"configurable": {"thread_id": "react-arrival-followup"}},
+    )
+
+    # The chat follow-up stays on the ordinary ReAct path...
+    assert result["response"]["kind"] == "react"
+    assert "到账" in result["response"]["message"]
+    # ...but the model was told about the active order and answered from the
+    # swap order status, not from a recent-transaction query.
+    assert "进行中的兑换订单" in model.system_snapshot
+    assert "active-swap-order" in model.system_snapshot
+    query_status = next(
+        (
+            item["result"]
+            for item in result["response"]["react_results"]
+            if item["tool"] == "query_swap_status"
+        ),
+        None,
+    )
+    assert query_status is not None
+    assert query_status["kind"] == "swap_status"
+    assert query_status["status"] == "completed"
+    assert query_status["provider_order_id"] == "active-swap-order"
+    assert not any(
+        item["tool"] == "transaction_history"
+        for item in result["response"]["react_results"]
+    )

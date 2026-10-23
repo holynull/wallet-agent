@@ -554,6 +554,57 @@ async def test_swap_status_followup_uses_previous_operation_history_after_transf
 
 
 @pytest.mark.asyncio
+async def test_bare_arrival_followup_uses_previous_swap_operation_history():
+    """A short "到账了没有？" follow-up carries no swap token; with a swap in
+    operation history it must still route to swap_status, not to a generic
+    transaction/portfolio query."""
+    old_order = ProviderOrder(
+        provider="bridgers",
+        provider_order_id="bare-order",
+        provider_reference="bare-reference",
+        tx_hash="0x" + "b" * 64,
+    )
+
+    class StatusProvider:
+        provider_name = "bridgers"
+
+        async def get_status(self, order):
+            assert order.provider_order_id == "bare-order"
+            return NormalizedOrderStatus(
+                provider="bridgers",
+                provider_order_id="bare-order",
+                provider_reference="bare-reference",
+                status="completed",
+                tx_hash=old_order.tx_hash,
+            )
+
+    graph = build_graph(
+        model=UnderstandingModel(["clarification"]),
+        providers={"bridgers": StatusProvider()},
+    )
+    result = await graph.ainvoke(
+        {
+            **turn("到账了没有？"),
+            "operation_history": [
+                {
+                    "task_id": "bare-swap",
+                    "kind": "swap",
+                    "provider_orders": {"bridgers": old_order.model_dump(mode="json")},
+                    "provider_order_ids": {"bridgers": "bare-order"},
+                    "broadcast_tx_hash": old_order.tx_hash,
+                    "broadcast_status": "confirmed",
+                }
+            ],
+        },
+        config={"configurable": {"thread_id": "bare-arrival-status"}},
+    )
+
+    assert result["response"]["kind"] == "swap_status"
+    assert result["response"]["provider_status"] == "completed"
+    assert "到账" in result["response"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_transaction_status_followups_merge_hash_then_chain_across_turns():
     tx_hash = "0x" + "d" * 64
     graph = build_graph(

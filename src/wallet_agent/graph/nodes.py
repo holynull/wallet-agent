@@ -2982,12 +2982,18 @@ def _mentioned_balance_chain(message: str) -> str | None:
 
 
 def _looks_like_swap_status_message(message: str) -> bool:
-    """Recognize a status question about a previously displayed swap."""
+    """Recognize a status question about a previously displayed swap.
+
+    A bare arrival follow-up ("到账了没有？") carries no swap token, but every
+    call site already gates this on a historical/active swap, so the swap
+    token is optional and the status token alone is enough to match.
+    """
     text = "".join(str(message).lower().split())
-    return (
-        any(token in text for token in ("兑换", "换的", "swap"))
-        and any(token in text for token in ("到账", "状态", "完成", "现在", "刚才"))
-    )
+    if any(token in text for token in ("兑换", "换的", "交换", "swap")):
+        return any(
+            token in text for token in ("到账", "状态", "完成", "进度", "现在", "刚才", "成功")
+        )
+    return any(token in text for token in ("到账", "到了", "到没", "进度"))
 
 
 def _operation_snapshot(state: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -11958,6 +11964,24 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             or query.get("session_id")
             or ""
         ).strip()
+        if not resolved_order_id:
+            # A chat follow-up after a signed swap ("到账了没有？") carries the
+            # order in state (backfilled from the session) even without a
+            # swap_query payload. Resolve the active order so the answer
+            # reflects the provider order instead of a chain lookup.
+            for raw_id in (state.get("provider_order_ids") or {}).values():
+                candidate = str(raw_id or "").strip()
+                if candidate:
+                    resolved_order_id = candidate
+                    break
+        if not resolved_order_id:
+            for raw_order in (state.get("provider_orders") or {}).values():
+                if not isinstance(raw_order, Mapping):
+                    continue
+                candidate = str(raw_order.get("provider_order_id") or "").strip()
+                if candidate:
+                    resolved_order_id = candidate
+                    break
         if resolved_order_id:
             observation = await _swap_status_by_order_id(resolved_order_id, state)
             if observation is not None:
@@ -11965,7 +11989,13 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         # Fall back to the transaction-status context when no order resolves.
         return await transaction_status_tool(
             str(chain or query.get("chain") or state.get("wallet_context", {}).get("chain") or ""),
-            str(tx_hash or query.get("tx_hash") or query.get("hash") or ""),
+            str(
+                tx_hash
+                or query.get("tx_hash")
+                or query.get("hash")
+                or state.get("broadcast_tx_hash")
+                or ""
+            ),
             state.get("broadcast_status"),
         )
 
@@ -12378,6 +12408,40 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "这是订单详情分析，不要调用 transaction_history 拉取最近交易流水，"
                     "也不要重新开始一笔新的兑换。"
                 )
+
+        # A plain chat follow-up after a signed swap ("到账了没有？") carries
+        # the order in state (backfilled from the session) but no swap_query
+        # payload. Surface the active order so the model reports the swap
+        # order status instead of falling back to a recent-transaction query.
+        active_order_ids = state.get("provider_order_ids") or {}
+        active_orders = state.get("provider_orders") or {}
+        active_tx_hash = str(state.get("broadcast_tx_hash") or "").strip()
+        active_order_id = str(next(iter(active_order_ids.values()), "") or "").strip()
+        if not active_order_id:
+            for raw_order in active_orders.values():
+                if not isinstance(raw_order, Mapping):
+                    continue
+                candidate = str(raw_order.get("provider_order_id") or "").strip()
+                if candidate:
+                    active_order_id = candidate
+                    break
+        if active_order_id or active_tx_hash:
+            active_chain = str(
+                (state.get("wallet_context") or {}).get("chain") or ""
+            ).strip().upper()
+            system = SystemMessage(
+                content=str(system.content)
+                + (
+                    "当前对话里有一笔进行中的兑换订单："
+                    + (f"订单 {active_order_id}。" if active_order_id else "")
+                    + (f"来源链交易 {active_tx_hash}。" if active_tx_hash else "")
+                    + (f"订单链 {active_chain}。" if active_chain else "")
+                    + "用户问这笔兑换是否到账/状态/进度/完成时，"
+                    "先用 query_swap_status 查询订单状态再如实说明到账情况；"
+                    "不要用 transaction_history 拉取最近交易流水来代替兑换订单到账查询，"
+                    "也不要重新开始一笔新的兑换。"
+                )
+            )
 
         if not existing or not any(isinstance(item, SystemMessage) for item in existing):
             history_messages: list[Any] = [system]
