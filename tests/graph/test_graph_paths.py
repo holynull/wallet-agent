@@ -2,6 +2,7 @@ import asyncio
 from decimal import Decimal
 
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
 
 from wallet_agent.domain.models import (
     Asset,
@@ -25,6 +26,30 @@ from wallet_agent.graph.nodes import (
 class FakeModel:
     async def ainvoke(self, value):
         return {"intent": value.get("intent", "clarification")}
+
+
+class ReactPrepareTransferModel:
+    """ReAct model that prepares a complete transfer on the first tool call."""
+
+    async def invoke_react(self, messages, tools):
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "prep-1",
+                        "name": "prepare_transfer",
+                        "args": {
+                            "chain": "BASE",
+                            "symbol": "ETH",
+                            "amount": "0.5",
+                            "recipient": "0x" + "2" * 40,
+                        },
+                    }
+                ],
+            )
+        return AIMessage(content="交易已准备好。")
 
 
 class NaturalLanguagePriceModel:
@@ -1495,6 +1520,32 @@ async def test_transaction_status_confirmed_token_transfer_falls_back_to_draft_a
     assert snapshot["status"] == "confirmed"
     assert snapshot["amount"] == "10.755859901486159764"
     assert snapshot["symbol"] == "DAI"
+
+
+@pytest.mark.asyncio
+async def test_react_transfer_prepare_carries_moved_asset_on_response():
+    """A ReAct transfer_prepare (prepare_transfer tool) must surface the moved
+    asset (amount + symbol) on the finalize_response so project_session can
+    persist it to the session — the REST status card falls back to that asset
+    for failed/success ERC-20 transfers instead of the native '0 ETH' row."""
+    graph = build_graph(
+        model=ReactPrepareTransferModel(),
+        chains={"BASE": TransferAdapter()},
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "转 0.5 ETH 到 0x2…"},
+            "conversation_id": "react-prep-1",
+            "user_id": "u1",
+            "wallet_context": {"address": "0x" + "1" * 40, "chain": "BASE"},
+        },
+        config={"configurable": {"thread_id": "react-prep-1"}},
+    )
+
+    assert result["response"]["kind"] == "react"
+    assert result["response"]["asset"]["symbol"] == "ETH"
+    assert result["response"]["asset"]["amount"] == "0.5"
+    assert result["pending_transaction"] is not None
 
 
 @pytest.mark.asyncio

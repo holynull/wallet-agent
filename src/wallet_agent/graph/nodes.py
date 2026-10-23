@@ -13194,6 +13194,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             update["pending_transaction"] = dict(transfer_result["pending_transaction"])
             if isinstance(transfer_result.get("preflight"), Mapping):
                 update["preflight"] = dict(transfer_result["preflight"])
+            # The prepared transfer's moved asset (amount + symbol + icon) lives
+            # inside the react_results tool payload; surface it on the response
+            # too so project_session persists it to the session (the REST
+            # status card later falls back to that asset instead of rendering
+            # the native "0 ETH" row for a failed/success ERC-20 transfer).
+            prepare_response = transfer_result.get("response")
+            if isinstance(prepare_response, Mapping):
+                if isinstance(prepare_response.get("asset"), Mapping):
+                    response["asset"] = dict(prepare_response["asset"])
+                if prepare_response.get("chain_logo_url") is not None:
+                    response["chain_logo_url"] = prepare_response["chain_logo_url"]
         elif state.get("pending_transaction") is not None:
             # A prepared unsigned transaction is only actionable while it is
             # still awaiting signature. Once it has been broadcast, or this
