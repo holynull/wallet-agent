@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from wallet_agent.chains._common import receipt_success
 from wallet_agent.domain.chains import (
     asset_logo_fields,
+    asset_logo_url,
     chain_logo_url,
     native_symbol,
     token_logo_url,
@@ -38,7 +39,7 @@ from wallet_agent.domain.models import (
     ProviderOrder,
     UnsignedTransaction,
 )
-from wallet_agent.domain.normalization import detect_message_language
+from wallet_agent.domain.normalization import canonical_symbol, detect_message_language
 from wallet_agent.okx import (
     OKX_CHAIN_INDEX_BY_NAME,
     OkxExplorerError,
@@ -786,6 +787,43 @@ def _display_int(record: SwapSessionRecord, *keys: str) -> int | None:
         return int(value, 0)
     except ValueError:
         return None
+
+
+async def _session_transfer_asset_fallback(
+    session_store: SessionStore,
+    user_id: str,
+    chain: str,
+    tx_hash: str,
+) -> dict[str, Any] | None:
+    """The moved asset of a session whose broadcast matches ``tx_hash``.
+
+    A failed ERC-20/TRC-20 transfer often has no token layer in the explorer
+    (native value 0), so the REST status would otherwise render the native
+    coin's "0 ETH" row. The session remembers the intended transfer asset (with
+    its icon) on ``record.asset``; return it so the card shows what actually
+    moved. ``None`` when no matching session or asset exists.
+    """
+    if not user_id or user_id == "anonymous":
+        return None
+    try:
+        sessions = await session_store.list_for_user(user_id, limit=100)
+    except Exception:
+        return None
+    normalized = tx_hash.strip().lower()
+    chain_text = str(chain or "").upper()
+    for session in sessions:
+        if not session.broadcast_tx_hash:
+            continue
+        if session.broadcast_tx_hash.strip().lower() != normalized:
+            continue
+        asset = session.asset
+        if not isinstance(asset, Mapping):
+            continue
+        session_chain = str(asset.get("chain") or "")
+        if session_chain and session_chain.upper() != chain_text:
+            continue
+        return dict(asset)
+    return None
 
 
 def _can_observe_broadcast(adapter: Any) -> bool:
@@ -2717,26 +2755,68 @@ def create_app(
         if explorer is not None and hasattr(explorer, "get_transaction_detail"):
             try:
                 detail = await explorer.get_transaction_detail(chain, tx_hash)
+                status_value = _transaction_status_value(detail.status)
+                # Surface the moved amount + symbol up top (token layer first,
+                # native coin otherwise), mirroring the SSE transaction_status
+                # card so a failed ERC20/TRC20 transfer never renders "0 ETH".
+                token_transfers = list(getattr(detail, "token_transfers", None) or [])
+                primary = token_transfers[0] if token_transfers else None
+                if primary is not None and primary.amount not in (None, ""):
+                    amount = primary.amount
+                    symbol = primary.symbol or getattr(detail, "symbol", None)
+                    logo_url = primary.logo_url or getattr(detail, "logo_url", None)
+                else:
+                    amount = getattr(detail, "value", None)
+                    symbol = getattr(detail, "symbol", None)
+                    logo_url = getattr(detail, "logo_url", None)
+                # A failed token transfer usually carries no token layer; fall
+                # back to the session's intended moved asset so the card shows
+                # the real amount/symbol instead of the native "0 ETH" row.
+                if status_value == "failed" and (
+                    amount in (None, "", "0", 0)
+                    or not symbol
+                    or canonical_symbol(str(symbol))
+                    == canonical_symbol(str(native_symbol(chain.upper()) or ""))
+                ):
+                    fallback = await _session_transfer_asset_fallback(
+                        app.state.session_store, str(user_id or ""), chain, tx_hash
+                    )
+                    if fallback:
+                        fallback_symbol = str(fallback.get("symbol") or "")
+                        if fallback_symbol:
+                            symbol = fallback_symbol
+                        fallback_amount = fallback.get("amount")
+                        if fallback_amount not in (None, ""):
+                            amount = str(fallback_amount)
+                        token_address = fallback.get("address") or fallback.get(
+                            "token_address"
+                        )
+                        if token_address:
+                            logo_url = asset_logo_url(chain.upper(), str(token_address))
+                        elif fallback.get("logo_url"):
+                            logo_url = str(fallback["logo_url"])
                 result: dict[str, Any] = {
                     "chain": chain.upper(),
                     "tx_hash": tx_hash,
-                    "status": detail.status.value,
+                    "status": status_value,
                     "message": {
                         "pending": "交易已提交，正在等待链上确认。",
                         "confirmed": "交易已确认。",
                         "failed": "交易执行失败或已回滚。",
                         "unknown": "暂时无法确定交易状态。",
-                    }.get(detail.status.value, "暂时无法确定交易状态。"),
+                    }.get(status_value, "暂时无法确定交易状态。"),
                     "source": detail.source or "okx",
                     "failure_reason": detail.failure_reason,
                     "eta": detail.eta,
                     "transaction": _jsonable(detail),
-                    # Top-level chain badge and the moved token's icon, mirroring
-                    # the SSE transaction_status card.
+                    # The moved amount + symbol and the chain badge + token icon,
+                    # mirroring the SSE transaction_status card.
+                    "amount": amount,
+                    "symbol": symbol,
                     **asset_logo_fields(
                         chain.upper(),
-                        getattr(detail, "symbol", None),
-                        getattr(detail, "logo_url", None),
+                        symbol,
+                        logo_url,
                     ),
                 }
                 return result

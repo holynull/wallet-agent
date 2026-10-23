@@ -31,6 +31,7 @@ from wallet_agent.chains._common import receipt_success
 from wallet_agent.domain.addresses import EVM_ALIASES, is_valid_address
 from wallet_agent.domain.chains import (
     asset_logo_fields,
+    asset_logo_url,
     chain_logo_url,
     native_decimals,
     native_symbol,
@@ -6222,12 +6223,48 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "message": message,
         }
 
+    def _transfer_status_fallback_asset(
+        state: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """The intended moved asset + amount from the in-flight transfer draft.
+
+        A failed ERC-20/TRC-20 transfer often carries no token-transfer detail
+        in the explorer, so the status card would otherwise fall back to the
+        native coin with a 0 amount (e.g. "0 ETH" for a failed DAI transfer).
+        Return the intended transfer asset so the failed card can render the
+        real amount + symbol instead of the native "0 ETH" row.
+        """
+        draft = state.get("transfer_draft") or {}
+        if not isinstance(draft, Mapping):
+            return None
+        chain = draft.get("transfer_chain") or draft.get("chain")
+        symbol = draft.get("transfer_symbol") or draft.get("symbol")
+        amount = draft.get("transfer_amount") or draft.get("amount")
+        if not chain or not symbol or amount in (None, ""):
+            return None
+        return {
+            "chain": str(chain).upper(),
+            "symbol": str(symbol),
+            "amount": str(amount),
+            "token_address": draft.get("transfer_token_address")
+            or draft.get("token_address"),
+            "decimals": draft.get("transfer_decimals") or draft.get("decimals"),
+        }
+
     async def transaction_status_tool(
         chain: str,
         tx_hash: str,
         broadcast_status: str | None = None,
+        *,
+        fallback_asset: dict[str, Any] | None = None,
+        state: Annotated[dict[str, Any] | None, InjectedState] = None,
     ) -> dict[str, Any]:
         """Read a transaction status from the configured chain adapter."""
+        # The deterministic transaction_status route runs this tool through a
+        # ToolNode (no explicit fallback_asset), so derive the intended moved
+        # asset from the injected graph state when a caller did not pass one.
+        if fallback_asset is None and isinstance(state, Mapping):
+            fallback_asset = _transfer_status_fallback_asset(state)
         local = local_transaction_status(chain, tx_hash, broadcast_status)
         explorer = runtime.explorer_provider
         if explorer is not None and hasattr(explorer, "get_transaction_detail"):
@@ -6256,6 +6293,32 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     amount = getattr(detail, "value", None)
                     symbol = getattr(detail, "symbol", None)
                     logo_url = getattr(detail, "logo_url", None)
+                # A failed token transfer usually has no token layer in the
+                # explorer (the native value is 0), so the App card would show
+                # "0 ETH" instead of the real moved asset. Fall back to the
+                # intended transfer asset from the session's draft so the
+                # failed card shows what actually moved.
+                if (
+                    value == "failed"
+                    and fallback_asset
+                    and (
+                        amount in (None, "", "0", 0)
+                        or not symbol
+                        or canonical_symbol(str(symbol))
+                        == canonical_symbol(
+                            str(native_symbol(str(chain).upper()) or "")
+                        )
+                    )
+                ):
+                    fallback_symbol = str(fallback_asset.get("symbol") or "")
+                    if fallback_symbol:
+                        symbol = fallback_symbol
+                    fallback_amount = fallback_asset.get("amount")
+                    if fallback_amount not in (None, ""):
+                        amount = str(fallback_amount)
+                    token_address = fallback_asset.get("token_address")
+                    if token_address:
+                        logo_url = asset_logo_url(str(chain).upper(), str(token_address))
                 return {
                     "ok": True,
                     "transaction": {
@@ -7038,6 +7101,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     or ""
                 ),
                 state.get("broadcast_status"),
+                fallback_asset=_transfer_status_fallback_asset(state),
             )
 
         async def gas_estimate(args: dict[str, Any]) -> dict[str, Any]:
@@ -7959,7 +8023,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "type": "tool_call",
         }
         result = await transaction_tool_node.ainvoke(
-            {"messages": [AIMessage(content="", tool_calls=[call])]}
+            {
+                # Pass the graph state through so the tool's InjectedState can
+                # recover the intended transfer asset for a failed-transfer card.
+                **{key: value for key, value in state.items() if key != "messages"},
+                "messages": [AIMessage(content="", tool_calls=[call])],
+            }
         )
         try:
             return {"tool_result": json.loads(result["messages"][-1].content)}
@@ -9955,6 +10024,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     }
                 )
             )
+            # Carry the human-readable moved amount on the card asset so the
+            # session (and later a failed-transfer status card) can render the
+            # real quantity instead of the native "0 ETH" row.
+            transfer_asset = {**transfer_asset, "amount": str(req.amount)}
             return {
                 "preflight": preflight,
                 "pending_transaction": tx.model_dump(mode="json"),
@@ -12025,6 +12098,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 or ""
             ),
             state.get("broadcast_status"),
+            fallback_asset=_transfer_status_fallback_asset(state),
         )
 
     react_tools = [

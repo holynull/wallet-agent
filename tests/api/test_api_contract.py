@@ -1036,6 +1036,58 @@ async def test_transaction_status_endpoint_returns_user_readable_status():
 
 
 @pytest.mark.asyncio
+async def test_transaction_status_failed_transfer_falls_back_to_session_asset():
+    """A failed ERC20 transfer with no token layer in the explorer must render
+    the session's intended moved asset (amount + symbol) instead of the native
+    "0 ETH" row on the failed status card."""
+    from wallet_agent.domain.models import TransactionDetail, TransactionStatus
+
+    class Explorer:
+        async def get_transaction_detail(self, chain, tx_hash):
+            return TransactionDetail(
+                chain=chain,
+                chain_id="1",
+                tx_hash=tx_hash,
+                status=TransactionStatus.FAILED,
+                source="okx",
+                history_kind="full",
+                value="0",
+                symbol="ETH",
+                method_id="0xa9059cbb",
+            )
+
+    tx_hash = "0x" + "a" * 64
+    session_store = InMemorySessionStore()
+    await session_store.save(
+        SwapSessionRecord(
+            session_id="session-failed-dai",
+            user_id="alice",
+            thread_id="conversation-failed-dai",
+            broadcast_tx_hash=tx_hash,
+            broadcast_status="failed",
+            asset={
+                "chain": "ETH",
+                "symbol": "DAI",
+                "address": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "decimals": 18,
+                "amount": "11.3426",
+            },
+        )
+    )
+
+    _app, client = await client_for(explorer_provider=Explorer(), store=session_store)
+    async with client:
+        response = await client.get(
+            f"/v1/transactions/ETH/{tx_hash}", params={"user_id": "alice"}
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["amount"] == "11.3426"
+    assert body["symbol"] == "DAI"
+
+
+@pytest.mark.asyncio
 async def test_transaction_status_endpoint_rejects_invalid_hash():
     _app, client = await client_for()
     async with client:
