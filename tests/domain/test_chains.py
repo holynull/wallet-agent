@@ -2,6 +2,7 @@
 
 from wallet_agent.domain.chains import (
     asset_logo_fields,
+    asset_logo_url,
     chain_logo_url,
     native_decimals,
     token_logo_url,
@@ -81,3 +82,28 @@ def test_asset_logo_fields_pair_the_icon_with_its_chain_badge():
 
     # Without a chain there is nothing to look up.
     assert asset_logo_fields(None, "USDC") == {"logo_url": None, "chain_logo_url": None}
+
+
+def test_asset_logo_url_checksums_evm_addresses_but_passes_tron_through():
+    """Trust Wallet keys its token directories by the EIP-55 checksummed
+    address, so a lowercase copy 404s and the App renders a broken image. The
+    logo URL must checksum EVM hex addresses and leave TRON base58 untouched."""
+    base = "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains"
+    # Lowercase USDC must become the checksummed directory that actually exists.
+    assert asset_logo_url("ETH", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48") == (
+        f"{base}/ethereum/assets/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/logo.png"
+    )
+    # An already-checksummed address is stable.
+    assert asset_logo_url("ETH", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48") == (
+        f"{base}/ethereum/assets/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/logo.png"
+    )
+    # DAI, lowercase vs checksummed.
+    assert asset_logo_url("ETH", "0x6b175474e89094c44da98b954eedeac495271d0f") == (
+        f"{base}/ethereum/assets/0x6B175474E89094C44Da98b954EedeAC495271d0F/logo.png"
+    )
+    # A TRON base58 contract address must not be "checksummed" into garbage.
+    assert asset_logo_url("TRON", "TXbXJ9pQ3z9Ux1v") == (
+        f"{base}/tron/assets/TXbXJ9pQ3z9Ux1v/logo.png"
+    )
+    assert asset_logo_url("ETH", None) is None
+    assert asset_logo_url("UNKNOWN", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48") is None

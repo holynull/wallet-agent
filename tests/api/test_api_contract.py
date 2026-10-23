@@ -1137,6 +1137,76 @@ async def test_transaction_status_confirmed_token_transfer_falls_back_to_session
     assert body["status"] == "confirmed"
     assert body["amount"] == "10.755859901486159764"
     assert body["symbol"] == "DAI"
+    # The icon must come from the session's intended asset, keyed by the
+    # checksummed Trust Wallet directory (a lowercase copy would 404).
+    assert body["logo_url"] == (
+        "https://raw.githubusercontent.com/trustwallet/assets/master/"
+        "blockchains/ethereum/assets/0x6B175474E89094C44Da98b954EedeAC495271d0F/logo.png"
+    )
+    assert body["chain_logo_url"].endswith("/blockchains/ethereum/info/logo.png")
+
+
+@pytest.mark.asyncio
+async def test_transaction_status_token_layer_without_icon_falls_back_to_session_logo():
+    """A confirmed token transfer whose explorer response carries the token
+    layer (amount + symbol) but no icon must still render the token's logo
+    derived from the session's intended asset."""
+    from wallet_agent.domain.models import TransactionDetail, TransactionStatus
+
+    class Explorer:
+        async def get_transaction_detail(self, chain, tx_hash):
+            return TransactionDetail(
+                chain=chain,
+                chain_id="1",
+                tx_hash=tx_hash,
+                status=TransactionStatus.CONFIRMED,
+                source="okx",
+                history_kind="full",
+                value="0",
+                symbol="ETH",
+                method_id="0xa9059cbb",
+                token_transfers=[
+                    {
+                        "symbol": "USDC",
+                        "amount": "42.5",
+                        "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+                    }
+                ],
+            )
+
+    tx_hash = "0x" + "e" * 64
+    session_store = InMemorySessionStore()
+    await session_store.save(
+        SwapSessionRecord(
+            session_id="session-usdc-success",
+            user_id="alice",
+            thread_id="conversation-usdc-success",
+            broadcast_tx_hash=tx_hash,
+            broadcast_status="confirmed",
+            asset={
+                "chain": "ETH",
+                "symbol": "USDC",
+                "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "decimals": 6,
+                "amount": "42.5",
+            },
+        )
+    )
+
+    _app, client = await client_for(explorer_provider=Explorer(), store=session_store)
+    async with client:
+        response = await client.get(
+            f"/v1/transactions/ETH/{tx_hash}", params={"user_id": "alice"}
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "confirmed"
+    assert body["amount"] == "42.5"
+    assert body["symbol"] == "USDC"
+    assert body["logo_url"] == (
+        "https://raw.githubusercontent.com/trustwallet/assets/master/"
+        "blockchains/ethereum/assets/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/logo.png"
+    )
 
 
 @pytest.mark.asyncio
@@ -1189,6 +1259,10 @@ async def test_transaction_status_failed_transfer_falls_back_without_user_id():
     assert body["status"] == "failed"
     assert body["amount"] == "31.105638"
     assert body["symbol"] == "USDT"
+    assert body["logo_url"] == (
+        "https://raw.githubusercontent.com/trustwallet/assets/master/"
+        "blockchains/ethereum/assets/0xdAC17F958D2ee523a2206206994597C13D831ec7/logo.png"
+    )
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,10 @@
 """Typed chain capability declarations and lookup registry."""
 
+import re
 from collections.abc import Iterable
 from enum import Enum
 
+from eth_hash.auto import keccak
 from pydantic import Field
 
 from .errors import ChainCapabilityUnavailable
@@ -87,6 +89,25 @@ def token_logo_url(
     return None
 
 
+def _evm_checksum_address(address: str) -> str:
+    """EIP-55 checksummed form of an EVM hex address.
+
+    Trust Wallet's per-token asset directories are keyed by the checksummed
+    contract address, so the lowercase copy of an address 404s and the App
+    renders a broken image. Non-EVM identifiers (e.g. TRON's base58 ``T...``
+    contract addresses) are left untouched.
+    """
+    text = str(address or "")
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", text):
+        return text
+    body = text[2:].lower()
+    digest = keccak(body.encode()).hex()
+    return "0x" + "".join(
+        ch.upper() if int(digest[i], 16) >= 8 else ch
+        for i, ch in enumerate(body)
+    )
+
+
 def asset_logo_url(chain: str, contract_address: str | None) -> str | None:
     """Trust Wallet logo URL for a contract-backed token (ERC20/TRC20 etc).
 
@@ -98,7 +119,8 @@ def asset_logo_url(chain: str, contract_address: str | None) -> str | None:
     slug = _CHAIN_LOGO_SLUGS.get(canonical_chain(chain))
     if not slug:
         return None
-    return f"{_CHAIN_LOGO_BASE}/{slug}/assets/{contract_address}/logo.png"
+    contract = _evm_checksum_address(str(contract_address))
+    return f"{_CHAIN_LOGO_BASE}/{slug}/assets/{contract}/logo.png"
 
 
 def asset_logo_fields(

@@ -290,9 +290,13 @@ async def test_detail_parses_okx_token_transfer_details_and_address_lists():
     assert transfer.amount == "10"
     assert transfer.from_address == sender
     assert transfer.to_address == recipient
+    # asset_logo_url keys Trust Wallet by the EIP-55 checksummed directory, so
+    # the logo points at the real (non-404) path even though the explorer
+    # reported the contract address in lowercase.
     assert transfer.logo_url == (
         "https://raw.githubusercontent.com/trustwallet/assets/master/"
-        f"blockchains/ethereum/assets/{usdt}/logo.png"
+        "blockchains/ethereum/assets/"
+        "0xdAC17F958D2ee523a2206206994597C13D831ec7/logo.png"
     )
 
 

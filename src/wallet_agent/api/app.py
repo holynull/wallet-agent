@@ -2827,6 +2827,28 @@ def create_app(
                                 )
                             elif fallback.get("logo_url"):
                                 logo_url = str(fallback["logo_url"])
+                # The explorer surfaced a token layer (amount + symbol) but the
+                # provider rarely ships an icon for the transfer. When the moved
+                # asset is a token and we still have no logo, derive the icon
+                # from the session's intended asset so a confirmed/failed card
+                # renders the token's real logo instead of a blank row.
+                if (
+                    not logo_url
+                    and symbol
+                    and canonical_symbol(str(symbol))
+                    != canonical_symbol(str(native_symbol(chain.upper()) or ""))
+                ):
+                    logo_fallback = await _session_transfer_asset_fallback(
+                        app.state.session_store, str(user_id or ""), chain, tx_hash
+                    )
+                    if logo_fallback:
+                        token_address = logo_fallback.get("address") or logo_fallback.get(
+                            "token_address"
+                        )
+                        if token_address:
+                            logo_url = asset_logo_url(chain.upper(), str(token_address))
+                        elif logo_fallback.get("logo_url"):
+                            logo_url = str(logo_fallback["logo_url"])
                 result: dict[str, Any] = {
                     "chain": chain.upper(),
                     "tx_hash": tx_hash,
