@@ -980,6 +980,91 @@ async def test_react_arrival_followup_returns_swap_order_not_transaction_history
     )
 
 
+class SwapNotPropagatedArrivalModel:
+    """A chat "到账了没有？" on a swap whose order has not reached the provider
+    yet (broadcast_status == "not_propagated", no provider order id). The model
+    only passes the source tx_hash it saw in the prompt; the tool must return a
+    swap_status observation reflecting the pending provider pickup instead of a
+    bare chain lookup, and the answer must not ask the user for an order id."""
+
+    def __init__(self):
+        self.system_snapshot = ""
+
+    async def invoke_react(self, messages, tools):
+        tool_names = [tool.name for tool in tools]
+        assert "query_swap_status" in tool_names
+        system = next(
+            (item for item in messages if isinstance(item, SystemMessage)), None
+        )
+        self.system_snapshot = str(system.content) if system else ""
+        tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "swap-status-2",
+                        "name": "query_swap_status",
+                        "args": {"tx_hash": "0x" + "e" * 64, "chain": "ETH"},
+                    }
+                ],
+            )
+        payload = json.loads(tool_messages[0].content)
+        assert payload["ok"] is True
+        assert payload["kind"] == "swap_status"
+        assert payload["provider_order_id"] is None
+        assert payload["status"] == "not_propagated"
+        return AIMessage(content="还没到账，兑换订单还在等待服务商接收，请稍后重新查询。")
+
+
+@pytest.mark.asyncio
+async def test_react_arrival_followup_not_propagated_reports_pending_provider_pickup():
+    from wallet_agent.graph.build import build_graph
+
+    model = SwapNotPropagatedArrivalModel()
+    graph = build_graph(model=model)
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "到账了没有？"},
+            "wallet_context": {"address": WALLET, "chain": "ETH"},
+            "conversation_history": [
+                {"role": "user", "content": "用 ETH 兑换 10 USDC"},
+                {"role": "assistant", "content": "报价已展示，请在 App 中确认。"},
+            ],
+            "broadcast_tx_hash": "0x" + "e" * 64,
+            "broadcast_status": "not_propagated",
+            "selected_quote": {
+                "provider": "omnibridge",
+                "provider_reference": "omni-ref",
+            },
+        },
+        config={"configurable": {"thread_id": "react-arrival-not-propagated"}},
+    )
+
+    assert result["response"]["kind"] == "react"
+    # The prompt surfaces the broadcast stage and forbids asking for an order id.
+    assert "进行中的兑换订单" in model.system_snapshot
+    assert "广播状态 not_propagated" in model.system_snapshot
+    assert "不要向用户索要订单号" in model.system_snapshot
+    query_status = next(
+        (
+            item["result"]
+            for item in result["response"]["react_results"]
+            if item["tool"] == "query_swap_status"
+        ),
+        None,
+    )
+    assert query_status is not None
+    assert query_status["kind"] == "swap_status"
+    assert query_status["status"] == "not_propagated"
+    assert query_status["provider_order_id"] is None
+    assert "等待 Provider 接收" in query_status["message"]
+    assert not any(
+        item["tool"] == "transaction_history"
+        for item in result["response"]["react_results"]
+    )
+
+
 def test_looks_like_balance_only_query_separates_read_from_transfer_steps():
     from wallet_agent.graph.nodes import _looks_like_balance_only_query
 

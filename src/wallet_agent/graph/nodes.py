@@ -319,6 +319,11 @@ def _swap_status_copy(language: str) -> dict[str, str]:
                 "The source-chain broadcast status is not confirmed yet; "
                 "provider polling has not started. Retry later."
             ),
+            "provider_pickup_pending": (
+                "The swap order is still awaiting the provider (the broadcast "
+                "has not been picked up); the destination assets have not "
+                "arrived yet. Check again later."
+            ),
             "swap_ready": (
                 "The swap transaction is ready; waiting for wallet signing and broadcast."
             ),
@@ -339,6 +344,10 @@ def _swap_status_copy(language: str) -> dict[str, str]:
         "processing": "兑换服务仍在处理中，目标链资产尚未到账。",
         "provider_fallback": "兑换订单状态已更新，建议稍后重新查询。",
         "propagation_unconfirmed": "源链广播状态尚未确认，兑换服务轮询还未开始，请稍后重新查询。",
+        "provider_pickup_pending": (
+            "兑换订单还在等待 Provider 接收（广播待确认），"
+            "目标资产尚未到账，请稍后重新查询。"
+        ),
         "swap_ready": "兑换交易已准备好，正在等待钱包签名并广播。",
         "broadcast_seen": "源链已收到交易广播",
         "broadcast_pending": "源链交易已广播，正在等待链上确认",
@@ -12223,6 +12232,62 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             observation = await _swap_status_by_order_id(resolved_order_id, state)
             if observation is not None:
                 return observation
+        # A signed swap whose order has not reached the provider yet (for
+        # example broadcast_status == "not_propagated") has no provider order
+        # id to query. Surface that propagation state as a swap_status
+        # observation instead of falling back to a bare source-chain lookup, so
+        # the "到账了没有？" answer reports the real swap stage and does not ask
+        # the user to supply an order number.
+        broadcast_hash = str(state.get("broadcast_tx_hash") or "").strip()
+        broadcast_status = str(state.get("broadcast_status") or "").strip()
+        if broadcast_hash and broadcast_status and broadcast_status not in {
+            "broadcast_seen",
+            "broadcast_pending",
+            "source_confirmed",
+            "confirmed",
+        }:
+            language = _status_language(state)
+            copy = _swap_status_copy(language)
+            message = copy["provider_pickup_pending"]
+            selected_quote = state.get("selected_quote") or {}
+            provider = (
+                str(selected_quote.get("provider") or "").strip() or None
+                if isinstance(selected_quote, Mapping)
+                else None
+            )
+            # When the source deposit already confirmed on-chain, phrase the
+            # answer around that plus the pending provider pickup.
+            try:
+                tx_status = await transaction_status_tool(
+                    str(
+                        chain
+                        or query.get("chain")
+                        or state.get("wallet_context", {}).get("chain")
+                        or ""
+                    ),
+                    broadcast_hash,
+                    broadcast_status,
+                )
+                tx_state = str(
+                    (tx_status or {}).get("transaction", {}).get("status") or ""
+                ).lower()
+                if tx_state == "confirmed":
+                    message = f"{copy['source_confirmed']}；{copy['provider_pickup_pending']}"
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "kind": "swap_status",
+                "provider": provider,
+                "provider_order_id": None,
+                "status": broadcast_status,
+                "broadcast_status": broadcast_status,
+                "tx_hash": broadcast_hash,
+                "failure_reason": None,
+                "eta": None,
+                "refund_tx_hash": None,
+                "message": message,
+            }
         # Fall back to the transaction-status context when no order resolves.
         return await transaction_status_tool(
             str(chain or query.get("chain") or state.get("wallet_context", {}).get("chain") or ""),
@@ -12678,6 +12743,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             active_chain = str(
                 (state.get("wallet_context") or {}).get("chain") or ""
             ).strip().upper()
+            active_broadcast_status = str(state.get("broadcast_status") or "").strip()
+            active_provider = ""
+            selected_quote = state.get("selected_quote") or {}
+            if isinstance(selected_quote, Mapping):
+                active_provider = str(selected_quote.get("provider") or "").strip()
             system = SystemMessage(
                 content=str(system.content)
                 + (
@@ -12685,10 +12755,19 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     + (f"订单 {active_order_id}。" if active_order_id else "")
                     + (f"来源链交易 {active_tx_hash}。" if active_tx_hash else "")
                     + (f"订单链 {active_chain}。" if active_chain else "")
+                    + (
+                        f"广播状态 {active_broadcast_status}。"
+                        if active_broadcast_status
+                        else ""
+                    )
+                    + (f"兑换服务商 {active_provider}。" if active_provider else "")
                     + "用户问这笔兑换是否到账/状态/进度/完成时，"
                     "先用 query_swap_status 查询订单状态再如实说明到账情况；"
                     "不要用 transaction_history 拉取最近交易流水来代替兑换订单到账查询，"
                     "也不要重新开始一笔新的兑换。"
+                    "如果订单还未建立（例如广播状态为 not_propagated、还没有订单号），"
+                    "要如实说明来源链是否已确认、订单仍在等待服务商接收，"
+                    "并让用户稍后重新查询；不要向用户索要订单号。"
                 )
             )
 
