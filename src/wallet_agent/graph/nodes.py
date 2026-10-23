@@ -10649,7 +10649,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             return {
                 "response": {
                     "kind": "clarification",
-                    "message": "A quote is required before preparation.",
+                    "message": "缺少报价信息，暂时无法准备交易，请重新获取报价。",
                 }
             }
         if state.get("pending_transaction"):
@@ -10680,7 +10680,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         if not confirmation.get("approved", False):
             return {
                 "user_confirmation": confirmation,
-                "response": {"kind": "cancelled", "message": "Swap cancelled."},
+                "response": {"kind": "cancelled", "message": "已取消该笔兑换。"},
             }
         provider_name = str(selected.get("provider"))
         provider = runtime.providers.get(provider_name)
@@ -10793,8 +10793,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "broadcast_status": broadcast_status,
                 "tx_hash": tx_hash,
                 "message": (
-                    "Source-chain transaction propagation is not confirmed yet; "
-                    "provider order polling has not started."
+                    "源链广播状态尚未确认，兑换服务轮询还未开始，请稍后重新查询。"
                 ),
                 **_swap_status_logo_context(state),
             }
@@ -10964,8 +10963,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     "broadcast_status": broadcast_status,
                     "tx_hash": tx_hash,
                     "message": (
-                        "Source-chain transaction propagation is not confirmed yet; "
-                        "provider order polling has not started."
+                        "源链广播状态尚未确认，兑换服务轮询还未开始，请稍后重新查询。"
                     ),
                     **_swap_status_logo_context(state),
                 }

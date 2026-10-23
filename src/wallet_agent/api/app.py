@@ -2309,18 +2309,17 @@ def create_app(
             if broadcast_status not in _BROADCAST_PROVIDER_VISIBLE:
                 message = {
                     "not_propagated": (
-                        "The transaction hash is not yet visible on the source chain. "
-                        "The hash was saved; retry broadcast status after RPC propagation."
+                        "源链暂时还没有查到这笔交易，哈希已保存，"
+                        "请稍后刷新广播状态（链上数据同步有延迟）。"
                     ),
                     "unknown": (
-                        "The transaction observer could not verify source-chain propagation. "
-                        "The hash was saved; retry status later."
+                        "暂时无法确认源链广播状态，哈希已保存，请稍后重试。"
                     ),
                     "dropped_or_replaced": (
-                        "The source account nonce has advanced while this hash is not visible; "
-                        "the transaction may have been dropped or replaced."
+                        "源账户 nonce 已推进但未查到该交易，交易可能已被替换或丢弃，"
+                        "请检查钱包重新广播。"
                     ),
-                }.get(broadcast_status, "The transaction is not ready for provider polling.")
+                }.get(broadcast_status, "交易暂时无法登记，请稍后重试。")
                 updated = await session_store.update(
                     session_id,
                     expected_revision=session.revision,

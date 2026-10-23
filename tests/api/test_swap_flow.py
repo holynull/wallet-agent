@@ -428,7 +428,7 @@ async def test_broadcast_records_hash_missing_from_chain_without_provider_pollin
     assert broadcast.json()["status"] == "not_propagated"
     assert broadcast.json()["broadcast_status"] == "not_propagated"
     assert broadcast.json()["broadcast_tx_hash"] == tx_hash
-    assert "not yet visible" in broadcast.json()["message"]
+    assert "源链暂时还没有查到这笔交易" in broadcast.json()["message"]
     assert provider.broadcast_calls == 0
 
 
