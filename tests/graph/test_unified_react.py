@@ -1076,6 +1076,63 @@ def test_looks_like_balance_only_query_separates_read_from_transfer_steps():
     assert _looks_like_balance_only_query("转 0.5 ETH 给小明") is False
 
 
+def test_swap_recommendation_skips_arrival_status_followups():
+    from wallet_agent.graph.nodes import _swap_recommendation_desired
+
+    assert _swap_recommendation_desired("到账了没有", []) is False
+    assert _swap_recommendation_desired("我是说兑换到账了没有", []) is False
+    assert _swap_recommendation_desired("帮我兑换", []) is True
+
+
+class SymbolScopedBalanceModel:
+    """A swap-arrival check that looks up one symbol (USDC) and finds 0 must not
+    be projected as the top-level "资产总览 $0.00" portfolio card."""
+
+    def __init__(self):
+        self.payload = None
+
+    async def invoke_react(self, messages, tools):
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "scoped-balance-1",
+                        "name": "wallet_balance",
+                        "args": {"chain": "BSC", "symbol": "USDC"},
+                    }
+                ],
+            )
+        self.payload = json.loads(tool_messages[0].content)
+        return AIMessage(content="你 BSC 上的 USDC 余额为 0，兑换目标资产尚未到账。")
+
+
+@pytest.mark.asyncio
+async def test_react_symbol_scoped_empty_balance_does_not_project_portfolio_card():
+    from wallet_agent.graph.build import build_graph
+
+    model = SymbolScopedBalanceModel()
+    graph = build_graph(model=model, wallet_provider=WalletProvider())
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "到账了没有？", "address": WALLET, "chain": "BSC"},
+            "wallet_context": {"address": WALLET, "chain": "BSC"},
+            "broadcast_tx_hash": "0x" + "f" * 64,
+            "broadcast_status": "not_propagated",
+        },
+        config={"configurable": {"thread_id": "react-scoped-balance-card"}},
+    )
+
+    assert result["response"]["kind"] == "react"
+    assert model.payload is not None
+    portfolio = model.payload["portfolio"]
+    assert portfolio["asset_scope"] == {"symbol": "USDC"}
+    assert portfolio["assets"] == []
+    # A single-symbol lookup is not a portfolio-level card.
+    assert "portfolio" not in result["response"]
+
+
 class BalanceQueryPrepModel:
     def __init__(self):
         self.observation = None

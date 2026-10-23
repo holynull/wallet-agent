@@ -1487,6 +1487,12 @@ def _swap_recommendation_desired(
         for marker in (
             "?", "？", "多少", "哪些", "怎么", "如何", "吗", "支持",
             "费率", "手续费", "滑点", "是什么",
+            # Arrival/status follow-ups on an existing swap are not open-ended
+            # swap requests. Without this, a clarification like
+            # "我是说兑换到账了没有" was answered with the "好的，想换什么？"
+            # recommendation card instead of the swap status.
+            "到账", "到没到", "进展", "进度", "状态",
+            "arrived", "status", "progress", "processed",
         )
     ):
         return False
@@ -12764,6 +12770,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     + "用户问这笔兑换是否到账/状态/进度/完成时，"
                     "先用 query_swap_status 查询订单状态再如实说明到账情况；"
                     "不要用 transaction_history 拉取最近交易流水来代替兑换订单到账查询，"
+                    "也不要用 wallet_balance 的某个币种余额代替兑换订单到账查询；"
+                    "某币种余额为 0 只能说该币种余额为 0，不能说成钱包没有任何资产。"
                     "也不要重新开始一笔新的兑换。"
                     "如果订单还未建立（例如广播状态为 not_propagated、还没有订单号），"
                     "要如实说明来源链是否已确认、订单仍在等待服务商接收，"
@@ -13230,6 +13238,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         )
         portfolio_result = next((payload.get("portfolio") for _, payload in reversed(tool_payloads)
                                  if isinstance(payload.get("portfolio"), Mapping)), None)
+        # A balance lookup scoped to one symbol (for example "USDC 余额" while
+        # checking whether a swap arrived) returns an empty/asset-scoped
+        # portfolio. Projecting it as the top-level "资产总览" card renders
+        # "$0.00 / 暂无资产数据", which reads as "your whole wallet is empty".
+        # Mirror the deterministic route and only project a portfolio card for
+        # a real portfolio-level query.
+        portfolio_asset_scope = (
+            portfolio_result.get("asset_scope")
+            if isinstance(portfolio_result, Mapping)
+            else None
+        )
+        portfolio_scoped_to_symbol = (
+            isinstance(portfolio_asset_scope, Mapping)
+            and bool(str(portfolio_asset_scope.get("symbol") or "").strip())
+        )
         # A transfer amount step drives a client surface (amount keypad /
         # address input / contacts / scanner) via client_action. Elevating a
         # wallet_balance observation to a top-level portfolio card in the same
@@ -13245,6 +13268,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             portfolio_result is not None
             and client_action is None
             and transfer_result is None
+            and not portfolio_scoped_to_symbol
         ):
             response["portfolio"] = dict(portfolio_result)
         quote_result = _best_react_quote_result(tool_payloads)
