@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | 凭据 | `POSTGRES_PASSWORD=wallet_agent`、Redis 无密码、`.env` 明文放在服务器上并手工维护（测试服务器上还留有 `.env.bak.20261010`） | 接密钥管理（Secrets Manager / SSM Parameter Store），凭据不入库不进镜像；上线前轮换 |
 | 鉴权 | `require_auth` 是可配开关，测试环境未强制 | 生产强制开启；确认所有 `/v1/*` 与 `/debug/*` 都受保护 |
-| 调试面 | `/docs`、`/debug/metrics` 对外可访问 | 关闭或加访问控制 |
+| 调试面 | 新增 `/v1/agent/runs/{run_id}` 巡检（owner-only / `ADMIN_TOKEN`），但 `/docs`、`/debug/metrics` 仍对外可访问 | 关闭或统一加访问控制；生产只通过 HTTPS 暴露巡检接口 |
 | CORS | `CORS_ALLOW_ORIGINS` 写的是 IP | 收敛到真实域名，禁止通配 |
 | 传输 | `:8000` / `:3000` 明文直连 | ALB/Nginx + TLS + HSTS，只暴露入口 |
 | Demo | 与 API 一起部署 | **生产不对公网暴露 `demo-next`**（联调控制台会展示调试数据） |

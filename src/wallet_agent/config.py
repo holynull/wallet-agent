@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     conversation_lock_wait_seconds: float = Field(default=30, gt=0)
     auth_required: bool = False
     auth_tokens: dict[str, str] = Field(default_factory=dict)
+    # Optional operator-only token for read-only run inspection. It is checked
+    # separately from AUTH_TOKENS so it can cross user boundaries without
+    # creating a normal app identity.
+    admin_token: SecretStr | None = None
     poll_interval_seconds: float = Field(default=5, gt=0)
     poll_max_attempts: int = Field(default=20, ge=1, le=1000)
     confirmation_ttl_seconds: int = Field(default=900, ge=1, le=86_400)

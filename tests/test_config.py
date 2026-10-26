@@ -35,6 +35,7 @@ def test_settings_load_non_secret_defaults(monkeypatch):
     assert settings.run_event_max_entries == 2_000
     assert settings.conversation_lock_lease_seconds == 120
     assert settings.conversation_lock_wait_seconds == 30
+    assert settings.admin_token is None
 
 
 def test_react_compatibility_mode_requires_explicit_opt_in(monkeypatch):

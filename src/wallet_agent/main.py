@@ -329,6 +329,9 @@ def build_application(settings: Settings | None = None) -> Any:
         metadata_cache=metadata_cache,
         token_verifier=StaticTokenVerifier(settings.auth_tokens) if settings.auth_tokens else None,
         require_auth=settings.auth_required,
+        admin_token=(
+            settings.admin_token.get_secret_value() if settings.admin_token is not None else None
+        ),
         chain_registry=chain_registry,
     )
     application.state.checkpointer_handle = checkpoint_handle

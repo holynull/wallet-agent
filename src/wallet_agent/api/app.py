@@ -51,6 +51,7 @@ from wallet_agent.persistence import (
     InMemoryRunStore,
     InMemorySessionStore,
     LockManager,
+    RunEvent,
     RunStore,
     SessionRevisionConflict,
     SessionStore,
@@ -59,7 +60,8 @@ from wallet_agent.persistence import (
 from wallet_agent.prices.okx import PriceProviderError
 
 from .auth import TokenVerifier
-from .dependencies import authenticated_user
+from .dependencies import authenticated_user, is_admin_token
+from .inspection import build_run_summary, sanitize_debug_value
 
 _AGENT_TEST_INTENTS = {
     "wallet_query",
@@ -340,6 +342,22 @@ def _conversation_summary(session: Any) -> dict[str, Any]:
         "created_at": session.created_at,
         "summary": fallback,
     }
+
+
+def _inspection_session_summary(session: Any) -> dict[str, Any]:
+    """Safe session fields needed to join a run to its business lifecycle."""
+    if session is None:
+        return {}
+    summary = _conversation_summary(session)
+    summary.update(
+        {
+            "last_run_id": session.last_run_id,
+            "selected_provider_reference": session.selected_provider_reference,
+            "broadcast_tx_hash": session.broadcast_tx_hash,
+            "broadcast_status": session.broadcast_status,
+        }
+    )
+    return summary
 
 
 def _conversation_cursor(value: str | None) -> datetime | None:
@@ -1068,6 +1086,7 @@ def create_app(
     lock_manager: LockManager | None = None,
     token_verifier: TokenVerifier | None = None,
     require_auth: bool = False,
+    admin_token: str | None = None,
     model_registry: Any = None,
     metrics: Any = None,
     metadata_cache: Any = None,
@@ -1126,6 +1145,7 @@ def create_app(
     app.state.lock_manager = conversation_locks
     app.state.token_verifier = token_verifier
     app.state.require_auth = require_auth
+    app.state.admin_token = admin_token
     app.state.model_registry = model_registry
     app.state.model_router = getattr(graph, "_model", None)
     app.state.metrics = metrics or getattr(graph, "metrics", None)
@@ -1137,6 +1157,54 @@ def create_app(
 
     async def append_run_event(run_id: str, event: Mapping[str, Any]) -> str:
         return await event_store.append(run_id, _jsonable(event))
+
+    async def authorized_run_metadata(
+        request: Request,
+        run_id: str,
+        *,
+        fallback_user_id: str = "browser-demo",
+    ) -> dict[str, str] | None:
+        """Authorize a run lookup and return its owner/link metadata.
+
+        With authentication disabled, run inspection keeps the same local-demo
+        semantics as the other owner-scoped endpoints. Once a verifier or
+        ``require_auth`` is configured, only the run owner or the operator token
+        may read it.
+        """
+        metadata = await event_store.get_metadata(run_id)
+        if is_admin_token(request, admin_token):
+            if metadata is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            return metadata
+        if token_verifier is None and not require_auth:
+            return metadata
+        owner = await authenticated_user(
+            request,
+            verifier=token_verifier,
+            required=require_auth,
+            fallback_user_id=fallback_user_id,
+        )
+        if (
+            metadata is None
+            or not metadata.get("owner_id")
+            or metadata["owner_id"] != owner
+        ):
+            raise HTTPException(status_code=404, detail="run not found")
+        return metadata
+
+    async def read_run_events(run_id: str, *, max_events: int = 5_000) -> list[RunEvent] | None:
+        """Read every event, paging the store because Redis caps each xread call."""
+        events: list[RunEvent] = []
+        cursor = "0"
+        while len(events) < max_events:
+            batch = await event_store.read(run_id, after_id=cursor)
+            if batch is None:
+                return None
+            if not batch:
+                break
+            events.extend(batch)
+            cursor = batch[-1].event_id
+        return events
 
     def execution_adapter(chain: str) -> Any:
         observer = app.state.execution_observer
@@ -1235,8 +1303,15 @@ def create_app(
         q: str | None = None,
     ) -> dict[str, Any]:
         """Newest first. ``cursor`` pages backwards, ``q`` matches the title."""
-        owner = await authenticated_user(
-            request, verifier=token_verifier, required=require_auth, fallback_user_id=user_id
+        owner = (
+            user_id
+            if is_admin_token(request, admin_token)
+            else await authenticated_user(
+                request,
+                verifier=token_verifier,
+                required=require_auth,
+                fallback_user_id=user_id,
+            )
         )
         limit = max(1, min(limit, 100))
         sessions = await session_store.list_for_user(
@@ -1254,8 +1329,15 @@ def create_app(
     async def get_conversation(
         conversation_id: str, request: Request, user_id: str = "browser-demo"
     ) -> dict[str, Any]:
-        owner = await authenticated_user(
-            request, verifier=token_verifier, required=require_auth, fallback_user_id=user_id
+        owner = (
+            user_id
+            if is_admin_token(request, admin_token)
+            else await authenticated_user(
+                request,
+                verifier=token_verifier,
+                required=require_auth,
+                fallback_user_id=user_id,
+            )
         )
         sessions = await session_store.list_for_user(owner, limit=100)
         session = next((item for item in sessions if item.thread_id == conversation_id), None)
@@ -1274,6 +1356,76 @@ def create_app(
             "latest_artifacts": _conversation_artifacts(state),
             "model_trace": _model_trace_for_state(state, model_registry),
         }
+
+    @app.get("/v1/agent/runs/{run_id}")
+    async def get_agent_run(
+        run_id: str,
+        request: Request,
+        user_id: str = "browser-demo",
+        event_limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Read-only run triage: safe summary, linked session, and event history."""
+        if event_limit is not None and not 1 <= event_limit <= 5_000:
+            raise HTTPException(status_code=422, detail="event_limit must be between 1 and 5000")
+        metadata = await authorized_run_metadata(
+            request,
+            run_id,
+            fallback_user_id=user_id,
+        )
+        if metadata is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        all_events = await read_run_events(run_id)
+        if all_events is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        returned_events = all_events[-event_limit:] if event_limit is not None else all_events
+        terminal_state: Mapping[str, Any] = {}
+        for stored_event in reversed(all_events):
+            state = stored_event.payload.get("state")
+            if isinstance(state, Mapping):
+                terminal_state = state
+                break
+
+        owner_id = metadata.get("owner_id")
+        conversation_id = metadata.get("conversation_id")
+        session_id = metadata.get("session_id")
+        session = None
+        if session_id:
+            session = await session_store.get(session_id)
+        if session is None and owner_id:
+            sessions = await session_store.list_for_user(owner_id, limit=100)
+            session = next(
+                (
+                    item
+                    for item in sessions
+                    if conversation_id and item.thread_id == conversation_id
+                ),
+                None,
+            )
+        if session is not None and owner_id and session.user_id != owner_id:
+            session = None
+        artifacts = _conversation_artifacts(terminal_state) if terminal_state else None
+        return sanitize_debug_value(
+            {
+                "run_id": run_id,
+                "status": metadata.get("status")
+                or await event_store.get_status(run_id)
+                or "unknown",
+                "owner_id": owner_id,
+                "session_id": session.session_id if session is not None else session_id,
+                "conversation_id": (
+                    session.thread_id if session is not None else conversation_id
+                ),
+                "summary": build_run_summary(all_events, artifacts=artifacts),
+                "session": _inspection_session_summary(session),
+                "events": [
+                    {"event_id": stored_event.event_id, **stored_event.payload}
+                    for stored_event in returned_events
+                ],
+                "event_count": len(all_events),
+                "returned_event_count": len(returned_events),
+                "events_truncated": len(returned_events) < len(all_events),
+            }
+        )
 
     @app.delete("/v1/agent/conversations/{conversation_id}")
     async def delete_conversation(
@@ -2157,7 +2309,14 @@ def create_app(
             input_state["forced_intent"] = raw_agent_test_intent
             input_state["intent"] = raw_agent_test_intent
         config = {"configurable": {"thread_id": conversation_id}}
-        await event_store.create(run_id, owner_id=user_id)
+        await event_store.create(
+            run_id,
+            owner_id=user_id,
+            metadata={
+                "session_id": session_id,
+                "conversation_id": conversation_id,
+            },
+        )
         app.state.runs.setdefault(run_id, {})
         task = asyncio.create_task(run_graph(run_id, input_state, config, session_id=session_id))
         app.state.runs[run_id]["task"] = task
@@ -2172,6 +2331,8 @@ def create_app(
 
     @app.get("/v1/agent/stream/{run_id}")
     async def stream(run_id: str, request: Request) -> StreamingResponse:
+        await authorized_run_metadata(request, run_id)
+
         async def events() -> AsyncIterator[str]:
             cursor = (
                 request.headers.get("last-event-id")
@@ -3091,13 +3252,18 @@ def create_app(
     async def get_swap(
         request: Request, session_id: str, user_id: str | None = None
     ) -> dict[str, Any]:
-        authenticated = await authenticated_user(
-            request,
-            verifier=token_verifier,
-            required=require_auth,
-            fallback_user_id=user_id,
-        )
-        session = await owned_session(session_id, authenticated)
+        if is_admin_token(request, admin_token):
+            session = await session_store.get(session_id)
+            if session is None:
+                raise HTTPException(status_code=404, detail="swap session not found")
+        else:
+            authenticated = await authenticated_user(
+                request,
+                verifier=token_verifier,
+                required=require_auth,
+                fallback_user_id=user_id,
+            )
+            session = await owned_session(session_id, authenticated)
         # The App polls this endpoint passively while a swap is in flight. Auto-
         # refresh a live provider order so completion (order_status=completed,
         # broadcast_status=confirmed) surfaces without waiting for a chat turn.

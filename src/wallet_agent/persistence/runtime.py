@@ -22,10 +22,17 @@ class RunEvent:
 
 
 class RunStore(Protocol):
-    async def create(self, run_id: str, *, owner_id: str | None = None) -> None: ...
+    async def create(
+        self,
+        run_id: str,
+        *,
+        owner_id: str | None = None,
+        metadata: Mapping[str, str | None] | None = None,
+    ) -> None: ...
     async def append(self, run_id: str, event: Mapping[str, Any]) -> str: ...
     async def set_status(self, run_id: str, status: str) -> None: ...
     async def get_status(self, run_id: str) -> str | None: ...
+    async def get_metadata(self, run_id: str) -> dict[str, str] | None: ...
     async def read(
         self, run_id: str, *, after_id: str = "0", block_ms: int = 0
     ) -> list[RunEvent] | None: ...
@@ -47,11 +54,22 @@ class InMemoryRunStore:
             self._conditions[run_id] = condition
         return condition
 
-    async def create(self, run_id: str, *, owner_id: str | None = None) -> None:
+    async def create(
+        self,
+        run_id: str,
+        *,
+        owner_id: str | None = None,
+        metadata: Mapping[str, str | None] | None = None,
+    ) -> None:
         self.runs[run_id] = {
             "status": "queued",
             "events": [],
             "owner_id": owner_id,
+            "metadata": {
+                str(key): str(value)
+                for key, value in (metadata or {}).items()
+                if value is not None
+            },
         }
         self._condition(run_id)
 
@@ -77,6 +95,21 @@ class InMemoryRunStore:
     async def get_status(self, run_id: str) -> str | None:
         run = self.runs.get(run_id)
         return str(run["status"]) if run is not None else None
+
+    async def get_metadata(self, run_id: str) -> dict[str, str] | None:
+        run = self.runs.get(run_id)
+        if run is None:
+            return None
+        metadata = {
+            "status": str(run.get("status") or ""),
+            "owner_id": str(run.get("owner_id") or ""),
+            **{
+                str(key): str(value)
+                for key, value in (run.get("metadata") or {}).items()
+                if value is not None
+            },
+        }
+        return {key: value for key, value in metadata.items() if value}
 
     async def read(
         self, run_id: str, *, after_id: str = "0", block_ms: int = 0
@@ -150,11 +183,25 @@ class RedisRunStore:
     def _events_key(self, run_id: str) -> str:
         return f"{self.key_prefix}:run:{run_id}:events"
 
-    async def create(self, run_id: str, *, owner_id: str | None = None) -> None:
+    async def create(
+        self,
+        run_id: str,
+        *,
+        owner_id: str | None = None,
+        metadata: Mapping[str, str | None] | None = None,
+    ) -> None:
         meta_key = self._meta_key(run_id)
         await self.client.hset(
             meta_key,
-            mapping={"status": "queued", "owner_id": owner_id or ""},
+            mapping={
+                "status": "queued",
+                "owner_id": owner_id or "",
+                **{
+                    str(key): str(value)
+                    for key, value in (metadata or {}).items()
+                    if value is not None
+                },
+            },
         )
         await self.client.expire(meta_key, self.ttl_seconds)
 
@@ -183,6 +230,17 @@ class RedisRunStore:
     async def get_status(self, run_id: str) -> str | None:
         value = await self.client.hget(self._meta_key(run_id), "status")
         return _text(value) if value is not None else None
+
+    async def get_metadata(self, run_id: str) -> dict[str, str] | None:
+        values = await self.client.hgetall(self._meta_key(run_id))
+        if not values:
+            return None
+        metadata = {
+            _text(key): _text(value)
+            for key, value in values.items()
+            if value is not None and _text(value)
+        }
+        return metadata or None
 
     async def read(
         self, run_id: str, *, after_id: str = "0", block_ms: int = 0

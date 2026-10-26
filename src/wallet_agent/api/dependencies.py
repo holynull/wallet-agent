@@ -2,9 +2,24 @@
 
 from __future__ import annotations
 
+import hmac
+
 from fastapi import HTTPException, Request
 
 from .auth import TokenVerifier
+
+
+def bearer_token(request: Request) -> str:
+    authorization = request.headers.get("authorization", "")
+    return authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+
+
+def is_admin_token(request: Request, admin_token: str | None) -> bool:
+    """Compare the operator token without exposing token values in errors."""
+    token = bearer_token(request)
+    if not token or not admin_token:
+        return False
+    return hmac.compare_digest(token.encode("utf-8"), admin_token.encode("utf-8"))
 
 
 async def authenticated_user(
@@ -14,8 +29,7 @@ async def authenticated_user(
     required: bool,
     fallback_user_id: str | None = None,
 ) -> str:
-    authorization = request.headers.get("authorization", "")
-    token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    token = bearer_token(request)
     if verifier is not None:
         if not token:
             raise HTTPException(status_code=401, detail="Bearer token is required")

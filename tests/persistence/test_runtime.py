@@ -21,6 +21,9 @@ class FakeRedis:
     async def hget(self, key, field):
         return self.hashes.get(key, {}).get(field)
 
+    async def hgetall(self, key):
+        return dict(self.hashes.get(key, {}))
+
     async def expire(self, _key, _seconds):
         return True
 
@@ -130,6 +133,10 @@ async def test_redis_run_stores_share_and_resume_stream_events():
         ("2-0", "complete")
     ]
     assert await consumer.get_status("run-1") == "complete"
+    assert await consumer.get_metadata("run-1") == {
+        "status": "complete",
+        "owner_id": "alice",
+    }
     assert replay_from_invalid_cursor is not None
     assert len(replay_from_invalid_cursor) == 2
     assert await consumer.ready() is True

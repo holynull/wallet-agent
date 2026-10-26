@@ -178,6 +178,13 @@ an `id`. Reconnect to the same `run_id` with `Last-Event-ID` or
 `?last_event_id=...`; only later events are replayed. Resume is bounded by
 `RUN_EVENT_TTL_SECONDS` and stream trimming.
 
+For operator debugging, `GET /v1/agent/runs/{run_id}` returns an owner-scoped,
+redacted run summary with tool/model/error timelines and event history. An
+optional `ADMIN_TOKEN` allows read-only cross-user inspection; when enabled it
+also authorizes the read-only conversation and swap-session lookup endpoints.
+Use `python scripts/inspect_agent.py --run-id <id>` locally or against a remote
+HTTPS deployment. See [docs/agent-run-inspection.md](docs/agent-run-inspection.md).
+
 `./scripts/redeploy.sh` starts the API with MySQL and Redis. The bundled MySQL
 lives in `docker-compose.bundled-db.yml`, which the script includes unless
 `DEPLOY_PERSISTENCE_URL` is set in `.env` -- a deployment with its own managed

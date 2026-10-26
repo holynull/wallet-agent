@@ -731,6 +731,9 @@ curl -N 'http://<server-ip>:8000/v1/agent/stream/<run-id>?last_event_id=<event-i
 ### 11.2 服务端已有的调试入口
 
 - `GET /debug/metrics`：进程内的模型/工具调用计数与缓存命中统计，用于判断「是模型慢还是工具慢」。
+- `GET /v1/agent/runs/{run_id}`：owner-only 的 run 摘要与事件历史，包含意图、路由、
+  工具/模型时间线、错误、卡片类型和关联 session；运维 token 可跨用户只读查询。
+  详见 [agent-run-inspection.md](agent-run-inspection.md)。
 - `GET /v1/agent/conversations/{id}`：拿到完整的 `messages`、`latest_artifacts`、`model_trace`，
   可复现某一轮的卡片快照，不必回放 SSE。
 - 每轮 SSE 都带 `run_id`，断线后可用 `Last-Event-ID` 续传，不要重新发一轮。
