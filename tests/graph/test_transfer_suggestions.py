@@ -14,6 +14,18 @@ class FakeModel:
         return {"intent": value.get("intent", "clarification")}
 
 
+def _render_decision(**overrides):
+    decision = {
+        "intent": "transfer",
+        "source_symbol": None,
+        "destination_symbol": None,
+        "recommend_swap_pairs": False,
+        "reason": "test",
+    }
+    decision.update(overrides)
+    return decision
+
+
 async def _clarify(thread_id: str, wallet_context: dict) -> dict:
     graph = build_graph(model=FakeModel())
     result = await graph.ainvoke(
@@ -327,12 +339,15 @@ async def test_missing_chain_with_tron_recipient_offers_only_matching_chains():
 async def test_react_text_only_answer_after_address_still_surfaces_chain_card():
     """The chain card must appear even when the model answers the address with prose."""
 
-    class ProseModel:
+    class ProseDecisionModel:
         async def invoke_react(self, messages, tools):
             return AIMessage(content="收到收款地址了，请选择网络：ETH、BSC、BASE……")
 
+        async def decide_render(self, request):
+            return _render_decision(intent="transfer")
+
     graph = build_graph(
-        model=ProseModel(),
+        model=ProseDecisionModel(),
         chains={"BASE": object(), "ETH": object(), "BSC": object()},
     )
     result = await graph.ainvoke(
@@ -367,12 +382,15 @@ async def test_react_text_only_answer_after_address_still_surfaces_chain_card():
 async def test_react_prose_address_without_recipient_prompt_does_not_inject_chain_card():
     """A bare address alone is not enough: the previous turn must have asked for a recipient."""
 
-    class ProseModel:
+    class ProseDecisionModel:
         async def invoke_react(self, messages, tools):
             return AIMessage(content="这个地址是 EVM 地址，可以走以太坊系列网络。")
 
+        async def decide_render(self, request):
+            return _render_decision(intent="other")
+
     graph = build_graph(
-        model=ProseModel(),
+        model=ProseDecisionModel(),
         chains={"BASE": object(), "ETH": object(), "BSC": object()},
     )
     result = await graph.ainvoke(
@@ -397,12 +415,15 @@ async def test_react_text_only_after_chain_still_surfaces_coin_card():
     calling transfer_quick_replies; the coin card must still appear so the
     amount card later has a symbol and balance to anchor to."""
 
-    class ProseModel:
+    class ProseDecisionModel:
         async def invoke_react(self, messages, tools):
             return AIMessage(content="网络已选 ETH，最后请提供转账金额和币种。")
 
+        async def decide_render(self, request):
+            return _render_decision(intent="transfer")
+
     graph = build_graph(
-        model=ProseModel(),
+        model=ProseDecisionModel(),
         chains={"BASE": object(), "ETH": object(), "BSC": object()},
     )
     result = await graph.ainvoke(
@@ -665,6 +686,9 @@ async def test_react_two_turn_address_then_prose_surfaces_chain_card():
             if self.calls == 2:
                 return AIMessage(content="好的，先确认收款方。你想怎么提供对方的收款地址？")
             return AIMessage(content="收到收款地址了，请选择网络：ETH、BSC、BASE……")
+
+        async def decide_render(self, request):
+            return _render_decision(intent="transfer")
 
     graph = build_graph(
         model=TwoTurnTransferModel(),

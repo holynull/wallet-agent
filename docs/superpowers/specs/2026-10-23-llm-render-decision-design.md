@@ -99,6 +99,17 @@ returns `None`, which renders prose only (a safe, card-free default).
 
 `active_pair` comes only from the decision's `source_symbol`/`destination_symbol`.
 
+The prose transfer-collection card (chain → coin → amount) uses the same
+boundary. When the model answers a collection step in prose instead of calling
+`transfer_quick_replies`, `finalize_response` attaches the next-slot card only
+when the render decision says `intent == "transfer"`. Only the slot extraction
+(`_react_transfer_slots`) and draft assembly (`_react_transfer_draft`) are
+deterministic; the former `_react_transfer_context` regex
+(`_looks_like_transfer_message`, “收款地址”/“输入地址” substring scan) no longer
+decides the card. `_react_transfer_context` survives only as a structural
+signal for `_react_transfer_user_symbol` (telling a user-chosen coin from a
+model-defaulted one on a keypad), with the free-text regex branch removed.
+
 ### 5. Supervisor (legacy path)
 
 The semantic fallback parsers (`explicit_transfer → transfer`,
@@ -115,7 +126,7 @@ mechanical state backfill.
   preflight-balance follow-up, `graph_resume`, checkpoint state.
 - Data assembly: `_swap_balance_rows`, `_swap_recommended_pairs`,
   `_swap_pair_chip`/`_swap_entry_chip`, `_swap_source_chain_rows`,
-  `_react_transfer_collection` slot reconstruction.
+  `_react_transfer_slots`/`_react_transfer_draft` slot reconstruction.
 - Schema validation (`ReactRenderDecision.model_validate`,
   `RouteDecision.model_validate`) and the response projection itself.
 - Routing hints fed to the supervisor classifier (`explicit_transfer`,

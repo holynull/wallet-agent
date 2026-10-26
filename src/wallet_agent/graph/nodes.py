@@ -1595,7 +1595,13 @@ def _react_transfer_supported_chains(state: Mapping[str, Any]) -> list[str]:
 
 
 def _react_transfer_context(state: Mapping[str, Any]) -> bool:
-    """Whether the conversation is clearly inside a transfer-collection flow."""
+    """Whether the conversation is structurally inside a transfer-collection flow.
+
+    Only structural signals count: the App echoed a transfer suggestion, or the
+    assistant already asked for a recipient address. Free-text intent (e.g.
+    ``_looks_like_transfer_message``) is the model's render-decision job, not
+    this helper's.
+    """
     request = state.get("request") or {}
     metadata = request.get("metadata") if isinstance(request, Mapping) else None
     suggestion = (
@@ -1606,26 +1612,20 @@ def _react_transfer_context(state: Mapping[str, Any]) -> bool:
     if isinstance(suggestion, Mapping) and suggestion.get("intent") == "transfer":
         return True
     for msg in state.get("messages") or []:
-        text = str(getattr(msg, "content", "") or "")
-        if isinstance(msg, HumanMessage):
-            if _looks_like_transfer_message(text):
-                return True
-        elif isinstance(msg, AIMessage):
+        if isinstance(msg, AIMessage):
+            text = str(getattr(msg, "content", "") or "")
             if "收款地址" in text or "输入地址" in text:
                 return True
     return False
 
 
-def _react_transfer_collection(
-    state: Mapping[str, Any],
-) -> tuple[list[str], dict[str, Any]] | None:
-    """Reconstruct a transfer collection step deterministically.
+def _react_transfer_slots(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Extract the transfer-collection slots already present (recipient/chain/coin).
 
-    The model sometimes answers a collection step (recipient → chain → coin →
-    amount) with prose instead of calling ``transfer_quick_replies``, and the
-    App renders cards from suggestions, not prose. Return the next missing slot
-    and a draft so ``finalize_response`` can attach the right card; ``None``
-    when no transfer collection card is due.
+    Mechanical data assembly only: pulls a recipient, chain and symbol from the
+    App's echoed suggestion and the message history. Returns ``None`` until a
+    recipient is known. No intent judgment here -- whether a transfer card is
+    due is the model's render decision, applied by the caller.
     """
     slots: dict[str, Any] = {}
     chain_names = {
@@ -1672,8 +1672,15 @@ def _react_transfer_collection(
             # stray "0" was surfacing as the amount card's coin).
             if _looks_like_asset_symbol(symbol):
                 slots["symbol"] = symbol
-    if not slots.get("recipient") or not _react_transfer_context(state):
+    if not slots.get("recipient"):
         return None
+    return slots
+
+
+def _react_transfer_draft(
+    slots: Mapping[str, Any],
+) -> tuple[list[str], dict[str, Any]]:
+    """Turn extracted slots into the next missing step and a transfer draft."""
     draft: dict[str, Any] = {"recipient": slots["recipient"]}
     if slots.get("chain"):
         draft["chain"] = slots["chain"]
@@ -1685,6 +1692,23 @@ def _react_transfer_collection(
     # presets, so the amount slot is "missing" and transfer_suggestions will
     # offer the coin card instead.
     return ["transfer_amount"], draft
+
+
+def _react_transfer_collection(
+    state: Mapping[str, Any],
+) -> tuple[list[str], dict[str, Any]] | None:
+    """Reconstruct a transfer collection step when the flow is structurally active.
+
+    Used by ``_react_transfer_user_symbol`` to tell a user-chosen coin from a
+    model-defaulted one. The card-render trigger in ``finalize_response`` uses
+    ``_react_transfer_slots`` gated on the model render decision instead; this
+    wrapper additionally requires structural transfer context so a bare address
+    in an unrelated turn is not treated as a collection draft.
+    """
+    slots = _react_transfer_slots(state)
+    if slots is None or not _react_transfer_context(state):
+        return None
+    return _react_transfer_draft(slots)
 
 
 def _react_transfer_user_symbol(state: Mapping[str, Any]) -> str:
@@ -13073,16 +13097,23 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         )
         if quick_replies:
             response["suggestions"] = quick_replies
-        elif client_action is None and current_user_index >= 0 and not swap_intent:
+        elif (
+            client_action is None
+            and current_user_index >= 0
+            and not swap_intent
+            and render_decision is not None
+            and render_decision.get("intent") == "transfer"
+        ):
             # The model answered a transfer-collection step with prose instead
             # of calling transfer_quick_replies. The App renders cards from
-            # suggestions, not prose, so deterministically attach the card for
-            # the next missing slot (chain → coin → amount) to keep the flow
-            # intact regardless of model behavior.
-            transfer_card = _react_transfer_collection(state)
-            if transfer_card is not None:
+            # suggestions, not prose, so attach the card for the next missing
+            # slot (chain → coin → amount). Whether a transfer card is due is
+            # the model's render decision (intent == "transfer"); only the slot
+            # reconstruction below is deterministic data assembly.
+            transfer_slots = _react_transfer_slots(state)
+            if transfer_slots is not None:
                 transfer_collection = True
-                missing, draft = transfer_card
+                missing, draft = _react_transfer_draft(transfer_slots)
                 card_suggestions = await transfer_suggestions(
                     {**dict(state), "transfer_draft": draft}, missing
                 )
