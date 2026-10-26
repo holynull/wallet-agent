@@ -119,6 +119,58 @@ async def test_react_balance_turn_drops_stale_pending_without_broadcast():
 
 
 @pytest.mark.asyncio
+async def test_react_balance_turn_mid_swap_projects_portfolio_only():
+    """A balance query in the middle of a swap must not re-project the swap
+    card (quote/confirmation/pending) — only the portfolio answer.
+
+    Mirrors the transfer regression: the conversation graph renders swap cards
+    exclusively from the current turn's tools / model decision, so a balance
+    turn with a stale selected_quote + prepared swap tx yields the portfolio
+    card alone and revokes the stale pending transaction.
+    """
+    from tests.graph.test_unified_react import WALLET, WalletProvider
+    from wallet_agent.graph.build import build_graph
+
+    model = BalanceQueryModel()
+    graph = build_graph(model=model, wallet_provider=WalletProvider())
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "余额"},
+            "wallet_context": {"address": WALLET, "chain": "BSC"},
+            "conversation_history": [
+                {"role": "user", "content": "用 BNB 换 USDT"},
+                {"role": "assistant", "content": "好的，1 BNB 大约能换 600 USDT，请在卡片上确认。"},
+            ],
+            "selected_quote": {
+                "provider_reference": "swap-ref-1",
+                "provider": "bridgers",
+                "input_amount": "1",
+                "expected_output": "600",
+                "source_asset": {"chain": "BSC", "symbol": "BNB"},
+                "destination_asset": {"chain": "BSC", "symbol": "USDT"},
+            },
+            "pending_transaction": _stale_bnb_pending(),
+            "preflight": {"ok": True, "checks": []},
+        },
+        config={"configurable": {"thread_id": "react-balance-mid-swap"}},
+    )
+
+    response = result["response"]
+    assert response["kind"] == "react"
+    # The balance answer is the portfolio card, with no swap card beside it.
+    assert isinstance(response.get("portfolio"), dict)
+    suggestions = response.get("suggestions") or []
+    assert not any(
+        str(item.get("type") or "") in {"swap_pair", "chain", "amount"}
+        for item in suggestions
+    )
+    # No stale swap/transfer projection survives the unrelated turn.
+    assert result.get("selected_quote") is None
+    assert result.get("pending_transaction") is None
+    assert result.get("preflight") is None
+
+
+@pytest.mark.asyncio
 async def test_react_transfer_slot_fill_drops_stale_pending_without_broadcast():
     """A new transfer-collection turn replaces an old, still-unsigned prepare."""
     from wallet_agent.graph.build import build_graph
