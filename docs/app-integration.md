@@ -458,6 +458,10 @@ POST /v1/transfer/{session_id}/broadcast
   `suggestions[].data` 对齐，包含 `intent`、`chain`、`symbol`、`token_address`、
   `decimals` 和余额字段。App 可以只读顶层动作，不需要从工具结果或
   `suggestions[].data` 二次拼接。
+- 这是向后兼容的**新增字段**：`react_results` 里的 `wallet_balance` /
+  `portfolio.assets[]` 和 `suggestions[].data` 都保留。兑换金额键盘回合两者都有；
+  转账 `transfer_quick_replies` 金额卡回合可能没有 `wallet_balance` 工具结果，
+  App 可统一优先读 `client_action.slots`，旧 `suggestions[].data` 继续兜底。
 
 **客户端动作** `response.client_action`
 
