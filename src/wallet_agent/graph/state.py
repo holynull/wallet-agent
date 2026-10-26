@@ -161,6 +161,10 @@ class AgentState(TypedDict, total=False):
     read_native: NotRequired[bool]
     read_facts: NotRequired[dict[str, Any] | None]
     read_tool_call: NotRequired[dict[str, Any] | None]
+    # Native read tool calls the model over-batched beyond the per-round
+    # parallel cap. They are queued here and executed in follow-up rounds so
+    # the turn never fails with a hard "too many parallel tools" error.
+    read_pending_calls: NotRequired[list[dict[str, Any]]]
     read_only_enabled: NotRequired[bool]
     read_only_complete: NotRequired[bool]
     read_only_pending: NotRequired[bool]

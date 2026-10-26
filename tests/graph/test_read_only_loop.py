@@ -678,34 +678,74 @@ async def test_repeated_native_tool_call_reuses_verified_fact_without_requerying
 
 
 @pytest.mark.asyncio
-async def test_native_read_tool_batch_over_limit_returns_safe_error():
+async def test_native_read_tool_batch_over_limit_chunks_across_rounds():
+    """An over-batched native read request is split across rounds, not failed."""
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import TokenPrice
     from wallet_agent.graph.build import build_graph
+
+    class PriceProvider:
+        async def get_prices(self, assets):
+            return [TokenPrice(asset=assets[0], usd_price=Decimal("1800"), provider="okx")]
 
     class TooManyCallsModel:
         read_agent_enabled = True
+
+        def __init__(self):
+            self.invocations = 0
 
         async def classify(self, _request):
             return {"intent": "price_query"}
 
         async def extract(self, _task_kind, _request):
-            return {"symbol": "ETH", "chain": "ETH"}
+            return {"symbol": "ETH", "chain": "ETH", "decimals": 18}
 
         async def invoke_read_tools(self, _messages, _tools):
+            self.invocations += 1
+            if self.invocations > 1:
+                # Once every chunk ran, the model answers instead of batching again.
+                return AIMessage(content="已取得行情")
             return AIMessage(
                 content="",
                 tool_calls=[
-                    {"id": f"call-{index}", "name": "price_lookup", "args": {"symbol": "ETH"}}
+                    {
+                        "id": f"call-{index}",
+                        "name": "price_lookup",
+                        "args": {"symbol": "ETH", "chain": "ETH", "decimals": 18},
+                    }
                     for index in range(READ_ONLY_MAX_PARALLEL_TOOLS + 1)
                 ],
             )
 
-    result = await build_graph(model=TooManyCallsModel()).ainvoke(
+        async def respond(self, _request, _facts, messages=None):
+            from wallet_agent.models.contracts import AgentResponseDraft
+
+            return AgentResponseDraft(
+                language="zh", message="ETH 当前约 1800 美元。", suggestions=[]
+            )
+
+    result = await build_graph(
+        model=TooManyCallsModel(), price_provider=PriceProvider()
+    ).ainvoke(
         {"request": {"message": "ETH 现在多少钱"}},
         config={"configurable": {"thread_id": "native-over-limit-read-only"}},
     )
 
-    assert result["response"]["kind"] == "error"
-    assert result["response"]["errors"][0]["code"] == "READ_TOOL_BATCH_TOO_LARGE"
+    assert result["response"]["kind"] == "price_query"
+    assert not result["response"].get("errors")
+    completed = [
+        record
+        for record in result["read_tool_calls"]
+        if record.get("status") == "completed"
+    ]
+    # Every over-batched call eventually ran; none was left queued or rejected.
+    assert len(completed) == READ_ONLY_MAX_PARALLEL_TOOLS + 1
+    assert result.get("read_pending_calls") in (None, [])
+    assert not any(
+        record.get("status") in {"failed", "rejected"}
+        for record in result["read_tool_calls"]
+    )
 
 
 @pytest.mark.asyncio

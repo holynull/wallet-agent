@@ -6861,12 +6861,60 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 if existing_react_messages:
                     return [*new_messages]
                 return [*messages, *new_messages]
-            try:
-                native_output = await native_invoker(messages, READ_ONLY_TOOL_SCHEMAS)
-            except ValueError:
-                # Injected legacy/fake models may expose the facade without a
-                # tool-capable backend. Fall back to the structured planner.
-                native_output = None
+
+            def chunk_read_batch(
+                batch: list[Any], original: Any | None
+            ) -> Any:
+                """Return an AI message carrying only ``batch`` tool calls.
+
+                The read tool node executes every tool call on the last AI
+                message, so an over-batched model request must be split into
+                chunks that never exceed the parallel cap. Keeping the
+                original message identity keeps the durable transcript merge
+                stable across the split rounds.
+                """
+                if original is not None and not isinstance(original, AIMessage):
+                    return original
+                return AIMessage(
+                    content=getattr(original, "content", "") if original is not None else "",
+                    additional_kwargs={
+                        key: value
+                        for key, value in (
+                            (original.additional_kwargs or {})
+                            if original is not None
+                            else {}
+                        ).items()
+                        if key != "tool_calls"
+                    },
+                    response_metadata=(
+                        getattr(original, "response_metadata", None) or {}
+                    )
+                    if original is not None
+                    else {},
+                    id=getattr(original, "id", None) if original is not None else None,
+                    name=getattr(original, "name", None) if original is not None else None,
+                    tool_calls=[dict(item) for item in batch],
+                )
+
+            # When a previous round over-batched read tools, keep draining the
+            # queued chunk instead of asking the model again. This turns a hard
+            # "too many parallel tools" failure into a split execution.
+            pending_read_calls = list(state.get("read_pending_calls") or [])
+            pending_update: dict[str, Any] = {}
+            if pending_read_calls:
+                batch = pending_read_calls[:READ_ONLY_MAX_PARALLEL_TOOLS]
+                pending_update["read_pending_calls"] = [
+                    dict(item)
+                    for item in pending_read_calls[READ_ONLY_MAX_PARALLEL_TOOLS:]
+                ]
+                native_output = chunk_read_batch(batch, None)
+            else:
+                try:
+                    native_output = await native_invoker(messages, READ_ONLY_TOOL_SCHEMAS)
+                except ValueError:
+                    # Injected legacy/fake models may expose the facade without a
+                    # tool-capable backend. Fall back to the structured planner.
+                    native_output = None
             if native_output is not None:
                 tool_calls = list(getattr(native_output, "tool_calls", None) or [])
                 invalid_calls = [
@@ -6876,30 +6924,20 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     or str(item.get("name") or "") not in READ_ONLY_TOOL_NAMES
                     or not isinstance(item.get("args", item.get("arguments", {})), Mapping)
                 ]
-                if len(tool_calls) > READ_ONLY_MAX_PARALLEL_TOOLS:
-                    return {
-                        "response": {
-                            "kind": "error",
-                            "errors": [
-                                _error(
-                                    "READ_TOOL_BATCH_TOO_LARGE",
-                                    (
-                                        f"一次最多只能并行查询 {READ_ONLY_MAX_PARALLEL_TOOLS} "
-                                        "个只读工具。"
-                                    ),
-                                    details={"max_parallel_tools": READ_ONLY_MAX_PARALLEL_TOOLS},
-                                )
-                            ],
-                        },
-                        "react_messages": react_update(native_output),
-                        "read_tool_calls": [
-                            dict(item) for item in state.get("read_tool_calls") or []
-                        ],
-                        "read_tool_call": None,
-                        "read_only_complete": True,
-                        "read_only_pending": False,
-                        "read_native": True,
-                    }
+                if (
+                    not invalid_calls
+                    and not pending_update
+                    and len(tool_calls) > READ_ONLY_MAX_PARALLEL_TOOLS
+                ):
+                    # Over-batched request: execute the first chunk now and
+                    # queue the remainder for the next read rounds instead of
+                    # failing the whole turn.
+                    batch = tool_calls[:READ_ONLY_MAX_PARALLEL_TOOLS]
+                    pending_update["read_pending_calls"] = [
+                        dict(item) for item in tool_calls[READ_ONLY_MAX_PARALLEL_TOOLS:]
+                    ]
+                    tool_calls = batch
+                    native_output = chunk_read_batch(batch, native_output)
                 if invalid_calls:
                     return {
                         "response": {
@@ -6936,7 +6974,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         )
                         for item in tool_calls
                     ]
-                    if incoming_signatures and all(
+                    # Queued over-batch chunks must actually run; a signature
+                    # collision with an earlier call must not mark them reused
+                    # and drop the queued work.
+                    if not pending_update and incoming_signatures and all(
                         signature in completed_signatures for signature in incoming_signatures
                     ):
                         reused_records = [
@@ -6984,6 +7025,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         "read_only_complete": False,
                         "read_only_pending": True,
                         "read_native": True,
+                        **pending_update,
                     }
                 completed: dict[str, Any] = {
                     "react_messages": react_update(native_output),
@@ -7935,6 +7977,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "request": request,
             "read_loop_count": 0,
             "read_tool_calls": [],
+            "read_pending_calls": [],
             "read_messages": [],
             "react_messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)],
             "react_result": None,
