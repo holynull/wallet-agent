@@ -1192,6 +1192,62 @@ async def test_react_symbol_scoped_empty_balance_does_not_project_portfolio_card
     assert "portfolio" not in result["response"]
 
 
+class SymbolScopedBalanceWithBalanceModel:
+    """A genuine single-coin balance question ("bnb 余额") that finds holdings
+    must project the 余额/单链资产卡 (response.wallet + asset rows), not the
+    multi-chain overview card and not prose-only."""
+
+    def __init__(self):
+        self.payload = None
+
+    async def invoke_react(self, messages, tools):
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "scoped-balance-2",
+                        "name": "wallet_balance",
+                        "args": {"chain": "BSC", "symbol": "BNB", "address": WALLET},
+                    }
+                ],
+            )
+        self.payload = json.loads(tool_messages[0].content)
+        return AIMessage(content="你 BSC 上的 BNB 余额是 0.5，约 384 美元。")
+
+
+@pytest.mark.asyncio
+async def test_react_symbol_scoped_balance_with_holdings_projects_wallet_card():
+    from wallet_agent.graph.build import build_graph
+
+    model = SymbolScopedBalanceWithBalanceModel()
+    graph = build_graph(model=model, wallet_provider=WalletProvider())
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "bnb 余额", "address": WALLET, "chain": "BSC"},
+            "wallet_context": {"address": WALLET, "chain": "BSC"},
+            "conversation_history": [],
+        },
+        config={"configurable": {"thread_id": "react-scoped-balance-with-holdings"}},
+    )
+
+    assert result["response"]["kind"] == "react"
+    assert model.payload is not None
+    portfolio = model.payload["portfolio"]
+    assert portfolio["asset_scope"] == {"symbol": "BNB"}
+    assert portfolio["has_assets"] is True
+    # The scoped balance is projected as the 余额/单链资产卡, not the overview.
+    assert "portfolio" not in result["response"]
+    assert isinstance(result["response"].get("wallet"), dict)
+    assert result["response"]["asset_scope"] == {"symbol": "BNB"}
+    assert len(result["response"].get("assets") or []) == 1
+    row = result["response"]["assets"][0]
+    assert row["asset"]["symbol"] == "BNB"
+    assert row["asset"]["chain"] == "BSC"
+    assert row["amount"] == "0.5"
+
+
 class BalanceQueryPrepModel:
     def __init__(self):
         self.observation = None

@@ -13240,8 +13240,6 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         # checking whether a swap arrived) returns an empty/asset-scoped
         # portfolio. Projecting it as the top-level "资产总览" card renders
         # "$0.00 / 暂无资产数据", which reads as "your whole wallet is empty".
-        # Mirror the deterministic route and only project a portfolio card for
-        # a real portfolio-level query.
         portfolio_asset_scope = (
             portfolio_result.get("asset_scope")
             if isinstance(portfolio_result, Mapping)
@@ -13262,13 +13260,33 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         # balance for "全部"), the App must render the transfer card, not a
         # balance card beside it (App report: "转 DAI" popped a balance card
         # and only a further "转账啊" produced the transfer card).
-        if (
-            portfolio_result is not None
-            and client_action is None
-            and transfer_result is None
-            and not portfolio_scoped_to_symbol
-        ):
-            response["portfolio"] = dict(portfolio_result)
+        if portfolio_result is not None and client_action is None and transfer_result is None:
+            if portfolio_scoped_to_symbol:
+                # A genuine single-coin/single-chain balance question ("bnb
+                # 余额", "ETH 有多少") is answered with a symbol-scoped
+                # portfolio. The App renders that as the 余额/单链资产卡 from
+                # response.wallet + asset rows (docs §3.2), so project the
+                # wallet_query shape (mirrors the deterministic
+                # portfolio_snapshot scoped path) instead of dropping the card
+                # entirely (App report: asking a coin balance rendered prose
+                # only, run 5fd06faf). An empty scoped lookup (an arrival check
+                # that finds 0 of a token) stays suppressed so it never renders
+                # an "资产总览 $0.00 / 暂无资产数据" card that reads as an empty
+                # wallet.
+                if portfolio_result.get("has_assets"):
+                    wallet_value = portfolio_result.get("wallet")
+                    response["wallet"] = (
+                        dict(wallet_value)
+                        if isinstance(wallet_value, Mapping)
+                        else dict(portfolio_result)
+                    )
+                    response["assets"] = portfolio_result.get("assets") or []
+                    response["asset_scope"] = portfolio_result.get("asset_scope")
+                    response["scope"] = portfolio_result.get("scope") or {}
+                    if portfolio_result.get("asset_count") is not None:
+                        response["asset_count"] = portfolio_result.get("asset_count")
+            else:
+                response["portfolio"] = dict(portfolio_result)
         quote_result = _best_react_quote_result(tool_payloads)
         if quote_result is not None:
             # The design defaults to one channel and renders the confirmation
