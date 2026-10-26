@@ -453,6 +453,11 @@ POST /v1/transfer/{session_id}/broadcast
 - `type: "amount"` 的 `data` 会带上 `token_address` / `decimals`（钱包可唯一定位该资产时），
   以及后端同回合查到的 `balance` / `balance_raw` / `balance_usd`；App 的金额输入卡
   据此渲染「资产与余额」一行，字段缺失时回退到 App 本地余额。
+- ReAct 的金额 step 无论模型是否单独调用 `request_client_action`，都会在响应顶层
+  同时下发 `client_action.type = "open_amount_keypad"`；其 `slots` 与
+  `suggestions[].data` 对齐，包含 `intent`、`chain`、`symbol`、`token_address`、
+  `decimals` 和余额字段。App 可以只读顶层动作，不需要从工具结果或
+  `suggestions[].data` 二次拼接。
 
 **客户端动作** `response.client_action`
 

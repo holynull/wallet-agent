@@ -278,8 +278,12 @@ App 需按占位处理（不要用别的链 logo 顶替）。
   - 卡片包含「资产与余额」行 + 金额输入框 + 25/50/75/100% + 余额不足 NoticeBar +
     取消/确认；余额优先用后端下发的 `data.balance`（无则 App 本地持有），百分比用该链余额换算。
   - 用户点百分比或输入金额后回传 `metadata.suggestion_data`（含 `amount`）。
-  - 若后端下发 `client_action.open_amount_keypad`，弹金额键盘输入。
-- 对齐：✅（资产身份已随 `data` 下发）。
+  - ReAct 金额卡回合的响应顶层**始终**下发 `client_action.open_amount_keypad`；
+    `slots` 与 `suggestions[].data` 对齐（`intent` / `chain` / `symbol` /
+    `token_address` / `decimals` / 余额字段），App 应优先读取
+    `client_action.slots` 渲染资产与余额行。
+  - 若客户端尚未迁移，仍可继续读取 `suggestions[].data`；两处数据由后端同步生成。
+- 对齐：✅（资产身份与余额同时随 `data`、顶层 `client_action.slots` 下发）。
 
 ### 3.11 风险提示卡（`preflight.risk`）
 

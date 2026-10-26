@@ -13468,6 +13468,53 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             quick_replies = swap_tool_suggestions if swap_tool_suggestions else None
         if quick_replies:
             response["suggestions"] = quick_replies
+            # The transfer amount card is a client surface. Some model runs ask
+            # for the standard amount chips via transfer_quick_replies without
+            # a separate request_client_action call. Mirror the chip data into
+            # the top-level action so App clients that only read
+            # client_action.slots still receive intent, asset identity and the
+            # exact-chain balance in the same turn.
+            amount_chip = next(
+                (
+                    item
+                    for item in quick_replies
+                    if isinstance(item, Mapping)
+                    and str(item.get("type") or "") == "amount"
+                    and isinstance(item.get("data"), Mapping)
+                ),
+                None,
+            )
+            if client_action is None and amount_chip is not None:
+                amount_data = dict(amount_chip["data"])
+                amount_intent = str(amount_data.get("intent") or "").strip().lower()
+                valid_amount_intent = amount_intent in {"transfer", "swap"}
+                if valid_amount_intent and amount_data.get("chain") and amount_data.get("symbol"):
+                    amount_slots = {
+                        key: value
+                        for key, value in amount_data.items()
+                        if value not in (None, "")
+                    }
+                    amount_slots["intent"] = amount_intent
+                    amount_slots["chain"] = canonical_chain(str(amount_data["chain"]))
+                    amount_slots["symbol"] = canonical_symbol(str(amount_data["symbol"]))
+                    for logo_key in ("logo_url", "chain_logo_url"):
+                        logo_value = amount_chip.get(logo_key)
+                        if logo_value:
+                            amount_slots[logo_key] = logo_value
+                    language = _message_language(current_message)
+                    client_action = {
+                        "type": "open_amount_keypad",
+                        "reason": (
+                            "输入转账金额"
+                            if amount_intent == "transfer" and language != "en"
+                            else "Enter transfer amount"
+                            if amount_intent == "transfer"
+                            else "输入兑换金额"
+                            if language != "en"
+                            else "Enter swap amount"
+                        ),
+                        "slots": amount_slots,
+                    }
         elif (
             client_action is None
             and current_user_index >= 0

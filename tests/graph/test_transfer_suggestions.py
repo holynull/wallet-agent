@@ -718,6 +718,106 @@ async def test_react_transfer_keypad_carries_exact_chain_balance_and_intent():
 
 
 @pytest.mark.asyncio
+async def test_react_quick_reply_amount_step_also_returns_top_level_keypad():
+    """A transfer amount card must expose the same slots even when the model
+    only called ``transfer_quick_replies`` instead of ``request_client_action``.
+
+    The App reads the amount card's balance and asset identity from the
+    top-level ``client_action.slots``. ``suggestions[].data`` alone is not
+    enough for clients that only consume the action payload.
+    """
+
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+
+    class ArbitrumWalletProvider:
+        chain_index_by_name = {"ARBITRUM": "42161"}
+
+        async def get_token_balances(self, address, indexes):
+            assert indexes == ["42161"]
+            return [
+                TokenBalance(
+                    asset=Asset(
+                        chain="ARBITRUM",
+                        chain_id=42161,
+                        symbol="ETH",
+                        decimals=18,
+                    ),
+                    amount=Decimal("0.00163120047"),
+                    amount_raw="1631200470000000",
+                    usd_value=Decimal("3.78"),
+                )
+            ]
+
+    class QuickRepliesOnlyModel:
+        async def invoke_react(self, messages, tools):
+            tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+            if not tool_messages:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "qr-1",
+                            "name": "transfer_quick_replies",
+                            "args": {
+                                "chain": "ARBITRUM",
+                                "symbol": "ETH",
+                                "recipient": "0x1F6E4FD185ce8C8171b4BDd2A64667BC69Aff11A",
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(content="ARBITRUM 网络上的 ETH 余额约 0.0016312 ETH，请输入金额。")
+
+        async def decide_render(self, request):
+            return _render_decision(intent="transfer")
+
+    graph = build_graph(
+        model=QuickRepliesOnlyModel(),
+        wallet_provider=ArbitrumWalletProvider(),
+        chains={"BASE": object(), "ETH": object(), "ARBITRUM": object()},
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {
+                "message": "ETH",
+                "metadata": {
+                    "suggestion_data": {
+                        "intent": "transfer",
+                        "chain": "ARBITRUM",
+                        "symbol": "ETH",
+                        "recipient": "0x1F6E4FD185ce8C8171b4BDd2A64667BC69Aff11A",
+                    }
+                },
+            },
+            "wallet_context": {
+                "address": "0x" + "1" * 40,
+                "chain": "ARBITRUM",
+                "wallet_accounts": [
+                    {"chain": "ARBITRUM", "address": "0x" + "1" * 40}
+                ],
+            },
+            "conversation_history": [],
+        },
+        config={"configurable": {"thread_id": "react-quick-reply-amount-keypad"}},
+    )
+
+    response = result["response"]
+    assert [item["type"] for item in response["suggestions"]] == ["amount"] * 4
+    assert response["client_action"]["type"] == "open_amount_keypad"
+    slots = response["client_action"]["slots"]
+    assert slots["intent"] == "transfer"
+    assert slots["chain"] == "ARBITRUM"
+    assert slots["symbol"] == "ETH"
+    assert slots["decimals"] == 18
+    assert slots["balance"] == "0.00163120047"
+    assert slots["balance_raw"] == "1631200470000000"
+    assert slots["balance_usd"] == "3.78"
+    assert "portfolio" not in response
+
+
+@pytest.mark.asyncio
 async def test_react_transfer_keypad_survives_balance_lookup_failure():
     """A failed balance lookup must not drop the amount keypad or its intent."""
 
