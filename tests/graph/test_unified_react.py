@@ -1245,3 +1245,76 @@ async def test_react_balance_query_does_not_prepare_stale_transfer():
     assert model.observation is not None
     assert model.observation["ok"] is False
     assert model.observation["code"] == "TRANSFER_NOT_REQUESTED"
+
+
+class BalanceAfterTransferCardModel:
+    """Answers a balance query with ``wallet_balance`` while a transfer card is
+    still pending in the conversation."""
+
+    def __init__(self):
+        self.saw_balance = False
+
+    async def invoke_react(self, messages, tools):
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "bal-1",
+                        "name": "wallet_balance",
+                        "args": {"chain": "BSC", "address": WALLET},
+                    }
+                ],
+            )
+        self.saw_balance = True
+        return AIMessage(content="你的 BSC 余额约 384 美元（0.5 BNB）。")
+
+
+@pytest.mark.asyncio
+async def test_balance_query_after_transfer_card_does_not_render_transfer_step_card():
+    """A balance question while a transfer card is pending must not also project
+    the next transfer-collection card (coin/amount chips) next to the balance.
+
+    Regression for the reported run: after the transfer card, the user asked
+    "余额" and got a coin card next to the balance text, and selecting the coin
+    then produced a transfer amount card. The transfer-collection fallback is
+    gated on the model render decision, and a balance turn that produced a
+    portfolio result suppresses that decision, so no transfer chips may appear.
+    """
+    from wallet_agent.graph.build import build_graph
+
+    model = BalanceAfterTransferCardModel()
+    graph = build_graph(model=model, wallet_provider=WalletProvider())
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "余额"},
+            "wallet_context": {"address": WALLET, "chain": "BSC"},
+            # The transfer card was already shown in an earlier turn: the
+            # recipient and network are collected, and only the coin is left.
+            # The graph rebuilds its message channel from this history, so the
+            # transfer-collection slots are visible to the render fallback.
+            "conversation_history": [
+                {"role": "user", "content": "转 0.1 BNB 给我自己"},
+                {"role": "assistant", "content": "好的，请提供收款地址。"},
+                {"role": "user", "content": WALLET},
+                {"role": "assistant", "content": "已记录收款地址，请选择网络。"},
+                {"role": "user", "content": "BSC"},
+                {"role": "assistant", "content": "BSC 网络已选定，请选择币种。"},
+            ],
+            "pending_transaction": {
+                "chain": "BSC",
+                "to": WALLET,
+                "value": "100000000000000000",
+            },
+        },
+        config={"configurable": {"thread_id": "react-balance-no-transfer-card"}},
+    )
+
+    response = result["response"]
+    assert response["kind"] == "react"
+    assert model.saw_balance is True
+    suggestions = response.get("suggestions") or []
+    suggestion_types = [str(item.get("type")) for item in suggestions]
+    assert "symbol" not in suggestion_types
+    assert "amount" not in suggestion_types
