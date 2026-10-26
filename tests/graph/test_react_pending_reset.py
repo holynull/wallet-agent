@@ -62,6 +62,62 @@ async def test_react_turn_drops_stale_pending_after_broadcast():
     assert result.get("preflight") is None
 
 
+class BalanceQueryModel:
+    """Answers a balance query with ``wallet_balance`` and no transfer tools."""
+
+    async def invoke_react(self, messages, tools):
+        tool_messages = [message for message in messages if isinstance(message, ToolMessage)]
+        if not tool_messages:
+            from tests.graph.test_unified_react import WALLET
+
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "bal-1",
+                        "name": "wallet_balance",
+                        "args": {"chain": "BSC", "address": WALLET},
+                    }
+                ],
+            )
+        return AIMessage(content="你的 BSC 余额约 0.5 BNB，约 384 美元。")
+
+
+@pytest.mark.asyncio
+async def test_react_balance_turn_drops_stale_pending_without_broadcast():
+    """A balance query while an unsigned transfer is still pending must drop
+    the stale pending_transaction + preflight.
+
+    Regression for the App-side report: after a prepared transfer, asking
+    "余额" made the App render the transfer confirmation card again next to
+    the balance answer. The card only survives while the transfer is the
+    subject of the conversation; a balance turn is not, so it must be revoked.
+    """
+    from tests.graph.test_unified_react import WALLET, WalletProvider
+    from wallet_agent.graph.build import build_graph
+
+    model = BalanceQueryModel()
+    graph = build_graph(model=model, wallet_provider=WalletProvider())
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "余额"},
+            "wallet_context": {"address": WALLET, "chain": "BSC"},
+            "pending_transaction": _stale_bnb_pending(),
+            "preflight": {"ok": True, "checks": []},
+            "conversation_history": [],
+        },
+        config={"configurable": {"thread_id": "react-balance-drops-stale-pending"}},
+    )
+
+    assert result["response"]["kind"] == "react"
+    # The balance answer is projected as the portfolio card...
+    assert isinstance(result["response"].get("portfolio"), dict)
+    # ...and the stale unsigned transfer is dropped, so the App must not
+    # re-render the transfer confirmation card next to it.
+    assert result.get("pending_transaction") is None
+    assert result.get("preflight") is None
+
+
 @pytest.mark.asyncio
 async def test_react_transfer_slot_fill_drops_stale_pending_without_broadcast():
     """A new transfer-collection turn replaces an old, still-unsigned prepare."""

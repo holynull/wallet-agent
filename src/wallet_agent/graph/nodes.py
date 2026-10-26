@@ -13092,9 +13092,6 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 None,
             )
             quick_replies = swap_tool_suggestions if swap_tool_suggestions else None
-        transfer_collection = any(
-            name == "transfer_quick_replies" for name, _ in tool_payloads
-        )
         if quick_replies:
             response["suggestions"] = quick_replies
         elif (
@@ -13112,7 +13109,6 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             # reconstruction below is deterministic data assembly.
             transfer_slots = _react_transfer_slots(state)
             if transfer_slots is not None:
-                transfer_collection = True
                 missing, draft = _react_transfer_draft(transfer_slots)
                 card_suggestions = await transfer_suggestions(
                     {**dict(state), "transfer_draft": draft}, missing
@@ -13338,20 +13334,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 if prepare_response.get("chain_logo_url") is not None:
                     response["chain_logo_url"] = prepare_response["chain_logo_url"]
         elif state.get("pending_transaction") is not None:
-            # A prepared unsigned transaction is only actionable while it is
-            # still awaiting signature. Once it has been broadcast, or this
-            # react turn is collecting parameters for a NEW transfer (quick
-            # replies / client surface / transfer card, with no fresh prepare),
-            # the old unsigned transaction no longer matches what the user is
-            # doing. Drop it here so the App stops rendering the stale
-            # confirmation card next to the current turn's card.
-            transfer_collection = (
-                transfer_collection
-                or client_action is not None
-            )
-            if state.get("broadcast_tx_hash") or transfer_collection:
-                update["pending_transaction"] = None
-                update["preflight"] = None
+            # A prepared unsigned transaction is only actionable while the
+            # transfer is still the subject of the conversation. This branch is
+            # only reached when the turn produced no fresh prepare_transfer, so
+            # the old card no longer matches what the user is doing: it was
+            # broadcast, or this turn is collecting a NEW transfer (quick
+            # replies / client surface / transfer card), or the user moved on
+            # to something else entirely (balance/swap/price/bare prose). Drop
+            # it here so the App stops re-rendering the stale confirmation
+            # card next to an unrelated answer (App report: asking "余额" after
+            # a prepared transfer popped the transfer card again).
+            update["pending_transaction"] = None
+            update["preflight"] = None
         return update
 
     return locals()

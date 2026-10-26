@@ -1523,7 +1523,11 @@ def create_app(
         for field in ("approval_transaction", "approval_tx_hash", "allowance_requirement"):
             if state.get(field) is not None:
                 changes[field] = state[field]
-        if state.get("preflight") is not None:
+        if "preflight" in state:
+            # Mirror the cleared value too: a turn that dropped the stale
+            # unsigned transaction (e.g. a balance query after a prepared
+            # transfer) must also revoke the old preflight from the session,
+            # or the App keeps rendering the obsolete confirmation card.
             changes["preflight"] = state["preflight"]
         # The unsigned-transaction / swap-status cards show the moved asset; keep
         # its identity (icon included) on the session so the REST clients get the
