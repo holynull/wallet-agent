@@ -10,6 +10,8 @@
   不暴露 run 是否存在。
 - 配置 `ADMIN_TOKEN` 后，运维可以用该 token 跨用户读取 run、conversation 和 session。
   `ADMIN_TOKEN` 不是普通 App 用户 token，不要放进 App 构建产物或客户端日志。
+- 如果测试环境暂时未开启 `AUTH_REQUIRED`，但已经配置了 `ADMIN_TOKEN`，
+  run 巡检接口会要求 operator token，避免 run 事件在无鉴权环境下裸露。
 - 使用 `ADMIN_TOKEN` 查看 conversation / session 时，同时传目标 `user_id` 作为筛选条件。
 - 响应会递归移除 Authorization/Cookie、API key、私钥/助记词、签名、raw/unsigned
   transaction 和 PSBT 等内容，只保留排查所需的元数据与业务摘要。

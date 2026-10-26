@@ -1163,6 +1163,7 @@ def create_app(
         run_id: str,
         *,
         fallback_user_id: str = "browser-demo",
+        require_operator_when_auth_disabled: bool = False,
     ) -> dict[str, str] | None:
         """Authorize a run lookup and return its owner/link metadata.
 
@@ -1177,6 +1178,8 @@ def create_app(
                 raise HTTPException(status_code=404, detail="run not found")
             return metadata
         if token_verifier is None and not require_auth:
+            if require_operator_when_auth_disabled and admin_token:
+                raise HTTPException(status_code=401, detail="Bearer token is required")
             return metadata
         owner = await authenticated_user(
             request,
@@ -1371,6 +1374,7 @@ def create_app(
             request,
             run_id,
             fallback_user_id=user_id,
+            require_operator_when_auth_disabled=True,
         )
         if metadata is None:
             raise HTTPException(status_code=404, detail="run not found")

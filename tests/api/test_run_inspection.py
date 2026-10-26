@@ -5,7 +5,7 @@ from wallet_agent.api import StaticTokenVerifier, create_app
 from wallet_agent.persistence import InMemoryRunStore, InMemorySessionStore, SwapSessionRecord
 
 
-async def _inspection_app(*, auth: bool = True):
+async def _inspection_app(*, auth: bool = True, admin_token: str | None = None):
     runs = InMemoryRunStore()
     sessions = InMemorySessionStore()
     app = create_app(
@@ -17,7 +17,7 @@ async def _inspection_app(*, auth: bool = True):
             else None
         ),
         require_auth=auth,
-        admin_token="operator-token" if auth else None,
+        admin_token="operator-token" if auth else admin_token,
     )
     await sessions.save(
         SwapSessionRecord(
@@ -203,3 +203,17 @@ async def test_unauthenticated_local_mode_keeps_inspection_available():
     assert run.status_code == 200
     assert run.json()["owner_id"] == "alice"
     assert "RUN_NOT_FOUND" in missing_stream.text
+
+
+@pytest.mark.asyncio
+async def test_configured_operator_token_protects_inspection_when_auth_is_off():
+    app, _runs = await _inspection_app(auth=False, admin_token="local-operator")
+    async with _client(app) as client:
+        missing = await client.get("/v1/agent/runs/run-1")
+        operator = await client.get(
+            "/v1/agent/runs/run-1",
+            headers={"Authorization": "Bearer local-operator"},
+        )
+
+    assert missing.status_code == 401
+    assert operator.status_code == 200
