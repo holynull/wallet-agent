@@ -33,6 +33,8 @@
 | 9 | 链选择卡（转账 step 2） | [`33692:48836`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33692-48836) | 缺网络 | `suggestions`（`type:"chain"`，当前网络第一） | ✅ |
 | 10 | 金额输入卡（转账 step 3） | [`33692:37984`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33692-37984) | 缺金额 | `suggestions`（`type:"amount"` 25/50/75/100%）+ `open_amount_keypad` | ✅ |
 | 11 | 风险提示卡 | [`33692:48838`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33692-48838) | 转账/兑换预检查 | `preflight.risk` | ✅ |
+| 11a | 输入地址风险卡 | [`33692:48838`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33692-48838) | 输入的地址命中风险 | `client_action.address_risk` | ✅ |
+| 11b | 添加好友卡 | [`33617:53621`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33617-53621) | 「保存联系人/添加好友」+ 地址 | `client_action.add_contact` | ✅ |
 | 12 | 报价列表卡 | 兑换流程 | 「我要兑换」→ 拿到报价 | `swap_quote`（`react_results` 里 `get_swap_quote`） | ✅ |
 | 13 | 兑换确认卡 | 兑换流程 | 选中报价后 | `confirmation_required`（`confirmation_state`） | ✅ |
 | 14 | 授权卡（Approve） | 兑换流程 | 需要代币授权 | `approval_required`（`approval_transaction`） | ✅ |
@@ -292,6 +294,28 @@ App 需按占位处理（不要用别的链 logo 顶替）。
   `transfer_prepare` / `swap_prepare` / `error` 的 `preflight` 里。
 - App 接入：`danger` 阻断签名前准备；`warning` 展示后确认继续。
 - 对齐：✅（`data-card-kind="risk"` 已实现）。
+
+### 3.11.1 输入地址时的风险提示（`client_action.address_risk`）
+
+- 触发：用户本轮消息里直接输入了地址，且后台识别到风险。
+- 数据：`client_action.type = "address_risk"`，`slots` 包含完整地址、短地址、
+  链、`level`（`warning` / `danger`）、`code`、标题/文案和
+  `cancel_label`（取消转账）/ `continue_label`（继续转账）/ `blocking`。
+- 合约地址：EVM 地址通过 `eth_getCode` 判断是否合约；合约地址不是天然恶意，
+  因此按 `warning` 提示用户核对来源。钓鱼、制裁、黑名单等声誉风险不在本服务
+  的离线能力内，App/安全数据源可通过 `metadata.address_risk` 传入判定。
+- App 接入：命中时优先渲染「地址风险提示」卡；`blocking=true` 时不可继续。
+- 对齐：✅（合约地址与客户端风险判定已接入，App 卡片渲染由 App 负责）。
+
+### 3.11.2 添加好友卡（v1.6.9）
+
+- 设计节点：[`33617:53621`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33617-53621)。
+- 触发：用户说“保存联系人/添加好友/把这个地址存为朋友”并给出地址。
+- 数据：顶层 `client_action.type = "add_contact"`，`slots` 包含完整 `address`、
+  `short_address`、`suggested_name`（默认“好友”），能确定网络时带 `chain`。
+- App 接入：按设计渲染联系人卡片和“修改备注”弹层；用户确认后由 App 写入地址本，
+  下一轮再把已保存的联系人/地址带回。后台只发动作，不保存联系人。
+- 对齐：✅（后端触发已实现，卡片与地址本交互由 App 负责）。
 
 ### 3.12 报价列表卡（`swap_quote`）
 

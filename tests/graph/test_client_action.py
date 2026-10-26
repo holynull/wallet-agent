@@ -29,16 +29,75 @@ class ClientActionModel:
 
 
 async def _run(args, thread_id):
+    return await _run_message(
+        args,
+        thread_id,
+        message="转一笔给朋友",
+        metadata=None,
+    )
+
+
+async def _run_message(args, thread_id, *, message, metadata):
     graph = build_graph(model=ClientActionModel(args))
+    request = {"message": message, "address": EVM, "chain": "BASE"}
+    if metadata is not None:
+        request["metadata"] = metadata
     result = await graph.ainvoke(
         {
-            "request": {"message": "转一笔给朋友", "address": EVM, "chain": "BASE"},
+            "request": request,
             "wallet_context": CONTEXT,
             "conversation_history": [],
         },
         config={"configurable": {"thread_id": thread_id}},
     )
     return result
+
+
+@pytest.mark.asyncio
+async def test_add_contact_request_reaches_the_app_with_contact_slots():
+    result = await _run_message(
+        {
+            "action": "add_contact",
+            "reason": "用户要保存联系人",
+            "contact_name": "朋友",
+        },
+        "client-action-add-contact",
+        message=f"保存联系人{EVM}",
+        metadata=None,
+    )
+
+    response = result["response"]
+    assert response["kind"] == "react"
+    assert response["client_action"] == {
+        "type": "add_contact",
+        "reason": "用户要保存联系人",
+        "slots": {
+            "address": EVM,
+            "short_address": "0x3f84...41d2a5",
+            "suggested_name": "朋友",
+            "chain": "BASE",
+        },
+    }
+    # The agent only asks the App to render/save the contact. Lifecycle state
+    # must not gain a contacts/address-book side effect.
+    assert "contacts" not in result
+
+
+@pytest.mark.asyncio
+async def test_add_contact_requires_a_valid_address():
+    result = await _run_message(
+        {"action": "add_contact", "reason": "用户要保存联系人"},
+        "client-action-add-contact-invalid",
+        message="保存联系人 not-an-address",
+        metadata=None,
+    )
+
+    response = result["response"]
+    assert "client_action" not in response
+    tool_messages = [item for item in result["messages"] if isinstance(item, ToolMessage)]
+    assert tool_messages
+    assert '"ok": false' in tool_messages[0].content
+    assert "INVALID_CONTACT_ADDRESS" in tool_messages[0].content
 
 
 @pytest.mark.asyncio

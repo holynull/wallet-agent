@@ -97,6 +97,15 @@ class EVMChainAdapter:
         raw = quantity(await rpc_call(self.transport, "eth_getBalance", [address, "latest"]))
         return token_balance(self.native_asset, raw)
 
+    async def is_contract(self, address: str) -> bool:
+        """Whether an address has deployed bytecode (and is therefore a contract)."""
+        code = await rpc_call(
+            self.transport,
+            "eth_getCode",
+            [validate_evm_address(address), "latest"],
+        )
+        return bool(code and str(code).lower() not in {"0x", "0x0"})
+
     async def get_token_balances(self, address: str) -> list[TokenBalance]:
         # ERC-20 balanceOf calls are deterministic and work with any standard EVM node.
         balances: list[TokenBalance] = []

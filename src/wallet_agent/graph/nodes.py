@@ -4046,11 +4046,78 @@ _ZERO_EVM_ADDRESS = "0x" + "0" * 40
 # data inside them itself.
 _CLIENT_ACTION_TYPES = (
     "open_contacts",
+    "add_contact",
     "scan_qr",
     "open_amount_keypad",
     "address_input",
     "select_btc_address",
 )
+
+_ADDRESS_TOKEN = re.compile(
+    r"(?:0x[0-9a-fA-F]{40}|(?:bc1|tb1)[0-9a-z]{25,90}|[1-9A-HJ-NP-Za-km-z]{32,44})"
+)
+
+
+def _first_address_in_text(text: str) -> str | None:
+    """Extract the first address understood by one of the supported chains."""
+    for match in _ADDRESS_TOKEN.finditer(str(text or "")):
+        candidate = match.group(0)
+        if any(
+            is_valid_address(chain, candidate) for chain in _CHAIN_ADDRESS_PROBES
+        ):
+            return candidate
+    return None
+
+
+def _short_address(address: str) -> str:
+    """Match the App contact card's 6 + 6 character address abbreviation."""
+    text = str(address or "").strip()
+    return text if len(text) <= 12 else f"{text[:6]}...{text[-6:]}"
+
+
+def _contact_address_from_state(state: Mapping[str, Any]) -> str | None:
+    """The address the user supplied in the current turn, not wallet defaults."""
+    for message in reversed(list(state.get("messages") or [])):
+        if isinstance(message, HumanMessage):
+            current_address = _first_address_in_text(str(message.content or ""))
+            if current_address:
+                return current_address
+            break
+    request = state.get("request") or {}
+    metadata = request.get("metadata") if isinstance(request, Mapping) else None
+    if isinstance(metadata, Mapping):
+        for key in ("address", "recipient"):
+            candidate = str(metadata.get(key) or "").strip()
+            if candidate and any(
+                is_valid_address(chain, candidate) for chain in _CHAIN_ADDRESS_PROBES
+            ):
+                return candidate
+        suggestion = metadata.get("suggestion_data")
+        if isinstance(suggestion, Mapping):
+            for key in ("address", "recipient"):
+                candidate = str(suggestion.get(key) or "").strip()
+                if candidate and any(
+                    is_valid_address(chain, candidate)
+                    for chain in _CHAIN_ADDRESS_PROBES
+                ):
+                    return candidate
+    return None
+
+
+def _contact_chain_for_address(
+    address: str, requested_chain: str | None, wallet_context: Mapping[str, Any] | None
+) -> str | None:
+    """Prefer an explicit/current chain only when it can parse this address."""
+    for candidate in (requested_chain, (wallet_context or {}).get("chain")):
+        canonical = canonical_chain(str(candidate or ""))
+        if canonical and is_valid_address(canonical, address):
+            return canonical
+    matches = [
+        chain
+        for chain in _CHAIN_ADDRESS_PROBES
+        if is_valid_address(chain, address)
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _address_risk(
@@ -4089,6 +4156,74 @@ def _address_risk(
             "code": "OWN_ADDRESS_RECIPIENT",
             "message": "收款地址属于本钱包自己的地址，请确认这是有意的（例如整理 UTXO）。",
         }
+    return None
+
+
+_ADDRESS_RISK_MESSAGE = (
+    "当前地址存在风险，请仔细核对地址来源及准确性，确认无误后再继续，避免资产损失。"
+)
+
+
+def _metadata_address_risk(
+    metadata: Mapping[str, Any] | None, address: str
+) -> dict[str, Any] | None:
+    """Relay an App/security-provider risk verdict for the exact entered address."""
+    if not isinstance(metadata, Mapping):
+        return None
+    candidates: list[Any] = [metadata.get("address_risk")]
+    suggestion = metadata.get("suggestion_data")
+    if isinstance(suggestion, Mapping):
+        candidates.append(suggestion.get("address_risk"))
+    wanted = str(address or "").strip().lower()
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        candidate_address = str(candidate.get("address") or "").strip().lower()
+        if candidate_address and candidate_address != wanted:
+            continue
+        level = str(candidate.get("level") or "").strip().lower()
+        if level not in {"warning", "danger"}:
+            continue
+        return {
+            "level": level,
+            "code": str(candidate.get("code") or "HIGH_RISK_ADDRESS").strip(),
+            "message": str(candidate.get("message") or _ADDRESS_RISK_MESSAGE).strip(),
+            "source": "client_metadata",
+        }
+    return None
+
+
+async def _input_address_risk(
+    address: str,
+    chain: str,
+    metadata: Mapping[str, Any] | None,
+    adapter: Any,
+) -> dict[str, Any] | None:
+    """Risk for a just-entered address, before any transaction is prepared.
+
+    A client/security-provider verdict is relayed as-is. Without one, the
+    backend reports only facts it can verify locally: deterministic wallet
+    checks and, on EVM, whether the address has contract bytecode. Reputation
+    (phishing/sanctions/blacklist) is not inferred from bytecode.
+    """
+    supplied = _metadata_address_risk(metadata, address)
+    if supplied is not None:
+        return supplied
+    canonical = canonical_chain(chain)
+    checker = getattr(adapter, "is_contract", None) if adapter is not None else None
+    if canonical in EVM_ALIASES and callable(checker):
+        try:
+            is_contract = bool(await checker(address))
+        except Exception:
+            is_contract = False
+        if is_contract:
+            return {
+                "level": "warning",
+                "code": "CONTRACT_ADDRESS_RECIPIENT",
+                "message": _ADDRESS_RISK_MESSAGE,
+                "detail": "该地址是合约地址，不是普通钱包地址。",
+                "source": "contract_code",
+            }
     return None
 
 
@@ -12002,10 +12137,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         chain: str | None = None,
         symbol: str | None = None,
         intent: str | None = None,
+        address: str | None = None,
+        contact_name: str | None = None,
         *,
         state: Annotated[dict[str, Any], InjectedState],
     ) -> dict[str, Any]:
-        """Ask the App to open its contacts/scanner/keypad with structured slots.
+        """Ask the App to open its contacts/contact-editor/scanner/keypad.
 
         ``intent`` labels an amount keypad as a transfer or swap; the final
         response projection also normalizes it so a client never has to infer
@@ -12018,6 +12155,38 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "code": "CLIENT_ACTION_UNSUPPORTED",
                 "error": f"App 不支持的动作：{name or '未提供'}。",
                 "allowed_actions": list(_CLIENT_ACTION_TYPES),
+            }
+        if name == "add_contact":
+            contact_address = str(address or "").strip() or _contact_address_from_state(
+                state
+            )
+            if not contact_address or not any(
+                is_valid_address(chain_name, contact_address)
+                for chain_name in _CHAIN_ADDRESS_PROBES
+            ):
+                return {
+                    "ok": False,
+                    "code": "INVALID_CONTACT_ADDRESS",
+                    "error": "保存联系人需要一个有效的钱包地址。",
+                }
+            contact_chain = _contact_chain_for_address(
+                contact_address, chain, state.get("wallet_context")
+            )
+            suggested_name = str(contact_name or "").strip() or "好友"
+            slots = {
+                "address": contact_address,
+                "short_address": _short_address(contact_address),
+                "suggested_name": suggested_name,
+            }
+            if contact_chain:
+                slots["chain"] = contact_chain
+            return {
+                "ok": True,
+                "client_action": {
+                    "type": "add_contact",
+                    "reason": str(reason or "").strip() or "用户要把地址保存为联系人",
+                    "slots": slots,
+                },
             }
         slots = {
             key: value
@@ -12471,12 +12640,17 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             name="request_client_action",
             description=(
                 "请求 App 弹出它自己的界面并把结果回填给这一轮对话。"
-                "action 取值：open_contacts（通讯录选联系人）、scan_qr（扫收款码）、"
+                "action 取值：open_contacts（通讯录选联系人）、"
+                "add_contact（弹出保存联系人卡片，需传 address；可选 contact_name）、"
+                "scan_qr（扫收款码）、"
                 "open_amount_keypad（数字键盘输入金额）、"
                 "address_input（弹出地址输入框让用户粘贴收款地址）、"
                 "select_btc_address（BTC 兑换时让用户在多个 BTC 地址中选择出金地址）。"
                 "用户说“从联系人选/转给朋友”“扫一扫”“输入金额”，"
-                "或需要用户提供收款地址时调用它，"
+                "或需要用户提供收款地址时调用它；"
+                "用户表达“保存联系人/添加好友/把这个地址存为朋友”时，"
+                "调用 add_contact，把用户给出的完整地址传给 address。"
+                "联系人由 App 保存，后台不写地址本。"
                 "不要用文字向用户索要通讯录、二维码或键盘里的数据，也不要自己编造联系人。"
             ),
         ),
@@ -12726,6 +12900,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "需要通讯录、扫码、金额键盘、地址输入或 BTC 出金地址选择时"
                 "调用 request_client_action 请求 App 弹出，"
                 "自己不要收集这些界面里的数据；"
+                "用户表达“保存联系人/添加好友/把地址存为朋友”时，"
+                "调用 request_client_action(action=\"add_contact\", address=用户给的完整地址)，"
+                "由 App 负责编辑备注和写入地址本；后台不保存联系人，也不要声称已保存。"
+                "保存成功后如果用户要转账，再进入正常转账流程。"
                 "请求金额键盘时传 intent=\"swap\" 或 intent=\"transfer\"，"
                 "服务端会把它放进 client_action.slots.intent，"
                 "不要省略，渲染决策以你的标注为准。"
@@ -13059,6 +13237,51 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         current_message = str(
             (state.get("request") or {}).get("message") or state.get("message") or ""
         ).strip()
+        request_metadata = (state.get("request") or {}).get("metadata")
+        input_address = _first_address_in_text(current_message)
+        if input_address:
+            wallet_context = state.get("wallet_context") or {}
+            input_chain = _contact_chain_for_address(
+                input_address,
+                (
+                    str((request_metadata or {}).get("chain") or "")
+                    if isinstance(request_metadata, Mapping)
+                    else None
+                ),
+                wallet_context,
+            )
+            risk = await _input_address_risk(
+                input_address,
+                input_chain or "",
+                request_metadata if isinstance(request_metadata, Mapping) else None,
+                execution_adapter(input_chain or ""),
+            )
+            if risk is not None:
+                risk_slots: dict[str, Any] = {
+                    "address": input_address,
+                    "short_address": _short_address(input_address),
+                    "level": risk["level"],
+                    "code": risk["code"],
+                    "title": "地址风险提示",
+                    "message": risk["message"],
+                    "cancel_label": "取消转账",
+                    "continue_label": "继续转账",
+                    "blocking": risk["level"] == "danger",
+                    "source": risk.get("source"),
+                }
+                if input_chain:
+                    risk_slots["chain"] = input_chain
+                if risk.get("detail"):
+                    risk_slots["detail"] = risk["detail"]
+                client_action = {
+                    "type": "address_risk",
+                    "reason": "用户输入的地址存在风险",
+                    "slots": {
+                        key: value
+                        for key, value in risk_slots.items()
+                        if value is not None
+                    },
+                }
         quote_result = _best_react_quote_result(tool_payloads)
         transfer_result = next(
             (

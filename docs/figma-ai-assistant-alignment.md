@@ -76,9 +76,9 @@ ReAct 工具：`wallet_balance`、`portfolio_snapshot`、`price_lookup`、`marke
 | 余额不足提示 | `INSUFFICIENT_BALANCE` 预检查 | 已有 |
 | 历史记录列表 | 已补：每轮对话都会建 session，只读问答也会出现在历史里（原先只有兑换/转账类消息才建 session，只读问答在历史中不可见） | 已有 |
 | 交易记录查询 | 已实现 `transaction_history` 工具：跨 App 声明的地址/网络取记录、按方向筛选、笔数汇总；`TransactionRecord` 补齐卡片字段 | 已有 |
-| 地址风险提示 | 已实现确定性 `address_risk` 预检查：零地址（阻断）、转给自己、转给本钱包其他地址；`preflight.risk` 带 level/code/message | 已有 |
+| 地址风险提示 | `preflight.risk` 保留零地址/自转/本钱包地址检查；用户刚输入地址时新增 `client_action.address_risk`，EVM 合约地址通过 `eth_getCode` 识别，第三方高风险判定可由 App 通过 `metadata.address_risk` 传入 | 已有（合约/客户端判定） |
 | 收款地址 | 已实现 `receive_address` 工具：从 `wallet_accounts` 汇总，EVM 全链合并为一张卡，返回 `groups`/`supported_chains`/`message` | 已有 |
-| 转给联系人 | 无联系人概念 | **缺失** |
+| 转给联系人 / 添加好友 | 用户表达保存联系人意图时下发 `client_action.add_contact`（完整地址、短地址、建议备注）；App 负责编辑备注和写入地址本，后台不持久化联系人 | 后端触发已有，App 待接 |
 | 语音输入 | 全仓库无 audio/speech/STT 代码 | **缺失** |
 | 历史记录独立搜索 | 只有资产搜索（`/v1/assets?search=`） | **缺失** |
 | 链覆盖 | `APP_NETWORKS` = ETH/BSC/BASE/POLYGON/ARBITRUM/OPTIMISM + BTC/TRON/SOLANA，缺 Avalanche/Robinhood/MegaETH/CELO | **缺失** |
@@ -102,9 +102,10 @@ ReAct 工具：`wallet_balance`、`portfolio_snapshot`、`price_lookup`、`marke
 
 3. 历史记录：列表项返回**用户原话**（当前 `summary` 对非兑换会话是固定串），
    并补对话历史搜索接口。
-4. ~~地址风险提示卡片~~ 已完成（见 4.3）。路线图第三阶段的"已知风险标签/黑名单"仍未做，
-   目前只覆盖零地址、自转和本钱包地址三种可确定的风险。
-5. 联系人（转给联系人）：需要 App 侧提供联系人或由用户手动录入。
+4. ~~地址风险提示卡片~~ 已完成（见 4.3）。输入地址时的 EVM 合约识别已接入；
+   "已知风险标签/黑名单"需要 App 或外部安全数据源提供 `metadata.address_risk`。
+5. 联系人：后端已能识别“保存联系人/添加好友”并通知 App 打开设计卡片；
+   联系人的编辑、持久化和“转给联系人”选择由 App 负责。
 
 **P2（范围扩张）**
 

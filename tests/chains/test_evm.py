@@ -156,6 +156,16 @@ async def test_get_token_balance_reads_standard_balance_of():
 
 
 @pytest.mark.asyncio
+async def test_is_contract_distinguishes_bytecode_from_an_eoa():
+    code_rpc = RecordingRpc({"eth_getCode": "0x6000"})
+    eoa_rpc = RecordingRpc({"eth_getCode": "0x"})
+
+    assert await EVMChainAdapter(code_rpc).is_contract(RECIPIENT) is True
+    assert await EVMChainAdapter(eoa_rpc).is_contract(RECIPIENT) is False
+    assert code_rpc.calls == [("eth_getCode", [RECIPIENT, "latest"])]
+
+
+@pytest.mark.asyncio
 async def test_allowance_reads_owner_and_spender_words():
     rpc = RecordingRpc({"eth_call": "0x" + ("0" * 63) + "f"})
     adapter = EVMChainAdapter(rpc)

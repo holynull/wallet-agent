@@ -465,8 +465,19 @@ POST /v1/transfer/{session_id}/broadcast
 {"type": "open_contacts", "reason": "用户要给朋友转账", "slots": {"chain": "BTC"}}
 ```
 
-- `type` 取 `open_contacts` / `scan_qr` / `open_amount_keypad` / `address_input`，
-  App 收到后弹出自己的界面（`address_input` 弹地址输入框让用户粘贴收款地址）。
+- `type` 取 `open_contacts` / `add_contact` / `scan_qr` / `open_amount_keypad` /
+  `address_input`，App 收到后弹出自己的界面（`address_input` 弹地址输入框让用户
+  粘贴收款地址）。
+- `add_contact` 用于用户表达“保存联系人/添加好友”时弹出设计稿 v1.6.9 的联系人
+  卡片：`slots.address` 是完整地址，`slots.short_address` 供卡片展示，
+  `slots.suggested_name` 是建议备注（默认“好友”），有明确网络时带 `slots.chain`。
+  App 负责编辑备注和写入地址本；后台不持久化联系人。
+- `address_risk` 由后台在用户本轮**刚输入地址**且命中风险时生成：`slots` 带
+  `address` / `short_address` / `chain` / `level` / `code` / `title` / `message`，
+  以及 `cancel_label` / `continue_label` / `blocking`。App 按 v1.6.9「地址风险提示」
+  卡片展示；`blocking=true` 时禁用继续。合约地址通过 EVM `eth_getCode` 识别为
+  `warning`；钓鱼/黑名单等声誉风险需要 App 在 `metadata.address_risk` 提供
+  `{address, level, code, message}`，后台只转发、不自行推断。
 - `open_amount_keypad` 的 `slots.intent` 为 `"transfer"` 或 `"swap"`，App 用它
   区分金额键盘属于转账还是兑换；转账键盘还可能在 `slots` 中带所选链资产的
   `balance` / `balance_raw` / `balance_usd` 和 logo 字段。
