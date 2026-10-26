@@ -99,17 +99,36 @@ App 只依赖 `complete`（或 `action_required`）帧里的 `state.response` �
 ```jsonc
 { "type": "open_contacts | scan_qr | open_amount_keypad | address_input | select_btc_address",
   "reason": "可选",
-  "slots": { "chain": "...", "symbol": "..." } }
+  "slots": {
+    "intent": "transfer | swap", // 金额键盘必带，客户端据此区分转账/兑换
+    "chain": "...",
+    "symbol": "...",
+    "decimals": 18,
+    "balance": "0.00163120047",  // 后端可查到所选链资产时
+    "balance_raw": "1631200470000000",
+    "balance_usd": "3.78",
+    "logo_url": "...",
+    "chain_logo_url": "..."
+  } }
 ```
 
 App 收到后弹出自己的界面；用户完成后的结果作为**下一轮** `turn` 输入回传
 （文本，或 `metadata.suggestion_data`）。未知 `type` 服务端不会下发
 （白名单校验，非法取值返回 `CLIENT_ACTION_UNSUPPORTED`）。
 
-兑换金额卡（Figma [`33715:134548`](https://www.figma.com/design/2N2sTwtjY3OznWq8m9zpmR/Cat-Wallet-v1.6.0?node-id=33715-134548)）
-的 `open_amount_keypad` 额外带 `slots.intent:"swap"`（转账不带）；点按推荐币对后
-再弹键盘时，`slots` 还会带上来源币的 `token_address` / `decimals`（从被点币对的
-`source` 复制），供 App 精确定位资产。App 只消费**顶层** `client_action`。
+金额输入卡的 `open_amount_keypad` **必须**带 `slots.intent`：转账为 `"transfer"`，
+兑换为 `"swap"`。App 依赖它区分后续是转账还是兑换流程。点按推荐币对后再弹兑换
+键盘时，`slots` 还会带上来源币的 `token_address` / `decimals`（从被点币对的
+`source` 复制），供 App 精确定位资产。转账金额键盘会尽量带上所选链资产的
+`balance` / `balance_raw` / `balance_usd` 及 `logo_url` / `chain_logo_url`；
+余额查询失败时这些字段可能缺失，App 应回退到本地余额。App 只消费**顶层**
+`client_action`。
+
+兑换金额键盘同回合会补查来源币余额：`react_results` 新增
+`tool:"wallet_balance"`，App 从 `result.portfolio.assets[]` 匹配
+`asset.chain + asset.symbol` 的行读取 `amount`；`slots.token_address` /
+`slots.decimals` 同时用于精确定位资产。成功查询但余额为 0 时
+`slots.balance` 为 `"0"`，这是业务真零而不是缺数。
 
 **BTC 兑换出金地址**：`select_btc_address`（`slots.chain:"BTC"`、`slots.symbol:"BTC"`，
 后端会尽量带 `slots.addresses:[{address, balance?, balance_raw?}]`）。BTC 作为兑换

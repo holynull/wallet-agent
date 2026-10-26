@@ -94,7 +94,9 @@ returns `None`, which renders prose only (a safe, card-free default).
 
 - a quote result exists,
 - `swap_quick_replies` was called,
-- `client_action.slots.intent == "swap"` (the model labels keypads), or
+- `client_action.slots.intent == "swap"` (the model labels keypads; the final
+  projection deterministically normalizes a transfer keypad to `intent:"transfer"`
+  and a swap keypad to `intent:"swap"`), or
 - the render decision says `intent == "swap"`.
 
 `active_pair` comes only from the decision's `source_symbol`/`destination_symbol`.

@@ -1773,16 +1773,14 @@ def _react_swap_keypad_slots(
     ``finalize_response`` owns that path.
     """
     slots = dict(keypad_slots)
-    if str(slots.get("intent") or "").strip().lower() == "swap":
-        slots.setdefault("intent", "swap")
-        return slots
-    if not swap_intent:
+    labelled_swap = str(slots.get("intent") or "").strip().lower() == "swap"
+    if not labelled_swap and not swap_intent:
         return None
     selected = _react_swap_selected(state)
     if selected is None and not str(slots.get("symbol") or "").strip():
         # No tapped pair and no coin at all: the keypad cannot anchor an amount.
         return None
-    slots.setdefault("intent", "swap")
+    slots["intent"] = "swap"
     if not slots.get("chain") and selected and selected.get("chain"):
         slots["chain"] = str(selected["chain"])
     if not slots.get("symbol") and selected and selected.get("symbol"):
@@ -1793,6 +1791,55 @@ def _react_swap_keypad_slots(
         if "decimals" not in slots and selected.get("decimals") is not None:
             slots["decimals"] = int(selected["decimals"])
     return slots
+
+
+def _react_swap_asset_from_history(
+    history: Any, chain: str, symbol: str
+) -> dict[str, Any] | None:
+    """Find a previously recommended asset descriptor for the exact chain+symbol.
+
+    A typed follow-up ("usdt换eth") does not carry ``suggestion_data`` even
+    when the previous turn recommended that token. The App still needs the
+    contract address/decimals on the swap amount keypad, so recover the exact
+    descriptor from the prior structured swap-pair chips instead of relying on
+    the client's local asset table.
+    """
+    wanted_chain = canonical_chain(chain)
+    wanted_symbol = canonical_symbol(symbol)
+    if not wanted_chain or not wanted_symbol:
+        return None
+    for item in reversed(list(history or [])):
+        if not isinstance(item, Mapping):
+            continue
+        suggestions = item.get("suggestions")
+        if not isinstance(suggestions, list):
+            continue
+        for suggestion in reversed(suggestions):
+            if not isinstance(suggestion, Mapping):
+                continue
+            data = suggestion.get("data")
+            if not isinstance(data, Mapping):
+                continue
+            candidates: list[Mapping[str, Any]] = []
+            for side in ("source", "destination"):
+                candidate = data.get(side)
+                if isinstance(candidate, Mapping):
+                    candidates.append(candidate)
+            if data.get("chain") and data.get("symbol"):
+                candidates.append(data)
+            for candidate in candidates:
+                if (
+                    canonical_chain(str(candidate.get("chain") or "")) == wanted_chain
+                    and canonical_symbol(str(candidate.get("symbol") or ""))
+                    == wanted_symbol
+                    and (
+                        candidate.get("address")
+                        or candidate.get("decimals") is not None
+                        or candidate.get("logo_url")
+                    )
+                ):
+                    return dict(candidate)
+    return None
 
 
 def _react_swap_pinned_chain(state: Mapping[str, Any]) -> str | None:
@@ -5782,6 +5829,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "decimals": getattr(asset, "decimals", None),
                 "address": getattr(asset, "address", None),
                 "symbol": getattr(asset, "symbol", None),
+                "logo_url": getattr(asset, "logo_url", None),
             }
         return None
 
@@ -11953,10 +12001,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         reason: str | None = None,
         chain: str | None = None,
         symbol: str | None = None,
+        intent: str | None = None,
         *,
         state: Annotated[dict[str, Any], InjectedState],
     ) -> dict[str, Any]:
-        """Ask the App to open one of its own surfaces (contacts, scanner, keypad)."""
+        """Ask the App to open its contacts/scanner/keypad with structured slots.
+
+        ``intent`` labels an amount keypad as a transfer or swap; the final
+        response projection also normalizes it so a client never has to infer
+        the flow from free text.
+        """
         name = str(action or "").strip()
         if name not in _CLIENT_ACTION_TYPES:
             return {
@@ -11970,6 +12024,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             for key, value in {
                 "chain": canonical_chain(str(chain or "")) or None,
                 "symbol": str(symbol or "").strip().upper() or None,
+                "intent": (
+                    str(intent or "").strip().lower()
+                    if str(intent or "").strip().lower() in {"swap", "transfer"}
+                    else None
+                ),
             }.items()
             if value
         }
@@ -12667,8 +12726,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "需要通讯录、扫码、金额键盘、地址输入或 BTC 出金地址选择时"
                 "调用 request_client_action 请求 App 弹出，"
                 "自己不要收集这些界面里的数据；"
-                "请求金额键盘时必须在 slots.intent 里标注 swap 或 transfer，"
+                "请求金额键盘时传 intent=\"swap\" 或 intent=\"transfer\"，"
+                "服务端会把它放进 client_action.slots.intent，"
                 "不要省略，渲染决策以你的标注为准。"
+                "兑换开金额键盘前先用 wallet_balance 查询来源链和来源币余额；"
+                "若余额为 0，不要只开空余额键盘，应说明真零并优先引导有余额的币对。"
                 "回复保持纯文本短句：禁止使用 Markdown 图片（如 ![ETH](url)）和表格，"
                 "禁止用 <suggestions>、JSON 或任何标签把选项写进文案；"
                 "币种与链的图标只通过结构化字段下发，由 App 渲染，不要写进文案；"
@@ -13056,11 +13118,228 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             or (render_decision is not None and render_decision.get("intent") == "swap")
         )
         swap_keypad_slots = None
+        synthetic_swap_tool_signatures: list[str] = []
         if client_action and str(client_action.get("type") or "") == "open_amount_keypad":
             swap_keypad_slots = _react_swap_keypad_slots(
                 dict(client_action.get("slots") or {}), state, swap_intent
             )
             if swap_keypad_slots is not None:
+                client_action = {**client_action, "slots": swap_keypad_slots}
+        if swap_keypad_slots is not None and client_action is not None:
+            keypad_chain = canonical_chain(str(swap_keypad_slots.get("chain") or ""))
+            keypad_symbol = canonical_symbol(str(swap_keypad_slots.get("symbol") or ""))
+            if keypad_chain and keypad_symbol:
+                def _balance_payload_covers_asset(payload: Mapping[str, Any]) -> bool:
+                    if not payload.get("ok"):
+                        return False
+                    portfolio = payload.get("portfolio")
+                    if isinstance(portfolio, Mapping):
+                        for row in portfolio.get("assets") or []:
+                            asset = row.get("asset") if isinstance(row, Mapping) else None
+                            if not isinstance(asset, Mapping):
+                                continue
+                            if (
+                                canonical_chain(str(asset.get("chain") or ""))
+                                == keypad_chain
+                                and canonical_symbol(str(asset.get("symbol") or ""))
+                                == keypad_symbol
+                            ):
+                                return True
+                        scope = portfolio.get("scope")
+                        resolved_chains = (
+                            scope.get("resolved_chains")
+                            if isinstance(scope, Mapping)
+                            else None
+                        )
+                        if isinstance(resolved_chains, list) and keypad_chain not in {
+                            canonical_chain(str(chain)) for chain in resolved_chains
+                        }:
+                            return False
+                    asset_scope = payload.get("asset_scope")
+                    return bool(
+                        isinstance(asset_scope, Mapping)
+                        and canonical_symbol(str(asset_scope.get("symbol") or ""))
+                        == keypad_symbol
+                    )
+
+                balance_payload = next(
+                    (
+                        dict(payload)
+                        for name, payload in reversed(tool_payloads)
+                        if name in {"wallet_balance", "portfolio_snapshot"}
+                        and _balance_payload_covers_asset(payload)
+                    ),
+                    None,
+                )
+                if (
+                    balance_payload is None
+                    and runtime.wallet_provider is not None
+                    and hasattr(runtime.wallet_provider, "get_token_balances")
+                ):
+                    started = perf_counter()
+                    try:
+                        balance_payload = dict(
+                            await _react_read_observation(
+                                "wallet_balance",
+                                {
+                                    "chain": keypad_chain,
+                                    "symbol": keypad_symbol,
+                                },
+                                dict(state),
+                            )
+                        )
+                    except Exception as exc:
+                        balance_payload = {
+                            "ok": False,
+                            "code": "WALLET_QUERY_FAILED",
+                            "error": str(exc),
+                        }
+                    elapsed_ms = round((perf_counter() - started) * 1000, 2)
+                    # The model did not request the source balance itself. Add
+                    # the deterministic read to the same tool trace because the
+                    # App reads the amount card's balance from react_results and
+                    # the Bot validates that this turn actually queried it.
+                    tool_payloads.append(("wallet_balance", balance_payload))
+                    react_results.append(
+                        {"tool": "wallet_balance", "result": balance_payload}
+                    )
+                    response["react_tool_timings"].append(
+                        {
+                            "call_id": f"wallet_balance:{keypad_chain}:{keypad_symbol}",
+                            "elapsed_ms": elapsed_ms,
+                            "error_code": (
+                                None
+                                if balance_payload.get("ok")
+                                else str(balance_payload.get("code") or "WALLET_QUERY_FAILED")
+                            ),
+                            "status": "success" if balance_payload.get("ok") else "failed",
+                            "tool": "wallet_balance",
+                        }
+                    )
+                    signature = read_tool_signature(
+                        "wallet_balance",
+                        {"chain": keypad_chain, "symbol": keypad_symbol},
+                    )
+                    prior_signatures = set(state.get("react_tool_signatures") or [])
+                    if signature not in prior_signatures:
+                        synthetic_swap_tool_signatures.append(signature)
+
+                balance_row = None
+                portfolio = balance_payload.get("portfolio") if balance_payload else None
+                if isinstance(portfolio, Mapping):
+                    balance_row = next(
+                        (
+                            dict(row)
+                            for row in portfolio.get("assets") or []
+                            if isinstance(row, Mapping)
+                            and isinstance(row.get("asset"), Mapping)
+                            and canonical_chain(
+                                str((row.get("asset") or {}).get("chain") or "")
+                            )
+                            == keypad_chain
+                            and canonical_symbol(
+                                str((row.get("asset") or {}).get("symbol") or "")
+                            )
+                            == keypad_symbol
+                        ),
+                        None,
+                    )
+                metadata: Mapping[str, Any] | None = None
+                selected = _react_swap_selected(state)
+                if (
+                    selected is not None
+                    and canonical_chain(str(selected.get("chain") or ""))
+                    == keypad_chain
+                    and canonical_symbol(str(selected.get("symbol") or ""))
+                    == keypad_symbol
+                ):
+                    metadata = selected
+                if balance_row is not None:
+                    row_asset = balance_row.get("asset")
+                    if isinstance(row_asset, Mapping):
+                        metadata = row_asset
+                        if row_asset.get("address"):
+                            swap_keypad_slots["token_address"] = str(
+                                row_asset["address"]
+                            )
+                        if row_asset.get("decimals") is not None:
+                            swap_keypad_slots["decimals"] = int(
+                                row_asset["decimals"]
+                            )
+                        swap_keypad_slots.update(
+                            asset_logo_fields(
+                                keypad_chain,
+                                keypad_symbol,
+                                row_asset.get("logo_url"),
+                            )
+                        )
+                        for key, value in (
+                            ("balance", balance_row.get("amount")),
+                            ("balance_raw", balance_row.get("amount_raw")),
+                            ("balance_usd", balance_row.get("usd_value")),
+                        ):
+                            if value not in (None, ""):
+                                swap_keypad_slots[key] = value
+                if metadata is None:
+                    metadata = _react_swap_asset_from_history(
+                        state.get("conversation_history"),
+                        keypad_chain,
+                        keypad_symbol,
+                    )
+                if metadata is None:
+                    native_asset = _native_swap_asset(keypad_chain, keypad_symbol)
+                    if native_asset is not None:
+                        metadata = {
+                            "chain": native_asset.chain,
+                            "symbol": native_asset.symbol,
+                            "decimals": native_asset.decimals,
+                        }
+                if metadata is None:
+                    discovered, _ = await _resolve_asset_metadata(
+                        {"chain": keypad_chain, "symbol": keypad_symbol},
+                        runtime.providers,
+                        state.get("wallet_context"),
+                    )
+                    if discovered is not None:
+                        metadata = {
+                            "chain": discovered.chain,
+                            "symbol": discovered.symbol,
+                            "address": discovered.address,
+                            "decimals": discovered.decimals,
+                            "logo_url": discovered.logo_url,
+                        }
+                if metadata is not None:
+                    if (
+                        not swap_keypad_slots.get("token_address")
+                        and metadata.get("address")
+                    ):
+                        swap_keypad_slots["token_address"] = str(metadata["address"])
+                    if (
+                        swap_keypad_slots.get("decimals") is None
+                        and metadata.get("decimals") is not None
+                    ):
+                        swap_keypad_slots["decimals"] = int(metadata["decimals"])
+                    if not swap_keypad_slots.get("logo_url"):
+                        swap_keypad_slots.update(
+                            asset_logo_fields(
+                                keypad_chain,
+                                keypad_symbol,
+                                metadata.get("logo_url"),
+                            )
+                        )
+                    if (
+                        balance_row is None
+                        and isinstance(portfolio, Mapping)
+                        and portfolio.get("complete")
+                        and balance_payload
+                        and balance_payload.get("ok")
+                    ):
+                        # The provider omits zero-balance rows from portfolio
+                        # assets, but the App's amount card still needs to know
+                        # that this exact token was queried and is truly zero.
+                        swap_keypad_slots["balance"] = "0"
+                        swap_keypad_slots["balance_raw"] = "0"
+                        swap_keypad_slots["balance_usd"] = "0"
                 client_action = {**client_action, "slots": swap_keypad_slots}
         # The model can pin the coin via request_client_action (keypad
         # slots.symbol) and also call transfer_quick_replies whose draft has no
@@ -13077,31 +13356,83 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             keypad_slots = dict(client_action.get("slots") or {})
             keypad_symbol = str(keypad_slots.get("symbol") or "").strip()
             if keypad_symbol and _react_transfer_user_symbol(state):
-                if "decimals" not in keypad_slots:
-                    decimals = next(
-                        (
-                            (item.get("data") or {}).get("decimals")
-                            for item in (quick_replies or [])
-                            if (item.get("data") or {}).get("symbol") == keypad_symbol
-                            and (item.get("data") or {}).get("decimals") is not None
-                        ),
-                        None,
+                keypad_chain = canonical_chain(str(keypad_slots.get("chain") or ""))
+                keypad_symbol = canonical_symbol(keypad_symbol)
+                matching_amount = next(
+                    (
+                        dict(item.get("data") or {})
+                        for item in (quick_replies or [])
+                        if isinstance(item.get("data"), Mapping)
+                        and str(item.get("type") or "") == "amount"
+                        and canonical_symbol(
+                            str((item.get("data") or {}).get("symbol") or "")
+                        )
+                        == keypad_symbol
+                    ),
+                    None,
+                )
+                asset = _transfer_wallet_asset(
+                    state.get("wallet_context") or {},
+                    keypad_chain,
+                    keypad_symbol,
+                )
+                token_address = (
+                    keypad_slots.get("token_address")
+                    or (matching_amount or {}).get("token_address")
+                    or ((asset or {}).get("address") if asset is not None else None)
+                )
+                decimals = keypad_slots.get("decimals")
+                if decimals is None:
+                    decimals = (matching_amount or {}).get("decimals")
+                if decimals is None and asset is not None:
+                    decimals = asset.get("decimals")
+                if decimals is None:
+                    decimals = _NATIVE_ASSET_DECIMALS.get(keypad_chain)
+                balance_data = (
+                    matching_amount
+                    if matching_amount is not None
+                    and (
+                        matching_amount.get("balance") is not None
+                        or matching_amount.get("balance_raw") is not None
                     )
-                    if decimals is None:
-                        asset = _transfer_wallet_asset(
-                            state.get("wallet_context") or {},
-                            str(keypad_slots.get("chain") or ""),
-                            keypad_symbol,
-                        )
-                        if asset is not None:
-                            decimals = asset.get("decimals")
-                    if decimals is None:
-                        decimals = _NATIVE_ASSET_DECIMALS.get(
-                            canonical_chain(str(keypad_slots.get("chain") or ""))
-                        )
-                    if decimals is not None:
-                        keypad_slots["decimals"] = decimals
-                        client_action = {**client_action, "slots": keypad_slots}
+                    else None
+                )
+                balance = None
+                if balance_data is None:
+                    balance = await _transfer_available_balance(
+                        state, keypad_chain, keypad_symbol, token_address
+                    )
+                if balance is not None:
+                    if not token_address and balance.get("address"):
+                        token_address = balance["address"]
+                    if decimals is None and balance.get("decimals") is not None:
+                        decimals = balance["decimals"]
+                    balance_data = {
+                        "balance": balance.get("amount"),
+                        "balance_raw": balance.get("amount_raw"),
+                        "balance_usd": balance.get("usd_value"),
+                    }
+                if token_address:
+                    keypad_slots["token_address"] = token_address
+                if decimals is not None:
+                    keypad_slots["decimals"] = decimals
+                keypad_slots["intent"] = "transfer"
+                if balance_data is not None:
+                    for key in ("balance", "balance_raw", "balance_usd"):
+                        if balance_data.get(key) not in (None, ""):
+                            keypad_slots[key] = balance_data[key]
+                provider_logo = (
+                    balance.get("logo_url") if balance is not None else None
+                )
+                keypad_slots.update(
+                    asset_logo_fields(
+                        keypad_chain,
+                        keypad_symbol,
+                        provider_logo
+                        or ((asset or {}).get("logo_url") if asset is not None else None),
+                    )
+                )
+                client_action = {**client_action, "slots": keypad_slots}
                 if quick_replies:
                     quick_replies = [
                         item
@@ -13261,6 +13592,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         if client_action:
             response["client_action"] = client_action
         update: dict[str, Any] = {"response": response, "react_active": False}
+        if synthetic_swap_tool_signatures:
+            prior_signatures = list(state.get("react_tool_signatures") or [])
+            update["react_tool_signatures"] = [
+                *prior_signatures,
+                *[
+                    signature
+                    for signature in synthetic_swap_tool_signatures
+                    if signature not in prior_signatures
+                ],
+            ]
         # Persist an App-pinned swap channel across ReAct turns. The App sends
         # suggestion_data.provider on the coin-selection turn and may omit it on
         # later amount/quote turns; storing it on the active task keeps the whole

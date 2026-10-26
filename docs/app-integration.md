@@ -451,7 +451,8 @@ POST /v1/transfer/{session_id}/broadcast
 - `type: "chain"` 的胶囊是**链选择卡**的选项，`value` 即链名，`data.chain` 相同；
   第一个胶囊是钱包当前网络，其余按支持列表顺序。
 - `type: "amount"` 的 `data` 会带上 `token_address` / `decimals`（钱包可唯一定位该资产时），
-  App 的金额输入卡可据此渲染「资产与余额」一行；余额本身由 App 侧持有。
+  以及后端同回合查到的 `balance` / `balance_raw` / `balance_usd`；App 的金额输入卡
+  据此渲染「资产与余额」一行，字段缺失时回退到 App 本地余额。
 
 **客户端动作** `response.client_action`
 
@@ -461,6 +462,13 @@ POST /v1/transfer/{session_id}/broadcast
 
 - `type` 取 `open_contacts` / `scan_qr` / `open_amount_keypad` / `address_input`，
   App 收到后弹出自己的界面（`address_input` 弹地址输入框让用户粘贴收款地址）。
+- `open_amount_keypad` 的 `slots.intent` 为 `"transfer"` 或 `"swap"`，App 用它
+  区分金额键盘属于转账还是兑换；转账键盘还可能在 `slots` 中带所选链资产的
+  `balance` / `balance_raw` / `balance_usd` 和 logo 字段。
+- 兑换键盘会在同回合查询来源币余额：`react_results` 中会有一条
+  `wallet_balance`，其 `portfolio.assets[]` 提供匹配的 `asset` 与 `amount`；
+  同一资产的身份也会写入顶层 `slots.token_address` / `slots.decimals`。若该
+  币种在所选链的真实余额为 0，`slots.balance` 为 `"0"`。
 - 用户选完，把结果作为**下一轮** `turn` 的输入回传（地址文本，或 `metadata.suggestion_data`）。
 - 服务端只会下发白名单内的动作；工具遇到其它取值返回 `CLIENT_ACTION_UNSUPPORTED`，不会误导 App 弹窗。
 

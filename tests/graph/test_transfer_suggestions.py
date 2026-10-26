@@ -595,8 +595,195 @@ async def test_react_keypad_after_user_picked_coin_keeps_keypad():
     assert response["kind"] == "react"
     assert [item["type"] for item in response["suggestions"]] == ["amount"] * 4
     assert response["client_action"]["type"] == "open_amount_keypad"
+    assert response["client_action"]["slots"]["intent"] == "transfer"
     assert response["client_action"]["slots"]["symbol"] == "BNB"
     assert response["client_action"]["slots"]["decimals"] == 18
+
+
+@pytest.mark.asyncio
+async def test_react_transfer_keypad_carries_exact_chain_balance_and_intent():
+    """The keypad turn itself carries the selected chain's balance and intent.
+
+    App report: the ARBITRUM-ETH amount keypad turn returned only
+    chain/symbol/decimals. The App needs ``slots.intent`` to distinguish a
+    transfer from a swap and the asset row to show the exact-chain balance
+    instead of falling back to another network's ETH balance.
+    """
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+
+    class ArbitrumWalletProvider:
+        chain_index_by_name = {"ARBITRUM": "42161", "ETH": "1"}
+
+        def __init__(self):
+            self.calls = []
+
+        async def get_token_balances(self, address, indexes):
+            self.calls.append(indexes)
+            assert indexes == ["42161"]
+            return [
+                TokenBalance(
+                    asset=Asset(
+                        chain="ARBITRUM",
+                        chain_id=42161,
+                        symbol="ETH",
+                        decimals=18,
+                    ),
+                    amount=Decimal("0.00163120047"),
+                    amount_raw="1631200470000000",
+                    usd_value=Decimal("3.78"),
+                )
+            ]
+
+    class ArbitrumKeypadModel:
+        async def invoke_react(self, messages, tools):
+            tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+            if not tool_messages:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "act-1",
+                            "name": "request_client_action",
+                            "args": {
+                                "action": "open_amount_keypad",
+                                "chain": "ARBITRUM",
+                                "symbol": "ETH",
+                                "reason": "输入要转出的 ETH 数量",
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(content="请在金额键盘里输入要转出的 ETH 数量。")
+
+    provider = ArbitrumWalletProvider()
+    graph = build_graph(
+        model=ArbitrumKeypadModel(),
+        wallet_provider=provider,
+        chains={"BASE": object(), "ETH": object(), "ARBITRUM": object()},
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {
+                "message": "ETH",
+                "metadata": {
+                    "suggestion_data": {
+                        "intent": "transfer",
+                        "chain": "ARBITRUM",
+                        "symbol": "ETH",
+                    }
+                },
+            },
+            "conversation_history": [
+                {"role": "user", "content": "转一笔帐给朋友"},
+                {"role": "assistant", "content": "请提供收款地址。"},
+                {
+                    "role": "user",
+                    "content": "0x1F6E4FD185ce8C8171b4BDd2A64667BC69Aff11A",
+                },
+                {"role": "assistant", "content": "请选择网络。"},
+                {"role": "user", "content": "在 ARBITRUM 网络上继续这笔转账。"},
+                {
+                    "role": "assistant",
+                    "content": "ARBITRUM 网络上你只有 ETH 0.00163120047（约 3.78 美元）。"
+                    "要转多少 ETH 给这个地址？",
+                },
+            ],
+            "wallet_context": {
+                "address": "0x" + "1" * 40,
+                "chain": "ARBITRUM",
+                "wallet_accounts": [
+                    {"chain": "ARBITRUM", "address": "0x" + "1" * 40}
+                ],
+            },
+        },
+        config={"configurable": {"thread_id": "react-keypad-arbitrum-balance"}},
+    )
+
+    response = result["response"]
+    assert response["client_action"]["type"] == "open_amount_keypad"
+    slots = response["client_action"]["slots"]
+    assert slots["intent"] == "transfer"
+    assert slots["chain"] == "ARBITRUM"
+    assert slots["symbol"] == "ETH"
+    assert slots["decimals"] == 18
+    assert slots["balance"] == "0.00163120047"
+    assert slots["balance_raw"] == "1631200470000000"
+    assert slots["balance_usd"] == "3.78"
+    assert "arbitrum" in slots["logo_url"]
+    assert "arbitrum" in slots["chain_logo_url"]
+    assert provider.calls == [["42161"]]
+    assert "portfolio" not in response
+
+
+@pytest.mark.asyncio
+async def test_react_transfer_keypad_survives_balance_lookup_failure():
+    """A failed balance lookup must not drop the amount keypad or its intent."""
+
+    class FailingWalletProvider:
+        chain_index_by_name = {"ARBITRUM": "42161"}
+
+        async def get_token_balances(self, address, indexes):
+            raise RuntimeError("balance service unavailable")
+
+    class ArbitrumKeypadModel:
+        async def invoke_react(self, messages, tools):
+            tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+            if not tool_messages:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "act-1",
+                            "name": "request_client_action",
+                            "args": {
+                                "action": "open_amount_keypad",
+                                "chain": "ARBITRUM",
+                                "symbol": "ETH",
+                                "reason": "输入要转出的 ETH 数量",
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(content="请输入要转出的 ETH 数量。")
+
+    graph = build_graph(
+        model=ArbitrumKeypadModel(),
+        wallet_provider=FailingWalletProvider(),
+        chains={"BASE": object(), "ETH": object(), "ARBITRUM": object()},
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {
+                "message": "ETH",
+                "metadata": {
+                    "suggestion_data": {
+                        "intent": "transfer",
+                        "chain": "ARBITRUM",
+                        "symbol": "ETH",
+                    }
+                },
+            },
+            "wallet_context": {
+                "address": "0x" + "1" * 40,
+                "chain": "ARBITRUM",
+                "wallet_accounts": [
+                    {"chain": "ARBITRUM", "address": "0x" + "1" * 40}
+                ],
+            },
+        },
+        config={"configurable": {"thread_id": "react-keypad-balance-failure"}},
+    )
+
+    slots = result["response"]["client_action"]["slots"]
+    assert slots["intent"] == "transfer"
+    assert slots["chain"] == "ARBITRUM"
+    assert slots["symbol"] == "ETH"
+    assert slots["decimals"] == 18
+    assert "balance" not in slots
+    assert "balance_raw" not in slots
+    assert "balance_usd" not in slots
 
 
 @pytest.mark.asyncio
