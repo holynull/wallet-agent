@@ -11436,7 +11436,21 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             ]
             swap_request = state.get("swap_request")
             if isinstance(swap_request, Mapping):
-                selected = _default_quote(candidates, swap_request) or {}
+                pinned_reference = str(
+                    state.get("selected_provider_reference") or ""
+                ).strip()
+                if pinned_reference:
+                    selected = next(
+                        (
+                            dict(candidate)
+                            for candidate in candidates
+                            if str(candidate.get("provider_reference") or "")
+                            == pinned_reference
+                        ),
+                        {},
+                    )
+                if not selected:
+                    selected = _default_quote(candidates, swap_request) or {}
         source_asset = selected.get("source_asset") or {}
         if isinstance(source_asset, Mapping):
             source_asset = _dump(source_asset) or {}

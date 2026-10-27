@@ -206,6 +206,11 @@ class AgentState(TypedDict, total=False):
     provider_name: NotRequired[str]
     quote_candidates: Annotated[list[dict[str, Any]], _merge_quote_candidates]
     selected_quote: NotRequired[dict[str, Any] | None]
+    # The provider_reference the user/API pinned for this swap session. ReAct
+    # turns clear ``selected_quote``, so stale-broadcast recovery uses this to
+    # register the same provider the user actually chose instead of re-defaulting
+    # to the "best output" candidate.
+    selected_provider_reference: NotRequired[str | None]
     swap_session: NotRequired[dict[str, Any] | None]
     pending_transaction: NotRequired[dict[str, Any] | None]
     user_confirmation: NotRequired[dict[str, Any] | None]

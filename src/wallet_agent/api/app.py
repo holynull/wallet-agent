@@ -2255,6 +2255,10 @@ def create_app(
                 input_state["operation_history"] = _jsonable(existing_session.operation_history)
             if existing_session.quote is not None:
                 input_state["selected_quote"] = existing_session.quote.model_dump(mode="json")
+            if existing_session.selected_provider_reference:
+                input_state["selected_provider_reference"] = (
+                    existing_session.selected_provider_reference
+                )
             if existing_session.approval_tx_hash is not None:
                 input_state["approval_tx_hash"] = existing_session.approval_tx_hash
             if existing_session.approval_transaction is not None:
