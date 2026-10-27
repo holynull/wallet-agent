@@ -10407,6 +10407,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "pending_transaction": tx.model_dump(mode="json"),
                 "response": {
                     "kind": "transfer_prepare",
+                    "pending_kind": "transfer",
                     "pending_transaction": tx.model_dump(mode="json"),
                     "preflight": preflight,
                     "asset": transfer_asset,
@@ -14184,6 +14185,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 response["kind"] = str(
                     prepare_response.get("kind") or "transfer_prepare"
                 )
+                response["pending_kind"] = "transfer"
                 for key in ("pending_transaction", "preflight"):
                     if isinstance(prepare_response.get(key), Mapping):
                         response[key] = dict(prepare_response[key])

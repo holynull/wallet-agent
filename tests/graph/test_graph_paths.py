@@ -1595,6 +1595,7 @@ async def test_react_transfer_prepare_carries_moved_asset_on_response():
     )
 
     assert result["response"]["kind"] == "transfer_prepare"
+    assert result["response"]["pending_kind"] == "transfer"
     assert result["response"]["asset"]["symbol"] == "ETH"
     assert result["response"]["asset"]["amount"] == "0.5"
     assert result["pending_transaction"] is not None
