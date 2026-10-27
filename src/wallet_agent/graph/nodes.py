@@ -2897,11 +2897,14 @@ def _balance_row_with_chain_logo(dumped: Any) -> Any:
     if isinstance(asset, Mapping):
         # Native coins have no provider logo, so the chain logo stands in; a
         # token whose logo no source supplied stays null for the App placeholder.
+        logo = token_logo_url(
+            str(chain), str(asset.get("symbol") or ""), fallback=asset.get("logo_url")
+        )
+        if not logo and asset.get("address"):
+            logo = asset_logo_url(str(chain), str(asset["address"]))
         row["asset"] = {
             **asset,
-            "logo_url": token_logo_url(
-                str(chain), str(asset.get("symbol") or ""), fallback=asset.get("logo_url")
-            ),
+            "logo_url": logo,
         }
     return row
 
@@ -2929,13 +2932,16 @@ def _asset_with_logo(value: Any) -> dict[str, Any] | None:
     asset = dict(value)
     chain = asset.get("chain")
     if chain:
-        asset["logo_url"] = token_logo_url(
+        logo = token_logo_url(
             str(chain),
             str(asset.get("symbol") or ""),
             fallback=(
                 str(asset.get("logo_url")) if asset.get("logo_url") else None
             ),
         )
+        if not logo and asset.get("address"):
+            logo = asset_logo_url(str(chain), str(asset["address"]))
+        asset["logo_url"] = logo
     return asset
 
 

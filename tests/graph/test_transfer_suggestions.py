@@ -4,7 +4,7 @@ import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 from wallet_agent.graph.build import build_graph
-from wallet_agent.graph.nodes import _sanitize_response_suggestions
+from wallet_agent.graph.nodes import _asset_with_logo, _sanitize_response_suggestions
 
 EVM = "0x3f847a21bcfbba535a5e2a1611bb4d545541d2a5"
 
@@ -1302,3 +1302,21 @@ async def test_missing_amount_carries_selected_chain_balance_not_fallback():
     assert amounts[0]["data"]["symbol"] == "ETH"
     assert amounts[0]["data"]["balance"] == "0.000030467544104"
     assert amounts[0]["data"]["balance_usd"] == "0.08"
+
+
+def test_asset_with_logo_fills_bsc_usdt_from_contract_address():
+    """A transfer card's asset must carry the token logo when the provider did
+    not supply one; BSC USDT's Trust Wallet logo lives under smartchain."""
+    asset = _asset_with_logo(
+        {
+            "chain": "BSC",
+            "symbol": "USDT",
+            "decimals": 18,
+            "address": "0x55d398326f99059ff775485246999027b3197955",
+        }
+    )
+    assert asset["logo_url"] == (
+        "https://raw.githubusercontent.com/trustwallet/assets/master/"
+        "blockchains/smartchain/assets/"
+        "0x55d398326f99059fF775485246999027B3197955/logo.png"
+    )

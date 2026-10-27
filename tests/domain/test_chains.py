@@ -106,4 +106,15 @@ def test_asset_logo_url_checksums_evm_addresses_but_passes_tron_through():
         f"{base}/tron/assets/TXbXJ9pQ3z9Ux1v/logo.png"
     )
     assert asset_logo_url("ETH", None) is None
+    assert asset_logo_url("ETH", "0x1") is None
     assert asset_logo_url("UNKNOWN", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48") is None
+
+
+def test_asset_logo_url_bsc_uses_the_smartchain_slug():
+    """Trust Wallet moved BSC token directories from ``binance`` to
+    ``smartchain``; the binance asset path 404s for BSC USDT."""
+    base = "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains"
+    assert asset_logo_url("BSC", "0x55d398326f99059ff775485246999027b3197955") == (
+        f"{base}/smartchain/assets/"
+        "0x55d398326f99059fF775485246999027B3197955/logo.png"
+    )

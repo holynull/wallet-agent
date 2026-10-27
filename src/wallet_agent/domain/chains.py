@@ -44,6 +44,13 @@ _CHAIN_LOGO_SLUGS = {
     "MEGAETH": "megaeth",
 }
 
+# Trust Wallet renamed BSC's directory from ``binance`` to ``smartchain``. The
+# chain info badge still exists under ``binance``, but per-token asset logos live
+# under ``smartchain`` (the ``binance/assets/...`` paths 404, e.g. BSC USDT).
+_TOKEN_LOGO_SLUGS = {
+    "BSC": "smartchain",
+}
+
 _NATIVE_SYMBOLS = {
     "BTC": "BTC",
     "BITCOIN": "BTC",
@@ -114,12 +121,18 @@ def asset_logo_url(chain: str, contract_address: str | None) -> str | None:
     Returns ``None`` when the chain slug or contract address is unknown, so the
     App renders its own placeholder instead of a broken image.
     """
-    if not contract_address:
+    text = str(contract_address or "").strip()
+    if not text:
         return None
-    slug = _CHAIN_LOGO_SLUGS.get(canonical_chain(chain))
+    # EVM token directories are keyed by a full 0x + 40 hex contract address; a
+    # placeholder/partial address would only produce a 404 image URL.
+    if text.startswith("0x") and len(text) != 42:
+        return None
+    canonical = canonical_chain(chain)
+    slug = _TOKEN_LOGO_SLUGS.get(canonical) or _CHAIN_LOGO_SLUGS.get(canonical)
     if not slug:
         return None
-    contract = _evm_checksum_address(str(contract_address))
+    contract = _evm_checksum_address(text)
     return f"{_CHAIN_LOGO_BASE}/{slug}/assets/{contract}/logo.png"
 
 

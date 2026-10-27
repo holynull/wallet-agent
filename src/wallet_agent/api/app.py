@@ -252,13 +252,16 @@ def _balance_logo_item(value: Any) -> dict[str, Any]:
     chain = asset.get("chain") if isinstance(asset, Mapping) else None
     if chain:
         dumped["chain_logo_url"] = chain_logo_url(chain)
+        logo = token_logo_url(
+            str(chain), str(asset.get("symbol") or ""), fallback=asset.get("logo_url")
+        )
+        if not logo and asset.get("address"):
+            logo = asset_logo_url(str(chain), str(asset["address"]))
         # Native coins have no provider logo, so fall back to the chain logo
         # rather than leaving the App to combine two fields itself.
         dumped["asset"] = {
             **asset,
-            "logo_url": token_logo_url(
-                str(chain), str(asset.get("symbol") or ""), fallback=asset.get("logo_url")
-            ),
+            "logo_url": logo,
         }
     return dumped
 
@@ -287,13 +290,16 @@ def _price_logo_item(value: Any) -> dict[str, Any]:
     if not isinstance(asset, Mapping) or not asset.get("chain"):
         return dumped
     chain = str(asset["chain"])
+    logo = token_logo_url(
+        chain, str(asset.get("symbol") or ""), fallback=asset.get("logo_url")
+    )
+    if not logo and asset.get("address"):
+        logo = asset_logo_url(chain, str(asset["address"]))
     return {
         **dumped,
         "asset": {
             **asset,
-            "logo_url": token_logo_url(
-                chain, str(asset.get("symbol") or ""), fallback=asset.get("logo_url")
-            ),
+            "logo_url": logo,
         },
         "chain_logo_url": chain_logo_url(chain),
     }
@@ -304,13 +310,16 @@ def _asset_logo_item(value: Any) -> dict[str, Any]:
     dumped = _jsonable(value)
     if not isinstance(dumped, Mapping) or not dumped.get("chain"):
         return dumped
+    logo = token_logo_url(
+        str(dumped["chain"]),
+        str(dumped.get("symbol") or ""),
+        fallback=dumped.get("logo_url"),
+    )
+    if not logo and dumped.get("address"):
+        logo = asset_logo_url(str(dumped["chain"]), str(dumped["address"]))
     return {
         **dumped,
-        "logo_url": token_logo_url(
-            str(dumped["chain"]),
-            str(dumped.get("symbol") or ""),
-            fallback=dumped.get("logo_url"),
-        ),
+        "logo_url": logo,
         "chain_logo_url": chain_logo_url(str(dumped["chain"])),
     }
 
