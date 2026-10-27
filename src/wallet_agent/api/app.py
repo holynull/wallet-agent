@@ -1964,6 +1964,7 @@ def create_app(
                     await persist_assistant_history(thread_id, result, run_id=run_id)
                     fresh_swap = bool(
                         input_state.get("swap_request")
+                        or result.get("fresh_swap_projected")
                         or any(
                             str(item.get("tool") or "") == "get_swap_quote"
                             and isinstance(item.get("result"), Mapping)

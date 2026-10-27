@@ -318,3 +318,57 @@ async def test_trx_to_btc_does_not_ask_for_a_btc_source_address():
     assert any(
         item.get("tool") == "get_swap_quote" for item in response.get("react_results") or []
     )
+
+
+class ProseRepeatSwapModel:
+    """Model answers a repeat swap request in prose without calling tools."""
+
+    async def invoke_react(self, messages, tools):
+        return AIMessage(
+            content="TRX 全部换 BTC 的报价如下，请在卡片上确认并签名。"
+        )
+
+    async def decide_render(self, request):
+        return {
+            "intent": "swap",
+            "source_symbol": "TRX",
+            "destination_symbol": "BTC",
+            "recommend_swap_pairs": False,
+            "reason": "test",
+        }
+
+
+@pytest.mark.asyncio
+async def test_repeat_swap_prose_reprojects_existing_quote_candidates():
+    """If the model reuses checkpoint quotes and only writes prose, the backend
+    must re-select a default quote so the API still shows the confirmation card."""
+    graph = build_graph(model=ProseRepeatSwapModel(), providers=[])
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "全部 TRX 换成 BTC"},
+            "wallet_context": _wallet_context([P2WPKH, P2TR]),
+            "swap_request": {
+                "source_asset": {"chain": "TRON", "symbol": "TRX"},
+                "destination_asset": {"chain": "BTC", "symbol": "BTC"},
+                "input_amount": "70.553436",
+            },
+            "quote_candidates": [
+                {
+                    "provider": "bridgers",
+                    "provider_reference": "quote-bridgers",
+                    "input_amount": "70.553436",
+                    "expected_output": "0.000262",
+                },
+                {
+                    "provider": "omnibridge",
+                    "provider_reference": "quote-omni",
+                    "input_amount": "70.553436",
+                    "expected_output": "0.0002627",
+                },
+            ],
+        },
+        config={"configurable": {"thread_id": "react-repeat-swap-prose"}},
+    )
+
+    assert result.get("fresh_swap_projected") is True
+    assert (result.get("selected_quote") or {}).get("provider") == "omnibridge"

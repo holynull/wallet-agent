@@ -14045,6 +14045,30 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 if not still_valid:
                     update["confirmation_state"] = None
                     update["user_confirmation"] = None
+        elif (
+            swap_intent
+            and render_decision is not None
+            and render_decision.get("intent") == "swap"
+            and isinstance(state.get("swap_request"), Mapping)
+        ):
+            # The model sometimes answers a repeat swap request with prose and
+            # reuses quote_candidates left in the checkpoint instead of calling
+            # get_swap_quote again (Lif's report: "地址没问题了，但 App 没出卡片").
+            # Deterministically re-select the best quote so the API can continue
+            # into the confirmation card instead of emitting prose only.
+            existing_quotes = [
+                dict(item)
+                for item in (state.get("quote_candidates") or [])
+                if isinstance(item, Mapping)
+            ]
+            default_quote = _default_quote(existing_quotes, state["swap_request"])
+            if default_quote is not None:
+                update["selected_quote"] = default_quote
+                update["quote_candidates"] = [
+                    {"__clear__": True},
+                    *existing_quotes,
+                ]
+                update["fresh_swap_projected"] = True
         if transfer_result is not None:
             update["pending_transaction"] = dict(transfer_result["pending_transaction"])
             if isinstance(transfer_result.get("preflight"), Mapping):

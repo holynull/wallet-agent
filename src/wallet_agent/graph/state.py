@@ -173,6 +173,12 @@ class AgentState(TypedDict, total=False):
     operation_history: NotRequired[list[dict[str, Any]]]
     operation_reference: NotRequired[str | None]
     operation_reference_task_id: NotRequired[str | None]
+    # API/ReAct marker: this swap_prepare is a freshly resolved quote and must
+    # not be hijacked by a stale broadcast lifecycle from a previous swap.
+    fresh_swap: NotRequired[bool]
+    # ReAct finalizer re-projected an existing quote when the model answered a
+    # repeat swap request in prose without calling get_swap_quote again.
+    fresh_swap_projected: NotRequired[bool]
     wallet_context: NotRequired[dict[str, Any] | None]
     capabilities: NotRequired[dict[str, Any] | None]
     swap_request: NotRequired[dict[str, Any] | None]
