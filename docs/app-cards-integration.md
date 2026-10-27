@@ -145,7 +145,7 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 
 | 字段 | 含义 |
 | --- | --- |
-| `asset.logo_url` | **币图标**。provider（OKX / Bridgers / OmniBridge）给的就用它；原生币没有 provider 图，回落成链 logo；两者都没有时为 `null`，App 画占位。 |
+| `asset.logo_url` | **币图标**。provider（OKX / Bridgers / OmniBridge）给的就用它；原生币没有 provider 图，回落成链 logo；普通代币只下发 Trust Wallet **已发布**的 URL（见 [`logo-url-maintenance.md`](logo-url-maintenance.md)），不在列表里时为 `null`，App 画占位。 |
 | `chain_logo_url` | **链角标**，与所在行/对象同级。未知链为 `null`。 |
 | 行级 `logo_url` | 交易流水行的便捷字段，等于该行的币图标（与 `asset.logo_url` 同值），只为少一层嵌套。 |
 

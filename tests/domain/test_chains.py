@@ -101,13 +101,17 @@ def test_asset_logo_url_checksums_evm_addresses_but_passes_tron_through():
     assert asset_logo_url("ETH", "0x6b175474e89094c44da98b954eedeac495271d0f") == (
         f"{base}/ethereum/assets/0x6B175474E89094C44Da98b954EedeAC495271d0F/logo.png"
     )
-    # A TRON base58 contract address must not be "checksummed" into garbage.
-    assert asset_logo_url("TRON", "TXbXJ9pQ3z9Ux1v") == (
-        f"{base}/tron/assets/TXbXJ9pQ3z9Ux1v/logo.png"
+    # A TRON base58 contract address from the Trust Wallet tokenlist passes
+    # through unchanged (it must not be "checksummed" into garbage).
+    assert asset_logo_url("TRON", "TMz2SWatiAtZVVcH2ebpsbVtYwUPT9EdjH") == (
+        f"{base}/tron/assets/TMz2SWatiAtZVVcH2ebpsbVtYwUPT9EdjH/logo.png"
     )
     assert asset_logo_url("ETH", None) is None
     assert asset_logo_url("ETH", "0x1") is None
     assert asset_logo_url("UNKNOWN", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48") is None
+    # A contract not published in Trust Wallet's tokenlist stays null so the App
+    # draws a placeholder instead of a broken image.
+    assert asset_logo_url("ETH", "0x" + "f" * 40) is None
 
 
 def test_asset_logo_url_bsc_uses_the_smartchain_slug():
