@@ -1065,6 +1065,123 @@ async def test_react_arrival_followup_not_propagated_reports_pending_provider_pi
     )
 
 
+class RecoverArrivalAdapter:
+    async def get_transaction_receipt(self, _tx_hash):
+        return {"status": "0x1", "blockNumber": "0x10"}
+
+
+class RecoverArrivalProvider:
+    provider_name = "bridgers"
+
+    def __init__(self):
+        self.broadcast_calls = 0
+        self.status_calls = 0
+
+    async def register_broadcast(self, provider_reference, tx_hash, **kwargs):
+        self.broadcast_calls += 1
+        return ProviderOrder(
+            provider="bridgers",
+            provider_order_id="recovered-order",
+            provider_reference=provider_reference,
+            tx_hash=tx_hash,
+        )
+
+    async def get_status(self, order):
+        self.status_calls += 1
+        return NormalizedOrderStatus(
+            provider="bridgers",
+            provider_order_id=order.provider_order_id,
+            provider_reference=order.provider_reference,
+            status="completed",
+            tx_hash=order.tx_hash,
+            eta="1-2 分钟",
+        )
+
+
+class RecoverArrivalModel:
+    async def invoke_react(self, messages, tools):
+        tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "swap-status-3",
+                        "name": "query_swap_status",
+                        "args": {"tx_hash": "0x" + "d" * 64, "chain": "ETH"},
+                    }
+                ],
+            )
+        payload = json.loads(tool_messages[0].content)
+        assert payload["ok"] is True
+        assert payload["kind"] == "swap_status"
+        assert payload["provider_order_id"] == "recovered-order"
+        assert payload["status"] == "completed"
+        return AIMessage(content="这笔兑换已经到账了。")
+
+
+@pytest.mark.asyncio
+async def test_react_arrival_recover_stale_not_propagated_broadcast():
+    """A chat arrival check on a broadcast saved as not_propagated must recover
+    the provider order once the source transaction confirms on-chain, instead of
+    permanently reporting 'not_propagated' (Lif's report: swap had arrived)."""
+    from wallet_agent.graph.build import build_graph
+
+    model = RecoverArrivalModel()
+    provider = RecoverArrivalProvider()
+    graph = build_graph(
+        model=model,
+        providers=[provider],
+        chains={"ETH": RecoverArrivalAdapter()},
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "到账了没有？"},
+            "wallet_context": {"address": WALLET, "chain": "ETH"},
+            "conversation_history": [
+                {"role": "user", "content": "用 ETH 兑换 10 USDT"},
+                {"role": "assistant", "content": "报价已展示，请在 App 中确认。"},
+            ],
+            "broadcast_tx_hash": "0x" + "d" * 64,
+            "broadcast_status": "not_propagated",
+            "swap_request": {
+                "source_asset": {"chain": "ETH", "symbol": "ETH", "decimals": 18},
+                "destination_asset": {"chain": "ETH", "symbol": "USDT", "decimals": 6},
+                "input_amount": "0.0044",
+            },
+            "quote_candidates": [
+                {
+                    "provider": "bridgers",
+                    "provider_reference": "recover-ref",
+                    "source_asset": {
+                        "chain": "ETH",
+                        "symbol": "ETH",
+                        "decimals": 18,
+                    },
+                    "destination_asset": {
+                        "chain": "ETH",
+                        "symbol": "USDT",
+                        "decimals": 6,
+                    },
+                    "input_amount": "0.0044",
+                    "expected_output": "10",
+                }
+            ],
+        },
+        config={"configurable": {"thread_id": "react-arrival-recover"}},
+    )
+
+    query_status = next(
+        item["result"]
+        for item in result["response"]["react_results"]
+        if item["tool"] == "query_swap_status"
+    )
+    assert query_status["status"] == "completed"
+    assert query_status["provider_order_id"] == "recovered-order"
+    assert provider.broadcast_calls == 1
+    assert provider.status_calls == 1
+
+
 def test_looks_like_balance_only_query_separates_read_from_transfer_steps():
     from wallet_agent.graph.nodes import _looks_like_balance_only_query
 

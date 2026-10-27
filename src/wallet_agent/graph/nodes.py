@@ -11425,6 +11425,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         selected = state.get("selected_quote") or {}
         if not isinstance(selected, Mapping):
             selected = _dump(selected) or {}
+        if not selected.get("provider"):
+            # ReAct turns clear selected_quote (they must not implicitly select
+            # one), so a stale not_propagated broadcast needs to rebuild it from
+            # the persisted quote candidates to recover the provider order.
+            candidates = [
+                dict(item)
+                for item in (state.get("quote_candidates") or [])
+                if isinstance(item, Mapping)
+            ]
+            swap_request = state.get("swap_request")
+            if isinstance(swap_request, Mapping):
+                selected = _default_quote(candidates, swap_request) or {}
         source_asset = selected.get("source_asset") or {}
         if isinstance(source_asset, Mapping):
             source_asset = _dump(source_asset) or {}
@@ -12520,6 +12532,27 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "source_confirmed",
             "confirmed",
         }:
+            # A source deposit that was saved as not_propagated at broadcast
+            # time may have confirmed on-chain since. Recover the provider
+            # order and poll it before reporting a permanent "pending pickup"
+            # stub (Lif's report: swap had already arrived but the chat still
+            # said not_propagated).
+            recovered = await _recover_stale_broadcast_order(state, broadcast_hash)
+            if recovered:
+                recovered_state = {**dict(state), "provider_orders": recovered}
+                for raw_order in recovered.values():
+                    if not isinstance(raw_order, Mapping):
+                        continue
+                    recovered_order_id = str(
+                        raw_order.get("provider_order_id") or ""
+                    ).strip()
+                    if not recovered_order_id:
+                        continue
+                    observation = await _swap_status_by_order_id(
+                        recovered_order_id, recovered_state
+                    )
+                    if observation is not None:
+                        return observation
             language = _status_language(state)
             copy = _swap_status_copy(language)
             message = copy["provider_pickup_pending"]
