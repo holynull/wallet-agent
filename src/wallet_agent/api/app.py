@@ -1729,6 +1729,20 @@ def create_app(
                 broadcast_tx_hash=None,
                 broadcast_status=None,
                 stage="transfer_ready",
+                # A fresh transfer must not inherit a swap session's quote/order
+                # lifecycle, otherwise the App broadcasts the transfer against
+                # /v1/transfer/{session}/broadcast and gets HTTP_409
+                # ("session is not a transfer session").
+                quote=None,
+                quote_candidates=[],
+                selected_provider_reference=None,
+                provider_order=None,
+                order_status=None,
+                confirmation_state=None,
+                approval_transaction=None,
+                approval_tx_hash=None,
+                allowance_requirement=None,
+                swap_gas_estimate=None,
             )
             broadcast_lifecycle_active = False
         if response.get("kind") == "swap_status" and not historical_reference:

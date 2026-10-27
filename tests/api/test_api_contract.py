@@ -1,10 +1,18 @@
+from decimal import Decimal
+
 import httpx
 import pytest
 from langgraph.types import Command, Interrupt
 
 from wallet_agent.api import create_app
 from wallet_agent.api.app import _assistant_history_entry, _conversation_artifacts, _stream_state
-from wallet_agent.domain.models import ProviderOrder, UnsignedTransaction
+from wallet_agent.domain.models import (
+    Asset,
+    NormalizedOrderStatus,
+    NormalizedQuote,
+    ProviderOrder,
+    UnsignedTransaction,
+)
 from wallet_agent.persistence import InMemorySessionStore, SwapSessionRecord
 
 
@@ -884,6 +892,34 @@ async def test_transfer_error_clears_stale_unsigned_transaction_from_session():
 @pytest.mark.asyncio
 async def test_new_transfer_prepare_clears_previous_broadcast_projection():
     old_hash = "0x" + "a" * 64
+    quote = NormalizedQuote(
+        provider="omnibridge",
+        source_asset=Asset(
+            chain="ETH",
+            chain_id=1,
+            symbol="USDT",
+            decimals=6,
+            address="0x" + "1" * 40,
+        ),
+        destination_asset=Asset(chain="BSC", chain_id=56, symbol="BNB", decimals=18),
+        input_amount=Decimal("9"),
+        input_amount_raw="9000000",
+        expected_output=Decimal("0.01"),
+        expected_output_raw="10000000000000000",
+        provider_reference="swap-ref",
+    )
+    provider_order = ProviderOrder(
+        provider="omnibridge",
+        provider_order_id="order-1",
+        provider_reference="swap-ref",
+        tx_hash="0x" + "b" * 64,
+    )
+    order_status = NormalizedOrderStatus(
+        provider="omnibridge",
+        provider_order_id="order-1",
+        provider_reference="swap-ref",
+        status="completed",
+    )
     new_transaction = UnsignedTransaction(
         chain="ETH",
         chain_id=1,
@@ -901,6 +937,10 @@ async def test_new_transfer_prepare_clears_previous_broadcast_projection():
             stage="not_propagated",
             broadcast_tx_hash=old_hash,
             broadcast_status="not_propagated",
+            quote=quote,
+            selected_provider_reference="swap-ref",
+            provider_order=provider_order,
+            order_status=order_status,
             pending_transaction=UnsignedTransaction(
                 chain="ETH", chain_id=1, to="0x" + "3" * 40, data="0x", value="1"
             ),
@@ -952,6 +992,10 @@ async def test_new_transfer_prepare_clears_previous_broadcast_projection():
     assert body["broadcast_tx_hash"] is None
     assert body["broadcast_status"] is None
     assert body["pending_transaction"]["value"] == "100000000000000"
+    assert body["quote"] is None
+    assert body["selected_provider_reference"] is None
+    assert body["provider_order"] is None
+    assert body["order_status"] is None
 
 
 @pytest.mark.asyncio
