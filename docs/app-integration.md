@@ -538,6 +538,18 @@ POST /v1/transfer/{session_id}/broadcast
 - `status`（`pending` / `confirmed` / `failed` / `dropped` / `unknown`）、`chain`、`tx_hash`、`message`。
 - `failure_reason`：失败原因；`reason_unavailable: true` 表示**来源没有提供原因**，此时按「无法获知原因」表述，不要编造。
 
+**兑换状态** `swap_status`
+
+- **完成/失败只以 `order_status.status` 为准**：`completed` / `refunded` /
+  `failed` / `timed_out` / `kyc_required` / `cancelled` 都是终态；`pending` /
+  `processing` / `confirmed` / `unknown` 等是处理中。
+- `broadcast_status` 只反映源链状态：`source_confirmed` / `confirmed` 单独出现
+  **不等于兑换完成**，目标链资产可能还没到账。
+- 没有 `order_status`（订单还没被 Provider 接收）时，才用 `broadcast_status`
+  判断：`failed` / `dropped_or_replaced` 为失败，其余为处理中。
+- 不要用顶层 `status` / `stage` 判终态；详细规则见
+  [`issue-025-swap-status-fields.md`](issue-025-swap-status-fields.md)。
+
 **从交易详情页进入对话**：把当前交易放进 `metadata.transaction_query`：
 
 ```json

@@ -382,6 +382,11 @@ App 需按占位处理（不要用别的链 logo 顶替）。
 - logo：顶层 `chain` + `chain_logo_url` + `asset` / `destination_asset`（带
   `logo_url`），订单状态卡的币图标从这里取，见 §2.5。
 - App 接入：广播后轮询展示「交易中…／完成／失败」。
+  **完成/失败只以 `order_status.status` 为准**（`completed` / `failed` /
+  `refunded` / `timed_out` / `kyc_required` / `cancelled` 为终态）；没有
+  `order_status` 时才看 `broadcast_status`。`source_confirmed` / `confirmed`
+  单独出现 ≠ 兑换完成。完整字段与判定规则见
+  [`issue-025-swap-status-fields.md`](issue-025-swap-status-fields.md)。
 - 对齐：✅（`data-card-kind="status"`）。
 
 ### 3.17 发送/兑换详情页入口默认问题（非卡片）
