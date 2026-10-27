@@ -2056,7 +2056,9 @@ def create_app(
                             and isinstance(item.get("result"), Mapping)
                             and item["result"].get("ok")
                             and item["result"].get("quotes")
-                            for item in (result.get("react_results") or [])
+                            for item in (
+                                (result.get("response") or {}).get("react_results") or []
+                            )
                         )
                     )
                     prepare_input: dict[str, Any] = {

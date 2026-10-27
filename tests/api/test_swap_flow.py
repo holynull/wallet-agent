@@ -1,7 +1,9 @@
+import json
 from decimal import Decimal
 
 import httpx
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
 
 from wallet_agent.api import create_app
 from wallet_agent.chains.execution_observer import ExecutionObserver
@@ -751,6 +753,102 @@ async def test_swap_get_recover_stale_not_propagated_broadcast():
     assert body["status"] == "completed"
     assert body["stage"] == "completed"
     assert body["broadcast_status"] == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_react_swap_auto_confirm_ignores_stale_broadcast():
+    """A fresh ReAct quote must not be hijacked by an old broadcast_tx_hash into
+    register_broadcast/status_poll (the App would never see the swap card)."""
+
+    class ReactSwapQuoteModel:
+        async def invoke_react(self, messages, tools):
+            tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+            if not tool_messages:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "sq-1",
+                            "name": "get_swap_quote",
+                            "args": {
+                                "source_chain": "ETH",
+                                "source_symbol": "ETH",
+                                "destination_chain": "ETH",
+                                "destination_symbol": "USDC",
+                                "amount_mode": "exact_in",
+                                "input_amount": "1",
+                                "recipient_address": "0x" + "1" * 40,
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(content="报价已获取，请确认。")
+
+    class ReActFakeProvider(FakeProvider):
+        async def list_assets(self, query):
+            if query.search == "ETH":
+                return [Asset(chain="ETH", chain_id=1, symbol="ETH", decimals=18)]
+            if query.search == "USDC":
+                return [
+                    Asset(
+                        chain="ETH",
+                        chain_id=1,
+                        symbol="USDC",
+                        decimals=6,
+                        address="0x" + "1" * 40,
+                    )
+                ]
+            return []
+
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-react-auto",
+            user_id="alice",
+            thread_id="t-react-auto",
+            broadcast_tx_hash="0x" + "c" * 64,
+            broadcast_status="confirmed",
+            status="quoted",
+            stage="confirmed",
+        )
+    )
+    provider = ReActFakeProvider()
+    graph = build_graph(model=ReactSwapQuoteModel(), providers=[provider])
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        store=store,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/agent/turn",
+            json={
+                "conversation_id": "t-react-auto",
+                "session_id": "s-react-auto",
+                "user_id": "alice",
+                "message": "用 ETH 换 10 USDC",
+                "address": "0x" + "1" * 40,
+                "chain": "ETH",
+                "wallet_accounts": [{"chain": "ETH", "address": "0x" + "1" * 40}],
+            },
+        )
+        body = response.json()
+        run = app.state.runs[body["run_id"]]
+        await run["task"]
+        session = await client.get(
+            "/v1/swap/s-react-auto", params={"user_id": "alice"}
+        )
+
+    assert response.status_code == 200
+    assert run["status"] == "awaiting_confirmation"
+    assert provider.broadcast_calls == 0
+    serialized = json.dumps(run["events"], ensure_ascii=False)
+    assert "register_broadcast" not in serialized
+    # The stale broadcast hash must not be re-registered as a new provider order.
+    assert session.json().get("provider_order") is None
 
 
 @pytest.mark.asyncio
