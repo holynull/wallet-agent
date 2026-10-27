@@ -12442,6 +12442,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "kind": "swap_status",
             "provider": dumped.get("provider"),
             "provider_order_id": dumped.get("provider_order_id"),
+            "provider_reference": dumped.get("provider_reference"),
             "status": provider_status,
             "tx_hash": dumped.get("tx_hash"),
             "failure_reason": dumped.get("failure_reason"),
@@ -14116,6 +14117,55 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     *existing_quotes,
                 ]
                 update["fresh_swap_projected"] = True
+        # A chat arrival check may recover a provider order and report its real
+        # terminal state (e.g. completed). Persist it to the session so the App's
+        # status card stops showing "交易中" after the swap has actually landed.
+        swap_status_payload = next(
+            (
+                payload
+                for name, payload in tool_payloads
+                if name == "query_swap_status"
+                and payload.get("ok")
+                and payload.get("provider_order_id")
+            ),
+            None,
+        )
+        if swap_status_payload:
+            provider_name = str(swap_status_payload.get("provider") or "").strip()
+            order_status = {
+                "provider": provider_name,
+                "provider_order_id": str(
+                    swap_status_payload.get("provider_order_id") or ""
+                ),
+                "provider_reference": str(
+                    swap_status_payload.get("provider_reference") or ""
+                ),
+                "status": str(swap_status_payload.get("status") or ""),
+                "tx_hash": swap_status_payload.get("tx_hash"),
+                "failure_reason": swap_status_payload.get("failure_reason"),
+                "eta": swap_status_payload.get("eta"),
+                "refund_tx_hash": swap_status_payload.get("refund_tx_hash"),
+            }
+            status = order_status["status"]
+            update["status_snapshot"] = {
+                key: value for key, value in order_status.items() if value is not None
+            }
+            if provider_name:
+                order_payload = {
+                    key: order_status[key]
+                    for key in (
+                        "provider",
+                        "provider_order_id",
+                        "provider_reference",
+                        "tx_hash",
+                    )
+                    if order_status.get(key)
+                }
+                update["provider_orders"] = {
+                    provider_name: order_payload
+                }
+            if status in {"completed", "refunded"}:
+                update["broadcast_status"] = "confirmed"
         if transfer_result is not None:
             update["pending_transaction"] = dict(transfer_result["pending_transaction"])
             if isinstance(transfer_result.get("preflight"), Mapping):

@@ -1222,6 +1222,11 @@ async def test_react_arrival_recover_stale_not_propagated_broadcast():
     assert query_status["provider_order_id"] == "recovered-order"
     assert provider.broadcast_calls == 1
     assert provider.status_calls == 1
+    # The chat result must persist the terminal state so the App status card
+    # stops showing "交易中" once the swap has landed.
+    assert (result.get("status_snapshot") or {}).get("status") == "completed"
+    assert result.get("broadcast_status") == "confirmed"
+    assert result.get("provider_orders")
 
 
 @pytest.mark.asyncio
@@ -1298,6 +1303,8 @@ async def test_react_arrival_recovery_keeps_the_pinned_provider():
     )
     assert query_status["provider_order_id"] == "order-omni-ref"
     assert query_status["status"] == "completed"
+    assert (result.get("status_snapshot") or {}).get("status") == "completed"
+    assert result.get("broadcast_status") == "confirmed"
 
 
 def test_looks_like_balance_only_query_separates_read_from_transfer_steps():

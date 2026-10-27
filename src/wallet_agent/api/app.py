@@ -1672,6 +1672,19 @@ def create_app(
                 # longer actionable and must not make clients render signing cards.
                 changes["approval_transaction"] = None
                 changes["pending_transaction"] = None
+        status_snapshot = state.get("status_snapshot")
+        if (
+            broadcast_lifecycle_active
+            and not historical_reference
+            and isinstance(status_snapshot, Mapping)
+            and status_snapshot.get("status")
+            and str(status_snapshot["status"])
+            in {"completed", "refunded", "failed", "timed_out", "kyc_required", "cancelled"}
+        ):
+            # A chat arrival check can recover the provider order and persist a
+            # terminal status_snapshot; mirror it onto the session stage so the
+            # App status card stops showing 交易中.
+            changes["stage"] = str(status_snapshot["status"])
         if response.get("kind") == "cancelled" and not broadcast_lifecycle_active:
             changes.update(
                 status="cancelled",
@@ -2050,10 +2063,24 @@ def create_app(
                     elif response_kind == "swap_quote" and not result.get("selected_quote"):
                         session_status = "quoted"
                     elif response_kind == "react" and result.get("quote_candidates"):
-                        # Ordinary ReAct turns may produce lifecycle-safe quote
-                        # candidates. Project them as quoted so the client can
-                        # render selection without pretending a quote was selected.
-                        session_status = "quoted"
+                        # A chat arrival check may recover and report a terminal
+                        # order state (e.g. completed). That must win over the
+                        # generic "quoted" projection so the App status card
+                        # stops showing 交易中.
+                        react_swap_status = next(
+                            (
+                                item["result"]
+                                for item in (result.get("react_results") or [])
+                                if item.get("tool") == "query_swap_status"
+                                and item.get("result")
+                                and item["result"].get("provider_order_id")
+                            ),
+                            None,
+                        )
+                        if react_swap_status and react_swap_status.get("status"):
+                            session_status = str(react_swap_status.get("status"))
+                        else:
+                            session_status = "quoted"
                     elif response_kind == "clarification":
                         active_task = result.get("active_task") or {}
                         task_stage = result.get("task_stage") or active_task.get("stage")
