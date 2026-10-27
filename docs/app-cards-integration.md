@@ -374,6 +374,9 @@ App 需按占位处理（不要用别的链 logo 顶替）。
 - App 接入：展示待签名交易/PSBT → 钱包签名 → 回传
   `POST /v1/transfer/{session_id}/broadcast` 或 `POST /v1/swap/{session_id}/broadcast`
   （body `{tx_hash, chain, user_id}`）。服务端只收 hash + chain，绝不收签名材料。
+- ReAct 聊天里的 `prepare_transfer` 工具结果会被提升为同款
+  `response.kind = "transfer_prepare"` 卡片（顶层带 `pending_transaction` /
+  `preflight` / `asset` / `chain_logo_url`），App 不需要从 `react_results` 二次拼接。
 - 对齐：✅（`data-card-kind="transaction"` / `bitcoin-signing`）。
 
 ### 3.16 兑换状态卡（`swap_status`）

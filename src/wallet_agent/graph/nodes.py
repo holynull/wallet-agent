@@ -14177,6 +14177,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             # the native "0 ETH" row for a failed/success ERC-20 transfer).
             prepare_response = transfer_result.get("response")
             if isinstance(prepare_response, Mapping):
+                # Elevate the ReAct tool result into the same typed card shape the
+                # lifecycle path emits, so the App renders the unsigned-transfer
+                # card from response.kind instead of only react_results (Lif's
+                # report: "app 没有出现转账的卡片").
+                response["kind"] = str(
+                    prepare_response.get("kind") or "transfer_prepare"
+                )
+                for key in ("pending_transaction", "preflight"):
+                    if isinstance(prepare_response.get(key), Mapping):
+                        response[key] = dict(prepare_response[key])
                 if isinstance(prepare_response.get("asset"), Mapping):
                     response["asset"] = dict(prepare_response["asset"])
                 if prepare_response.get("chain_logo_url") is not None:

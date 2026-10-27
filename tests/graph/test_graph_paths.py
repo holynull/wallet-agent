@@ -1594,7 +1594,7 @@ async def test_react_transfer_prepare_carries_moved_asset_on_response():
         config={"configurable": {"thread_id": "react-prep-1"}},
     )
 
-    assert result["response"]["kind"] == "react"
+    assert result["response"]["kind"] == "transfer_prepare"
     assert result["response"]["asset"]["symbol"] == "ETH"
     assert result["response"]["asset"]["amount"] == "0.5"
     assert result["pending_transaction"] is not None
@@ -1639,7 +1639,7 @@ async def test_react_prepared_transfer_supersedes_balance_card():
     assert isinstance(balance_result.get("portfolio"), dict)
 
     # The transfer card wins: asset + pending_transaction present, no portfolio.
-    assert result["response"]["kind"] == "react"
+    assert result["response"]["kind"] == "transfer_prepare"
     assert result["response"]["asset"]["symbol"] == "USDC"
     assert result["response"]["asset"]["amount"] == "0.5"
     assert result["pending_transaction"] is not None
