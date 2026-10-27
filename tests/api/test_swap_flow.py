@@ -669,6 +669,91 @@ async def test_status_turn_preserves_not_propagated_broadcast_state_without_prov
 
 
 @pytest.mark.asyncio
+async def test_swap_get_recover_stale_not_propagated_broadcast():
+    """A passive GET /v1/swap must also self-heal a broadcast saved as
+    not_propagated once the source transaction confirms on-chain."""
+
+    class RecoveringProvider(FakeProvider):
+        def __init__(self):
+            super().__init__()
+            self.status_calls = 0
+
+        async def register_broadcast(self, provider_reference, tx_hash, **kwargs):
+            self.broadcast_calls += 1
+            return ProviderOrder(
+                provider="bridgers",
+                provider_order_id="recovered-order",
+                provider_reference=provider_reference,
+                tx_hash=tx_hash,
+            )
+
+        async def get_status(self, order):
+            self.status_calls += 1
+            return NormalizedOrderStatus(
+                provider="bridgers",
+                provider_order_id=order.provider_order_id,
+                provider_reference=order.provider_reference,
+                status="completed",
+                tx_hash=order.tx_hash,
+            )
+
+    class ReceiptAdapter:
+        async def get_transaction_receipt(self, _tx_hash):
+            return {"status": "0x1", "blockNumber": "0x10"}
+
+    quote = NormalizedQuote(
+        provider="bridgers",
+        source_asset=Asset(
+            chain="ETH", chain_id=1, symbol="USDC", decimals=6, address="0x" + "1" * 40
+        ),
+        destination_asset=Asset(
+            chain="BSC", chain_id=56, symbol="USDT", decimals=6, address="0x" + "2" * 40
+        ),
+        input_amount=Decimal("10"),
+        input_amount_raw="10000000",
+        expected_output=Decimal("9"),
+        expected_output_raw="9000000",
+        provider_reference="recover-ref",
+    )
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-recover-get",
+            user_id="alice",
+            thread_id="t-recover-get",
+            quote=quote,
+            broadcast_tx_hash="0x" + "e" * 64,
+            status="not_propagated",
+            stage="not_propagated",
+            broadcast_status="not_propagated",
+        )
+    )
+    provider = RecoveringProvider()
+    graph = build_graph(model=FakeModel(), providers=[provider])
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        store=store,
+        chain_registry=ChainAdapterRegistry({"ETH": ReceiptAdapter()}),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/v1/swap/s-recover-get", params={"user_id": "alice"}
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provider_order"]["provider_order_id"] == "recovered-order"
+    assert body["order_status"]["status"] == "completed"
+    assert body["status"] == "completed"
+    assert body["stage"] == "completed"
+    assert body["broadcast_status"] == "confirmed"
+
+
+@pytest.mark.asyncio
 async def test_status_turn_localizes_not_propagated_card_to_english():
     provider = FakeProvider()
     quote = NormalizedQuote(

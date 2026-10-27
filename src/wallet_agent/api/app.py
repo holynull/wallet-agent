@@ -737,10 +737,74 @@ def _provider_order_with_persisted_metadata(
     return order.model_copy(update={"provider_payload": merged})
 
 
+async def _broadcast_transaction_confirmed(adapter: Any, tx_hash: str) -> bool:
+    """Best-effort check that the source transaction is confirmed on-chain."""
+    if hasattr(adapter, "get_transaction_receipt"):
+        receipt = await adapter.get_transaction_receipt(tx_hash)
+        if receipt is None:
+            return False
+        return receipt_success(receipt) is True
+    if hasattr(adapter, "get_transaction_status"):
+        status = await adapter.get_transaction_status(tx_hash)
+        value = getattr(status, "value", status)
+        return str(value).lower() == "confirmed"
+    return False
+
+
+async def _recover_swap_session_order(
+    session: SwapSessionRecord,
+    providers: Mapping[str, Any],
+    session_store: SessionStore,
+    execution_adapter: Any,
+) -> SwapSessionRecord | None:
+    """Register a provider order for a broadcast saved without one.
+
+    Mirrors the graph's ``_recover_stale_broadcast_order`` so a passive
+    ``GET /v1/swap/{session_id}`` can also self-heal a swap that was saved as
+    ``not_propagated`` at broadcast time but confirmed on-chain later.
+    """
+    if session.quote is None or not session.broadcast_tx_hash:
+        return None
+    provider = providers.get(str(session.quote.provider))
+    if provider is None or not hasattr(provider, "register_broadcast"):
+        return None
+    adapter = execution_adapter(str(session.quote.source_asset.chain)) if callable(
+        execution_adapter
+    ) else None
+    if adapter is None:
+        return None
+    try:
+        if not await _broadcast_transaction_confirmed(adapter, session.broadcast_tx_hash):
+            return None
+    except Exception:
+        return None
+    try:
+        order = await provider.register_broadcast(
+            str(session.quote.provider_reference),
+            session.broadcast_tx_hash,
+            quote=session.quote,
+        )
+    except Exception:
+        return None
+    order = _provider_order_with_persisted_metadata(
+        order, session.pending_transaction, session.quote
+    )
+    try:
+        return await session_store.update(
+            session.session_id,
+            expected_revision=session.revision,
+            provider_order=order,
+        )
+    except SessionRevisionConflict:
+        return await session_store.get(session.session_id) or session
+
+
 async def _poll_swap_order_status(
     session: SwapSessionRecord,
     providers: Mapping[str, Any],
     session_store: SessionStore,
+    *,
+    execution_adapter: Any = None,
 ) -> SwapSessionRecord:
     """Refresh an in-flight swap order's status without a new chat turn.
 
@@ -753,7 +817,16 @@ async def _poll_swap_order_status(
     node's projection here: while an order is still live, query the provider
     once per read and persist the normalized status.
     """
-    if session.quote is None or session.provider_order is None:
+    if session.quote is None:
+        return session
+    if session.provider_order is None:
+        recovered = await _recover_swap_session_order(
+            session, providers, session_store, execution_adapter
+        )
+        if recovered is None:
+            return session
+        session = recovered
+    if session.provider_order is None:
         return session
     if session.status == "cancelled" or session.stage == "cancelled":
         return session
@@ -3339,7 +3412,10 @@ def create_app(
         # refresh a live provider order so completion (order_status=completed,
         # broadcast_status=confirmed) surfaces without waiting for a chat turn.
         session = await _poll_swap_order_status(
-            session, app.state.providers, session_store
+            session,
+            app.state.providers,
+            session_store,
+            execution_adapter=execution_adapter,
         )
         return _jsonable(session)
 
