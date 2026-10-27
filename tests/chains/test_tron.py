@@ -82,6 +82,31 @@ async def test_tron_build_native_transfer_returns_unsigned_transaction():
     assert tx.display["action"] == "native_transfer"
 
 
+async def test_tron_native_self_transfer_is_rejected_before_node_call():
+    transport = WriteHttpFake()
+    adapter = TronChainAdapter(transport)
+
+    with pytest.raises(ValueError, match="TRON 不支持向自己转账"):
+        await adapter.build_native_transfer(
+            from_address=OWNER, to_address=OWNER, amount_raw="3000000"
+        )
+
+    assert transport.calls == []
+
+
+async def test_tron_node_error_is_forwarded_in_unsigned_transaction_failure():
+    class ErrorHttpFake:
+        async def post(self, path, **kwargs):
+            return {"Error": "Cannot transfer TRX to yourself."}
+
+    adapter = TronChainAdapter(ErrorHttpFake())
+
+    with pytest.raises(ValueError, match="Cannot transfer TRX to yourself"):
+        await adapter.build_native_transfer(
+            from_address=OWNER, to_address=RECIPIENT, amount_raw="3000000"
+        )
+
+
 async def test_tron_build_erc20_transfer_encodes_trc20_calldata():
     transport = WriteHttpFake()
     adapter = TronChainAdapter(transport)

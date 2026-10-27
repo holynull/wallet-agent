@@ -293,7 +293,13 @@ class TronChainAdapter:
         if isinstance(payload, Mapping) and isinstance(payload.get("transaction"), Mapping):
             payload = payload["transaction"]
         if not isinstance(payload, Mapping) or not payload.get("raw_data_hex"):
-            raise ValueError("TRON node did not return an unsigned transaction")
+            node_error = ""
+            if isinstance(payload, Mapping):
+                node_error = str(payload.get("Error") or payload.get("error") or "")
+            suffix = f": {node_error}" if node_error else ""
+            raise ValueError(
+                "TRON node did not return an unsigned transaction" + suffix
+            )
         tx_id = str(payload.get("txID") or "")
         display = {
             "action": action,
@@ -381,6 +387,8 @@ class TronChainAdapter:
     ) -> UnsignedTransaction:
         owner = validate_address(self.chain, from_address)
         recipient = validate_address(self.chain, to_address)
+        if owner == recipient:
+            raise ValueError("TRON 不支持向自己转账（TRX）")
         amount = normalize_raw_integer(amount_raw)
         payload = await http_call(
             self.transport,
