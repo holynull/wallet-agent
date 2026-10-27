@@ -32,7 +32,18 @@ def route_after_intent(state: dict[str, Any]) -> str:
         return "response"
     if intent == "swap_status" and state.get("provider_orders"):
         return "status_poll"
-    if state.get("broadcast_tx_hash") and intent in {"swap_status", "swap_prepare"}:
+    if intent == "swap_status" and state.get("broadcast_tx_hash"):
+        return "register_broadcast"
+    # A fresh swap_prepare (a newly resolved quote this turn, marked by the API
+    # with ``fresh_swap``) must not be hijacked by a stale broadcast_tx_hash left
+    # in the checkpoint from a previous swap: it used to route into
+    # register_broadcast/status_poll, which failed on the old order and left the
+    # App without the new confirmation card.
+    if (
+        intent == "swap_prepare"
+        and state.get("broadcast_tx_hash")
+        and not state.get("fresh_swap")
+    ):
         return "register_broadcast"
     if (
         intent == "swap_status"

@@ -1962,20 +1962,46 @@ def create_app(
                     # Preserve it before the automatic confirmation execution
                     # replaces ``response`` in the same checkpoint.
                     await persist_assistant_history(thread_id, result, run_id=run_id)
-                    result = await execute(
-                        {
-                            "request": result.get("request"),
-                            "wallet_context": result.get("wallet_context"),
-                            "conversation_state": result.get("conversation_state"),
-                            "active_task": result.get("active_task"),
-                            "swap_draft": result.get("swap_draft"),
-                            "intent": "swap_prepare",
-                            "forced_intent": "swap_prepare",
-                            "swap_request": result.get("swap_request"),
-                            "selected_quote": result.get("selected_quote"),
-                            "swap_session": {"session_id": session_id},
-                        }
+                    fresh_swap = bool(
+                        input_state.get("swap_request")
+                        or any(
+                            str(item.get("tool") or "") == "get_swap_quote"
+                            and isinstance(item.get("result"), Mapping)
+                            and item["result"].get("ok")
+                            and item["result"].get("quotes")
+                            for item in (result.get("react_results") or [])
+                        )
                     )
+                    prepare_input: dict[str, Any] = {
+                        "request": result.get("request"),
+                        "wallet_context": result.get("wallet_context"),
+                        "conversation_state": result.get("conversation_state"),
+                        "active_task": result.get("active_task"),
+                        "swap_draft": result.get("swap_draft"),
+                        "intent": "swap_prepare",
+                        "forced_intent": "swap_prepare",
+                        "swap_request": result.get("swap_request"),
+                        "selected_quote": result.get("selected_quote"),
+                        "swap_session": {"session_id": session_id},
+                        # ``route_after_intent`` must not let a stale
+                        # broadcast_tx_hash hijack a *fresh* swap_prepare into
+                        # register_broadcast/status_poll, and a fresh prepare
+                        # must not carry the previous broadcast's lifecycle
+                        # fields into the new confirmation card.
+                        "fresh_swap": fresh_swap,
+                    }
+                    if fresh_swap:
+                        prepare_input.update(
+                            {
+                                "operation_reset": True,
+                                "broadcast_tx_hash": None,
+                                "broadcast_status": None,
+                                "provider_orders": None,
+                                "provider_order_ids": None,
+                                "status_snapshot": None,
+                            }
+                        )
+                    result = await execute(prepare_input)
                 snapshot = await get_snapshot()
                 result = snapshot.values
                 await persist_assistant_history(thread_id, result, run_id=run_id)
