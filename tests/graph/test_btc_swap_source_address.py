@@ -259,3 +259,62 @@ async def test_btc_address_surface_outranks_the_amount_keypad():
     action = result["response"].get("client_action")
     assert action is not None
     assert action["type"] == "select_btc_address"
+
+
+class TrxToBtcReactModel:
+    """Model mistakenly asks for a BTC 出金地址 on a TRX -> BTC swap."""
+
+    async def invoke_react(self, messages, tools):
+        tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "ca-1",
+                        "name": "request_client_action",
+                        "args": {
+                            "action": "select_btc_address",
+                            "chain": "TRON",
+                            "symbol": "TRX",
+                            "reason": "TRX 换成 BTC 需要选定出金地址",
+                        },
+                    },
+                    {
+                        "id": "sq-1",
+                        "name": "get_swap_quote",
+                        "args": {
+                            "source_symbol": "TRX",
+                            "source_chain": "TRON",
+                            "destination_symbol": "BTC",
+                            "destination_chain": "BTC",
+                            "input_amount": "70.5",
+                        },
+                    },
+                ],
+            )
+        return AIMessage(content="TRON 上的 TRX 全部换成 BTC 的报价已生成。")
+
+
+@pytest.mark.asyncio
+async def test_trx_to_btc_does_not_ask_for_a_btc_source_address():
+    """BTC as the *target* must not trigger the 出金地址 picker: the backend
+    already defaults to the wallet's first BTC receive address."""
+    graph = build_graph(
+        model=TrxToBtcReactModel(),
+        providers=[FakeProvider()],
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "全部 TRX 换成 BTC"},
+            "wallet_context": _wallet_context([P2WPKH, P2TR]),
+        },
+        config={"configurable": {"thread_id": "react-trx-to-btc-no-selector"}},
+    )
+
+    response = result["response"]
+    assert response["kind"] == "react"
+    assert (response.get("client_action") or {}).get("type") != "select_btc_address"
+    assert any(
+        item.get("tool") == "get_swap_quote" for item in response.get("react_results") or []
+    )

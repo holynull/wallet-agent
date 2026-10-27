@@ -3993,6 +3993,39 @@ def _swap_requires_btc_source_selection(
     return addresses
 
 
+def _swap_source_chain_is_btc(state: Mapping[str, Any]) -> bool:
+    """Whether the active swap's source chain is Bitcoin.
+
+    ``select_btc_address`` is only meaningful when the user is spending BTC (a
+    single 出金 address the Provider requires). When BTC is merely the *target*
+    (e.g. TRX → BTC) the backend already defaults to the wallet's first BTC
+    receive address, so the model must not ask the App to pick one.
+    """
+    selected = state.get("selected_quote")
+    if isinstance(selected, Mapping):
+        source = selected.get("source_asset")
+        if isinstance(source, Mapping):
+            if canonical_chain(str(source.get("chain") or "")) in {"BTC", "BITCOIN"}:
+                return True
+    draft = state.get("swap_draft")
+    if isinstance(draft, Mapping):
+        if canonical_chain(str(draft.get("source_chain") or "")) in {"BTC", "BITCOIN"}:
+            return True
+    request = state.get("request") or {}
+    metadata = request.get("metadata") if isinstance(request, Mapping) else None
+    suggestion = (
+        metadata.get("suggestion_data")
+        if isinstance(metadata, Mapping) and isinstance(metadata.get("suggestion_data"), Mapping)
+        else None
+    )
+    if isinstance(suggestion, Mapping):
+        source = suggestion.get("source") or suggestion.get("source_asset")
+        if isinstance(source, Mapping):
+            if canonical_chain(str(source.get("chain") or "")) in {"BTC", "BITCOIN"}:
+                return True
+    return False
+
+
 async def _adapter_balance_rows(adapter: Any, addresses: Sequence[str]) -> list[Any]:
     """Native balance pooled across ``addresses``, plus any token balances.
 
@@ -12651,7 +12684,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "scan_qr（扫收款码）、"
                 "open_amount_keypad（数字键盘输入金额）、"
                 "address_input（弹出地址输入框让用户粘贴收款地址）、"
-                "select_btc_address（BTC 兑换时让用户在多个 BTC 地址中选择出金地址）。"
+                "select_btc_address（BTC 作为卖出方/源链时，让用户在多个 BTC 地址中"
+                "选择出金地址；BTC 只是买入方/目标链时不要调用，后端默认用钱包第一个"
+                "BTC 地址作接收地址）。"
                 "用户说“从联系人选/转给朋友”“扫一扫”“输入金额”，"
                 "或需要用户提供收款地址时调用它；"
                 "用户表达“保存联系人/添加好友/把这个地址存为朋友”时，"
@@ -12910,6 +12945,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "调用 request_client_action(action=\"add_contact\", address=用户给的完整地址)，"
                 "由 App 负责编辑备注和写入地址本；后台不保存联系人，也不要声称已保存。"
                 "保存成功后如果用户要转账，再进入正常转账流程。"
+                "只有“BTC 卖出/源链是 BTC”时才调用 select_btc_address 让用户选出金地址；"
+                "BTC 只是目标链（如 TRX 换成 BTC）时不要调用，直接用钱包的第一个 BTC 地址。"
                 "请求金额键盘时传 intent=\"swap\" 或 intent=\"transfer\"，"
                 "服务端会把它放进 client_action.slots.intent，"
                 "不要省略，渲染决策以你的标注为准。"
@@ -13346,6 +13383,18 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             or slot_intent == "swap"
             or (render_decision is not None and render_decision.get("intent") == "swap")
         )
+        # ``select_btc_address`` only makes sense when BTC is the source (the
+        # Provider needs one explicit 出金 address). When BTC is merely the
+        # target (e.g. TRX -> BTC) the backend already defaulted to the wallet's
+        # first BTC receive address, so drop a model-requested picker instead of
+        # making the App ask again (Lif's report).
+        if (
+            client_action
+            and str(client_action.get("type") or "") == "select_btc_address"
+            and swap_intent
+            and not _swap_source_chain_is_btc(state)
+        ):
+            client_action = None
         swap_keypad_slots = None
         synthetic_swap_tool_signatures: list[str] = []
         if client_action and str(client_action.get("type") or "") == "open_amount_keypad":

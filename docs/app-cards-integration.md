@@ -138,6 +138,8 @@ App 收到后弹出自己的界面；用户完成后的结果作为**下一轮**
 地址只能选一个，provider 的 fromAddress 是单个地址）；选中后把该地址回传
 `metadata.suggestion_data = { intent:"swap", sender_address:"bc1..." }`。`sender_address`
 未下发时不会进入模型提示词白名单，避免模型把它当普通槽位猜值。
+**BTC 只是目标链时（如 TRX → BTC）不会下发 `select_btc_address`**：后端直接用钱包
+声明列表里的第一个 BTC 地址作为接收地址，App 不需要再弹地址选择。
 
 ### 2.5 币 / 链 logo 字段约定
 
