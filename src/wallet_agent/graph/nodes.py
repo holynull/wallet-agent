@@ -273,6 +273,13 @@ def _requested_language(state: Mapping[str, Any]) -> str | None:
     return normalized if normalized in {"zh", "en"} else None
 
 
+def _conversation_language(state: Mapping[str, Any]) -> str:
+    """Best language for a turn: App-pinned, else detected from the message."""
+    request = state.get("request") or {}
+    message = str(request.get("message") or "") if isinstance(request, Mapping) else ""
+    return _requested_language(state) or _message_language(message) or "zh"
+
+
 def _response_language(message: str, history: Any = None) -> str:
     current = _message_language(message)
     if current:
@@ -12244,11 +12251,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         the flow from free text.
         """
         name = str(action or "").strip()
+        language = _conversation_language(state)
         if name not in _CLIENT_ACTION_TYPES:
             return {
                 "ok": False,
                 "code": "CLIENT_ACTION_UNSUPPORTED",
-                "error": f"App 不支持的动作：{name or '未提供'}。",
+                "error": (
+                    f"App 不支持的动作：{name or '未提供'}。"
+                    if language == "zh"
+                    else f"App does not support the action: {name or 'not provided'}."
+                ),
                 "allowed_actions": list(_CLIENT_ACTION_TYPES),
             }
         if name == "add_contact":
@@ -12262,12 +12274,19 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 return {
                     "ok": False,
                     "code": "INVALID_CONTACT_ADDRESS",
-                    "error": "保存联系人需要一个有效的钱包地址。",
+                    "error": (
+                        "保存联系人需要一个有效的钱包地址。"
+                        if language == "zh"
+                        else "Saving a contact requires a valid wallet address."
+                    ),
                 }
             contact_chain = _contact_chain_for_address(
                 contact_address, chain, state.get("wallet_context")
             )
-            suggested_name = str(contact_name or "").strip() or "好友"
+            suggested_name = (
+                str(contact_name or "").strip()
+                or ("好友" if language == "zh" else "Friend")
+            )
             slots = {
                 "address": contact_address,
                 "short_address": _short_address(contact_address),
@@ -12279,7 +12298,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "ok": True,
                 "client_action": {
                     "type": "add_contact",
-                    "reason": str(reason or "").strip() or "用户要把地址保存为联系人",
+                    "reason": (
+                        str(reason or "").strip()
+                        or (
+                            "用户要把地址保存为联系人"
+                            if language == "zh"
+                            else "The user wants to save this address as a contact"
+                        )
+                    ),
                     "slots": slots,
                 },
             }
@@ -13388,25 +13414,56 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 execution_adapter(input_chain or ""),
             )
             if risk is not None:
+                risk_language = _conversation_language(state)
+                if (
+                    risk_language == "en"
+                    and risk["code"] == "CONTRACT_ADDRESS_RECIPIENT"
+                ):
+                    risk_message = (
+                        "This address is risky. Please double-check its source and "
+                        "accuracy before continuing to avoid losing assets."
+                    )
+                    risk_detail = "This address is a contract, not a regular wallet address."
+                elif risk_language == "en" and risk["message"] == _ADDRESS_RISK_MESSAGE:
+                    risk_message = (
+                        "This address is risky. Please double-check its source and "
+                        "accuracy before continuing to avoid losing assets."
+                    )
+                    risk_detail = risk.get("detail")
+                else:
+                    risk_message = risk["message"]
+                    risk_detail = risk.get("detail")
                 risk_slots: dict[str, Any] = {
                     "address": input_address,
                     "short_address": _short_address(input_address),
                     "level": risk["level"],
                     "code": risk["code"],
-                    "title": "地址风险提示",
-                    "message": risk["message"],
-                    "cancel_label": "取消转账",
-                    "continue_label": "继续转账",
+                    "title": (
+                        "地址风险提示"
+                        if risk_language == "zh"
+                        else "Address Risk Warning"
+                    ),
+                    "message": risk_message,
+                    "cancel_label": (
+                        "取消转账" if risk_language == "zh" else "Cancel transfer"
+                    ),
+                    "continue_label": (
+                        "继续转账" if risk_language == "zh" else "Continue transfer"
+                    ),
                     "blocking": risk["level"] == "danger",
                     "source": risk.get("source"),
                 }
                 if input_chain:
                     risk_slots["chain"] = input_chain
-                if risk.get("detail"):
-                    risk_slots["detail"] = risk["detail"]
+                if risk_detail:
+                    risk_slots["detail"] = risk_detail
                 client_action = {
                     "type": "address_risk",
-                    "reason": "用户输入的地址存在风险",
+                    "reason": (
+                        "用户输入的地址存在风险"
+                        if risk_language == "zh"
+                        else "The entered address is risky"
+                    ),
                     "slots": {
                         key: value
                         for key, value in risk_slots.items()

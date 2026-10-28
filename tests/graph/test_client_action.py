@@ -84,6 +84,21 @@ async def test_add_contact_request_reaches_the_app_with_contact_slots():
 
 
 @pytest.mark.asyncio
+async def test_add_contact_uses_app_pinned_english_language():
+    result = await _run_message(
+        {"action": "add_contact"},
+        "client-action-add-contact-en",
+        message=f"save {EVM}",
+        metadata={"language": "en"},
+    )
+
+    action = result["response"]["client_action"]
+    assert action["type"] == "add_contact"
+    assert action["slots"]["suggested_name"] == "Friend"
+    assert action["reason"] == "The user wants to save this address as a contact"
+
+
+@pytest.mark.asyncio
 async def test_add_contact_requires_a_valid_address():
     result = await _run_message(
         {"action": "add_contact", "reason": "用户要保存联系人"},

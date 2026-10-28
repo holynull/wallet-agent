@@ -68,6 +68,23 @@ async def test_contract_recipient_opens_the_designed_risk_card():
 
 
 @pytest.mark.asyncio
+async def test_contract_risk_card_follows_app_pinned_english():
+    adapter = ContractAdapter(True)
+
+    response = await _turn(
+        adapter=adapter,
+        metadata={"language": "en"},
+    )
+
+    slots = response["client_action"]["slots"]
+    assert slots["title"] == "Address Risk Warning"
+    assert slots["cancel_label"] == "Cancel transfer"
+    assert slots["continue_label"] == "Continue transfer"
+    assert slots["message"].startswith("This address is risky")
+    assert slots["detail"].startswith("This address is a contract")
+
+
+@pytest.mark.asyncio
 async def test_eoa_recipient_does_not_open_a_risk_card():
     adapter = ContractAdapter(False)
 

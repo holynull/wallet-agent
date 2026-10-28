@@ -54,6 +54,8 @@ GET /ready    -> {"status":"ready"}
 | `language` | string? | App 指定回复语言：`zh` / `en`。传了优先使用 App 语言；不传按消息自动判断 |
 | `conversation_id` | string? | 会话 ID；首轮不传，之后回传服务端返回的值 |
 | `session_id` | string? | 兑换/转账 session；由服务端创建并返回，续轮原样回传 |
+
+语言本地化的完整卡片/文案清单见 [`language-localization.md`](language-localization.md)。
 | `address` | string? | 当前签名钱包的公开地址 |
 | `chain` | string? | 当前签名网络，如 `BASE`、`ETH`、`TRON`、`SOLANA` |
 | `metadata.wallet_chain_id` | string? | 当前网络 ID，如 `0x2105`；用于网络一致性校验 |
