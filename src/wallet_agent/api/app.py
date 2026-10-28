@@ -144,6 +144,7 @@ class TurnRequest(BaseModel):
     message: str
     address: str | None = None
     chain: str | None = None
+    language: str | None = None
     supported_networks: list[str] | None = Field(default=None, max_length=50)
     wallet_accounts: list[WalletAccount] | None = Field(default=None, max_length=100)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -2312,6 +2313,10 @@ def create_app(
         )
         raw_gas_query = payload.metadata.get("gas_request") or payload.metadata.get("gas")
         raw_asset_query = payload.metadata.get("asset_query") or payload.metadata.get("assets")
+        explicit_language = payload.language or payload.metadata.get("language")
+        normalized_language = str(explicit_language or "").strip().lower().split("-")[0]
+        if normalized_language not in {"zh", "en"}:
+            normalized_language = detect_message_language(payload.message) or "zh"
         session_id = payload.session_id
         # Every turn gets a session record so read-only conversations (asset,
         # balance, receive-address questions) also show up in the chat history.
@@ -2327,9 +2332,24 @@ def create_app(
                         title=_conversation_title(payload.message),
                         # Keep the Chinese product default when the first
                         # message carries no language signal (amounts, hashes).
-                        language=detect_message_language(payload.message) or "zh",
+                        language=normalized_language,
                     )
                 )
+            elif (
+                explicit_language
+                and existing_session.language != normalized_language
+            ):
+                try:
+                    existing_session = await session_store.update(
+                        existing_session.session_id,
+                        expected_revision=existing_session.revision,
+                        language=normalized_language,
+                    ) or existing_session
+                except SessionRevisionConflict:
+                    existing_session = (
+                        await session_store.get(existing_session.session_id)
+                        or existing_session
+                    )
             elif existing_session.thread_id != conversation_id:
                 raise HTTPException(status_code=409, detail="session thread cannot be changed")
         wallet_context: dict[str, Any] = {}

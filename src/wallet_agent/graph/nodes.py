@@ -259,6 +259,20 @@ def _message_language(message: str) -> str | None:
     return "en" if re.search(r"[A-Za-z]{2,}", text) else None
 
 
+def _requested_language(state: Mapping[str, Any]) -> str | None:
+    """App-pinned language from ``request.language`` / ``metadata.language``."""
+    request = state.get("request") or {}
+    if not isinstance(request, Mapping):
+        return None
+    value = request.get("language")
+    if not value:
+        metadata = request.get("metadata")
+        if isinstance(metadata, Mapping):
+            value = metadata.get("language")
+    normalized = str(value or "").strip().lower().split("-")[0]
+    return normalized if normalized in {"zh", "en"} else None
+
+
 def _response_language(message: str, history: Any = None) -> str:
     current = _message_language(message)
     if current:
@@ -279,6 +293,9 @@ def _status_language(state: Mapping[str, Any]) -> str:
     cards (swap order, broadcast) follow the conversation instead, so a
     Chinese session that only ever typed amounts must not flip to English.
     """
+    pinned = _requested_language(state)
+    if pinned:
+        return pinned
     request = state.get("request")
     message = ""
     if isinstance(request, Mapping):
@@ -2327,7 +2344,8 @@ def dialogue_snapshot(state: Mapping[str, Any]) -> DialogueState:
         goal=goal,
         active_topic=active_topic or "unknown",
         referent=_dialogue_referent(result),
-        language=_response_language(message, state.get("conversation_history")),
+        language=_requested_language(state)
+        or _response_language(message, state.get("conversation_history")),
         last_result_kind=kind or None,
     )
 
@@ -5632,7 +5650,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "intent": intent,
             "missing_fields": list(missing),
             "user_message": message,
-            "language_hint": _response_language(message, state.get("conversation_history")),
+            "language_hint": _requested_language(state)
+            or _response_language(message, state.get("conversation_history")),
             "wallet": {
                 "address": context.get("address") or request.get("address"),
                 "chain": context.get("chain") or request.get("chain"),
@@ -6297,7 +6316,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             "intent": kind,
             "missing_fields": [],
             "user_message": message,
-            "language_hint": _response_language(message, state.get("conversation_history")),
+            "language_hint": _requested_language(state)
+            or _response_language(message, state.get("conversation_history")),
             "dialogue": _dump(state.get("dialogue") or {}),
             "result": result,
         }
@@ -7795,7 +7815,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         result: dict[str, Any] = {}
         request = _mapping(state.get("request"))
         message = str(request.get("message") or state.get("message") or "")
-        language = _response_language(message, state.get("conversation_history"))
+        language = _requested_language(state) or _response_language(
+            message, state.get("conversation_history")
+        )
         # A value request is a fan-in operation.  Do this before the generic
         # last-tool projection so a failed price call cannot hide a successful
         # balance call (or vice versa).
@@ -8917,7 +8939,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         if isinstance(state.get("preflight_followup"), Mapping):
             response = _preflight_balance_response(
                 state["preflight_followup"],
-                _response_language(message, state.get("conversation_history")),
+                _requested_language(state)
+                or _response_language(message, state.get("conversation_history")),
             )
             return {
                 "intent": "clarification",
@@ -9581,7 +9604,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         message = _swap_clarification_message(
                             {"swap_draft": draft, "request": state.get("request") or {}},
                             missing_networks,
-                            _response_language(message, state.get("conversation_history")),
+                            _requested_language(state)
+                            or _response_language(
+                                message, state.get("conversation_history")
+                            ),
                         )
                         return {
                             **common_update,
@@ -11676,7 +11702,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 response["message"] = _response_fallback(
                     "clarification",
                     [],
-                    _response_language(
+                    _requested_language(state)
+                    or _response_language(
                         str(
                             (state.get("request") or {}).get("message")
                             or state.get("message")
@@ -11693,7 +11720,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "response": {
                     "kind": "unsupported",
                     "message": _response_fallback(
-                        "unsupported", [], _response_language(message)
+                        "unsupported",
+                        [],
+                        _requested_language(state) or _response_language(message),
                     ),
                 }
             }
@@ -12318,7 +12347,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         state: Annotated[dict[str, Any], InjectedState],
     ) -> dict[str, Any]:
         """Standard quick replies for the swap card's pair selection."""
-        language = _message_language(
+        language = _requested_language(state) or _message_language(
             str((state.get("request") or {}).get("message") or "")
         )
         suggestions = await _react_swap_pair_suggestions(
@@ -13009,6 +13038,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "短追问要结合历史理解；工具失败时说明真实原因并提出最小澄清；不要编造事实或描述内部推理。"
             )
         )
+        pinned_language = _requested_language(state)
+        if pinned_language:
+            language_instruction = (
+                "请始终使用中文回复用户。"
+                if pinned_language == "zh"
+                else "Always reply to the user in English."
+            )
+            system = SystemMessage(
+                content=str(system.content) + language_instruction
+            )
         # The App can open the assistant from a transaction detail screen with a
         # default question ("explain the failure"). Without this the model only
         # sees the question text and has no hash to check.
@@ -13828,7 +13867,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         logo_value = amount_chip.get(logo_key)
                         if logo_value:
                             amount_slots[logo_key] = logo_value
-                    language = _message_language(current_message)
+                    language = _requested_language(state) or _message_language(
+                        current_message
+                    )
                     client_action = {
                         "type": "open_amount_keypad",
                         "reason": (
@@ -13898,7 +13939,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 wallet_context=state.get("wallet_context") or {},
                 tool_payloads=tool_payloads,
                 read_facts=state.get("read_facts"),
-                language=_message_language(current_message),
+                language=_requested_language(state) or _message_language(current_message),
             )
             if swap_suggestions:
                 response["suggestions"] = swap_suggestions
@@ -13929,7 +13970,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     ordered_chains = _order_supported_chains(
                         list(chain_rows), (state.get("wallet_context") or {}).get("chain")
                     )
-                    language = _message_language(current_message)
+                    language = _requested_language(state) or _message_language(
+                        current_message
+                    )
                     chain_suggestions: list[dict[str, Any]] = []
                     for chain in ordered_chains:
                         descriptor = chain_rows[chain]

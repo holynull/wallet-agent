@@ -852,6 +852,29 @@ async def test_react_swap_auto_confirm_ignores_stale_broadcast():
 
 
 @pytest.mark.asyncio
+async def test_turn_language_param_persists_to_session():
+    """App can force session language with the top-level language parameter."""
+    app, client, _provider = await make_client()
+    async with client:
+        response = await client.post(
+            "/v1/agent/turn",
+            json={
+                "user_id": "alice",
+                "message": "兑换",
+                "language": "en",
+            },
+        )
+        await app.state.runs[response.json()["run_id"]]["task"]
+        session = await client.get(
+            f"/v1/swap/{response.json()['session_id']}",
+            params={"user_id": "alice"},
+        )
+
+    assert response.status_code == 200
+    assert session.json()["language"] == "en"
+
+
+@pytest.mark.asyncio
 async def test_status_turn_localizes_not_propagated_card_to_english():
     provider = FakeProvider()
     quote = NormalizedQuote(
