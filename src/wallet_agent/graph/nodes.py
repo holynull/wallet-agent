@@ -1622,9 +1622,11 @@ def _react_transfer_context(state: Mapping[str, Any]) -> bool:
     """Whether the conversation is structurally inside a transfer-collection flow.
 
     Only structural signals count: the App echoed a transfer suggestion, or the
-    assistant already asked for a recipient address. Free-text intent (e.g.
+    assistant already asked for a recipient address, or the user already
+    supplied a valid recipient address. Free-text intent (e.g.
     ``_looks_like_transfer_message``) is the model's render-decision job, not
-    this helper's.
+    this helper's. Prompt markers are language-agnostic so an English-language
+    session is not mistaken for a non-transfer conversation.
     """
     request = state.get("request") or {}
     metadata = request.get("metadata") if isinstance(request, Mapping) else None
@@ -1635,10 +1637,23 @@ def _react_transfer_context(state: Mapping[str, Any]) -> bool:
     )
     if isinstance(suggestion, Mapping) and suggestion.get("intent") == "transfer":
         return True
+    recipient_asked_markers = (
+        "收款地址",
+        "输入地址",
+        "转账给谁",
+        "recipient address",
+        "paste the recipient",
+        "who should receive",
+        "who do you want to send",
+    )
     for msg in state.get("messages") or []:
         if isinstance(msg, AIMessage):
-            text = str(getattr(msg, "content", "") or "")
-            if "收款地址" in text or "输入地址" in text:
+            text = str(getattr(msg, "content", "") or "").lower()
+            if any(marker in text for marker in recipient_asked_markers):
+                return True
+        elif isinstance(msg, HumanMessage):
+            text = str(getattr(msg, "content", "") or "").strip()
+            if any(is_valid_address(chain, text) for chain in _CHAIN_ADDRESS_PROBES):
                 return True
     return False
 
@@ -13768,9 +13783,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         # slots.symbol) and also call transfer_quick_replies whose draft has no
         # symbol yet, surfacing an amount keypad and a coin chip in the same
         # round. Reconcile them so the App renders one consistent amount step.
-        # The keypad's symbol only counts when the user actually chose it; the
-        # model defaulting to the chain's native coin must not skip the
-        # coin-selection step, or the user gets locked to that coin.
+        # The keypad's symbol counts when the user actually chose it, or when
+        # the flow is structurally inside a transfer (a recipient is already
+        # collected) and there is no coin card to fall back on; a model-defaulted
+        # native coin must not skip the coin-selection step when a coin card is
+        # present, and a cold keypad with no collected recipient would lock the
+        # user to a coin they never picked.
         if (
             swap_keypad_slots is None
             and client_action
@@ -13778,7 +13796,16 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         ):
             keypad_slots = dict(client_action.get("slots") or {})
             keypad_symbol = str(keypad_slots.get("symbol") or "").strip()
-            if keypad_symbol and _react_transfer_user_symbol(state):
+            coin_chips = [
+                item
+                for item in (quick_replies or [])
+                if str(item.get("type") or "") in {"symbol", "token"}
+            ]
+            user_symbol = _react_transfer_user_symbol(state)
+            transfer_established = _react_transfer_collection(state) is not None
+            if keypad_symbol and (
+                user_symbol or (not coin_chips and transfer_established)
+            ):
                 keypad_chain = canonical_chain(str(keypad_slots.get("chain") or ""))
                 keypad_symbol = canonical_symbol(keypad_symbol)
                 matching_amount = next(
@@ -13864,8 +13891,9 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                     ]
             else:
                 # The coin was not user-chosen (unknown, or the model defaulted
-                # the native coin): a keypad cannot anchor a raw amount, so drop
-                # it and let the coin card drive the step.
+                # the native coin) and a coin-selection card is present: drop
+                # the keypad so the coin card drives the step instead of
+                # locking the user to a coin they never picked.
                 client_action = None
         # The model can anchor on an unfinished transfer task and call
         # transfer_quick_replies even when the user asked to swap (e.g. "我要兑换"

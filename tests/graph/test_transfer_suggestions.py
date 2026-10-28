@@ -523,6 +523,133 @@ async def test_react_keypad_with_model_default_symbol_keeps_coin_card():
 
 
 @pytest.mark.asyncio
+async def test_react_keypad_pinned_symbol_survives_english_transfer_flow():
+    """An amount keypad requested alone (no coin chips) must still reach the App.
+
+    agent_app_bot report: an English ARBITRUM-ETH transfer flow where the model
+    called only ``request_client_action(open_amount_keypad, chain=ARBITRUM,
+    symbol=ETH, intent=transfer)`` returned no top-level ``client_action``, so
+    the App rendered only a text bubble and no amount card. The coin was not
+    re-provable as a user choice (the choice lives in free text like
+    ``发送eth``), but the transfer flow is structurally established (a recipient
+    is already collected) and there is no coin-selection chip to fall back on,
+    so the keypad must stay, be enriched with the exact-chain balance, and be
+    elevated to the top-level response.
+    """
+    from decimal import Decimal
+
+    from wallet_agent.domain.models import Asset, TokenBalance
+
+    class ArbitrumWalletProvider:
+        chain_index_by_name = {"ARBITRUM": "42161"}
+
+        async def get_token_balances(self, address, indexes):
+            assert indexes == ["42161"]
+            return [
+                TokenBalance(
+                    asset=Asset(
+                        chain="ARBITRUM",
+                        chain_id=42161,
+                        symbol="ETH",
+                        decimals=18,
+                    ),
+                    amount=Decimal("0.00163120047"),
+                    amount_raw="1631200470000000",
+                    usd_value=Decimal("3.78"),
+                )
+            ]
+
+    class AmountKeypadOnlyModel:
+        async def invoke_react(self, messages, tools):
+            tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+            if not tool_messages:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "act-1",
+                            "name": "request_client_action",
+                            "args": {
+                                "action": "open_amount_keypad",
+                                "chain": "ARBITRUM",
+                                "symbol": "ETH",
+                                "intent": "transfer",
+                                "reason": "Enter the ETH amount to send on ARBITRUM",
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(
+                content="The amount keypad is open again - please enter how much "
+                "ETH you'd like to send on ARBITRUM to 0x1F6E...f11A."
+            )
+
+    graph = build_graph(
+        model=AmountKeypadOnlyModel(),
+        wallet_provider=ArbitrumWalletProvider(),
+        chains={"BASE": object(), "ETH": object(), "ARBITRUM": object()},
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "输入金额"},
+            "conversation_history": [
+                {"role": "user", "content": "你好"},
+                {
+                    "role": "assistant",
+                    "content": "Hi! I'm your multi-chain wallet assistant.",
+                },
+                {"role": "user", "content": "转账"},
+                {
+                    "role": "assistant",
+                    "content": "Sure, let's set up a transfer. First, who should "
+                    "receive it - paste the recipient address, or pick a contact?",
+                },
+                {"role": "user", "content": "0x1F6E4FD185ce8C8171b4BDd2A64667BC69Aff11A"},
+                {
+                    "role": "assistant",
+                    "content": "Got the recipient. Now which network should the "
+                    "transfer use?",
+                },
+                {"role": "user", "content": "Continue this transfer on ARBITRUM."},
+                {
+                    "role": "assistant",
+                    "content": "ARBITRUM it is - the token there is ETH. How much "
+                    "ETH would you like to send?",
+                },
+                {"role": "user", "content": "发送eth"},
+                {
+                    "role": "assistant",
+                    "content": "Sending ETH on ARBITRUM to 0x1F6E...f11A. Enter "
+                    "the amount on the keypad that just opened.",
+                },
+            ],
+            "wallet_context": {
+                "address": "0x" + "1" * 40,
+                "chain": "ARBITRUM",
+                "wallet_accounts": [
+                    {"chain": "ARBITRUM", "address": "0x" + "1" * 40}
+                ],
+            },
+        },
+        config={"configurable": {"thread_id": "react-keypad-english-flow"}},
+    )
+
+    response = result["response"]
+    assert response["kind"] == "react"
+    assert response["client_action"]["type"] == "open_amount_keypad"
+    slots = response["client_action"]["slots"]
+    assert slots["intent"] == "transfer"
+    assert slots["chain"] == "ARBITRUM"
+    assert slots["symbol"] == "ETH"
+    assert slots["decimals"] == 18
+    assert slots["balance"] == "0.00163120047"
+    assert slots["balance_raw"] == "1631200470000000"
+    assert slots["balance_usd"] == "3.78"
+    assert "arbitrum" in slots["logo_url"]
+    assert "arbitrum" in slots["chain_logo_url"]
+
+
+@pytest.mark.asyncio
 async def test_react_keypad_after_user_picked_coin_keeps_keypad():
     """When the user actually picked a coin (suggestion_data.symbol), the keypad
     is the amount step: drop the coin chip and carry decimals on the keypad."""
