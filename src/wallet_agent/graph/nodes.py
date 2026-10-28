@@ -4033,24 +4033,26 @@ def _swap_requires_btc_source_selection(
     return addresses
 
 
-def _swap_source_chain_is_btc(state: Mapping[str, Any]) -> bool:
-    """Whether the active swap's source chain is Bitcoin.
+def _swap_source_chain_non_btc(state: Mapping[str, Any]) -> bool:
+    """Whether the active swap's source chain is known and is NOT Bitcoin.
 
-    ``select_btc_address`` is only meaningful when the user is spending BTC (a
-    single 出金 address the Provider requires). When BTC is merely the *target*
-    (e.g. TRX → BTC) the backend already defaults to the wallet's first BTC
-    receive address, so the model must not ask the App to pick one.
+    The old positive check returned ``False`` both when the source is a non-BTC
+    chain (TRX → BTC) *and* when the source is simply unknown yet (the user
+    typed "Swap BTC to USDT" in prose, before any quote/draft exists). Only drop
+    a model-requested ``select_btc_address`` when we have positive evidence that
+    the source is a non-BTC chain; an unknown source keeps the model's explicit
+    picker request (the model is the authority on the pair).
     """
     selected = state.get("selected_quote")
     if isinstance(selected, Mapping):
         source = selected.get("source_asset")
         if isinstance(source, Mapping):
-            if canonical_chain(str(source.get("chain") or "")) in {"BTC", "BITCOIN"}:
-                return True
+            chain = canonical_chain(str(source.get("chain") or ""))
+            return bool(chain) and chain not in {"BTC", "BITCOIN"}
     draft = state.get("swap_draft")
     if isinstance(draft, Mapping):
-        if canonical_chain(str(draft.get("source_chain") or "")) in {"BTC", "BITCOIN"}:
-            return True
+        chain = canonical_chain(str(draft.get("source_chain") or ""))
+        return bool(chain) and chain not in {"BTC", "BITCOIN"}
     request = state.get("request") or {}
     metadata = request.get("metadata") if isinstance(request, Mapping) else None
     suggestion = (
@@ -4061,9 +4063,53 @@ def _swap_source_chain_is_btc(state: Mapping[str, Any]) -> bool:
     if isinstance(suggestion, Mapping):
         source = suggestion.get("source") or suggestion.get("source_asset")
         if isinstance(source, Mapping):
-            if canonical_chain(str(source.get("chain") or "")) in {"BTC", "BITCOIN"}:
-                return True
+            chain = canonical_chain(str(source.get("chain") or ""))
+            return bool(chain) and chain not in {"BTC", "BITCOIN"}
     return False
+
+
+def _react_btc_picker_addresses(
+    tool_payloads: list[tuple[str, dict[str, Any]]],
+    wallet_context: Mapping[str, Any] | None,
+) -> list[str]:
+    """BTC addresses for the ReAct ``select_btc_address`` surface.
+
+    Prefers the addresses the same turn's ``wallet_balance`` already queried
+    (``portfolio.network_status[].addresses`` / ``wallet.native_balance.addresses``),
+    falling back to the App-declared BTC accounts. The picker needs the full
+    address list, not just the primary sender (agent_app_bot: the amount-keypad
+    round's ``wallet_balance`` carried 4 BTC addresses but ``slots.addresses``
+    was empty, so the App refused to render the card).
+    """
+    ordered: list[str] = []
+    for name, payload in reversed(tool_payloads):
+        if name != "wallet_balance":
+            continue
+        if not isinstance(payload, Mapping) or not payload.get("ok"):
+            continue
+        portfolio = payload.get("portfolio")
+        if not isinstance(portfolio, Mapping):
+            continue
+        for row in portfolio.get("network_status") or []:
+            if not isinstance(row, Mapping):
+                continue
+            if canonical_chain(str(row.get("chain") or "")) not in {"BTC", "BITCOIN"}:
+                continue
+            for address in row.get("addresses") or []:
+                address = str(address or "").strip()
+                if address and address not in ordered:
+                    ordered.append(address)
+        native = portfolio.get("wallet")
+        if isinstance(native, Mapping):
+            native_balance = native.get("native_balance")
+            if isinstance(native_balance, Mapping):
+                for address in native_balance.get("addresses") or []:
+                    address = str(address or "").strip()
+                    if address and address not in ordered:
+                        ordered.append(address)
+    if ordered:
+        return ordered
+    return _btc_swap_source_options(wallet_context, "BTC")
 
 
 async def _adapter_balance_rows(adapter: Any, addresses: Sequence[str]) -> list[Any]:
@@ -13547,14 +13593,43 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         # Provider needs one explicit 出金 address). When BTC is merely the
         # target (e.g. TRX -> BTC) the backend already defaulted to the wallet's
         # first BTC receive address, so drop a model-requested picker instead of
-        # making the App ask again (Lif's report).
+        # making the App ask again (Lif's report). The drop only applies when we
+        # have positive evidence of a non-BTC source (or the picker itself is
+        # not even asking for a BTC address); an unknown source keeps the
+        # model's explicit picker request (agent_app_bot: a typed "Swap BTC to
+        # USDT" round dropped ``select_btc_address``, leaving the App with no
+        # card at all).
         if (
             client_action
             and str(client_action.get("type") or "") == "select_btc_address"
             and swap_intent
-            and not _swap_source_chain_is_btc(state)
+            and (
+                canonical_chain(
+                    str((client_action.get("slots") or {}).get("chain") or "")
+                )
+                not in {"BTC", "BITCOIN"}
+                or _swap_source_chain_non_btc(state)
+            )
         ):
             client_action = None
+        # The ReAct picker must carry the full BTC address list (the App's
+        # ``select_btc_address`` card refuses to render without ``addresses``).
+        # Collect the addresses this turn's wallet_balance already queried and
+        # attach per-address entries with best-effort balances, mirroring the
+        # lifecycle path's ``select_btc_address`` payload.
+        if (
+            client_action
+            and str(client_action.get("type") or "") == "select_btc_address"
+            and not (client_action.get("slots") or {}).get("addresses")
+        ):
+            picker_addresses = _react_btc_picker_addresses(
+                tool_payloads, state.get("wallet_context") or {}
+            )
+            if picker_addresses:
+                address_options = await _btc_source_address_options(picker_addresses)
+                picker_slots = dict(client_action.get("slots") or {})
+                picker_slots["addresses"] = address_options
+                client_action = {**client_action, "slots": picker_slots}
         swap_keypad_slots = None
         synthetic_swap_tool_signatures: list[str] = []
         if client_action and str(client_action.get("type") or "") == "open_amount_keypad":

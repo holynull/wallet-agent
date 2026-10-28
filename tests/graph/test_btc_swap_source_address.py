@@ -16,12 +16,14 @@ from wallet_agent.domain.models import NormalizedQuote
 from wallet_agent.graph.build import build_graph
 from wallet_agent.graph.nodes import (
     _btc_swap_source_options,
+    _react_btc_picker_addresses,
     _swap_requires_btc_source_selection,
 )
 
 P2WPKH = "bc1qdqahz8x62rsyfmlkv0m5e5rc234zr7vyl690d5"
 P2TR = "bc1p47u7v2k5cpfqt0gxftkat3ade7ucs588g8lr0znzr9le06taty6q6x9gut"
 P2SH = "3FGALr2UNebKnBTErhePUk3CuzmDd9FJux"
+P2PKH = "1Nqs6wvbYfZK15GQ43ydsiDU7NDnnWR2tm"
 EVM = "0x3f847a21bcfbba535a5e2a1611bb4d545541d2a5"
 
 
@@ -372,3 +374,129 @@ async def test_repeat_swap_prose_reprojects_existing_quote_candidates():
 
     assert result.get("fresh_swap_projected") is True
     assert (result.get("selected_quote") or {}).get("provider") == "omnibridge"
+
+
+class TypedBtcPairModel:
+    """Model asks for the BTC source picker and the amount keypad in one turn
+    after the user typed the pair in prose (no suggestion_data echo)."""
+
+    async def invoke_react(self, messages, tools):
+        tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "ca-1",
+                        "name": "request_client_action",
+                        "args": {
+                            "action": "select_btc_address",
+                            "chain": "BTC",
+                            "symbol": "BTC",
+                            "intent": "swap",
+                            "reason": "BTC is the source asset of the swap; "
+                            "choose which BTC address to send from.",
+                        },
+                    },
+                    {
+                        "id": "ca-2",
+                        "name": "request_client_action",
+                        "args": {
+                            "action": "open_amount_keypad",
+                            "chain": "BTC",
+                            "symbol": "BTC",
+                            "intent": "swap",
+                            "reason": "Enter the BTC amount to swap to USDT.",
+                        },
+                    },
+                ],
+            )
+        return AIMessage(
+            content="Your BTC balance is 0.00038502 BTC. Please pick which BTC "
+            "address to send from and enter the amount you want to swap to USDT."
+        )
+
+
+@pytest.mark.asyncio
+async def test_react_btc_source_picker_survives_typed_pair_prose():
+    """agent_app_bot report: typing "Swap BTC to USDT" (no tapped card, no
+    quote/draft yet) must still surface the top-level ``select_btc_address``
+    card with ``slots.addresses``; the amount keypad waits for the next turn.
+
+    Previously the picker was dropped because ``_swap_source_chain_is_btc``
+    returned False when the source was merely unknown (no suggestion_data,
+    quote or draft), leaving the App with only a text bubble.
+    """
+    graph = build_graph(
+        model=TypedBtcPairModel(),
+        chains={"BTC": object(), "ETH": object()},
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "Swap BTC to USDT"},
+            "wallet_context": _wallet_context([P2WPKH, P2TR, P2SH, P2PKH]),
+        },
+        config={"configurable": {"thread_id": "react-typed-btc-pair-picker"}},
+    )
+
+    response = result["response"]
+    assert response["kind"] == "react"
+    action = response.get("client_action")
+    assert action is not None
+    assert action["type"] == "select_btc_address"
+    assert action["slots"]["chain"] == "BTC"
+    assert action["slots"]["symbol"] == "BTC"
+    assert action["slots"]["intent"] == "swap"
+    assert [item["address"] for item in action["slots"]["addresses"]] == [
+        P2WPKH,
+        P2TR,
+        P2SH,
+        P2PKH,
+    ]
+    # Only the picker is elevated; the amount keypad stays inside react_results
+    # until the user picks an address.
+    assert response["client_action"]["type"] == "select_btc_address"
+    keypad_results = [
+        item
+        for item in response.get("react_results") or []
+        if item.get("result", {}).get("client_action", {}).get("type")
+        == "open_amount_keypad"
+    ]
+    assert len(keypad_results) == 1
+
+
+def test_react_btc_picker_addresses_prefer_wallet_balance_rows():
+    """The picker's address list comes from the same turn's wallet_balance
+    network_status (the report's run carried 4 BTC addresses there), falling
+    back to the App-declared accounts."""
+    wallet_balance_payload = {
+        "ok": True,
+        "portfolio": {
+            "network_status": [
+                {
+                    "chain": "BTC",
+                    "addresses": [
+                        "bc1q8aw7823qeneuayzzz69khl6hsvygwkwg70hnu7",
+                        "bc1p5z74y9aee7dkfr6zzmu3y50zvqvfwfm7s7hcnftrwc53haema7wqshz62l",
+                        "37socxkGRYM3rVBLcPccVCF3LuP4JvvvBn",
+                        "1Nqs6wvbYfZK15GQ43ydsiDU7NDnnWR2tm",
+                    ],
+                },
+                {"chain": "ETH", "addresses": ["0x3f847a21bcfbba535a5e2a1611bb4d545541d2a5"]},
+            ],
+            "wallet": {
+                "native_balance": {
+                    "addresses": ["bc1q8aw7823qeneuayzzz69khl6hsvygwkwg70hnu7"]
+                }
+            },
+        },
+    }
+    tool_payloads = [("wallet_balance", wallet_balance_payload)]
+    context = _wallet_context([P2WPKH, P2TR])
+    assert _react_btc_picker_addresses(tool_payloads, context) == [
+        "bc1q8aw7823qeneuayzzz69khl6hsvygwkwg70hnu7",
+        "bc1p5z74y9aee7dkfr6zzmu3y50zvqvfwfm7s7hcnftrwc53haema7wqshz62l",
+        "37socxkGRYM3rVBLcPccVCF3LuP4JvvvBn",
+        "1Nqs6wvbYfZK15GQ43ydsiDU7NDnnWR2tm",
+    ]
+    assert _react_btc_picker_addresses([], context) == [P2WPKH, P2TR]
