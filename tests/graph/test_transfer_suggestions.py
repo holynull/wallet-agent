@@ -459,9 +459,12 @@ async def test_react_text_only_after_chain_still_surfaces_coin_card():
 
 
 @pytest.mark.asyncio
-async def test_react_keypad_with_model_default_symbol_keeps_coin_card():
-    """The model defaulting the chain's native coin into the keypad is not a
-    user choice; drop the keypad so the coin-selection card still appears."""
+async def test_react_keypad_with_model_pinned_symbol_is_the_amount_step():
+    """A symbol-pinned keypad is the amount step even when it also arrives with
+    transfer_quick_replies chips: the model is the authority, so the keypad
+    stays and the coin chips are dropped to render one consistent amount card.
+    The old "model-defaulted coin" heuristic kept dropping the keypad and left
+    the App with a coin card instead of the amount step the model asked for."""
 
     class BothToolsModel:
         async def invoke_react(self, messages, tools):
@@ -516,10 +519,17 @@ async def test_react_keypad_with_model_default_symbol_keeps_coin_card():
 
     response = result["response"]
     assert response["kind"] == "react"
-    assert "client_action" not in response
-    assert [(item["type"], item["value"]) for item in response["suggestions"]] == [
-        ("symbol", "BNB"),
-    ]
+    assert response["client_action"]["type"] == "open_amount_keypad"
+    slots = response["client_action"]["slots"]
+    assert slots["intent"] == "transfer"
+    assert slots["chain"] == "BSC"
+    assert slots["symbol"] == "BNB"
+    assert slots["decimals"] == 18
+    # The coin chip is consumed by the keypad so the App renders one card.
+    assert not any(
+        str(item.get("type") or "") in {"symbol", "token"}
+        for item in response.get("suggestions") or []
+    )
 
 
 @pytest.mark.asyncio

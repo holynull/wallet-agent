@@ -455,8 +455,11 @@ async def test_typed_swap_keypad_marks_an_exact_zero_source_balance():
 
 
 @pytest.mark.asyncio
-async def test_transfer_keypad_without_chosen_coin_still_dropped():
-    """Regression: a transfer keypad with no user-chosen coin is still dropped."""
+async def test_model_pinned_transfer_keypad_survives_without_user_choice():
+    """A model-pinned transfer keypad is the amount step and must be surfaced,
+    even when no user coin choice is provable from the message history. The old
+    "user-chosen coin" heuristic kept dropping it and left the App with only a
+    text bubble (agent_app_bot report), so no fallback overrides the model."""
 
     class TransferNoCoinModel:
         def __init__(self, decision=None):
@@ -491,6 +494,10 @@ async def test_transfer_keypad_without_chosen_coin_still_dropped():
         config={"configurable": {"thread_id": "react-transfer-keypad-no-coin"}},
     )
 
-    # Not a swap message and no suggestion_data: the keypad must be dropped and
-    # the coin-selection card drives the step.
-    assert "client_action" not in result["response"]
+    # The model pinned ETH on the keypad: keep it at the top level so the App
+    # renders the amount card.
+    action = result["response"].get("client_action")
+    assert action is not None
+    assert action["type"] == "open_amount_keypad"
+    assert action["slots"]["intent"] == "transfer"
+    assert action["slots"]["symbol"] == "ETH"

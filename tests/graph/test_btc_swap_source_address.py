@@ -299,9 +299,12 @@ class TrxToBtcReactModel:
 
 
 @pytest.mark.asyncio
-async def test_trx_to_btc_does_not_ask_for_a_btc_source_address():
-    """BTC as the *target* must not trigger the 出金地址 picker: the backend
-    already defaults to the wallet's first BTC receive address."""
+async def test_model_requested_btc_picker_is_respected():
+    """The model is the authority on ``select_btc_address``: an explicit picker
+    request is surfaced even when a heuristic could argue against it (here a
+    TRX → BTC swap). The previous hardcoded drop kept misfiring and left the App
+    with no card (agent_app_bot follow-ups), so no fallback overrides the model.
+    """
     graph = build_graph(
         model=TrxToBtcReactModel(),
         providers=[FakeProvider()],
@@ -316,7 +319,7 @@ async def test_trx_to_btc_does_not_ask_for_a_btc_source_address():
 
     response = result["response"]
     assert response["kind"] == "react"
-    assert (response.get("client_action") or {}).get("type") != "select_btc_address"
+    assert (response.get("client_action") or {}).get("type") == "select_btc_address"
     assert any(
         item.get("tool") == "get_swap_quote" for item in response.get("react_results") or []
     )
@@ -415,6 +418,84 @@ class TypedBtcPairModel:
             content="Your BTC balance is 0.00038502 BTC. Please pick which BTC "
             "address to send from and enter the amount you want to swap to USDT."
         )
+
+
+@pytest.mark.asyncio
+async def test_react_btc_picker_survives_chainless_chinese_typed_pair():
+    """agent_app_bot follow-up (run f5233bd6): Chinese "把 BTC 换成 USDT" with
+    the model calling ``select_btc_address`` without a ``slots.chain`` (only
+    ``symbol: "BTC"``) must still surface the picker with chain recovered and
+    ``addresses`` filled from the declared BTC accounts (no wallet_balance
+    call this turn). The previous strict chain sanity check dropped it."""
+
+    class ChainlessBtcPickerModel:
+        async def invoke_react(self, messages, tools):
+            tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
+            if not tool_messages:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "ca-1",
+                            "name": "request_client_action",
+                            "args": {
+                                "action": "select_btc_address",
+                                "symbol": "BTC",
+                                "intent": "swap",
+                                "reason": "BTC 是卖出方，需要选择出金地址",
+                            },
+                        },
+                        {
+                            "id": "ca-2",
+                            "name": "request_client_action",
+                            "args": {
+                                "action": "open_amount_keypad",
+                                "symbol": "BTC",
+                                "intent": "swap",
+                                "reason": "输入要兑换的 BTC 数量",
+                            },
+                        },
+                    ],
+                )
+            return AIMessage(
+                content="你有一个 BTC 地址列表，请先选择用哪个 BTC 地址出金，"
+                "然后输入要兑换的 BTC 数量。"
+            )
+
+    graph = build_graph(
+        model=ChainlessBtcPickerModel(),
+        chains={"BTC": object(), "ETH": object()},
+    )
+    result = await graph.ainvoke(
+        {
+            "request": {"message": "把 BTC 换成 USDT"},
+            "wallet_context": _wallet_context([P2WPKH, P2TR, P2SH, P2PKH]),
+        },
+        config={"configurable": {"thread_id": "react-chainless-btc-picker"}},
+    )
+
+    response = result["response"]
+    action = response.get("client_action")
+    assert action is not None
+    assert action["type"] == "select_btc_address"
+    assert action["slots"]["chain"] == "BTC"
+    assert action["slots"]["symbol"] == "BTC"
+    assert action["slots"]["intent"] == "swap"
+    assert [item["address"] for item in action["slots"]["addresses"]] == [
+        P2WPKH,
+        P2TR,
+        P2SH,
+        P2PKH,
+    ]
+    # Only the picker is elevated; the amount keypad stays in react_results.
+    assert response["client_action"]["type"] == "select_btc_address"
+    keypad_results = [
+        item
+        for item in response.get("react_results") or []
+        if item.get("result", {}).get("client_action", {}).get("type")
+        == "open_amount_keypad"
+    ]
+    assert len(keypad_results) == 1
 
 
 @pytest.mark.asyncio

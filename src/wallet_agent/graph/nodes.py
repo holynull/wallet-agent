@@ -1618,46 +1618,6 @@ def _react_transfer_supported_chains(state: Mapping[str, Any]) -> list[str]:
     return list(_NATIVE_ASSET_DECIMALS)
 
 
-def _react_transfer_context(state: Mapping[str, Any]) -> bool:
-    """Whether the conversation is structurally inside a transfer-collection flow.
-
-    Only structural signals count: the App echoed a transfer suggestion, or the
-    assistant already asked for a recipient address, or the user already
-    supplied a valid recipient address. Free-text intent (e.g.
-    ``_looks_like_transfer_message``) is the model's render-decision job, not
-    this helper's. Prompt markers are language-agnostic so an English-language
-    session is not mistaken for a non-transfer conversation.
-    """
-    request = state.get("request") or {}
-    metadata = request.get("metadata") if isinstance(request, Mapping) else None
-    suggestion = (
-        metadata.get("suggestion_data")
-        if isinstance(metadata, Mapping) and isinstance(metadata.get("suggestion_data"), Mapping)
-        else None
-    )
-    if isinstance(suggestion, Mapping) and suggestion.get("intent") == "transfer":
-        return True
-    recipient_asked_markers = (
-        "收款地址",
-        "输入地址",
-        "转账给谁",
-        "recipient address",
-        "paste the recipient",
-        "who should receive",
-        "who do you want to send",
-    )
-    for msg in state.get("messages") or []:
-        if isinstance(msg, AIMessage):
-            text = str(getattr(msg, "content", "") or "").lower()
-            if any(marker in text for marker in recipient_asked_markers):
-                return True
-        elif isinstance(msg, HumanMessage):
-            text = str(getattr(msg, "content", "") or "").strip()
-            if any(is_valid_address(chain, text) for chain in _CHAIN_ADDRESS_PROBES):
-                return True
-    return False
-
-
 def _react_transfer_slots(state: Mapping[str, Any]) -> dict[str, Any] | None:
     """Extract the transfer-collection slots already present (recipient/chain/coin).
 
@@ -1731,46 +1691,6 @@ def _react_transfer_draft(
     # presets, so the amount slot is "missing" and transfer_suggestions will
     # offer the coin card instead.
     return ["transfer_amount"], draft
-
-
-def _react_transfer_collection(
-    state: Mapping[str, Any],
-) -> tuple[list[str], dict[str, Any]] | None:
-    """Reconstruct a transfer collection step when the flow is structurally active.
-
-    Used by ``_react_transfer_user_symbol`` to tell a user-chosen coin from a
-    model-defaulted one. The card-render trigger in ``finalize_response`` uses
-    ``_react_transfer_slots`` gated on the model render decision instead; this
-    wrapper additionally requires structural transfer context so a bare address
-    in an unrelated turn is not treated as a collection draft.
-    """
-    slots = _react_transfer_slots(state)
-    if slots is None or not _react_transfer_context(state):
-        return None
-    return _react_transfer_draft(slots)
-
-
-def _react_transfer_user_symbol(state: Mapping[str, Any]) -> str:
-    """The coin the user actually chose, not one the model defaulted.
-
-    A coin counts as chosen only when the App echoes a tapped card's
-    ``suggestion_data`` (which carries ``symbol``) or the user typed a bare coin
-    into the conversation. The model filling the chain's native coin into a
-    keypad is not a user choice and must not skip the coin-selection step.
-    """
-    request = state.get("request") or {}
-    metadata = request.get("metadata") if isinstance(request, Mapping) else None
-    suggestion = (
-        metadata.get("suggestion_data")
-        if isinstance(metadata, Mapping) and isinstance(metadata.get("suggestion_data"), Mapping)
-        else None
-    )
-    if isinstance(suggestion, Mapping) and suggestion.get("symbol"):
-        return canonical_symbol(str(suggestion["symbol"]))
-    collection = _react_transfer_collection(state)
-    if collection is not None and collection[1].get("symbol"):
-        return canonical_symbol(str(collection[1]["symbol"]))
-    return ""
 
 
 def _react_swap_selected(state: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -4031,41 +3951,6 @@ def _swap_requires_btc_source_selection(
     if len(addresses) < 2:
         return None
     return addresses
-
-
-def _swap_source_chain_non_btc(state: Mapping[str, Any]) -> bool:
-    """Whether the active swap's source chain is known and is NOT Bitcoin.
-
-    The old positive check returned ``False`` both when the source is a non-BTC
-    chain (TRX → BTC) *and* when the source is simply unknown yet (the user
-    typed "Swap BTC to USDT" in prose, before any quote/draft exists). Only drop
-    a model-requested ``select_btc_address`` when we have positive evidence that
-    the source is a non-BTC chain; an unknown source keeps the model's explicit
-    picker request (the model is the authority on the pair).
-    """
-    selected = state.get("selected_quote")
-    if isinstance(selected, Mapping):
-        source = selected.get("source_asset")
-        if isinstance(source, Mapping):
-            chain = canonical_chain(str(source.get("chain") or ""))
-            return bool(chain) and chain not in {"BTC", "BITCOIN"}
-    draft = state.get("swap_draft")
-    if isinstance(draft, Mapping):
-        chain = canonical_chain(str(draft.get("source_chain") or ""))
-        return bool(chain) and chain not in {"BTC", "BITCOIN"}
-    request = state.get("request") or {}
-    metadata = request.get("metadata") if isinstance(request, Mapping) else None
-    suggestion = (
-        metadata.get("suggestion_data")
-        if isinstance(metadata, Mapping) and isinstance(metadata.get("suggestion_data"), Mapping)
-        else None
-    )
-    if isinstance(suggestion, Mapping):
-        source = suggestion.get("source") or suggestion.get("source_asset")
-        if isinstance(source, Mapping):
-            chain = canonical_chain(str(source.get("chain") or ""))
-            return bool(chain) and chain not in {"BTC", "BITCOIN"}
-    return False
 
 
 def _react_btc_picker_addresses(
@@ -13589,47 +13474,35 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             or slot_intent == "swap"
             or (render_decision is not None and render_decision.get("intent") == "swap")
         )
-        # ``select_btc_address`` only makes sense when BTC is the source (the
-        # Provider needs one explicit 出金 address). When BTC is merely the
-        # target (e.g. TRX -> BTC) the backend already defaulted to the wallet's
-        # first BTC receive address, so drop a model-requested picker instead of
-        # making the App ask again (Lif's report). The drop only applies when we
-        # have positive evidence of a non-BTC source (or the picker itself is
-        # not even asking for a BTC address); an unknown source keeps the
-        # model's explicit picker request (agent_app_bot: a typed "Swap BTC to
-        # USDT" round dropped ``select_btc_address``, leaving the App with no
-        # card at all).
-        if (
-            client_action
-            and str(client_action.get("type") or "") == "select_btc_address"
-            and swap_intent
-            and (
-                canonical_chain(
-                    str((client_action.get("slots") or {}).get("chain") or "")
+        # ``select_btc_address`` is a BTC-address picker; the model is the
+        # authority on when it is due. No hardcoded drop overrides the model's
+        # explicit request (agent_app_bot: typed "把 BTC 换成 USDT" rounds were
+        # dropped both by a source-chain heuristic and by a strict chain sanity
+        # check that misfired when the model omitted slots.chain). We only
+        # normalize the slots and attach the address list so the App can render.
+        if client_action and str(client_action.get("type") or "") == "select_btc_address":
+            picker_slots = dict(client_action.get("slots") or {})
+            picker_chain = canonical_chain(str(picker_slots.get("chain") or ""))
+            if picker_chain not in {"BTC", "BITCOIN"}:
+                # The model may omit ``chain`` and pin only ``symbol: "BTC"``;
+                # recover the chain from the symbol so the picker can render.
+                if canonical_symbol(str(picker_slots.get("symbol") or "")) == "BTC":
+                    picker_chain = "BTC"
+            if picker_chain in {"BTC", "BITCOIN"}:
+                picker_slots["chain"] = picker_chain
+            if not picker_slots.get("addresses"):
+                # The App's select_btc_address card refuses to render without
+                # ``addresses``. Prefer the addresses this turn's wallet_balance
+                # already queried, falling back to the App-declared BTC accounts.
+                picker_addresses = _react_btc_picker_addresses(
+                    tool_payloads, state.get("wallet_context") or {}
                 )
-                not in {"BTC", "BITCOIN"}
-                or _swap_source_chain_non_btc(state)
-            )
-        ):
-            client_action = None
-        # The ReAct picker must carry the full BTC address list (the App's
-        # ``select_btc_address`` card refuses to render without ``addresses``).
-        # Collect the addresses this turn's wallet_balance already queried and
-        # attach per-address entries with best-effort balances, mirroring the
-        # lifecycle path's ``select_btc_address`` payload.
-        if (
-            client_action
-            and str(client_action.get("type") or "") == "select_btc_address"
-            and not (client_action.get("slots") or {}).get("addresses")
-        ):
-            picker_addresses = _react_btc_picker_addresses(
-                tool_payloads, state.get("wallet_context") or {}
-            )
-            if picker_addresses:
-                address_options = await _btc_source_address_options(picker_addresses)
-                picker_slots = dict(client_action.get("slots") or {})
-                picker_slots["addresses"] = address_options
-                client_action = {**client_action, "slots": picker_slots}
+                if picker_addresses:
+                    address_options = await _btc_source_address_options(
+                        picker_addresses
+                    )
+                    picker_slots["addresses"] = address_options
+            client_action = {**client_action, "slots": picker_slots}
         swap_keypad_slots = None
         synthetic_swap_tool_signatures: list[str] = []
         if client_action and str(client_action.get("type") or "") == "open_amount_keypad":
@@ -13854,16 +13727,14 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         swap_keypad_slots["balance_raw"] = "0"
                         swap_keypad_slots["balance_usd"] = "0"
                 client_action = {**client_action, "slots": swap_keypad_slots}
-        # The model can pin the coin via request_client_action (keypad
-        # slots.symbol) and also call transfer_quick_replies whose draft has no
-        # symbol yet, surfacing an amount keypad and a coin chip in the same
-        # round. Reconcile them so the App renders one consistent amount step.
-        # The keypad's symbol counts when the user actually chose it, or when
-        # the flow is structurally inside a transfer (a recipient is already
-        # collected) and there is no coin card to fall back on; a model-defaulted
-        # native coin must not skip the coin-selection step when a coin card is
-        # present, and a cold keypad with no collected recipient would lock the
-        # user to a coin they never picked.
+        # The model pins the coin via request_client_action (keypad
+        # slots.symbol) and may also call transfer_quick_replies whose draft
+        # has no symbol yet, surfacing an amount keypad and a coin chip in the
+        # same round. The model is the authority on which card to show: a
+        # symbol-pinned keypad is the amount step, so keep it (dropping the
+        # coin chips so the App renders one consistent amount card). Only a
+        # keypad without any pinned coin cannot anchor an amount and is
+        # dropped, letting a coin card (if the model also sent one) drive.
         if (
             swap_keypad_slots is None
             and client_action
@@ -13871,16 +13742,7 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
         ):
             keypad_slots = dict(client_action.get("slots") or {})
             keypad_symbol = str(keypad_slots.get("symbol") or "").strip()
-            coin_chips = [
-                item
-                for item in (quick_replies or [])
-                if str(item.get("type") or "") in {"symbol", "token"}
-            ]
-            user_symbol = _react_transfer_user_symbol(state)
-            transfer_established = _react_transfer_collection(state) is not None
-            if keypad_symbol and (
-                user_symbol or (not coin_chips and transfer_established)
-            ):
+            if keypad_symbol:
                 keypad_chain = canonical_chain(str(keypad_slots.get("chain") or ""))
                 keypad_symbol = canonical_symbol(keypad_symbol)
                 matching_amount = next(
@@ -13965,10 +13827,8 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                         if str(item.get("type") or "") not in {"symbol", "token"}
                     ]
             else:
-                # The coin was not user-chosen (unknown, or the model defaulted
-                # the native coin) and a coin-selection card is present: drop
-                # the keypad so the coin card drives the step instead of
-                # locking the user to a coin they never picked.
+                # A keypad without a pinned coin cannot anchor an amount; drop
+                # it so a coin card (if the model also sent one) drives.
                 client_action = None
         # The model can anchor on an unfinished transfer task and call
         # transfer_quick_replies even when the user asked to swap (e.g. "我要兑换"
