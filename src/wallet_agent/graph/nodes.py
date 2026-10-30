@@ -8790,6 +8790,11 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 "retryable": payload.get("retryable", False),
                 "category": payload.get("category"),
             }
+            # Preserve the raw downstream code (e.g. Bridgers ``412``) in a
+            # structured field, not just inside the message, so the App can
+            # branch on it (Lif request).
+            if payload.get("provider_code"):
+                provider_error["provider_code"] = str(payload["provider_code"])
             _emit_progress(
                 "quote_provider",
                 "failed",
@@ -11297,9 +11302,23 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 },
             }
         except Exception as exc:
+            provider_code = getattr(exc, "code", None)
             return {
                 "errors": [
-                    _error("PROVIDER_PREPARE_FAILED", str(exc), details={"provider": provider_name})
+                    _error(
+                        "PROVIDER_PREPARE_FAILED",
+                        str(exc),
+                        # Keep Omnibridge's raw code (e.g. ``218``) structured
+                        # so the App can branch on it (Lif request).
+                        details={
+                            "provider": provider_name,
+                            **(
+                                {"provider_code": str(provider_code)}
+                                if provider_code
+                                else {}
+                            ),
+                        },
+                    )
                 ]
             }
 

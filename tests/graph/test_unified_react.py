@@ -856,6 +856,81 @@ class NoQuoteModel:
         return AIMessage(content="暂时没有可用的兑换报价。")
 
 
+class ProviderQuoteFailModel:
+    """Model asks for a quote from a provider that rejects it with a raw code."""
+
+    async def invoke_react(self, messages, tools):
+        tool_messages = [item for item in messages if isinstance(item, ToolMessage)]
+        if not tool_messages:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "qf-1",
+                        "name": "get_swap_quote",
+                        "args": {
+                            "source_symbol": "USDC",
+                            "destination_symbol": "USDT",
+                            "input_amount": "1",
+                            "source_chain": "BASE",
+                            "destination_chain": "BASE",
+                        },
+                    }
+                ],
+            )
+        payload = json.loads(tool_messages[0].content)
+        assert payload["ok"] is False
+        assert payload["code"] == "NO_VALID_QUOTES"
+        # The raw provider code must survive in a structured field (Lif: 412 /
+        # 218 need to reach the App), not just inside the message text.
+        details = payload["provider_errors"][0]["details"]
+        assert details["provider_code"] == "412"
+        assert details["provider"] == "bridgers"
+        return AIMessage(content="Provider 返回 412，暂时无法报价。")
+
+
+@pytest.mark.asyncio
+async def test_react_quote_failure_preserves_raw_provider_code():
+    """Bridgers' raw ``412`` quote failure is exposed as ``details.provider_code``."""
+    from wallet_agent.graph.build import build_graph
+    from wallet_agent.providers.http import ProviderResponseError
+
+    class QuoteRejectProvider:
+        provider_name = "bridgers"
+
+        async def list_assets(self, query):
+            if query.search == "USDC":
+                return [
+                    Asset(chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x1")
+                ]
+            if query.search == "USDT":
+                return [
+                    Asset(chain="BASE", chain_id=8453, symbol="USDT", decimals=6, address="0x2")
+                ]
+            return []
+
+        async def quote(self, request):
+            raise ProviderResponseError("412", "quote fail", retryable=True)
+
+    result = await build_graph(
+        model=ProviderQuoteFailModel(), providers=[QuoteRejectProvider()]
+    ).ainvoke(
+        {
+            "request": {"message": "在 Base 把 1 USDC 换成 USDT"},
+            "wallet_context": {"address": WALLET, "chain": "BASE"},
+        },
+        config={"configurable": {"thread_id": "react-quote-provider-code"}},
+    )
+    response = result["response"]
+    quote_result = next(
+        item
+        for item in response.get("react_results") or []
+        if item.get("tool") == "get_swap_quote"
+    )
+    errors = quote_result["result"]["provider_errors"]
+    assert errors[0]["details"]["provider_code"] == "412"
+
+
 @pytest.mark.asyncio
 async def test_react_swap_no_valid_quotes_carries_a_deterministic_message():
     from wallet_agent.graph.build import build_graph
