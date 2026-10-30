@@ -331,6 +331,27 @@ async def test_omnibridge_quote_rejects_amount_above_deposit_maximum():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [False, "false", "N", "0"])
+async def test_omnibridge_quote_rejects_pair_flagged_unsupported(flag):
+    """Omni returns a rate for pairs it no longer trades (``isSupport=false``).
+
+    The same pair would otherwise surface as ``PROVIDER_PREPARE_FAILED`` /
+    ``218`` at /accountExchange. Fail at quote time with ``PAIR_NOT_SUPPORTED``
+    instead, so the App learns the pair is unsupported before confirming.
+    """
+    transport = FakeTransport(quote_response(isSupport=flag))
+    provider = OmniBridgeProvider.from_transport(transport)
+
+    with pytest.raises(ProviderResponseError) as exc_info:
+        await provider.quote(valid_quote_request("1.5"))
+
+    assert exc_info.value.code == "PAIR_NOT_SUPPORTED"
+    assert exc_info.value.category == "client"
+    assert "ETH" in exc_info.value.message
+    assert "BNB(BSC)" in exc_info.value.message
+
+
+@pytest.mark.asyncio
 async def test_omnibridge_rejects_non_800_response():
     provider = OmniBridgeProvider.from_transport(
         FakeTransport({"resCode": 801, "resMsg": "Unsupported", "data": {}}),

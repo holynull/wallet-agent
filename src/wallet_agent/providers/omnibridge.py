@@ -39,6 +39,21 @@ def _success(response: dict[str, Any]) -> Any:
     return response.get("data", {})
 
 
+def _support_flag_false(value: Any) -> bool:
+    """Whether Omni's ``isSupport`` field explicitly says "not supported".
+
+    The quote endpoint still returns a rate for pairs it can no longer trade
+    (they were removed from ``queryCoinList``); ``isSupport: false`` (or
+    ``"false"`` / ``"N"``) is the authoritative per-pair signal. Missing/None
+    must not be treated as "unsupported" so older responses keep working.
+    """
+    if isinstance(value, bool):
+        return value is False
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"false", "n", "no", "0"}
+
+
 def _raw(amount: Decimal, decimals: int) -> str:
     return str(int(amount * (Decimal(10) ** decimals)))
 
@@ -216,6 +231,17 @@ class OmniBridgeProvider:
         data = _success(await self.transport.post("/api/v1/getBaseInfo", payload))
         if not isinstance(data, dict):
             raise ProviderResponseError("800", "Malformed quote data", category="client")
+        # Fail fast on a pair Omni no longer trades, instead of returning a
+        # bogus quote that only blows up later at /accountExchange with 218.
+        if _support_flag_false(data.get("isSupport")):
+            raise ProviderResponseError(
+                "PAIR_NOT_SUPPORTED",
+                (
+                    f"OmniBridge 暂不支持 {deposit_code} → {receive_code} 这一币对兑换，"
+                    "请更换币对后再试。"
+                ),
+                category="client",
+            )
         self.minimum_source_amount = str(data.get("depositMin", "0"))
         # Reject out-of-bounds deposit amounts here, at quote time, instead of
         # letting the user approve a quote that prepare() later rejects
