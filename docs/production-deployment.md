@@ -44,7 +44,7 @@ wallet-agent ──► MySQL（外部托管，PERSISTENCE_URL / DEPLOY_PERSISTEN
 ## 2. 前置条件
 
 - Linux 服务器，已安装 Docker 24+ 与 Docker Compose v2（`docker compose version`）
-- 可访问 GitHub（`git pull`）、模型 API、OKX、CoinGecko、各链 RPC
+- 可访问 GitHub（`git pull`）、模型 API、OKX、各链 RPC
 - 可访问生产 MySQL；数据库已建库（默认库名 `wallet_agent`）
 - 端口：HTTPS 入口（默认 8443；对外建议 443）
 
@@ -64,7 +64,6 @@ chmod 600 .env
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | 模型 API Key | 生产账号的 key |
 | `OKX_API_KEY` / `OKX_SECRET_KEY` / `OKX_PASSPHRASE` / `OKX_PROJECT_ID` | OKX 读链/行情 | 生产账号的一组凭据（四个必须齐） |
-| `COINGECKO_API_KEY` | 行情兜底 | 生产 key（无 key 时 CoinGecko 有严格限流） |
 | `AUTH_TOKENS` | App 鉴权 token（JSON `{"token":"user_id"}`） | 生产 token，`openssl rand -hex 32` 生成 |
 | `ADMIN_TOKEN` | 运维巡检 token（可跨用户只读 run） | 随机长串，仅值班人员持有 |
 | `PERSISTENCE_URL` / `DEPLOY_PERSISTENCE_URL` | 生产 MySQL 账号密码 | 生产库地址 + 只读写该库的账号 |
@@ -96,8 +95,11 @@ AUTH_TOKENS='{"prod-app-token":"w1_xxx","prod-app-token-2":"w1_yyy"}'
 | 链路 | `ALLOWED_CHAINS`、`RPC_URLS`、`BTC_MIN_CONFIRMATIONS`、`BTC_FEE_TARGET_BLOCKS`、`BTC_RBF_ENABLED` |
 | 轮询 | `POLL_INTERVAL_SECONDS`、`POLL_MAX_ATTEMPTS`、`CONFIRMATION_TTL_SECONDS` |
 | 持久化 | `RUN_EVENT_TTL_SECONDS`、`RUN_EVENT_MAX_ENTRIES`、`CONVERSATION_LOCK_LEASE_SECONDS`、`CONVERSATION_LOCK_WAIT_SECONDS`、`REDIS_KEY_PREFIX` |
-| 行情缓存 | `PRICE_CACHE_TTL_SECONDS`、`ASSET_CACHE_TTL_SECONDS` |
+| 行情缓存 | `ASSET_CACHE_TTL_SECONDS`、`METADATA_CACHE_TTL_SECONDS`、`METADATA_CACHE_MAX_ENTRIES` |
 | 部署地址 | `NEXT_PUBLIC_AGENT_API_URL`、`CORS_ALLOW_ORIGINS`（改成生产域名） |
+
+> 价格数据只走 OKX（`OKX_ENABLED=true` 且四个 OKX 凭据齐全）；CoinGecko 已不再使用，
+> `COINGECKO_*` / `PRICE_CACHE_TTL_SECONDS` 属于历史遗留配置，无需配置。
 
 ### 3.3 生产安全建议（与"配置不变"并存）
 
