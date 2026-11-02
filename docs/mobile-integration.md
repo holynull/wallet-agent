@@ -97,6 +97,11 @@ is accepted only when its task ID, revision, and payload hash still match.
    `approval_failed`, or `approval_required`; retry only the continue call as
    appropriate. It returns `stage: "swap_ready"` and `pending_transaction`
    only after allowance is sufficient.
+
+   Do not call `/confirm` again after submitting the approval hash. Retrying the
+   same `approve_tx_hash` is idempotent; a different hash returns 409
+   `APPROVAL_HASH_CONFLICT`. Refresh `GET /v1/swap/{session_id}` before retrying
+   and record the response's `X-Request-ID` in App diagnostics.
 7. Show the final unsigned swap transaction, sign and broadcast it locally,
    then submit `{user_id, chain, tx_hash}` to
    `POST /v1/swap/{session_id}/broadcast`. Poll

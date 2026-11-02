@@ -33,6 +33,9 @@ class RunStore(Protocol):
     async def set_status(self, run_id: str, status: str) -> None: ...
     async def get_status(self, run_id: str) -> str | None: ...
     async def get_metadata(self, run_id: str) -> dict[str, str] | None: ...
+    async def list_for_conversation(
+        self, conversation_id: str, *, limit: int = 50
+    ) -> list[dict[str, str]]: ...
     async def read(
         self, run_id: str, *, after_id: str = "0", block_ms: int = 0
     ) -> list[RunEvent] | None: ...
@@ -111,6 +114,32 @@ class InMemoryRunStore:
         }
         return {key: value for key, value in metadata.items() if value}
 
+    async def list_for_conversation(
+        self, conversation_id: str, *, limit: int = 50
+    ) -> list[dict[str, str]]:
+        found: list[dict[str, str]] = []
+        for run_id, run in reversed(list(self.runs.items())):
+            metadata = {
+                "status": str(run.get("status") or ""),
+                "owner_id": str(run.get("owner_id") or ""),
+                **{
+                    str(key): str(value)
+                    for key, value in (run.get("metadata") or {}).items()
+                    if value is not None
+                },
+            }
+            if metadata.get("conversation_id") != conversation_id:
+                continue
+            found.append(
+                {
+                    "run_id": run_id,
+                    **{key: value for key, value in metadata.items() if value},
+                }
+            )
+            if len(found) >= limit:
+                break
+        return found
+
     async def read(
         self, run_id: str, *, after_id: str = "0", block_ms: int = 0
     ) -> list[RunEvent] | None:
@@ -183,6 +212,9 @@ class RedisRunStore:
     def _events_key(self, run_id: str) -> str:
         return f"{self.key_prefix}:run:{run_id}:events"
 
+    def _conversation_runs_key(self, conversation_id: str) -> str:
+        return f"{self.key_prefix}:conversation:{conversation_id}:runs"
+
     async def create(
         self,
         run_id: str,
@@ -204,6 +236,11 @@ class RedisRunStore:
             },
         )
         await self.client.expire(meta_key, self.ttl_seconds)
+        conversation_id = str((metadata or {}).get("conversation_id") or "")
+        if conversation_id:
+            runs_key = self._conversation_runs_key(conversation_id)
+            await self.client.zadd(runs_key, {run_id: time.time_ns()})
+            await self.client.expire(runs_key, self.ttl_seconds)
 
     async def append(self, run_id: str, event: Mapping[str, Any]) -> str:
         meta_key = self._meta_key(run_id)
@@ -241,6 +278,21 @@ class RedisRunStore:
             if value is not None and _text(value)
         }
         return metadata or None
+
+    async def list_for_conversation(
+        self, conversation_id: str, *, limit: int = 50
+    ) -> list[dict[str, str]]:
+        run_ids = await self.client.zrevrange(
+            self._conversation_runs_key(conversation_id), 0, max(0, limit - 1)
+        )
+        runs: list[dict[str, str]] = []
+        for run_id in run_ids:
+            resolved = _text(run_id)
+            metadata = await self.get_metadata(resolved)
+            if metadata is None:
+                continue
+            runs.append({"run_id": resolved, **metadata})
+        return runs
 
     async def read(
         self, run_id: str, *, after_id: str = "0", block_ms: int = 0

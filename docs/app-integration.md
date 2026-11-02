@@ -684,8 +684,10 @@ setRows(sortHistoryRows(conversations));
 REST 错误统一信封：
 
 ```json
-{"code":"VALIDATION_ERROR","message":"..."}
+{"code":"VALIDATION_ERROR","message":"...","request_id":"..."}
 ```
+
+所有 HTTP 响应都带 `X-Request-ID`。App 记录报错日志并反馈问题时，应带上该值。
 
 | code | 场景 | App 处理 |
 | --- | --- | --- |
@@ -694,6 +696,8 @@ REST 错误统一信封：
 | `INVALID_AGENT_TEST_INTENT` | 测试意图非法 | 仅联调用 |
 | `CONFIRMATION_EXPIRED` / `CONFIRMATION_NOT_PENDING` | 确认已过期或不存在 | 重新发起业务 |
 | `CONFIRMATION_RESUME_NOOP` | 重复恢复确认 | 忽略 |
+| `APPROVAL_HASH_CONFLICT` | 重复提交了不同的 Approve hash | 不重新签名；刷新 session 后继续 `/continue` |
+| `BROADCAST_HASH_CONFLICT` | 重复提交了不同的兑换广播 hash | 复用第一次 tx hash，刷新 session 后重试 |
 | `PROVIDER_REGISTRATION_FAILED` | 广播哈希登记失败 | 可重试同一哈希 |
 | `INVALID_TRANSACTION_HASH` | 哈希格式错误 | 修正后重试 |
 | `OKX_CAPABILITY_UNAVAILABLE` / `PRICE_PROVIDER_UNAVAILABLE` | 上游不可用 | 降级展示，稍后重试 |

@@ -14,6 +14,7 @@ class FakeRedis:
         self.hashes = {}
         self.streams = {}
         self.values = {}
+        self.zsets = {}
 
     async def hset(self, key, *, mapping):
         self.hashes.setdefault(key, {}).update(mapping)
@@ -45,6 +46,20 @@ class FakeRedis:
             if int(entry[0].split("-", 1)[0]) > cursor_number
         ]
         return [(key, entries)] if entries else []
+
+    async def zadd(self, key, mapping):
+        zset = self.zsets.setdefault(key, {})
+        zset.update(mapping)
+        return len(mapping)
+
+    async def zrevrange(self, key, start, end):
+        ordered = sorted(
+            self.zsets.get(key, {}).items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        stop = None if end == -1 else end + 1
+        return [member for member, _score in ordered[start:stop]]
 
     async def ping(self):
         return True
@@ -115,6 +130,33 @@ async def test_in_memory_run_store_blocking_read_wakes_for_new_event():
 
 
 @pytest.mark.asyncio
+async def test_in_memory_run_store_lists_runs_for_conversation_newest_first():
+    store = InMemoryRunStore()
+    await store.create(
+        "run-old",
+        owner_id="alice",
+        metadata={"conversation_id": "conversation-1", "session_id": "session-1"},
+    )
+    await store.create(
+        "run-new",
+        owner_id="alice",
+        metadata={"conversation_id": "conversation-1", "session_id": "session-2"},
+    )
+    await store.create(
+        "run-other",
+        owner_id="alice",
+        metadata={"conversation_id": "conversation-2", "session_id": "session-3"},
+    )
+    await store.set_status("run-new", "complete")
+
+    runs = await store.list_for_conversation("conversation-1", limit=20)
+
+    assert [item["run_id"] for item in runs] == ["run-new", "run-old"]
+    assert runs[0]["status"] == "complete"
+    assert runs[0]["session_id"] == "session-2"
+
+
+@pytest.mark.asyncio
 async def test_redis_run_stores_share_and_resume_stream_events():
     redis = FakeRedis()
     producer = RedisRunStore(redis, key_prefix="test")
@@ -140,6 +182,34 @@ async def test_redis_run_stores_share_and_resume_stream_events():
     assert replay_from_invalid_cursor is not None
     assert len(replay_from_invalid_cursor) == 2
     assert await consumer.ready() is True
+
+
+@pytest.mark.asyncio
+async def test_redis_run_store_lists_runs_for_conversation_newest_first():
+    redis = FakeRedis()
+    producer = RedisRunStore(redis, key_prefix="test")
+    await producer.create(
+        "run-old",
+        owner_id="alice",
+        metadata={"conversation_id": "conversation-1", "session_id": "session-1"},
+    )
+    await producer.create(
+        "run-new",
+        owner_id="alice",
+        metadata={"conversation_id": "conversation-1", "session_id": "session-2"},
+    )
+    await producer.create(
+        "run-other",
+        owner_id="alice",
+        metadata={"conversation_id": "conversation-2", "session_id": "session-3"},
+    )
+    await producer.set_status("run-new", "complete")
+
+    runs = await producer.list_for_conversation("conversation-1", limit=20)
+
+    assert [item["run_id"] for item in runs] == ["run-new", "run-old"]
+    assert runs[0]["status"] == "complete"
+    assert runs[0]["session_id"] == "session-2"
 
 
 @pytest.mark.asyncio

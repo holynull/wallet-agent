@@ -223,6 +223,31 @@ curl -fsS "$BASE/ready"
 鉴权：走 `authenticated_user`。`AUTH_REQUIRED=true` 时需要任一有效 `AUTH_TOKENS`；
 `AUTH_REQUIRED=false` 时无需 token。生产建议网关屏蔽或仅内网放行。
 
+#### 请求审计与业务时间线
+
+以下接口必须配置 `ADMIN_TOKEN`，并使用
+`Authorization: Bearer <ADMIN_TOKEN>`；未配置时返回 404
+`DEBUG_ENDPOINTS_DISABLED`，token 无效时返回 401 `ADMIN_TOKEN_REQUIRED`。
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /debug/requests` | 最近请求审计，支持 `status` / `path` / `session_id` / `conversation_id` / `since` / `limit` 过滤 |
+| `GET /debug/errors` | 同上，但只返回 4xx/5xx |
+| `GET /v1/swap/{session_id}/timeline` | `confirm` / `approve-broadcast` / `continue` / `broadcast` 调用顺序、状态和 request id |
+| `GET /v1/agent/conversations/{conversation_id}/runs?limit=20` | 某对话下所有 run 的摘要，用于排查多轮卡片问题 |
+
+```bash
+curl -fsS "$BASE/debug/errors?status=409&limit=50" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+curl -fsS "$BASE/v1/swap/<session-id>/timeline" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+所有响应带 `X-Request-ID`；错误响应也包含 `request_id`，App 报错时应一并回传。
+请求审计只保存安全元数据，不保存 Authorization、token、私钥、签名材料或完整请求体。
+当前缓冲区是**单实例进程内**、有界保存；多实例部署需要接日志聚合或将审计写入 Redis。
+
 > **HTTPS overlay 的路由注意**：`deploy/https/Caddyfile` 只把 `/health`、`/ready`、`/v1/*`
 > 转发给 API，`/debug/metrics` 等路径会落到 `demo-next`（通常 404）。调试时请直连
 > API 的 8000 端口（内网或 `ssh -L 8000:127.0.0.1:8000 <prod-host>` 隧道）。
@@ -306,6 +331,9 @@ Last-Event-ID: <上次事件 id>
 | --- | --- | --- | --- |
 | `/health`、`/ready` | 保留（内网/负载均衡） | 无鉴权 | 无鉴权 |
 | `/debug/metrics` | 网关屏蔽或仅内网 | 任意有效 App token | 无鉴权 |
+| `/debug/requests`、`/debug/errors` | **必须 operator-only** | `ADMIN_TOKEN` | `ADMIN_TOKEN`；未配置则 404 |
+| `/v1/swap/{id}/timeline` | 仅运维 | `ADMIN_TOKEN` | `ADMIN_TOKEN` |
+| `/v1/agent/conversations/{id}/runs` | 仅运维 | `ADMIN_TOKEN` | `ADMIN_TOKEN` |
 | `/v1/agent/runs/{run_id}` | 保留给运维 | owner 或 `ADMIN_TOKEN` | 配置 `ADMIN_TOKEN` 时需 operator；否则开放 |
 | `/docs`、`/openapi.json`、`/redoc` | **屏蔽 404** | 无鉴权（默认） | 无鉴权（默认） |
 | `/v1/agent/conversations*` | 保留给 App | Bearer | 无鉴权（可带 `user_id`） |
@@ -338,6 +366,8 @@ python scripts/inspect_agent.py --base-url "$BASE" --token "$ADMIN_TOKEN" \
 | `PROVIDER_PREPARE_FAILED` | 建单失败；看 `details.provider_code`（如 omnibridge `218`） | 历史路径；已改为询价阶段 `PAIR_NOT_SUPPORTED` |
 | `NO_VALID_QUOTES` | 所有 Provider 都没出价 | 看 `react_results.provider_errors` |
 | `CONFIRMATION_NOT_PENDING`（409） | 确认态已变化（App 重复 `/confirm`） | App 收到 409 应停止重试并刷新 `GET /v1/swap` |
+| `APPROVAL_HASH_CONFLICT`（409） | App 重复提交了不同的 Approve hash | 复用第一次 `approve_tx_hash`；不同 Approve 交易不可覆盖 |
+| `BROADCAST_HASH_CONFLICT`（409） | App 重复提交了不同的兑换广播 hash | 复用第一次 `tx_hash`，先刷新 session 再决定是否重试 |
 | `TRANSACTION_PREFLIGHT_FAILED` | 预检查失败（余额不足/模拟失败） | 看 `preflight.simulation.failure_reason` |
 | `PERSISTENCE_UNAVAILABLE`（`/ready` 503） | MySQL/Redis 不可用 | 检查 `DEPLOY_PERSISTENCE_URL`、Redis 容器 |
 | `RUN_NOT_FOUND`（SSE error） | run 已过期/不存在 | 受 `RUN_EVENT_TTL_SECONDS` 限制 |

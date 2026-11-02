@@ -6,12 +6,15 @@ import asyncio
 import hashlib
 import json
 import os
+import time
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import fields, is_dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -1053,6 +1056,164 @@ def _qualified_hash(chain: str, tx_hash: str) -> bool:
     return False
 
 
+def _normalize_transaction_hash(tx_hash: str) -> str:
+    """Normalize chain hashes for idempotency comparisons."""
+    value = tx_hash.strip()
+    if value[:2].lower() == "0x":
+        return "0x" + value[2:].lower()
+    return value.lower()
+
+
+def _valid_request_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    candidate = value.strip()
+    if not 1 <= len(candidate) <= 128:
+        return None
+    if any(not (char.isalnum() or char in "-_.:") for char in candidate):
+        return None
+    return candidate
+
+
+def _utc_timestamp(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).isoformat()
+
+
+def _parse_timestamp_ms(value: str | None) -> int | None:
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
+
+class _RequestAuditBuffer:
+    """Bounded process-local request metadata; never stores credentials or bodies."""
+
+    def __init__(self, max_entries: int = 2_000) -> None:
+        self._entries: deque[dict[str, Any]] = deque(maxlen=max_entries)
+
+    def append(self, entry: Mapping[str, Any]) -> None:
+        self._entries.append(dict(entry))
+
+    def entries(
+        self,
+        *,
+        errors_only: bool = False,
+        status: int | None = None,
+        path: str | None = None,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        since_ms: int | None = None,
+        limit: int = 100,
+        newest_first: bool = True,
+    ) -> list[dict[str, Any]]:
+        candidates = reversed(self._entries) if newest_first else iter(self._entries)
+        found: list[dict[str, Any]] = []
+        for entry in candidates:
+            if errors_only and int(entry.get("status") or 0) < 400:
+                continue
+            if status is not None and int(entry.get("status") or 0) != status:
+                continue
+            if path and path not in str(entry.get("path") or ""):
+                continue
+            if session_id and entry.get("session_id") != session_id:
+                continue
+            if conversation_id and entry.get("conversation_id") != conversation_id:
+                continue
+            if since_ms is not None and int(entry.get("timestamp_ms") or 0) < since_ms:
+                continue
+            found.append(dict(entry))
+            if len(found) >= limit:
+                break
+        return found
+
+
+def _scope_header(scope: Mapping[str, Any], name: str) -> str | None:
+    target = name.lower().encode("latin-1")
+    for raw_name, raw_value in scope.get("headers", []):
+        if bytes(raw_name).lower() == target:
+            return bytes(raw_value).decode("latin-1")
+    return None
+
+
+def _annotate_audit(request: Request, **fields: Any) -> None:
+    state = request.scope.setdefault("state", {})
+    for key, value in fields.items():
+        if value is not None:
+            state[f"audit_{key}"] = str(value)
+
+
+class _RequestAuditMiddleware:
+    """Attach a request id and record safe aggregate metadata for debugging."""
+
+    def __init__(self, app: Any, *, audit: _RequestAuditBuffer) -> None:
+        self.app = app
+        self.audit = audit
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        state = scope.setdefault("state", {})
+        request_id = _valid_request_id(_scope_header(scope, "x-request-id")) or uuid.uuid4().hex
+        state["request_id"] = request_id
+        started = time.perf_counter()
+        response_status = 500
+
+        async def send_with_request_id(message: dict[str, Any]) -> None:
+            nonlocal response_status
+            if message.get("type") == "http.response.start":
+                response_status = int(message.get("status") or 500)
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if bytes(name).lower() != b"x-request-id"
+                ]
+                headers.append((b"x-request-id", request_id.encode("ascii")))
+                message["headers"] = headers
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_request_id)
+        finally:
+            path_params = scope.get("path_params") or {}
+            query = parse_qs(bytes(scope.get("query_string") or b"").decode("latin-1"))
+            route = scope.get("route")
+            timestamp_ms = int(time.time() * 1000)
+            self.audit.append(
+                {
+                    "request_id": request_id,
+                    "timestamp": _utc_timestamp(timestamp_ms),
+                    "timestamp_ms": timestamp_ms,
+                    "method": str(scope.get("method") or ""),
+                    "path": str(scope.get("path") or ""),
+                    "route": str(getattr(route, "path", "") or "") or None,
+                    "status": response_status,
+                    "error_code": state.get("audit_error_code"),
+                    "message": state.get("audit_error_message"),
+                    "session_id": (
+                        state.get("audit_session_id")
+                        or path_params.get("session_id")
+                    ),
+                    "conversation_id": (
+                        state.get("audit_conversation_id")
+                        or path_params.get("conversation_id")
+                    ),
+                    "run_id": state.get("audit_run_id") or path_params.get("run_id"),
+                    "user_id": state.get("audit_user_id")
+                    or (query.get("user_id") or [None])[0],
+                    "approval_tx_hash": state.get("audit_approval_tx_hash"),
+                    "broadcast_tx_hash": state.get("audit_broadcast_tx_hash"),
+                    "app_version": _scope_header(scope, "x-app-version"),
+                    "platform": _scope_header(scope, "x-platform"),
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+                }
+            )
+
+
 def _okx_chain_indexes(chains: str) -> list[str]:
     values = [item.strip() for item in str(chains).split(",") if item.strip()]
     if not values:
@@ -1210,6 +1371,9 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    request_audit = _RequestAuditBuffer()
+    app.state.request_audit = request_audit
+    app.add_middleware(_RequestAuditMiddleware, audit=request_audit)
     session_store = store or InMemorySessionStore()
     local_runs: dict[str, dict[str, Any]] = {}
     event_store = run_store or InMemoryRunStore(local_runs)
@@ -1306,18 +1470,22 @@ def create_app(
         )
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        request_id = getattr(request.state, "request_id", None)
+        request.scope.setdefault("state", {})["audit_error_code"] = "VALIDATION_ERROR"
+        request.scope["state"]["audit_error_message"] = "Request validation failed."
         return JSONResponse(
             status_code=422,
             content={
                 "code": "VALIDATION_ERROR",
                 "message": "Request validation failed.",
                 "details": {"errors": jsonable_encoder(exc.errors())},
+                **({"request_id": request_id} if request_id else {}),
             },
         )
 
     @app.exception_handler(HTTPException)
-    async def http_error(_request: Request, exc: HTTPException) -> JSONResponse:
+    async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
         detail = exc.detail
         if isinstance(detail, Mapping) and detail.get("code") and detail.get("message"):
             body = {
@@ -1331,6 +1499,11 @@ def create_app(
                 "code": f"HTTP_{exc.status_code}",
                 "message": str(detail),
             }
+        request_id = getattr(request.state, "request_id", None)
+        request.scope.setdefault("state", {})["audit_error_code"] = body["code"]
+        request.scope["state"]["audit_error_message"] = body["message"]
+        if request_id:
+            body["request_id"] = request_id
         return JSONResponse(
             status_code=exc.status_code,
             content=jsonable_encoder(body),
@@ -1379,6 +1552,96 @@ def create_app(
             else None
         )
         return {"metrics": metrics_snapshot, "metadata_cache": cache_stats}
+
+    async def require_debug_operator(request: Request) -> None:
+        if not admin_token:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "DEBUG_ENDPOINTS_DISABLED",
+                    "message": "Debug endpoints require a configured ADMIN_TOKEN.",
+                },
+            )
+        if not is_admin_token(request, admin_token):
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "ADMIN_TOKEN_REQUIRED",
+                    "message": "A valid operator bearer token is required.",
+                },
+            )
+
+    def request_audit_response(
+        *,
+        errors_only: bool,
+        status: int | None,
+        path: str | None,
+        session_id: str | None,
+        conversation_id: str | None,
+        since: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        if not 1 <= limit <= 500:
+            raise HTTPException(status_code=422, detail="limit must be between 1 and 500")
+        try:
+            since_ms = _parse_timestamp_ms(since)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail="since must be an ISO-8601 timestamp"
+            ) from exc
+        entries = request_audit.entries(
+            errors_only=errors_only,
+            status=status,
+            path=path,
+            session_id=session_id,
+            conversation_id=conversation_id,
+            since_ms=since_ms,
+            limit=limit,
+            newest_first=True,
+        )
+        return {"entries": entries, "count": len(entries)}
+
+    @app.get("/debug/requests")
+    async def debug_requests(
+        request: Request,
+        status: int | None = None,
+        path: str | None = None,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        since: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        await require_debug_operator(request)
+        return request_audit_response(
+            errors_only=False,
+            status=status,
+            path=path,
+            session_id=session_id,
+            conversation_id=conversation_id,
+            since=since,
+            limit=limit,
+        )
+
+    @app.get("/debug/errors")
+    async def debug_errors(
+        request: Request,
+        status: int | None = None,
+        path: str | None = None,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        since: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        await require_debug_operator(request)
+        return request_audit_response(
+            errors_only=True,
+            status=status,
+            path=path,
+            session_id=session_id,
+            conversation_id=conversation_id,
+            since=since,
+            limit=limit,
+        )
 
     @app.get("/v1/agent/conversations")
     async def list_conversations(
@@ -1441,6 +1704,27 @@ def create_app(
             "messages": _jsonable(state.get("conversation_history") or []),
             "latest_artifacts": _conversation_artifacts(state),
             "model_trace": _model_trace_for_state(state, model_registry),
+        }
+
+    @app.get("/v1/agent/conversations/{conversation_id}/runs")
+    async def conversation_runs(
+        conversation_id: str,
+        request: Request,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        await require_debug_operator(request)
+        if not 1 <= limit <= 100:
+            raise HTTPException(status_code=422, detail="limit must be between 1 and 100")
+        runs = await event_store.list_for_conversation(conversation_id, limit=limit)
+        enriched: list[dict[str, Any]] = []
+        for run in runs:
+            run_id = str(run.get("run_id") or "")
+            events = await read_run_events(run_id, max_events=1_000) if run_id else None
+            enriched.append({**run, "summary": build_run_summary(events or [])})
+        return {
+            "conversation_id": conversation_id,
+            "runs": enriched,
+            "count": len(enriched),
         }
 
     @app.get("/v1/agent/runs/{run_id}")
@@ -2507,6 +2791,13 @@ def create_app(
         }
         if session_id:
             response["session_id"] = session_id
+        _annotate_audit(
+            request,
+            session_id=session_id,
+            conversation_id=conversation_id,
+            run_id=run_id,
+            user_id=user_id,
+        )
         return response
 
     @app.get("/v1/agent/stream/{run_id}")
@@ -2567,6 +2858,12 @@ def create_app(
             fallback_user_id=payload.user_id,
         )
         session = await owned_session(session_id, user_id)
+        _annotate_audit(request, user_id=user_id, session_id=session_id)
+        if payload.approved and session.approval_tx_hash:
+            # Approve submission already advanced the confirmation step. A
+            # repeated /confirm from a retrying client is idempotent; the App
+            # resumes the flow through /continue.
+            return _jsonable(session)
         if not payload.approved:
             graph = app.state.graph
             if graph is not None:
@@ -2691,12 +2988,20 @@ def create_app(
             fallback_user_id=payload.user_id,
         )
         session = await owned_session(session_id, user_id)
-        if not _qualified_hash(payload.chain, payload.tx_hash):
+        tx_hash = _normalize_transaction_hash(payload.tx_hash)
+        if not _qualified_hash(payload.chain, tx_hash):
             raise HTTPException(
                 status_code=422, detail="tx_hash must be a chain-qualified transaction hash"
             )
+        _annotate_audit(
+            request,
+            user_id=user_id,
+            session_id=session_id,
+            broadcast_tx_hash=tx_hash,
+        )
         if session.broadcast_tx_hash:
-            if session.broadcast_tx_hash == payload.tx_hash:
+            existing_hash = _normalize_transaction_hash(session.broadcast_tx_hash)
+            if existing_hash == tx_hash:
                 if session.status not in {
                     "not_propagated",
                     "unknown",
@@ -2705,7 +3010,16 @@ def create_app(
                     return _broadcast_response(session)
             else:
                 raise HTTPException(
-                    status_code=409, detail="session already has a different broadcast hash"
+                    status_code=409,
+                    detail={
+                        "code": "BROADCAST_HASH_CONFLICT",
+                        "message": "session already has a different broadcast hash",
+                        "details": {
+                            "session_id": session_id,
+                            "existing_hash": existing_hash,
+                            "submitted_hash": tx_hash,
+                        },
+                    },
                 )
         provider = app.state.providers.get(session.quote.provider if session.quote else "")
         if provider is None or session.quote is None:
@@ -2727,7 +3041,7 @@ def create_app(
             nonce = _display_int(session, "nonce", "transaction_nonce", "source_nonce")
             chain_status = await _chain_broadcast_status(
                 adapter,
-                payload.tx_hash,
+                tx_hash,
                 sender=sender,
                 nonce=nonce,
             )
@@ -2737,7 +3051,7 @@ def create_app(
                     detail={
                         "code": "TRANSACTION_FAILED",
                         "message": "链上交易已确认失败，请检查钱包和交易参数。",
-                        "details": {"tx_hash": payload.tx_hash},
+                        "details": {"tx_hash": tx_hash},
                     },
                 )
             # Source-chain confirmation is not swap completion: the order was
@@ -2752,7 +3066,8 @@ def create_app(
         async with graph_lock(session.thread_id):
             session = await owned_session(session_id, user_id)
             if session.broadcast_tx_hash:
-                if session.broadcast_tx_hash == payload.tx_hash:
+                existing_hash = _normalize_transaction_hash(session.broadcast_tx_hash)
+                if existing_hash == tx_hash:
                     if session.status not in {
                         "not_propagated",
                         "unknown",
@@ -2761,7 +3076,16 @@ def create_app(
                         return _broadcast_response(session)
                 else:
                     raise HTTPException(
-                        status_code=409, detail="session already has a different broadcast hash"
+                        status_code=409,
+                        detail={
+                            "code": "BROADCAST_HASH_CONFLICT",
+                            "message": "session already has a different broadcast hash",
+                            "details": {
+                                "session_id": session_id,
+                                "existing_hash": existing_hash,
+                                "submitted_hash": tx_hash,
+                            },
+                        },
                     )
             provider = app.state.providers.get(session.quote.provider if session.quote else "")
             if provider is None or session.quote is None:
@@ -2779,7 +3103,7 @@ def create_app(
                     status=broadcast_status,
                     stage=broadcast_status,
                     broadcast_status=broadcast_status,
-                    broadcast_tx_hash=payload.tx_hash,
+                    broadcast_tx_hash=tx_hash,
                     provider_order=None,
                     # The approve is already broadcast at this point; the
                     # unsigned approval transaction is no longer actionable and
@@ -2797,7 +3121,7 @@ def create_app(
                     reference = str(transaction_reference)
             try:
                 order = await provider.register_broadcast(
-                    reference, payload.tx_hash, quote=session.quote
+                    reference, tx_hash, quote=session.quote
                 )
                 order = _provider_order_with_persisted_metadata(
                     order,
@@ -2812,7 +3136,7 @@ def create_app(
                         "message": "兑换服务暂时无法登记交易，请使用同一交易哈希重试。",
                         "details": {
                             "provider": session.quote.provider,
-                            "tx_hash": payload.tx_hash,
+                            "tx_hash": tx_hash,
                             "retryable": True,
                         },
                     },
@@ -2823,7 +3147,7 @@ def create_app(
                 status="processing",
                 stage="processing",
                 broadcast_status=broadcast_status,
-                broadcast_tx_hash=payload.tx_hash,
+                broadcast_tx_hash=tx_hash,
                 provider_order=order,
                 # Once the swap is broadcast, the approval step is complete:
                 # drop the stale unsigned approval transaction and allowance
@@ -2929,23 +3253,48 @@ def create_app(
             fallback_user_id=payload.user_id,
         )
         session = await owned_session(session_id, user_id)
-        if not _qualified_hash(payload.chain, payload.approve_tx_hash):
+        approve_tx_hash = _normalize_transaction_hash(payload.approve_tx_hash)
+        if not _qualified_hash(payload.chain, approve_tx_hash):
             raise HTTPException(
                 status_code=422, detail="approve_tx_hash must be a chain-qualified transaction hash"
             )
+        _annotate_audit(
+            request,
+            user_id=user_id,
+            session_id=session_id,
+            approval_tx_hash=approve_tx_hash,
+        )
         async with graph_lock(session.thread_id):
             session = await owned_session(session_id, user_id)
             if session.approval_tx_hash:
-                if session.approval_tx_hash == payload.approve_tx_hash:
+                existing_hash = _normalize_transaction_hash(session.approval_tx_hash)
+                if existing_hash == approve_tx_hash:
+                    if session.status == "approval_required":
+                        session = await session_store.update(
+                            session_id,
+                            expected_revision=session.revision,
+                            status="approval_submitted",
+                            stage="approval_submitted",
+                        )
                     return _jsonable(session)
                 raise HTTPException(
-                    status_code=409, detail="session already has a different approval hash"
+                    status_code=409,
+                    detail={
+                        "code": "APPROVAL_HASH_CONFLICT",
+                        "message": "session already has a different approval hash",
+                        "details": {
+                            "session_id": session_id,
+                            "existing_hash": existing_hash,
+                            "submitted_hash": approve_tx_hash,
+                        },
+                    },
                 )
             return _jsonable(
                 await session_store.update(
                     session_id,
                     expected_revision=session.revision,
-                    approval_tx_hash=payload.approve_tx_hash,
+                    status="approval_submitted",
+                    approval_tx_hash=approve_tx_hash,
                     stage="approval_submitted",
                 )
             )
@@ -2961,6 +3310,7 @@ def create_app(
             fallback_user_id=(payload or {}).get("user_id"),
         )
         session = await owned_session(session_id, user_id)
+        _annotate_audit(request, user_id=user_id, session_id=session_id)
         if session.status == "cancelled" or session.stage == "cancelled":
             return _jsonable(session)
         if app.state.graph is None:
@@ -3040,25 +3390,65 @@ def create_app(
             fallback_user_id=payload.user_id,
         )
         session = await owned_session(session_id, user_id)
-        if not _qualified_hash(payload.chain, payload.tx_hash):
+        tx_hash = _normalize_transaction_hash(payload.tx_hash)
+        if not _qualified_hash(payload.chain, tx_hash):
             raise HTTPException(
                 status_code=422, detail="tx_hash must be a chain-qualified transaction hash"
             )
+        _annotate_audit(
+            request,
+            user_id=user_id,
+            session_id=session_id,
+            broadcast_tx_hash=tx_hash,
+        )
         if session.quote is not None or session.provider_order is not None:
-            raise HTTPException(status_code=409, detail="session is not a transfer session")
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "SESSION_NOT_TRANSFER",
+                    "message": "session is not a transfer session",
+                    "details": {"session_id": session_id},
+                },
+            )
         pending = session.pending_transaction
         if pending is None:
-            raise HTTPException(status_code=409, detail="transfer transaction is not prepared")
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "TRANSFER_NOT_PREPARED",
+                    "message": "transfer transaction is not prepared",
+                    "details": {"session_id": session_id},
+                },
+            )
         pending_chain = str(getattr(pending, "chain", ""))
         if pending_chain.upper() != payload.chain.upper():
             raise HTTPException(
-                status_code=409, detail="broadcast chain does not match prepared transfer"
+                status_code=409,
+                detail={
+                    "code": "BROADCAST_CHAIN_MISMATCH",
+                    "message": "broadcast chain does not match prepared transfer",
+                    "details": {
+                        "session_id": session_id,
+                        "prepared_chain": pending_chain,
+                        "submitted_chain": payload.chain,
+                    },
+                },
             )
         if session.broadcast_tx_hash:
-            if session.broadcast_tx_hash == payload.tx_hash:
+            existing_hash = _normalize_transaction_hash(session.broadcast_tx_hash)
+            if existing_hash == tx_hash:
                 return _broadcast_response(session)
             raise HTTPException(
-                status_code=409, detail="session already has a different broadcast hash"
+                status_code=409,
+                detail={
+                    "code": "BROADCAST_HASH_CONFLICT",
+                    "message": "session already has a different broadcast hash",
+                    "details": {
+                        "session_id": session_id,
+                        "existing_hash": existing_hash,
+                        "submitted_hash": tx_hash,
+                    },
+                },
             )
 
         try:
@@ -3069,18 +3459,27 @@ def create_app(
         if adapter is not None and _can_observe_broadcast(adapter):
             broadcast_status = await _chain_broadcast_status(
                 adapter,
-                payload.tx_hash,
+                tx_hash,
                 sender=_display_text(session, "from", "sender", "sender_address"),
                 nonce=_display_int(session, "nonce", "transaction_nonce", "source_nonce"),
             )
         async with graph_lock(session.thread_id):
             session = await owned_session(session_id, user_id)
             if session.broadcast_tx_hash:
-                if session.broadcast_tx_hash == payload.tx_hash:
+                existing_hash = _normalize_transaction_hash(session.broadcast_tx_hash)
+                if existing_hash == tx_hash:
                     return _broadcast_response(session)
                 raise HTTPException(
                     status_code=409,
-                    detail="session already has a different broadcast hash",
+                    detail={
+                        "code": "BROADCAST_HASH_CONFLICT",
+                        "message": "session already has a different broadcast hash",
+                        "details": {
+                            "session_id": session_id,
+                            "existing_hash": existing_hash,
+                            "submitted_hash": tx_hash,
+                        },
+                    },
                 )
             updated = await session_store.update(
                 session_id,
@@ -3088,7 +3487,7 @@ def create_app(
                 status=broadcast_status,
                 stage=broadcast_status,
                 broadcast_status=broadcast_status,
-                broadcast_tx_hash=payload.tx_hash,
+                broadcast_tx_hash=tx_hash,
             )
         return _broadcast_response(updated, broadcast_status)
 
@@ -3454,6 +3853,68 @@ def create_app(
             execution_adapter=execution_adapter,
         )
         return _jsonable(session)
+
+    @app.get("/v1/swap/{session_id}/timeline")
+    async def swap_timeline(request: Request, session_id: str) -> dict[str, Any]:
+        await require_debug_operator(request)
+        session = await session_store.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="swap session not found")
+        current_path = request.url.path
+        entries = request_audit.entries(
+            session_id=session_id,
+            limit=200,
+            newest_first=False,
+        )
+        events: list[dict[str, Any]] = []
+        for entry in entries:
+            if entry.get("path") == current_path:
+                continue
+            path = str(entry.get("path") or "")
+            action = next(
+                (
+                    suffix.removeprefix("/")
+                    for suffix in (
+                        "/approve-broadcast",
+                        "/select-quote",
+                        "/confirm",
+                        "/continue",
+                        "/broadcast",
+                    )
+                    if path.endswith(suffix)
+                ),
+                "request",
+            )
+            events.append(
+                {
+                    "request_id": entry.get("request_id"),
+                    "timestamp": entry.get("timestamp"),
+                    "action": action,
+                    "method": entry.get("method"),
+                    "path": path,
+                    "status": entry.get("status"),
+                    "error_code": entry.get("error_code"),
+                    "message": entry.get("message"),
+                    "approval_tx_hash": entry.get("approval_tx_hash"),
+                    "broadcast_tx_hash": entry.get("broadcast_tx_hash"),
+                }
+            )
+        order_status = session.order_status
+        return {
+            "session_id": session.session_id,
+            "conversation_id": session.thread_id,
+            "status": session.status,
+            "stage": session.stage,
+            "provider": session.quote.provider if session.quote else None,
+            "selected_provider_reference": session.selected_provider_reference,
+            "approval_tx_hash": session.approval_tx_hash,
+            "broadcast_tx_hash": session.broadcast_tx_hash,
+            "broadcast_status": session.broadcast_status,
+            "order_status": (
+                order_status.status if order_status is not None else None
+            ),
+            "events": events,
+        }
 
     async def wallet_operation(address: str, chain: str, operation: str, limit: int = 20) -> Any:
         wallet_provider = app.state.wallet_provider

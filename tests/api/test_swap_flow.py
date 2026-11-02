@@ -386,7 +386,7 @@ async def test_broadcast_is_idempotent_and_conflicting_hash_is_rejected():
         )
         second = await client.post(
             f"/v1/swap/{session_id}/broadcast",
-            json={"user_id": "alice", "chain": "BASE", "tx_hash": tx_hash},
+            json={"user_id": "alice", "chain": "BASE", "tx_hash": "0x" + "A" * 64},
         )
         conflict = await client.post(
             f"/v1/swap/{session_id}/broadcast",
@@ -395,6 +395,9 @@ async def test_broadcast_is_idempotent_and_conflicting_hash_is_rejected():
         assert first.status_code == 200
         assert second.status_code == 200
         assert conflict.status_code == 409
+        assert conflict.json()["code"] == "BROADCAST_HASH_CONFLICT"
+        assert conflict.json()["details"]["existing_hash"] == tx_hash
+        assert conflict.json()["details"]["submitted_hash"] == "0x" + "b" * 64
         assert provider.broadcast_calls == 1
 
 
@@ -1194,11 +1197,13 @@ async def test_provider_registration_timeout_allows_same_hash_retry_without_dupl
         )
 
     assert first.status_code == 503
-    assert first.json() == {
+    first_body = first.json()
+    assert {key: value for key, value in first_body.items() if key != "request_id"} == {
         "code": "PROVIDER_REGISTRATION_FAILED",
         "message": "兑换服务暂时无法登记交易，请使用同一交易哈希重试。",
         "details": {"provider": "bridgers", "tx_hash": tx_hash, "retryable": True},
     }
+    assert first_body["request_id"]
     assert second.status_code == 200
     assert duplicate.status_code == 200
     assert second.json()["broadcast_tx_hash"] == tx_hash

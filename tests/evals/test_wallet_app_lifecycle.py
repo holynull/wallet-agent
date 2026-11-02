@@ -1462,7 +1462,7 @@ async def test_duplicate_hash_is_idempotent_and_conflicting_hash_is_rejected():
     ]
 
     assert [step.http_status for step in broadcasts] == [200, 200, 409]
-    assert broadcasts[2].error_code == "HTTP_409"
+    assert broadcasts[2].error_code == "BROADCAST_HASH_CONFLICT"
     assert len(registrations) == 1
     assert registrations[0]["tx_hash"] == "0x" + "d" * 64
 

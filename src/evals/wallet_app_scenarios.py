@@ -2028,7 +2028,7 @@ async def drive_scenario(runtime: ScenarioRuntime, max_attempts: int = 3) -> Lif
                             continue
                         if (
                             action == "broadcast_conflict"
-                            and exc.code == "HTTP_409"
+                            and exc.code in {"HTTP_409", "BROADCAST_HASH_CONFLICT"}
                             and exc.status_code == 409
                         ):
                             session = await client.session()

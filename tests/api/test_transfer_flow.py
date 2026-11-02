@@ -113,7 +113,8 @@ async def test_transfer_broadcast_persists_hash_and_is_idempotent():
             "/v1/transfer/transfer-broadcast/broadcast", json=payload
         )
         second = await client.post(
-            "/v1/transfer/transfer-broadcast/broadcast", json=payload
+            "/v1/transfer/transfer-broadcast/broadcast",
+            json={**payload, "tx_hash": "0x" + "A" * 64},
         )
         wrong_chain = await client.post(
             "/v1/transfer/transfer-broadcast/broadcast",
@@ -126,6 +127,7 @@ async def test_transfer_broadcast_persists_hash_and_is_idempotent():
     assert second.status_code == 200
     assert second.json()["broadcast_tx_hash"] == tx_hash
     assert wrong_chain.status_code == 409
+    assert wrong_chain.json()["code"] == "BROADCAST_CHAIN_MISMATCH"
     persisted = await store.get("transfer-broadcast")
     assert persisted is not None
     assert persisted.broadcast_tx_hash == tx_hash

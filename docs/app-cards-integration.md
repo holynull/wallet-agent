@@ -361,6 +361,12 @@ App 需按占位处理（不要用别的链 logo 顶替）。
   `approval_transaction.chain_logo_url`（链角标），见 §2.5。
 - App 接入：把 `approval_transaction` 交给钱包签名，回传
   `POST /v1/swap/{session_id}/approve-broadcast`（body `{approve_tx_hash, chain, user_id}`）。
+- 授权 hash 提交后，后端会把 session 的 `status` / `stage` 都推进到
+  `approval_submitted`。App 必须继续轮询
+  `POST /v1/swap/{session_id}/continue`，不能再次调用 `/confirm`。
+- 同一个 `approve_tx_hash` 重试是幂等 200；提交不同的 hash 返回 409
+  `APPROVAL_HASH_CONFLICT`。收到 409 时先刷新 `GET /v1/swap/{session_id}`，
+  不要重新签名广播。
 - 对齐：✅（`data-card-kind="approval"`）。
 
 ### 3.15 未签名交易卡（`transfer_prepare` / `swap_prepare`）

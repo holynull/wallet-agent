@@ -511,6 +511,29 @@ async def select_and_confirm(client, session_id: str, provider_reference: str):
     )
 
 
+async def make_authorization_app(session_id: str, provider_reference: str):
+    quote = authorization_quote(provider_reference)
+    adapter = Adapter()
+    provider = Provider()
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id=session_id,
+            user_id="alice",
+            thread_id=f"t-{session_id}",
+            quote_candidates=[quote],
+        )
+    )
+    graph = build_graph(model=Model(), providers=[provider], chains={"BASE": adapter})
+    app = create_app(
+        graph=graph,
+        providers={"bridgers": provider},
+        chain_registry=ChainAdapterRegistry({"BASE": adapter}),
+        store=store,
+    )
+    return quote, adapter, provider, store, app
+
+
 @pytest.mark.asyncio
 async def test_continue_rechecks_pending_approval_until_receipt_confirms():
     token = Asset(chain="BASE", chain_id=8453, symbol="USDC", decimals=6, address="0x" + "3" * 40)
@@ -579,6 +602,152 @@ async def test_continue_rechecks_pending_approval_until_receipt_confirms():
 
     assert continued.status_code == 200
     assert continued.json()["pending_transaction"]["data"] == "0xabc"
+
+
+@pytest.mark.asyncio
+async def test_approve_broadcast_advances_status_and_normalizes_hash():
+    quote, _, _, store, app = await make_authorization_app(
+        "s-approve-status", "ref-approve-status"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await select_and_confirm(client, "s-approve-status", quote.provider_reference)
+        approved = await client.post(
+            "/v1/swap/s-approve-status/approve-broadcast",
+            json={
+                "user_id": "alice",
+                "chain": "BASE",
+                "approve_tx_hash": "0x" + "A" * 64,
+            },
+        )
+
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approval_submitted"
+    assert approved.json()["stage"] == "approval_submitted"
+    assert approved.json()["approval_tx_hash"] == "0x" + "a" * 64
+    session = await store.get("s-approve-status")
+    assert session is not None
+    assert session.status == "approval_submitted"
+    assert session.stage == "approval_submitted"
+
+
+@pytest.mark.asyncio
+async def test_approve_broadcast_same_hash_is_idempotent_and_conflict_is_structured():
+    quote, _, _, store, app = await make_authorization_app(
+        "s-approve-conflict", "ref-approve-conflict"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await select_and_confirm(client, "s-approve-conflict", quote.provider_reference)
+        first = await client.post(
+            "/v1/swap/s-approve-conflict/approve-broadcast",
+            json={
+                "user_id": "alice",
+                "chain": "BASE",
+                "approve_tx_hash": "0x" + "A" * 64,
+            },
+        )
+        same = await client.post(
+            "/v1/swap/s-approve-conflict/approve-broadcast",
+            json={
+                "user_id": "alice",
+                "chain": "BASE",
+                "approve_tx_hash": "0x" + "a" * 64,
+            },
+        )
+        conflict = await client.post(
+            "/v1/swap/s-approve-conflict/approve-broadcast",
+            json={
+                "user_id": "alice",
+                "chain": "BASE",
+                "approve_tx_hash": "0x" + "b" * 64,
+            },
+        )
+
+    assert first.status_code == 200
+    assert same.status_code == 200
+    assert conflict.status_code == 409
+    assert conflict.json()["code"] == "APPROVAL_HASH_CONFLICT"
+    assert conflict.json()["details"]["existing_hash"] == "0x" + "a" * 64
+    assert conflict.json()["details"]["submitted_hash"] == "0x" + "b" * 64
+    session = await store.get("s-approve-conflict")
+    assert session is not None
+    assert session.approval_tx_hash == "0x" + "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_confirm_after_submitted_approval_is_idempotent():
+    quote, _, _, store, app = await make_authorization_app(
+        "s-confirm-after-approve", "ref-confirm-after-approve"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await select_and_confirm(
+            client, "s-confirm-after-approve", quote.provider_reference
+        )
+        await client.post(
+            "/v1/swap/s-confirm-after-approve/approve-broadcast",
+            json={
+                "user_id": "alice",
+                "chain": "BASE",
+                "approve_tx_hash": "0x" + "a" * 64,
+            },
+        )
+        repeated = await client.post(
+            "/v1/swap/s-confirm-after-approve/confirm",
+            json={"user_id": "alice", "approved": True},
+        )
+
+    assert repeated.status_code == 200
+    assert repeated.json()["status"] == "approval_submitted"
+    assert repeated.json()["approval_tx_hash"] == "0x" + "a" * 64
+    session = await store.get("s-confirm-after-approve")
+    assert session is not None
+    assert session.status == "approval_submitted"
+
+
+@pytest.mark.asyncio
+async def test_approve_retry_after_swap_ready_does_not_regress_status():
+    quote, adapter, _, store, app = await make_authorization_app(
+        "s-approve-no-regression", "ref-approve-no-regression"
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await select_and_confirm(
+            client, "s-approve-no-regression", quote.provider_reference
+        )
+        await client.post(
+            "/v1/swap/s-approve-no-regression/approve-broadcast",
+            json={
+                "user_id": "alice",
+                "chain": "BASE",
+                "approve_tx_hash": "0x" + "a" * 64,
+            },
+        )
+        adapter.allowance = "100"
+        ready = await client.post(
+            "/v1/swap/s-approve-no-regression/continue",
+            json={"user_id": "alice"},
+        )
+        assert ready.json()["status"] == "swap_ready"
+        retried = await client.post(
+            "/v1/swap/s-approve-no-regression/approve-broadcast",
+            json={
+                "user_id": "alice",
+                "chain": "BASE",
+                "approve_tx_hash": "0x" + "a" * 64,
+            },
+        )
+
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "swap_ready"
+    session = await store.get("s-approve-no-regression")
+    assert session is not None
+    assert session.status == "swap_ready"
 
 
 @pytest.mark.asyncio
