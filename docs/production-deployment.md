@@ -58,6 +58,9 @@ wallet-agent ──► MySQL（外部托管，PERSISTENCE_URL / DEPLOY_PERSISTEN
 chmod 600 .env
 ```
 
+> **不要在服务器上保留 `.env` 备份文件（`.env.bak*` 等）**：它们包含完整密钥且权限容易放松。
+> 需要保留旧配置时放进密钥管理系统（Secrets Manager / SSM / Vault），不要落在部署目录。
+
 ### 3.1 必须替换的密钥（生产）
 
 | 变量 | 用途 | 生产做法 |
