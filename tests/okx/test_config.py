@@ -10,7 +10,6 @@ def test_okx_is_disabled_without_credentials(monkeypatch):
     assert settings.okx_enabled is False
     assert settings.okx_base_url == "https://web3.okx.com"
     assert settings.okx_max_attempts == 3
-    assert settings.okx_exclude_risk_tokens is True
 
 
 def test_enabled_okx_requires_all_credentials(monkeypatch):

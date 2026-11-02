@@ -11,7 +11,6 @@ def test_settings_load_non_secret_defaults(monkeypatch):
     assert settings.omnibridge_enabled is False
     assert settings.provider_timeout_seconds == 15
     assert settings.poll_max_attempts == 20
-    assert settings.allowed_chains == ["EVM", "BTC", "TRON", "SOLANA"]
     assert settings.openai_model == "deepseek-flash"
     assert settings.intent_model == "deepseek-flash"
     assert settings.slot_extraction_model == "deepseek-flash"
@@ -50,7 +49,6 @@ def test_react_compatibility_mode_requires_explicit_opt_in(monkeypatch):
     [
         ("provider_timeout_seconds", 0),
         ("http_timeout_seconds", -1),
-        ("poll_interval_seconds", 0),
         ("poll_max_attempts", 0),
         ("poll_max_attempts", 1001),
         ("run_event_ttl_seconds", 59),

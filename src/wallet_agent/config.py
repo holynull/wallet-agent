@@ -48,7 +48,6 @@ class Settings(BaseSettings):
 
     provider_timeout_seconds: float = Field(default=15, gt=0)
     http_timeout_seconds: float = Field(default=15, gt=0)
-    allowed_chains: list[str] = Field(default_factory=lambda: ["EVM", "BTC", "TRON", "SOLANA"])
     rpc_urls: dict[str, str | list[str]] = Field(default_factory=dict)
     rpc_timeout_seconds: float = Field(default=10, gt=0)
     rpc_max_attempts: int = Field(default=2, ge=1, le=5)
@@ -70,7 +69,6 @@ class Settings(BaseSettings):
     okx_project_id: SecretStr | None = None
     okx_max_attempts: int = Field(default=3, ge=1, le=5)
     okx_cache_ttl_seconds: int = Field(default=60, ge=0)
-    okx_exclude_risk_tokens: bool = True
     asset_cache_ttl_seconds: int = Field(default=600, ge=0)
     metadata_cache_ttl_seconds: int = Field(default=600, ge=0)
     metadata_cache_max_entries: int = Field(default=512, ge=0, le=100_000)
@@ -88,7 +86,6 @@ class Settings(BaseSettings):
     # separately from AUTH_TOKENS so it can cross user boundaries without
     # creating a normal app identity.
     admin_token: SecretStr | None = None
-    poll_interval_seconds: float = Field(default=5, gt=0)
     poll_max_attempts: int = Field(default=20, ge=1, le=1000)
     confirmation_ttl_seconds: int = Field(default=900, ge=1, le=86_400)
 
