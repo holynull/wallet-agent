@@ -42,6 +42,25 @@ GET /ready    -> {"status":"ready"}
    App 侧 token 由自有账号体系换取，不要硬编码在包内。
 4. 为每个本地用户生成稳定的 `user_id`，并在**所有**请求中保持一致。会话归属按 `user_id` 校验，
    App 不能用别人的 `conversation_id` / `session_id`。
+5. 若服务端开启 `REQUEST_SIGNATURE_MODE=warn|enforce`，所有 `/v1/*` 请求还要带：
+
+   ```http
+   X-Timestamp: <Unix 毫秒>
+   X-Nonce: <每次请求随机值>
+   X-Signature: Base64(HMAC-SHA256(SecretKey, canonical))
+   ```
+
+   canonical 字符串严格为：
+
+   ```text
+   METHOD\nraw_path\nraw_query\ntimestamp\nnonce\nsha256(raw_body)
+   ```
+
+   - body 使用实际发送的原始字节计算 SHA-256；GET 用空 body。
+   - `raw_path` / `raw_query` 使用实际发送的 URL 路径和 query string。
+   - nonce 每次请求重新生成，失败重试也不能复用。
+   - 401 错误码包括 `REQUEST_SIGNATURE_REQUIRED`、`INVALID_REQUEST_SIGNATURE`、
+     `STALE_REQUEST_TIMESTAMP`、`REPLAYED_REQUEST_NONCE`。
 
 ## 3. 每轮请求都要携带的钱包上下文
 
@@ -698,6 +717,10 @@ REST 错误统一信封：
 | `CONFIRMATION_RESUME_NOOP` | 重复恢复确认 | 忽略 |
 | `APPROVAL_HASH_CONFLICT` | 重复提交了不同的 Approve hash | 不重新签名；刷新 session 后继续 `/continue` |
 | `BROADCAST_HASH_CONFLICT` | 重复提交了不同的兑换广播 hash | 复用第一次 tx hash，刷新 session 后重试 |
+| `REQUEST_SIGNATURE_REQUIRED` | 缺少请求签名头 | App 补齐 `X-Timestamp/X-Nonce/X-Signature` |
+| `INVALID_REQUEST_SIGNATURE` | 签名错误或参数被修改 | 检查 canonical 串和原始 body bytes，不要盲目重试 |
+| `STALE_REQUEST_TIMESTAMP` | 请求时间超出窗口 | 校准设备时间后生成新 nonce 重试 |
+| `REPLAYED_REQUEST_NONCE` | nonce 已使用 | 每次请求/重试生成新 nonce |
 | `PROVIDER_REGISTRATION_FAILED` | 广播哈希登记失败 | 可重试同一哈希 |
 | `INVALID_TRANSACTION_HASH` | 哈希格式错误 | 修正后重试 |
 | `OKX_CAPABILITY_UNAVAILABLE` / `PRICE_PROVIDER_UNAVAILABLE` | 上游不可用 | 降级展示，稍后重试 |

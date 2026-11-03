@@ -24,6 +24,7 @@ SAFE_REQUEST_ENTRY_KEYS = {
     "user_id",
     "approval_tx_hash",
     "broadcast_tx_hash",
+    "signature_status",
     "app_version",
     "platform",
     "duration_ms",

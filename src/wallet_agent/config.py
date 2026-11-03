@@ -1,5 +1,7 @@
 """Application configuration loaded from environment variables and dotenv files."""
 
+from typing import Literal
+
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -82,6 +84,9 @@ class Settings(BaseSettings):
     conversation_lock_wait_seconds: float = Field(default=30, gt=0)
     auth_required: bool = False
     auth_tokens: dict[str, str] = Field(default_factory=dict)
+    request_signature_mode: Literal["off", "warn", "enforce"] = "off"
+    request_signature_secret: SecretStr | None = None
+    request_signature_ttl_seconds: int = Field(default=300, ge=30, le=3_600)
     # Optional operator-only token for read-only run inspection. It is checked
     # separately from AUTH_TOKENS so it can cross user boundaries without
     # creating a normal app identity.
@@ -93,6 +98,13 @@ class Settings(BaseSettings):
     def require_model_key(self) -> "Settings":
         if not (self.deepseek_api_key or self.openai_api_key):
             raise ValueError("DEEPSEEK_API_KEY or OPENAI_API_KEY is required")
+        if self.request_signature_mode != "off" and (
+            self.request_signature_secret is None
+            or not self.request_signature_secret.get_secret_value()
+        ):
+            raise ValueError(
+                "REQUEST_SIGNATURE_SECRET is required when REQUEST_SIGNATURE_MODE is enabled"
+            )
         if self.okx_enabled:
             missing = [
                 name

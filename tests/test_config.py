@@ -34,7 +34,26 @@ def test_settings_load_non_secret_defaults(monkeypatch):
     assert settings.run_event_max_entries == 2_000
     assert settings.conversation_lock_lease_seconds == 120
     assert settings.conversation_lock_wait_seconds == 30
+    assert settings.request_signature_mode == "off"
+    assert settings.request_signature_ttl_seconds == 300
     assert settings.admin_token is None
+
+
+def test_request_signature_enforcement_requires_secret(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            request_signature_mode="enforce",
+        )
+
+    settings = Settings(
+        _env_file=None,
+        request_signature_mode="enforce",
+        request_signature_secret="shared-secret",
+    )
+    assert settings.request_signature_mode == "enforce"
+    assert settings.request_signature_secret is not None
 
 
 def test_react_compatibility_mode_requires_explicit_opt_in(monkeypatch):

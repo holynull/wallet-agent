@@ -104,6 +104,36 @@ AUTH_TOKENS='{"prod-app-token":"w1_xxx","prod-app-token-2":"w1_yyy"}'
 > 价格数据只走 OKX（`OKX_ENABLED=true` 且四个 OKX 凭据齐全）；CoinGecko 已不再使用，
 > `COINGECKO_*` / `PRICE_CACHE_TTL_SECONDS` 属于历史遗留配置，无需配置。
 
+### 3.2.1 App 请求签名（独立于 AUTH_REQUIRED）
+
+`REQUEST_SIGNATURE_*` 控制 App 级 HMAC 请求签名，和用户 Bearer 鉴权相互独立：
+
+| 变量 | 说明 |
+| --- | --- |
+| `REQUEST_SIGNATURE_MODE` | `off` / `warn` / `enforce` |
+| `REQUEST_SIGNATURE_SECRET` | App 共享 SecretKey；`warn` / `enforce` 必填 |
+| `REQUEST_SIGNATURE_TTL_SECONDS` | timestamp 允许偏差和 nonce TTL，默认 300 秒 |
+
+请求头：
+
+```http
+X-Timestamp: <Unix 毫秒>
+X-Nonce: <每次请求随机值>
+X-Signature: Base64(HMAC-SHA256(SecretKey, canonical))
+```
+
+canonical 字符串：
+
+```text
+METHOD\nraw_path\nraw_query\ntimestamp\nnonce\nsha256(raw_body)
+```
+
+- 测试服可先使用 `off` 方便联调。
+- 切换 App 时先用 `warn` 观察失败率，再切 `enforce`。
+- 生产最终必须使用 `enforce`。
+- `/health`、`/ready` 和 `/debug/*` 不参与 App 请求签名；调试接口仍只用 `ADMIN_TOKEN`。
+- 该请求签名只证明请求来自持有共享 SecretKey 的 App，不证明具体用户身份。
+
 ### 3.3 生产安全建议（与"配置不变"并存）
 
 当前测试服是 `AUTH_REQUIRED=false`、CORS 写 IP、Demo 对外暴露、`/docs` 可访问。

@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from wallet_agent.api import StaticTokenVerifier, create_app
+from wallet_agent.api.request_signature import RedisRequestReplayStore
 from wallet_agent.chains import ExecutionObserver, build_default_registry
 from wallet_agent.config import Settings
 from wallet_agent.graph import build_graph
@@ -298,6 +299,7 @@ def build_application(settings: Settings | None = None) -> Any:
     redis_client = None
     run_store = None
     lock_manager = None
+    request_replay_store = None
     if settings.redis_url:
         from redis.asyncio import from_url as redis_from_url
 
@@ -314,6 +316,10 @@ def build_application(settings: Settings | None = None) -> Any:
             lease_seconds=settings.conversation_lock_lease_seconds,
             wait_seconds=settings.conversation_lock_wait_seconds,
         )
+        request_replay_store = RedisRequestReplayStore(
+            redis_client,
+            key_prefix=settings.redis_key_prefix,
+        )
     application = create_app(
         graph=graph,
         providers=providers,
@@ -329,6 +335,14 @@ def build_application(settings: Settings | None = None) -> Any:
         metadata_cache=metadata_cache,
         token_verifier=StaticTokenVerifier(settings.auth_tokens) if settings.auth_tokens else None,
         require_auth=settings.auth_required,
+        request_signature_mode=settings.request_signature_mode,
+        request_signature_secret=(
+            settings.request_signature_secret.get_secret_value()
+            if settings.request_signature_secret is not None
+            else None
+        ),
+        request_signature_ttl_seconds=settings.request_signature_ttl_seconds,
+        request_replay_store=request_replay_store,
         admin_token=(
             settings.admin_token.get_secret_value() if settings.admin_token is not None else None
         ),

@@ -65,6 +65,11 @@ from wallet_agent.prices.okx import PriceProviderError
 from .auth import TokenVerifier
 from .dependencies import authenticated_user, is_admin_token
 from .inspection import build_run_summary, sanitize_debug_value
+from .request_signature import (
+    InMemoryRequestReplayStore,
+    RequestReplayStore,
+    RequestSignatureMiddleware,
+)
 
 _AGENT_TEST_INTENTS = {
     "wallet_query",
@@ -1207,6 +1212,7 @@ class _RequestAuditMiddleware:
                     or (query.get("user_id") or [None])[0],
                     "approval_tx_hash": state.get("audit_approval_tx_hash"),
                     "broadcast_tx_hash": state.get("audit_broadcast_tx_hash"),
+                    "signature_status": state.get("audit_signature_status"),
                     "app_version": _scope_header(scope, "x-app-version"),
                     "platform": _scope_header(scope, "x-platform"),
                     "duration_ms": round((time.perf_counter() - started) * 1000, 3),
@@ -1331,6 +1337,10 @@ def create_app(
     token_verifier: TokenVerifier | None = None,
     require_auth: bool = False,
     admin_token: str | None = None,
+    request_signature_mode: str = "off",
+    request_signature_secret: str | None = None,
+    request_signature_ttl_seconds: int = 300,
+    request_replay_store: RequestReplayStore | None = None,
     model_registry: Any = None,
     metrics: Any = None,
     metadata_cache: Any = None,
@@ -1373,6 +1383,15 @@ def create_app(
     )
     request_audit = _RequestAuditBuffer()
     app.state.request_audit = request_audit
+    replay_store = request_replay_store or InMemoryRequestReplayStore()
+    app.state.request_replay_store = replay_store
+    app.add_middleware(
+        RequestSignatureMiddleware,
+        mode=request_signature_mode,
+        secret=request_signature_secret,
+        ttl_seconds=request_signature_ttl_seconds,
+        replay_store=replay_store,
+    )
     app.add_middleware(_RequestAuditMiddleware, audit=request_audit)
     session_store = store or InMemorySessionStore()
     local_runs: dict[str, dict[str, Any]] = {}

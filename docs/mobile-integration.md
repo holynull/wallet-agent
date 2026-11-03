@@ -53,6 +53,9 @@ is accepted only when its task ID, revision, and payload hash still match.
    returned `run_id`, `conversation_id`, and `session_id`.
    If the service returns a clarification, send the missing information in a
    follow-up turn using the same `conversation_id` and `session_id`.
+   When request signing is enabled, add `X-Timestamp`, `X-Nonce`, and
+   `X-Signature` to every `/v1/*` call using the canonical string documented in
+   `docs/app-integration.md`; a retry must use a fresh nonce.
 2. Read `GET /v1/agent/stream/{run_id}` until `action_required`. The graph
    response/session contains every `quote_candidates` item. Render every quote;
    do not auto-select a provider.
