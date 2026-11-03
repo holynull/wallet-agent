@@ -248,6 +248,29 @@ curl -fsS "$BASE/health"
 curl -fsS "$BASE/ready"
 ```
 
+#### 本地安全保存 ADMIN_TOKEN
+
+不要把长期 `ADMIN_TOKEN` 写入 `.env.bak`、shell history 或代码仓库。macOS
+本地建议保存到 Keychain：
+
+```bash
+# 交互输入，不进入 shell history
+scripts/keychain_secret.sh store catwallet-admin-token-prod
+
+# 只打印条目存在和字符数，不打印 token
+scripts/keychain_secret.sh check catwallet-admin-token-prod
+
+# 只在子进程环境中注入，不把 token 写进磁盘
+scripts/keychain_secret.sh exec catwallet-admin-token-prod ADMIN_TOKEN -- \
+  curl http://127.0.0.1:8000/debug/requests
+
+# 轮换或不再需要时删除
+scripts/keychain_secret.sh delete catwallet-admin-token-prod
+```
+
+测试服和生产使用不同 service 名称，例如：
+`catwallet-admin-token-test`、`catwallet-admin-token-prod`。
+
 ### 7.2 进程指标
 
 | 接口 | 返回 | 说明 |
