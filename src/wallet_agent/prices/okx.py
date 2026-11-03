@@ -103,7 +103,7 @@ class OkxPriceProvider:
                     volume_24h=self._optional_decimal(
                         row.get("volume24h", row.get("volume24H")), "volume24h"
                     ),
-                    price_change_24h=self._optional_decimal(
+                    price_change_24h=self._optional_signed_decimal(
                         row.get("priceChange24h", row.get("priceChange24H")), "priceChange24h"
                     ),
                     liquidity=self._optional_decimal(row.get("liquidity"), "liquidity"),
@@ -317,6 +317,20 @@ class OkxPriceProvider:
     @classmethod
     def _optional_decimal(cls, value, field):
         return None if value in (None, "") else cls._decimal(value, field)
+
+    @staticmethod
+    def _signed_decimal(value, field):
+        try:
+            result = Decimal(str(value))
+            if not result.is_finite():
+                raise InvalidOperation
+            return result
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise PriceProviderError(f"Malformed {field}.") from exc
+
+    @classmethod
+    def _optional_signed_decimal(cls, value, field):
+        return None if value in (None, "") else cls._signed_decimal(value, field)
 
     @staticmethod
     def _optional_int(value):

@@ -92,6 +92,30 @@ async def test_market_details_normalizes_decimal_metrics():
 
 
 @pytest.mark.asyncio
+async def test_market_details_allows_negative_price_change():
+    client = FakeClient(
+        {
+            "/api/v6/dex/market/price-info": {
+                "code": "0",
+                "data": [
+                    {
+                        "chainIndex": "1",
+                        "tokenContractAddress": OKX_NATIVE_TOKEN_ADDRESS,
+                        "price": "2500",
+                        "priceChange24h": "-2.5",
+                    }
+                ],
+            }
+        }
+    )
+    provider = OkxPriceProvider(client, {"ETH": "1"})
+
+    details = await provider.get_market_details([ETH])
+
+    assert details[0].price_change_24h == Decimal("-2.5")
+
+
+@pytest.mark.asyncio
 async def test_history_and_candles_encode_queries_and_parse_tuples():
     client = FakeClient(
         {
