@@ -39,6 +39,7 @@ but it does not prove which user sent the request.
 X-Timestamp: <Unix timestamp in milliseconds>
 X-Nonce: <random per-request value>
 X-Signature: <Base64 HMAC-SHA256>
+X-Key-Id: <platform/version key id when multiple keys are configured>
 X-App-Version: <optional App version>
 X-Platform: <optional ios|android>
 ```
@@ -66,6 +67,7 @@ sha256(raw_request_body_bytes)
 ```dotenv
 REQUEST_SIGNATURE_MODE=off|warn|enforce
 REQUEST_SIGNATURE_SECRET=<shared App SecretKey>
+REQUEST_SIGNATURE_KEYS={"ios-v1":"...","android-v1":"..."}
 REQUEST_SIGNATURE_TTL_SECONDS=300
 ```
 
@@ -83,6 +85,11 @@ Exempt routes:
 
 Nonce claims are stored in Redis when available, with an in-process fallback for
 tests and single-process local runs.
+
+When `REQUEST_SIGNATURE_KEYS` is configured, App requests select the platform
+key through `X-Key-Id`. This supports distinct iOS and Android keys and enables
+per-key rotation. The single `REQUEST_SIGNATURE_SECRET` remains supported for
+backward compatibility.
 
 ### Error codes
 

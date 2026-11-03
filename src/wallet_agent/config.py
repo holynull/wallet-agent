@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     auth_tokens: dict[str, str] = Field(default_factory=dict)
     request_signature_mode: Literal["off", "warn", "enforce"] = "off"
     request_signature_secret: SecretStr | None = None
+    request_signature_keys: dict[str, SecretStr] = Field(default_factory=dict)
     request_signature_ttl_seconds: int = Field(default=300, ge=30, le=3_600)
     # Optional operator-only token for read-only run inspection. It is checked
     # separately from AUTH_TOKENS so it can cross user boundaries without
@@ -98,12 +99,19 @@ class Settings(BaseSettings):
     def require_model_key(self) -> "Settings":
         if not (self.deepseek_api_key or self.openai_api_key):
             raise ValueError("DEEPSEEK_API_KEY or OPENAI_API_KEY is required")
-        if self.request_signature_mode != "off" and (
-            self.request_signature_secret is None
-            or not self.request_signature_secret.get_secret_value()
+        configured_signature_secret = (
+            self.request_signature_secret is not None
+            and bool(self.request_signature_secret.get_secret_value())
+        )
+        configured_signature_keys = any(
+            secret.get_secret_value() for secret in self.request_signature_keys.values()
+        )
+        if self.request_signature_mode != "off" and not (
+            configured_signature_secret or configured_signature_keys
         ):
             raise ValueError(
-                "REQUEST_SIGNATURE_SECRET is required when REQUEST_SIGNATURE_MODE is enabled"
+                "REQUEST_SIGNATURE_SECRET or REQUEST_SIGNATURE_KEYS is required "
+                "when REQUEST_SIGNATURE_MODE is enabled"
             )
         if self.okx_enabled:
             missing = [

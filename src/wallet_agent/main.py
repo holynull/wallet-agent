@@ -341,6 +341,10 @@ def build_application(settings: Settings | None = None) -> Any:
             if settings.request_signature_secret is not None
             else None
         ),
+        request_signature_keys={
+            key_id: secret.get_secret_value()
+            for key_id, secret in settings.request_signature_keys.items()
+        },
         request_signature_ttl_seconds=settings.request_signature_ttl_seconds,
         request_replay_store=request_replay_store,
         admin_token=(

@@ -112,6 +112,7 @@ AUTH_TOKENS='{"prod-app-token":"w1_xxx","prod-app-token-2":"w1_yyy"}'
 | --- | --- |
 | `REQUEST_SIGNATURE_MODE` | `off` / `warn` / `enforce` |
 | `REQUEST_SIGNATURE_SECRET` | App 共享 SecretKey；`warn` / `enforce` 必填 |
+| `REQUEST_SIGNATURE_KEYS` | 可选多平台 key map，如 `{"ios-v1":"...","android-v1":"..."}`；配置后请求必须带 `X-Key-Id` |
 | `REQUEST_SIGNATURE_TTL_SECONDS` | timestamp 允许偏差和 nonce TTL，默认 300 秒 |
 
 请求头：
@@ -120,6 +121,7 @@ AUTH_TOKENS='{"prod-app-token":"w1_xxx","prod-app-token-2":"w1_yyy"}'
 X-Timestamp: <Unix 毫秒>
 X-Nonce: <每次请求随机值>
 X-Signature: Base64(HMAC-SHA256(SecretKey, canonical))
+X-Key-Id: <ios-v1|android-v1；使用多 key 配置时必填>
 ```
 
 canonical 字符串：
@@ -131,6 +133,8 @@ METHOD\nraw_path\nraw_query\ntimestamp\nnonce\nsha256(raw_body)
 - 测试服可先使用 `off` 方便联调。
 - 切换 App 时先用 `warn` 观察失败率，再切 `enforce`。
 - 生产最终必须使用 `enforce`。
+- iOS/Android 使用不同 SecretKey 时配置 `REQUEST_SIGNATURE_KEYS`，App
+  必须用对应平台 key id 签名；`REQUEST_SIGNATURE_SECRET` 仍可用于单 key 兼容。
 - `/health`、`/ready` 和 `/debug/*` 不参与 App 请求签名；调试接口仍只用 `ADMIN_TOKEN`。
 - 该请求签名只证明请求来自持有共享 SecretKey 的 App，不证明具体用户身份。
 

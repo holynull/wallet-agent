@@ -66,6 +66,7 @@ class SignatureCheck:
     code: str | None = None
     message: str | None = None
     status_code: int = 401
+    key_id: str | None = None
 
 
 def canonical_request_string(
@@ -156,17 +157,19 @@ class RequestSignatureMiddleware:
         *,
         mode: str,
         secret: str | None,
+        keys: Mapping[str, str] | None,
         ttl_seconds: int,
         replay_store: RequestReplayStore,
     ) -> None:
         normalized_mode = mode.strip().lower()
         if normalized_mode not in {"off", "warn", "enforce"}:
             raise ValueError("request signature mode must be off, warn, or enforce")
-        if normalized_mode != "off" and not secret:
+        if normalized_mode != "off" and not secret and not keys:
             raise ValueError("request signature secret is required when enabled")
         self.app = app
         self.mode = normalized_mode
         self.secret = secret
+        self.keys = {str(key): str(value) for key, value in (keys or {}).items()}
         self.ttl_seconds = ttl_seconds
         self.replay_store = replay_store
 
@@ -199,6 +202,8 @@ class RequestSignatureMiddleware:
         state["audit_signature_status"] = (
             "valid" if check.valid else f"{self.mode}:{check.code or 'invalid'}"
         )
+        if check.key_id:
+            state["audit_signature_key_id"] = check.key_id
         if not check.valid and self.mode == "enforce":
             await _signature_error(scope, check)(scope, receive, send)
             return
@@ -209,6 +214,23 @@ class RequestSignatureMiddleware:
         scope: Mapping[str, Any],
         body: bytes,
     ) -> SignatureCheck:
+        key_id = _header(scope, "x-key-id")
+        secret = self.secret
+        if self.keys:
+            if not key_id:
+                return SignatureCheck(
+                    valid=False,
+                    code="REQUEST_SIGNATURE_KEY_REQUIRED",
+                    message="X-Key-Id is required when multiple signature keys are configured.",
+                )
+            secret = self.keys.get(key_id)
+            if not secret:
+                return SignatureCheck(
+                    valid=False,
+                    code="UNKNOWN_SIGNATURE_KEY",
+                    message="X-Key-Id does not identify a configured signature key.",
+                    key_id=key_id,
+                )
         timestamp = _header(scope, "x-timestamp")
         nonce = _header(scope, "x-nonce")
         signature = _header(scope, "x-signature")
@@ -256,7 +278,7 @@ class RequestSignatureMiddleware:
             nonce=nonce,
             body=body,
         )
-        expected = request_signature_value(str(self.secret), canonical)
+        expected = request_signature_value(str(secret), canonical)
         if not hmac.compare_digest(signature, expected):
             return SignatureCheck(
                 valid=False,
@@ -281,4 +303,4 @@ class RequestSignatureMiddleware:
                 code="REPLAYED_REQUEST_NONCE",
                 message="Request nonce has already been used.",
             )
-        return SignatureCheck(valid=True)
+        return SignatureCheck(valid=True, key_id=key_id)

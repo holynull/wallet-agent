@@ -55,6 +55,13 @@ def test_request_signature_enforcement_requires_secret(monkeypatch):
     assert settings.request_signature_mode == "enforce"
     assert settings.request_signature_secret is not None
 
+    keyed = Settings(
+        _env_file=None,
+        request_signature_mode="enforce",
+        request_signature_keys={"ios-v1": "ios-secret"},
+    )
+    assert keyed.request_signature_keys["ios-v1"].get_secret_value() == "ios-secret"
+
 
 def test_react_compatibility_mode_requires_explicit_opt_in(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")

@@ -25,6 +25,7 @@ SAFE_REQUEST_ENTRY_KEYS = {
     "approval_tx_hash",
     "broadcast_tx_hash",
     "signature_status",
+    "signature_key_id",
     "app_version",
     "platform",
     "duration_ms",

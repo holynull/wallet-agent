@@ -1213,6 +1213,7 @@ class _RequestAuditMiddleware:
                     "approval_tx_hash": state.get("audit_approval_tx_hash"),
                     "broadcast_tx_hash": state.get("audit_broadcast_tx_hash"),
                     "signature_status": state.get("audit_signature_status"),
+                    "signature_key_id": state.get("audit_signature_key_id"),
                     "app_version": _scope_header(scope, "x-app-version"),
                     "platform": _scope_header(scope, "x-platform"),
                     "duration_ms": round((time.perf_counter() - started) * 1000, 3),
@@ -1339,6 +1340,7 @@ def create_app(
     admin_token: str | None = None,
     request_signature_mode: str = "off",
     request_signature_secret: str | None = None,
+    request_signature_keys: Mapping[str, str] | None = None,
     request_signature_ttl_seconds: int = 300,
     request_replay_store: RequestReplayStore | None = None,
     model_registry: Any = None,
@@ -1389,6 +1391,7 @@ def create_app(
         RequestSignatureMiddleware,
         mode=request_signature_mode,
         secret=request_signature_secret,
+        keys=request_signature_keys,
         ttl_seconds=request_signature_ttl_seconds,
         replay_store=replay_store,
     )

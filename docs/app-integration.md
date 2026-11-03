@@ -48,6 +48,7 @@ GET /ready    -> {"status":"ready"}
    X-Timestamp: <Unix 毫秒>
    X-Nonce: <每次请求随机值>
    X-Signature: Base64(HMAC-SHA256(SecretKey, canonical))
+   X-Key-Id: <服务端分配的 key id，例如 ios-v1>
    ```
 
    canonical 字符串严格为：
@@ -59,8 +60,10 @@ GET /ready    -> {"status":"ready"}
    - body 使用实际发送的原始字节计算 SHA-256；GET 用空 body。
    - `raw_path` / `raw_query` 使用实际发送的 URL 路径和 query string。
    - nonce 每次请求重新生成，失败重试也不能复用。
+   - 服务端配置多平台 key 时，`X-Key-Id` 必填并与 iOS/Android 的 SecretKey 对应。
    - 401 错误码包括 `REQUEST_SIGNATURE_REQUIRED`、`INVALID_REQUEST_SIGNATURE`、
-     `STALE_REQUEST_TIMESTAMP`、`REPLAYED_REQUEST_NONCE`。
+     `STALE_REQUEST_TIMESTAMP`、`REPLAYED_REQUEST_NONCE`、
+     `REQUEST_SIGNATURE_KEY_REQUIRED`、`UNKNOWN_SIGNATURE_KEY`。
 
 ## 3. 每轮请求都要携带的钱包上下文
 
@@ -721,6 +724,8 @@ REST 错误统一信封：
 | `INVALID_REQUEST_SIGNATURE` | 签名错误或参数被修改 | 检查 canonical 串和原始 body bytes，不要盲目重试 |
 | `STALE_REQUEST_TIMESTAMP` | 请求时间超出窗口 | 校准设备时间后生成新 nonce 重试 |
 | `REPLAYED_REQUEST_NONCE` | nonce 已使用 | 每次请求/重试生成新 nonce |
+| `REQUEST_SIGNATURE_KEY_REQUIRED` | 多 key 环境未传 `X-Key-Id` | 使用平台对应的 key id |
+| `UNKNOWN_SIGNATURE_KEY` | key id 未配置 | 检查 App 与服务端 `REQUEST_SIGNATURE_KEYS` 是否一致 |
 | `PROVIDER_REGISTRATION_FAILED` | 广播哈希登记失败 | 可重试同一哈希 |
 | `INVALID_TRANSACTION_HASH` | 哈希格式错误 | 修正后重试 |
 | `OKX_CAPABILITY_UNAVAILABLE` / `PRICE_PROVIDER_UNAVAILABLE` | 上游不可用 | 降级展示，稍后重试 |

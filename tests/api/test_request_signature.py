@@ -65,12 +65,18 @@ def signed_headers(
     }
 
 
-def signature_app(*, mode: str, secret: str | None = "shared-secret"):
+def signature_app(
+    *,
+    mode: str,
+    secret: str | None = "shared-secret",
+    keys: dict[str, str] | None = None,
+):
     store = InMemorySessionStore()
     return create_app(
         store=store,
         request_signature_mode=mode,
         request_signature_secret=secret,
+        request_signature_keys=keys,
     ), store
 
 
@@ -207,3 +213,36 @@ async def test_signature_off_and_health_are_exempt():
 
     assert off_response.status_code == 200
     assert health.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_signature_keys_are_selected_by_key_id():
+    app, _ = signature_app(
+        mode="enforce",
+        secret=None,
+        keys={"ios-v1": "ios-secret", "android-v1": "android-secret"},
+    )
+    path = "/v1/agent/conversations"
+    query = "user_id=alice"
+    ios_headers = signed_headers("ios-secret", "GET", path, query=query) | {
+        "X-Key-Id": "ios-v1"
+    }
+    android_headers = signed_headers("android-secret", "GET", path, query=query) | {
+        "X-Key-Id": "android-v1"
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        ios = await client.get(f"{path}?{query}", headers=ios_headers)
+        android = await client.get(f"{path}?{query}", headers=android_headers)
+        missing_key_id = await client.get(f"{path}?{query}", headers=ios_headers | {"X-Key-Id": ""})
+        unknown_key_id = await client.get(
+            f"{path}?{query}", headers=ios_headers | {"X-Key-Id": "unknown"}
+        )
+
+    assert ios.status_code == 200
+    assert android.status_code == 200
+    assert missing_key_id.status_code == 401
+    assert missing_key_id.json()["code"] == "REQUEST_SIGNATURE_KEY_REQUIRED"
+    assert unknown_key_id.status_code == 401
+    assert unknown_key_id.json()["code"] == "UNKNOWN_SIGNATURE_KEY"
