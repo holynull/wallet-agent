@@ -10,7 +10,7 @@ import pytest
 
 from wallet_agent.api import create_app
 from wallet_agent.api.request_signature import RedisRequestReplayStore
-from wallet_agent.persistence import InMemorySessionStore, SwapSessionRecord
+from wallet_agent.persistence import InMemoryRunStore, InMemorySessionStore, SwapSessionRecord
 
 
 def request_signature(
@@ -246,3 +246,42 @@ async def test_signature_keys_are_selected_by_key_id():
     assert missing_key_id.json()["code"] == "REQUEST_SIGNATURE_KEY_REQUIRED"
     assert unknown_key_id.status_code == 401
     assert unknown_key_id.json()["code"] == "UNKNOWN_SIGNATURE_KEY"
+
+
+@pytest.mark.asyncio
+async def test_operator_only_v1_debug_routes_are_signature_exempt():
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-operator-debug",
+            user_id="alice",
+            thread_id="conversation-operator-debug",
+        )
+    )
+    runs = InMemoryRunStore()
+    await runs.create(
+        "run-operator-debug",
+        owner_id="alice",
+        metadata={"conversation_id": "conversation-operator-debug"},
+    )
+    app = create_app(
+        store=store,
+        run_store=runs,
+        admin_token="operator-secret",
+        request_signature_mode="enforce",
+        request_signature_secret="shared-secret",
+    )
+    headers = {"Authorization": "Bearer operator-secret"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        timeline = await client.get(
+            "/v1/swap/s-operator-debug/timeline", headers=headers
+        )
+        conversation_runs = await client.get(
+            "/v1/agent/conversations/conversation-operator-debug/runs?limit=5",
+            headers=headers,
+        )
+
+    assert timeline.status_code == 200
+    assert conversation_runs.status_code == 200

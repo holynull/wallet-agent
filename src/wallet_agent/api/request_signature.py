@@ -120,6 +120,11 @@ def _is_exempt(scope: Mapping[str, Any]) -> bool:
     return (
         path in {"/health", "/ready", "/docs", "/openapi.json", "/redoc"}
         or path.startswith("/debug/")
+        or (path.startswith("/v1/swap/") and path.endswith("/timeline"))
+        or (
+            path.startswith("/v1/agent/conversations/")
+            and path.endswith("/runs")
+        )
     )
 
 
