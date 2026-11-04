@@ -338,8 +338,20 @@ class OmniBridgeProvider:
             input_amount_raw=request.input_amount_raw,
             expected_output=expected,
             expected_output_raw=_raw(expected, request.destination_asset.decimals),
-            provider_fee=request.input_amount * fee_rate,
+            # OmniBridge applies the deposit fee on the source side, but the
+            # resulting loss is in destination units after ``instantRate``.
+            # Expose both fee fields in destination units for the confirmation
+            # card; ``chainFee`` is already denominated in the destination coin.
+            provider_fee=request.input_amount * fee_rate * rate,
+            provider_fee_raw=_raw(
+                request.input_amount * fee_rate * rate,
+                request.destination_asset.decimals,
+            ),
+            provider_fee_asset=request.destination_asset,
+            provider_fee_rate=fee_rate,
             network_fee=network_fee,
+            network_fee_raw=_raw(network_fee, request.destination_asset.decimals),
+            network_fee_asset=request.destination_asset,
             provider_reference=reference,
             provider_payload=provider_payload,
             allowance_requirement=allowance,

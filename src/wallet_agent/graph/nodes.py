@@ -2529,7 +2529,10 @@ def _swap_confirmation_summary(
     summary["usd_input_value"] = selected.get("usd_input_value")
     summary["usd_expected_output"] = selected.get("usd_expected_output")
     summary["network_fee"] = selected.get("network_fee")
+    summary["network_fee_asset"] = selected.get("network_fee_asset")
     summary["provider_fee"] = selected.get("provider_fee")
+    summary["provider_fee_asset"] = selected.get("provider_fee_asset")
+    summary["provider_fee_rate"] = selected.get("provider_fee_rate")
     summary["reference_rate"] = selected.get("reference_rate")
     summary["total_payment"] = selected.get("total_payment")
     summary["eta"] = selected.get("eta") or _provider_eta_estimate(
@@ -2553,6 +2556,30 @@ def _provider_eta_estimate(provider: Any) -> str | None:
     """
     value = str(provider or "").lower()
     return _PROVIDER_ETA_ESTIMATES.get(value)
+
+
+def _fee_is_in_source_asset(
+    quote: Mapping[str, Any], fee_key: str, fee_asset_key: str
+) -> bool:
+    """Whether a quoted fee is debited from the source asset.
+
+    Swap providers normally deduct fees from the destination amount. Keep this
+    check generic so a provider that charges a source fee can still add it to
+    ``total_payment`` without changing the graph.
+    """
+    source = quote.get("source_asset")
+    fee_asset = quote.get(fee_asset_key)
+    if not isinstance(source, Mapping) or not isinstance(fee_asset, Mapping):
+        return False
+    source_address = str(source.get("address") or "").lower()
+    fee_address = str(fee_asset.get("address") or "").lower()
+    return (
+        canonical_chain(str(source.get("chain") or ""))
+        == canonical_chain(str(fee_asset.get("chain") or ""))
+        and canonical_symbol(str(source.get("symbol") or ""))
+        == canonical_symbol(str(fee_asset.get("symbol") or ""))
+        and (not source_address or not fee_address or source_address == fee_address)
+    )
 
 
 def _snapshot_price(snapshots: Any, asset: Mapping[str, Any]) -> Decimal | None:
@@ -10174,9 +10201,10 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 pass
         # Fee/rate/ETA display enrichment always runs (independent of the price
         # provider). reference_rate prefers the market price ratio and falls
-        # back to the quoted output/input; total_payment is the source asset
-        # the user pays including provider + network fees; eta is a documented
-        # per-provider estimate unless the provider discloses a real one.
+        # back to the quoted output/input. Provider/network fees normally reduce
+        # the destination amount, so only source-denominated fees belong in
+        # total_payment. eta is a documented per-provider estimate unless the
+        # provider discloses a real one.
         enriched_display: list[dict[str, Any]] = []
         for item in quotes:
             q = dict(item)
@@ -10196,7 +10224,12 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
                 reference_rate = output / input_amount
             if reference_rate is not None:
                 q["reference_rate"] = str(reference_rate)
-            q["total_payment"] = str(input_amount + network_fee + provider_fee)
+            source_fee = Decimal(0)
+            if _fee_is_in_source_asset(q, "provider_fee", "provider_fee_asset"):
+                source_fee += provider_fee
+            if _fee_is_in_source_asset(q, "network_fee", "network_fee_asset"):
+                source_fee += network_fee
+            q["total_payment"] = str(input_amount + source_fee)
             q["eta"] = q.get("eta") or _provider_eta_estimate(q.get("provider"))
             enriched_display.append(q)
         if enriched_display:

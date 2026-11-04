@@ -411,6 +411,11 @@ POST /v1/transfer/{session_id}/broadcast
   服务端归一化成 `PROVIDER_PREPARE_FAILED`（`details.provider_code = "103"`）；App 应提示用户
   检查收款地址，不要当成可重试的服务故障。BTC 兑换的 `pending_transaction` 与转账同形：
   `display.format = "psbt"`，另有 `input_count` / `fee_raw` / `change_raw` / `unsigned_tx_hex`。
+- 报价手续费口径：`provider_fee` 与 `network_fee` 都是**目标币数量**，
+  `provider_fee_asset` / `network_fee_asset` 给出各自币种。Bridgers 的 `feeToken`
+  通常是空字符串，其 `fee` 是费率；OmniBridge 的 `depositCoinFeeRate` 虽在源币侧
+  计算，归一化后也换算成目标币损失再返回。两笔费用都从目标币到账金额中扣除，
+  `total_payment` 只表示源币实付，不能把手续费再加到源币输入金额上。
 - 实测还发现 Bridgers 对**中国大陆出口 IP** 返回 `resCode 1114`（不在服务地区），
   因此部署出口必须在境外（测试服 us-east-1 正常）；App 侧遇到该错误应提示用户，不要当成参数错误。
   `/v1/swap/{session_id}/broadcast` 回传哈希，再按 Provider 订单轮询状态。

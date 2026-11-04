@@ -47,6 +47,13 @@ class FakeProvider:
             input_amount_raw=request.input_amount_raw,
             expected_output=Decimal("9"),
             expected_output_raw="9000000",
+            provider_fee=Decimal("0.02"),
+            provider_fee_raw="20000",
+            provider_fee_asset=request.destination_asset,
+            provider_fee_rate=Decimal("0.002"),
+            network_fee=Decimal("0.01"),
+            network_fee_raw="10000",
+            network_fee_asset=request.destination_asset,
             provider_reference="quote-ref",
         )
 
@@ -207,9 +214,9 @@ async def test_okx_price_enrichment_survives_session_projection_and_confirmation
     )
     assert session.json()["quote"]["price_snapshots"][0]["provider"] == "okx"
     assert session.json()["quote"]["usd_input_value"] == "10"
-    # Display enrichment: reference rate (price ratio when prices are known),
-    # total payment (source asset incl. fees) and ETA are on the quote and the
-    # confirmation summary so the App does not recompute them itself.
+    # Display enrichment: reference rate, total payment and ETA are on the quote
+    # and confirmation summary. Provider/network fees are deducted from the
+    # destination amount, so they must not be added to the source payment.
     assert session.json()["quote"]["reference_rate"] == "1"
     assert session.json()["quote"]["total_payment"] == "10"
     assert session.json()["quote"]["eta"] == "约 1-2 分钟"
@@ -225,10 +232,11 @@ async def test_okx_price_enrichment_survives_session_projection_and_confirmation
     assert summary["total_payment"] == "10"
     assert summary["eta"] == "约 1-2 分钟"
     assert summary["usd_input_value"] == "10"
-    # FakeProvider returns no fee fields, so the confirmation mirrors them as
-    # None (the App falls back gracefully) while the derived values still exist.
-    assert summary["network_fee"] is None
-    assert summary["provider_fee"] is None
+    assert summary["provider_fee"] == "0.02"
+    assert summary["provider_fee_asset"]["symbol"] == "USDT"
+    assert summary["provider_fee_rate"] == "0.002"
+    assert summary["network_fee"] == "0.01"
+    assert summary["network_fee_asset"]["symbol"] == "USDT"
     card_kinds = [
         next(iter(item["artifacts"].keys() - {"response"}))
         for item in conversation.json()["messages"]

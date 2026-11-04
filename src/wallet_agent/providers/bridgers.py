@@ -256,6 +256,35 @@ class BridgersProvider:
         expected_raw = _raw_decimal(expected, to_decimals)
         minimum_raw = str(tx.get("amountOutMin", "0"))
         minimum = _quote_decimal(minimum_raw, "amountOutMin") / (Decimal(10) ** to_decimals)
+        fee_rate = (
+            _quote_decimal(tx["fee"], "fee") if tx.get("fee") is not None else Decimal(0)
+        )
+        if fee_rate > 1:
+            raise ProviderResponseError("100", "Invalid fee", category="client")
+        instant_rate = (
+            _quote_decimal(tx["instantRate"], "instantRate")
+            if tx.get("instantRate") is not None
+            else None
+        )
+        network_fee = (
+            _quote_decimal(tx["chainFee"], "chainFee")
+            if tx.get("chainFee") is not None
+            else None
+        )
+        # Bridgers documents ``fee`` as a ratio. It is applied after conversion
+        # and, together with ``chainFee``, reduces the destination amount. When
+        # ``instantRate`` is present we can calculate the destination-denominated
+        # provider fee directly. Otherwise infer it from the net output and the
+        # destination network fee using the same ratio.
+        if instant_rate is not None:
+            provider_fee = request.input_amount * instant_rate * fee_rate
+        elif fee_rate < 1:
+            provider_fee = (
+                (expected + (network_fee or Decimal(0))) * fee_rate
+                / (Decimal(1) - fee_rate)
+            )
+        else:
+            provider_fee = Decimal(0)
         metadata = {
             "request": payload,
             "tx_data": tx,
@@ -302,10 +331,17 @@ class BridgersProvider:
             expected_output_raw=expected_raw,
             minimum_output=minimum,
             minimum_output_raw=minimum_raw,
-            provider_fee=_quote_decimal(tx["fee"], "fee") if tx.get("fee") is not None else None,
-            network_fee=_quote_decimal(tx["chainFee"], "chainFee")
-            if tx.get("chainFee") is not None
-            else None,
+            provider_fee=provider_fee,
+            provider_fee_raw=_raw_decimal(provider_fee, to_decimals),
+            provider_fee_asset=request.destination_asset,
+            provider_fee_rate=fee_rate,
+            network_fee=network_fee,
+            network_fee_raw=(
+                _raw_decimal(network_fee, to_decimals) if network_fee is not None else None
+            ),
+            network_fee_asset=(
+                request.destination_asset if network_fee is not None else None
+            ),
             expires_at=None,
             provider_reference=reference,
             provider_payload=provider_payload,

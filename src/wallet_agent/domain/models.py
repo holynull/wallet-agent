@@ -275,10 +275,19 @@ class NormalizedQuote(DomainModel):
     expected_output_raw: RawInteger
     minimum_output: Decimal | None = Field(default=None, ge=0)
     minimum_output_raw: RawInteger | None = None
+    #: Provider fee expressed in ``provider_fee_asset`` units. Swap providers
+    #: deduct it from the destination amount, so this is normally the
+    #: destination asset even when the provider applies the rate to the source
+    #: amount before conversion.
     provider_fee: Decimal | None = Field(default=None, ge=0)
     provider_fee_raw: RawInteger | None = None
+    provider_fee_asset: Asset | None = None
+    provider_fee_rate: Decimal | None = Field(default=None, ge=0)
+    #: Provider-reported destination-chain gas/fee. It reduces the amount the
+    #: user receives and is denominated in ``network_fee_asset``.
     network_fee: Decimal | None = Field(default=None, ge=0)
     network_fee_raw: RawInteger | None = None
+    network_fee_asset: Asset | None = None
     expires_at: datetime | None = None
     provider_reference: str
     provider_payload: dict[str, JsonValue] = Field(default_factory=dict)
@@ -299,8 +308,9 @@ class NormalizedQuote(DomainModel):
     #: the source data is unavailable so the App can fall back gracefully.
     #: ``reference_rate`` is how many destination units one source unit buys
     #: (price-based when available, else the quoted output/input ratio).
-    #: ``total_payment`` is the source asset the user pays including provider
-    #: and network fees (best effort; provider fee semantics vary by provider).
+    #: ``total_payment`` is the amount debited from the user's source asset.
+    #: Provider/network fees are deducted from the destination amount by the
+    #: supported swap providers and therefore are not added to this value.
     #: ``eta`` is the provider's estimated landing time, or a documented
     #: per-provider display estimate when the provider does not disclose one.
     reference_rate: Decimal | None = Field(default=None, ge=0)

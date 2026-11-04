@@ -169,8 +169,16 @@ async def test_omnibridge_800_quote_normalizes_amounts_and_preserves_source_flag
 
     assert quote.expected_output == Decimal("10.2920366334312920")
     assert quote.expected_output_raw == "10292036633431292000"
-    assert quote.provider_fee == Decimal("0.003")
+    # OmniBridge deducts the source-side deposit fee before applying
+    # ``instantRate``. For the card, normalize it to the destination amount the
+    # user loses; ``chainFee`` is already denominated in the destination coin.
+    assert quote.provider_fee == Decimal("0.020627327922708")
+    assert quote.provider_fee_raw == "20627327922708000"
+    assert quote.provider_fee_asset == quote.destination_asset
+    assert quote.provider_fee_rate == Decimal("0.002")
     assert quote.network_fee == Decimal("0.001")
+    assert quote.network_fee_raw == "1000000000000000"
+    assert quote.network_fee_asset == quote.destination_asset
     assert transport.calls[0] == {
         "path": "/api/v1/getBaseInfo",
         "payload": {

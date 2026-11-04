@@ -269,18 +269,19 @@ def valid_quote_request() -> SwapQuoteRequest:
 
 def quote_response(**overrides: Any) -> dict[str, Any]:
     tx_data = {
-        "toTokenAmount": "9.8",
-        "amountOutMin": "9700000",
+        "toTokenAmount": "9.972562",
+        "amountOutMin": "9972562",
         "fromTokenAmount": "10000000",
         "fromTokenDecimal": 6,
         "toTokenDecimal": 6,
         "depositMin": "0.1",
         "depositMax": "1000",
-        "fee": "0.002",
+        "fee": "0.003",
         "chainFee": "0.01",
+        "instantRate": "1.00126",
         "contractAddress": "0x0000000000000000000000000000000000000033",
         "dex": "Bridgers",
-        "feeToken": "USDC",
+        "feeToken": "",
         "path": [],
         "logoUrl": "https://example.invalid/logo.png",
     }
@@ -295,12 +296,20 @@ async def test_bridgers_quote_converts_units_and_preserves_raw_amounts():
 
     quote = await provider.quote(valid_quote_request())
 
-    assert quote.expected_output == Decimal("9.8")
-    assert quote.expected_output_raw == "9800000"
-    assert quote.minimum_output == Decimal("9.7")
-    assert quote.minimum_output_raw == "9700000"
-    assert quote.provider_fee == Decimal("0.002")
+    assert quote.expected_output == Decimal("9.972562")
+    assert quote.expected_output_raw == "9972562"
+    assert quote.minimum_output == Decimal("9.972562")
+    assert quote.minimum_output_raw == "9972562"
+    # Bridgers documents ``fee`` as a ratio, not a token amount. Both the
+    # provider fee and the target-chain gas fee reduce the destination amount,
+    # so the normalized quote exposes both in destination units.
+    assert quote.provider_fee == Decimal("0.030037800")
+    assert quote.provider_fee_raw == "30037"
+    assert quote.provider_fee_asset == quote.destination_asset
+    assert quote.provider_fee_rate == Decimal("0.003")
     assert quote.network_fee == Decimal("0.01")
+    assert quote.network_fee_raw == "10000"
+    assert quote.network_fee_asset == quote.destination_asset
     assert transport.calls == [
         {
             "path": "/api/sswap/quote",
@@ -509,7 +518,7 @@ async def test_bridgers_quote_payload_contains_only_normalized_resume_metadata()
         "from_token_address": "0x0000000000000000000000000000000000000011",
         "to_token_address": "0x0000000000000000000000000000000000000022",
         "slippage_bps": 100,
-        "amount_out_min_raw": "9700000",
+            "amount_out_min_raw": "9972562",
     }
     assert "request" not in quote.provider_payload
     assert "tx_data" not in quote.provider_payload
@@ -544,12 +553,12 @@ async def test_bridgers_prepare_uses_quote_minimum_and_returns_unsigned_transact
     assert transaction.gas_limit is None
     assert transaction.display == {
         "input_amount": "10",
-        "expected_output": "9.8",
-        "minimum_output": "9.7",
+        "expected_output": "9.972562",
+        "minimum_output": "9.972562",
     }
     payload = transport.calls[1]["payload"]
     assert payload["fromTokenAmount"] == "10000000"
-    assert payload["amountOutMin"] == "9700000"
+    assert payload["amountOutMin"] == "9972562"
     assert payload["slippage"] == "0.01"
 
 

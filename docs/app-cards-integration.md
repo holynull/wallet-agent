@@ -337,6 +337,11 @@ App 需按占位处理（不要用别的链 logo 顶替）。
 - 数据：`react_results` 里 `tool=="get_swap_quote"` 且 `result.ok==true` 的
   `result.quotes[]`，每项含 `provider` / `provider_reference` / `input_amount` /
   `expected_output` / `source_asset{symbol}` / `destination_asset{symbol}` 等。
+- 手续费：`provider_fee` / `network_fee` 都是**目标币数量**，各自用
+  `provider_fee_asset` / `network_fee_asset` 标明币种；`provider_fee_rate` 是
+  Provider 返回的费率（如 `0.003` 表示 0.3%）。`total_payment` 是用户源币账户的
+  实际扣款，手续费已从目标币到账数量中扣除，**不要再把两个 fee 加到
+  `total_payment`**。
 - logo：每个报价带 `source_chain_logo_url` / `destination_chain_logo_url`，
   资产图标在 `source_asset.logo_url` / `destination_asset.logo_url`，见 §2.5。
 - App 接入：渲染报价行；点「选择此报价」调 `POST /v1/swap/{session_id}/select-quote`
@@ -348,6 +353,8 @@ App 需按占位处理（不要用别的链 logo 顶替）。
 - 数据：`confirmation_state` = `{action, status:"requested", requested_at, expires_at,
   summary{input_amount, source_asset, expected_output, destination_asset,
   recipient_address, provider}, reason, task_id, task_revision, payload_hash}`。
+- 手续费：`summary.provider_fee` / `summary.network_fee` 均为目标币数量，
+  同时返回对应 `*_fee_asset`；`summary.total_payment` 只表示源币实付，不要相加。
 - logo：`summary.source_asset.logo_url` / `summary.destination_asset.logo_url` +
   `summary.source_chain_logo_url` / `summary.destination_chain_logo_url`，见 §2.5。
 - App 接入：确认/取消按钮 → `POST /v1/swap/{session_id}/confirm`
