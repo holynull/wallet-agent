@@ -88,6 +88,37 @@ _AGENT_TEST_INTENTS = {
     "asset_discovery",
 }
 
+_PERSISTENCE_ERROR_MARKERS = (
+    "not connected",
+    "mysql server has gone away",
+    "lost connection to mysql",
+    "connection reset by peer",
+    "server closed the connection unexpectedly",
+    "connection is closed",
+)
+
+
+def _execution_error(exc: Exception) -> dict[str, Any]:
+    """Map internal failures to a stable App-facing error contract."""
+    message = str(exc).lower()
+    if any(marker in message for marker in _PERSISTENCE_ERROR_MARKERS):
+        return AgentError(
+            code="PERSISTENCE_UNAVAILABLE",
+            message="服务暂时不可用，请稍后重试。",
+            retryable=True,
+            details={
+                "reason": "database_connection_lost",
+                "exception_type": type(exc).__name__,
+            },
+        ).model_dump(mode="json")
+    return AgentError(
+        code="AGENT_EXECUTION_ERROR",
+        message="Agent 暂时无法完成请求，请稍后重试。",
+        retryable=True,
+        details={"exception_type": type(exc).__name__},
+    ).model_dump(mode="json")
+
+
 _BROADCAST_RPC_ATTEMPTS = 3
 _BROADCAST_RPC_DELAY_SECONDS = 0.2
 #: Two ways a chain can report on a wallet-returned hash. EVM exposes a
@@ -1551,6 +1582,9 @@ def create_app(
         try:
             if not await event_store.ready() or not await session_store.ready():
                 raise RuntimeError("persistence dependency is unavailable")
+            checkpointer_handle = getattr(app.state, "checkpointer_handle", None)
+            if checkpointer_handle is not None and not await checkpointer_handle.ready():
+                raise RuntimeError("checkpointer persistence is unavailable")
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
@@ -2523,9 +2557,7 @@ def create_app(
             )
             await event_store.set_status(run_id, "failed")
         except Exception as exc:  # errors are returned without exception internals
-            error = AgentError(code="AGENT_EXECUTION_ERROR", message=str(exc)).model_dump(
-                mode="json"
-            )
+            error = _execution_error(exc)
             await append_run_event(
                 run_id,
                 {

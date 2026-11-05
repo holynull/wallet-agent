@@ -158,6 +158,14 @@ class LazyAsyncPostgresSaver:
                 self._context, self._saver = await self._open()
         return self._saver
 
+    async def ready(self) -> bool:
+        """Best-effort check that the configured saver can be opened."""
+        try:
+            await self._get()
+            return True
+        except Exception:
+            return False
+
     async def aget_tuple(self, config: dict[str, Any]) -> Any:
         return await (await self._get()).aget_tuple(config)
 
@@ -212,6 +220,15 @@ class CheckpointerHandle:
     async def aclose(self) -> None:
         await self.checkpointer.aclose()
 
+    async def ready(self) -> bool:
+        ready = getattr(self.checkpointer, "ready", None)
+        if ready is None:
+            return True
+        try:
+            return bool(await ready())
+        except Exception:
+            return False
+
 
 class LazyAsyncMySQLSaver(LazyAsyncPostgresSaver):
     """MySQL saver (community package, mirrors the official Postgres one).
@@ -236,27 +253,44 @@ class LazyAsyncMySQLSaver(LazyAsyncPostgresSaver):
         from langgraph.checkpoint.mysql.asyncmy import AsyncMySaver
 
         parsed = urllib.parse.urlparse(self.dsn)
-        connection = await asyncmy.connect(
+        pool = await asyncmy.create_pool(
             host=parsed.hostname or "localhost",
             port=parsed.port or 3306,
             user=parsed.username,
             password=urllib.parse.unquote(parsed.password or ""),
             db=(parsed.path or "/").lstrip("/").split("?")[0] or None,
             autocommit=True,
-            # The saver keeps one connection for the process lifetime, so an idle
-            # 8h (the server default) is enough for MySQL to drop it and make the
-            # next checkpoint raise "(2006, 'MySQL server has gone away')".
-            # Pinging per call would interleave with concurrent queries on the
-            # same socket, so keep the session alive instead.
-            init_command="SET SESSION wait_timeout=31536000",
+            # LangGraph's AsyncMySaver accepts either a connection or a pool. A
+            # pool is required in production: a single long-lived connection
+            # becomes permanently unusable after an RDS/network reset and every
+            # later checkpoint fails with "(0, 'Not connected')". Recycling idle
+            # pool connections also avoids MySQL wait_timeout failures.
+            minsize=1,
+            maxsize=10,
+            pool_recycle=1800,
         )
-        saver = AsyncMySaver(connection)
+        saver = AsyncMySaver(pool)
         await saver.setup()
-        return connection, saver
+        return pool, saver
 
     async def _close(self, context: Any) -> None:
         context.close()
-        await context.ensure_closed()
+        await context.wait_closed()
+
+    async def ready(self) -> bool:
+        try:
+            await self._get()
+        except Exception:
+            return False
+        try:
+            async with self._context.acquire() as connection:
+                await connection.ping(reconnect=False)
+            return True
+        except Exception:
+            # Readiness is observational: do not tear down a pool that other
+            # in-flight requests may still be using. The pool retires broken
+            # connections on release and recreates them on the next acquire.
+            return False
 
 
 def create_checkpointer(persistence_url: str) -> CheckpointerHandle:

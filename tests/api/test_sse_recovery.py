@@ -167,6 +167,11 @@ class UnavailableRunStore(InMemoryRunStore):
         return False
 
 
+class UnavailableCheckpointerHandle:
+    async def ready(self) -> bool:
+        return False
+
+
 @pytest.mark.asyncio
 async def test_readiness_fails_when_runtime_persistence_is_unavailable():
     app = create_app(graph=object(), run_store=UnavailableRunStore())
@@ -176,3 +181,25 @@ async def test_readiness_fails_when_runtime_persistence_is_unavailable():
 
     assert response.status_code == 503
     assert response.json()["code"] == "PERSISTENCE_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_readiness_fails_when_graph_checkpointer_is_unavailable():
+    app = create_app(graph=object())
+    app.state.checkpointer_handle = UnavailableCheckpointerHandle()
+
+    async with client_for(app) as client:
+        response = await client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "PERSISTENCE_UNAVAILABLE"
+
+
+def test_execution_errors_do_not_expose_database_connection_details():
+    from wallet_agent.api.app import _execution_error
+
+    error = _execution_error(RuntimeError("(0, 'Not connected')"))
+
+    assert error["code"] == "PERSISTENCE_UNAVAILABLE"
+    assert "Not connected" not in error["message"]
+    assert error["retryable"] is True
