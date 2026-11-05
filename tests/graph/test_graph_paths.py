@@ -1470,6 +1470,87 @@ async def test_transaction_status_node_exposes_erc20_amount_and_symbol():
 
 
 @pytest.mark.asyncio
+async def test_transaction_detail_request_overrides_generic_model_reply():
+    """When the user asks for order details, a terse model reply such as
+    “交易已确认。” must not hide the verified token changes and fee."""
+    from wallet_agent.domain.models import TokenTransfer, TransactionDetail, TransactionStatus
+
+    wallet = "0x" + "1" * 40
+
+    class Explorer:
+        async def get_transaction_detail(self, chain, tx_hash):
+            return TransactionDetail(
+                chain=chain,
+                chain_id="1",
+                tx_hash=tx_hash,
+                status=TransactionStatus.CONFIRMED,
+                source="okx",
+                history_kind="full",
+                value="0",
+                symbol="ETH",
+                fee="0.000045666962631906",
+                confirmed_at="2026-09-12T16:11:23Z",
+                token_transfers=[
+                    TokenTransfer(
+                        token="0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                        symbol="USDC",
+                        amount="2",
+                        from_address=wallet,
+                        to_address="0x" + "3" * 40,
+                    ),
+                    TokenTransfer(
+                        token="0x2d1f7226bd1f780af6b9a49dcc0ae00e8df4bdee",
+                        symbol="NVDAon",
+                        amount="0.009060991681527839",
+                        from_address="0x" + "3" * 40,
+                        to_address=wallet,
+                    ),
+                ],
+            )
+
+    class GenericNarratorModel(FakeModel):
+        async def ainvoke(self, _value):
+            return {"intent": "transaction_status"}
+
+        async def respond(self, _request, _facts, messages=None):
+            del messages
+            return {
+                "language": "zh",
+                "message": "交易已确认。",
+                "suggestions": [],
+            }
+
+    graph = build_graph(
+        model=GenericNarratorModel(),
+        chains={"ETH": TransferAdapter()},
+        explorer_provider=Explorer(),
+    )
+    result = await graph.ainvoke(
+        {
+            "conversation_id": "tx-detail",
+            "user_id": "u1",
+            "intent": "transaction_status",
+            "request": {
+                "message": "分析这笔订单的详情？\n交易哈希：0x" + "a" * 64,
+                "address": wallet,
+                "language": "zh",
+            },
+            "wallet_context": {"address": wallet, "chain": "ETH"},
+            "transaction_query": {
+                "chain": "ETH",
+                "tx_hash": "0x" + "a" * 64,
+            },
+        },
+        config={"configurable": {"thread_id": "tx-detail"}},
+    )
+
+    message = result["response"]["message"]
+    assert "2 USDC" in message
+    assert "0.009060991681527839 NVDAon" in message
+    assert "0.000045666962631906 ETH" in message
+
+
+@pytest.mark.asyncio
 async def test_transaction_status_failed_transfer_falls_back_to_draft_asset():
     """A failed ERC20 transfer (explorer carries only the native 0 value) must
     surface the intended moved asset from the session's transfer draft instead

@@ -70,3 +70,48 @@ def test_rejects_portfolio_asset_count_that_does_not_match_facts():
         assert validate_response_draft(
             {"language": "zh", "message": message, "suggestions": []}, facts
         ) is None
+
+
+def test_transaction_detail_message_summarizes_net_wallet_token_changes():
+    from wallet_agent.graph.nodes import _transaction_status_detail_message
+
+    wallet = "0x" + "1" * 40
+    response = {
+        "kind": "transaction_status",
+        "chain": "ETH",
+        "status": "confirmed",
+        "amount": "2",
+        "symbol": "USDC",
+        "detail": {
+            "chain": "ETH",
+            "status": "confirmed",
+            "from_address": wallet,
+            "to_address": "0x" + "2" * 40,
+            "fee": "0.000045666962631906",
+            "symbol": "ETH",
+            "confirmed_at": "2026-09-12T16:11:23Z",
+            "token_transfers": [
+                {
+                    "symbol": "USDC",
+                    "amount": "2",
+                    "from_address": wallet,
+                    "to_address": "0x" + "3" * 40,
+                },
+                {
+                    "symbol": "NVDAon",
+                    "amount": "0.009060991681527839",
+                    "from_address": "0x" + "3" * 40,
+                    "to_address": wallet,
+                },
+            ],
+        },
+    }
+
+    message = _transaction_status_detail_message(
+        response, "zh", wallet_address=wallet
+    )
+
+    assert "ETH" in message
+    assert "2 USDC" in message
+    assert "0.009060991681527839 NVDAon" in message
+    assert "0.000045666962631906 ETH" in message

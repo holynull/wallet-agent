@@ -2345,6 +2345,150 @@ def _wallet_summary_message(wallet: Mapping[str, Any], language: str) -> str:
     return f"This wallet has {len(items)} assets on {chain}:\n" + "\n".join(lines)
 
 
+_TRANSACTION_DETAIL_REQUEST = re.compile(
+    r"(详情|详细|明细|分析|解释|订单|交易内容|发生了什么|"
+    r"\bdetail(?:s)?\b|\bbreakdown\b|\banaly[sz]e\b|\bexplain\b|"
+    r"what happened)",
+    re.IGNORECASE,
+)
+
+
+def _wants_transaction_details(message: str) -> bool:
+    return bool(_TRANSACTION_DETAIL_REQUEST.search(str(message or "")))
+
+
+def _transaction_token_changes(
+    detail: Mapping[str, Any], wallet_address: str | None
+) -> list[tuple[str, Decimal]]:
+    wallet = str(wallet_address or "").strip()
+    if not wallet:
+        return []
+    wallet_lower = wallet.lower()
+    changes: dict[tuple[str, str], Decimal] = {}
+    for transfer in detail.get("token_transfers") or []:
+        if not isinstance(transfer, Mapping):
+            continue
+        try:
+            amount = Decimal(str(transfer.get("amount") or "0"))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if not amount.is_finite() or amount <= 0:
+            continue
+        token = str(transfer.get("token") or "")
+        symbol = str(transfer.get("symbol") or "Token")
+        from_address = str(transfer.get("from_address") or "")
+        to_address = str(transfer.get("to_address") or "")
+        key = (token.lower(), symbol)
+        changes.setdefault(key, Decimal(0))
+        if from_address and (
+            from_address == wallet or from_address.lower() == wallet_lower
+        ):
+            changes[key] -= amount
+        if to_address and (to_address == wallet or to_address.lower() == wallet_lower):
+            changes[key] += amount
+    return [
+        (symbol, amount)
+        for (_, symbol), amount in sorted(changes.items(), key=lambda item: item[0][1])
+        if amount != 0
+    ]
+
+
+def _transaction_status_detail_message(
+    response: Mapping[str, Any],
+    language: str,
+    *,
+    wallet_address: str | None = None,
+) -> str:
+    """Build a deterministic, fact-complete transaction summary."""
+    detail = response.get("detail")
+    if not isinstance(detail, Mapping):
+        detail = {}
+    chain = str(response.get("chain") or detail.get("chain") or "").strip()
+    status = str(response.get("status") or detail.get("status") or "").lower()
+    english = str(language or "").split("-")[0].lower() == "en"
+    if status == "confirmed":
+        headline = (
+            f"This {chain} transaction is confirmed."
+            if english
+            else f"这笔 {chain} 交易已确认。"
+        )
+    elif status in {"pending", "processing"}:
+        headline = (
+            f"This {chain} transaction is still confirming."
+            if english
+            else f"这笔 {chain} 交易仍在确认中。"
+        )
+    elif status == "failed":
+        headline = (
+            f"This {chain} transaction failed."
+            if english
+            else f"这笔 {chain} 交易已失败。"
+        )
+    else:
+        headline = (
+            f"The status of this {chain} transaction is currently unknown."
+            if english
+            else f"暂时无法确定这笔 {chain} 交易的状态。"
+        )
+    lines = [headline]
+    changes = _transaction_token_changes(detail, wallet_address)
+    if changes:
+        lines.append("Balance changes:" if english else "资金变化：")
+        for symbol, amount in changes:
+            if amount < 0:
+                action = "Paid" if english else "支付"
+                amount_text = format(abs(amount), "f")
+            else:
+                action = "Received" if english else "收到"
+                amount_text = format(amount, "f")
+            lines.append(f"- {action} {amount_text} {symbol}")
+    else:
+        amount = response.get("amount")
+        symbol = response.get("symbol")
+        if amount is not None and symbol:
+            label = "Amount" if english else "数量"
+            lines.append(f"{label}: {amount} {symbol}")
+        transfers = [
+            item for item in detail.get("token_transfers") or [] if isinstance(item, Mapping)
+        ]
+        if transfers:
+            lines.append("Token transfers:" if english else "代币转账：")
+            for transfer in transfers[:4]:
+                lines.append(
+                    f"- {transfer.get('amount')} {transfer.get('symbol') or 'Token'}: "
+                    f"{_short_address(str(transfer.get('from_address') or ''))} → "
+                    f"{_short_address(str(transfer.get('to_address') or ''))}"
+                )
+    fee = detail.get("fee")
+    if fee not in (None, ""):
+        fee_symbol = str(detail.get("symbol") or chain)
+        lines.append(
+            f"{'Network fee' if english else '网络手续费'}: {fee} {fee_symbol}"
+        )
+    confirmed_at = detail.get("confirmed_at") or detail.get("occurred_at")
+    if confirmed_at:
+        lines.append(
+            f"{'Confirmed at' if english else '确认时间'}: {confirmed_at}"
+        )
+    from_address = str(detail.get("from_address") or "")
+    to_address = str(detail.get("to_address") or "")
+    if from_address or to_address:
+        lines.append(
+            (
+                f"From: {_short_address(from_address)}; To: {_short_address(to_address)}"
+                if english
+                else f"发送方：{_short_address(from_address)}；接收方："
+                f"{_short_address(to_address)}"
+            )
+        )
+    failure_reason = response.get("failure_reason") or detail.get("failure_reason")
+    if failure_reason:
+        lines.append(
+            f"{'Failure reason' if english else '失败原因'}: {failure_reason}"
+        )
+    return "\n".join(lines)
+
+
 def _read_response_fallback(response: Mapping[str, Any], language: str) -> str:
     """Provide a useful deterministic summary when response generation is unavailable."""
     kind = str(response.get("kind") or "")
@@ -2439,7 +2583,9 @@ def _read_response_fallback(response: Mapping[str, Any], language: str) -> str:
             if language == "zh"
             else f"I found {count} matching assets."
         )
-    if kind in {"transaction_status", "swap_status"}:
+    if kind == "transaction_status":
+        return _transaction_status_detail_message(response, language)
+    if kind == "swap_status":
         return str(response.get("message") or "暂时无法确定交易状态。")
     if kind == "swap_quote":
         count = len(response.get("quotes") or [])
@@ -6383,6 +6529,19 @@ def make_nodes(runtime: GraphRuntime) -> dict[str, Any]:
             result["message"] = _read_response_fallback(result, facts["language_hint"])
             if response_validation == "deterministic":
                 response_validation = "fallback"
+        if kind == "transaction_status" and _wants_transaction_details(message):
+            wallet_context = state.get("wallet_context") or {}
+            wallet_address = request.get("address") or (
+                wallet_context.get("address")
+                if isinstance(wallet_context, Mapping)
+                else None
+            )
+            result["message"] = _transaction_status_detail_message(
+                result,
+                facts["language_hint"],
+                wallet_address=str(wallet_address) if wallet_address else None,
+            )
+            response_validation = "deterministic_detail"
         portfolio = result.get("portfolio") or result if kind == "portfolio_query" else {}
         scope = portfolio.get("scope") or {} if isinstance(portfolio, Mapping) else {}
         wallet_event(
