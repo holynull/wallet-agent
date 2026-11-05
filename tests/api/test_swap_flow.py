@@ -767,6 +767,103 @@ async def test_swap_get_recover_stale_not_propagated_broadcast():
 
 
 @pytest.mark.asyncio
+async def test_swap_get_recovery_uses_prepared_provider_order_reference():
+    """OmniBridge expects its order id for ``modifyTxId``, not the quote hash.
+
+    A stale ``not_propagated`` session can only self-heal on passive GET if the
+    recovery path forwards the prepared order reference. Using the quote
+    reference makes OmniBridge reject the registration and leaves the swap
+    stuck forever.
+    """
+
+    class RecordingProvider(FakeProvider):
+        def __init__(self):
+            super().__init__()
+            self.registration_reference = None
+
+        async def register_broadcast(self, provider_reference, tx_hash, **kwargs):
+            self.registration_reference = provider_reference
+            return ProviderOrder(
+                provider="omnibridge",
+                provider_order_id=provider_reference,
+                provider_reference=provider_reference,
+                tx_hash=tx_hash,
+            )
+
+        async def get_status(self, order):
+            return NormalizedOrderStatus(
+                provider="omnibridge",
+                provider_order_id=order.provider_order_id,
+                provider_reference=order.provider_reference,
+                status="completed",
+                tx_hash=order.tx_hash,
+            )
+
+    class ReceiptAdapter:
+        async def get_transaction_receipt(self, _tx_hash):
+            return {"status": "0x1", "blockNumber": "0x10"}
+
+    source = Asset(
+        chain="ETH", chain_id=1, symbol="USDC", decimals=6, address="0x" + "1" * 40
+    )
+    destination = Asset(
+        chain="BSC", chain_id=56, symbol="BNB", decimals=18
+    )
+    quote = NormalizedQuote(
+        provider="omnibridge",
+        source_asset=source,
+        destination_asset=destination,
+        input_amount=Decimal("8.483569"),
+        input_amount_raw="8483569",
+        expected_output=Decimal("0.0117"),
+        expected_output_raw="11700000000000000",
+        provider_reference="quote-hash",
+    )
+    pending = DepositOrder(
+        provider="omnibridge",
+        provider_order_id="omni-order-123",
+        deposit_address="0x" + "9" * 40,
+        source_asset=source,
+        destination_asset=destination,
+        input_amount=Decimal("8.483569"),
+        input_amount_raw="8483569",
+        provider_reference="omni-order-123",
+    )
+    store = InMemorySessionStore()
+    await store.save(
+        SwapSessionRecord(
+            session_id="s-recover-order-id",
+            user_id="alice",
+            thread_id="t-recover-order-id",
+            quote=quote,
+            pending_transaction=pending,
+            broadcast_tx_hash="0x" + "e" * 64,
+            status="not_propagated",
+            stage="not_propagated",
+            broadcast_status="not_propagated",
+        )
+    )
+    provider = RecordingProvider()
+    graph = build_graph(model=FakeModel(), providers=[provider])
+    app = create_app(
+        graph=graph,
+        providers={"omnibridge": provider},
+        store=store,
+        chain_registry=ChainAdapterRegistry({"ETH": ReceiptAdapter()}),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/v1/swap/s-recover-order-id", params={"user_id": "alice"}
+        )
+
+    assert response.status_code == 200
+    assert provider.registration_reference == "omni-order-123"
+
+
+@pytest.mark.asyncio
 async def test_react_swap_auto_confirm_ignores_stale_broadcast():
     """A fresh ReAct quote must not be hijacked by an old broadcast_tx_hash into
     register_broadcast/status_poll (the App would never see the swap card)."""

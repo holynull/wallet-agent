@@ -787,9 +787,17 @@ async def _recover_swap_session_order(
             return None
     except Exception:
         return None
+    # OmniBridge registers ``modifyTxId`` by the order id returned from
+    # ``/api/v2/accountExchange``. The quote reference is only a local hash and
+    # is rejected by the provider, leaving a not_propagated swap unrecoverable
+    # forever. Prefer the reference persisted on the prepared deposit order.
+    provider_reference = (
+        getattr(session.pending_transaction, "provider_reference", None)
+        or session.quote.provider_reference
+    )
     try:
         order = await provider.register_broadcast(
-            str(session.quote.provider_reference),
+            str(provider_reference),
             session.broadcast_tx_hash,
             quote=session.quote,
         )
