@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 import pytest
 
-from wallet_agent.persistence.checkpoints import LazyAsyncMySQLSaver
+from wallet_agent.persistence.checkpoints import LazyAsyncMySQLSaver, create_checkpointer
 
 
 class FakeConnection:
@@ -54,7 +54,10 @@ async def test_mysql_checkpointer_opens_a_recycled_connection_pool(monkeypatch):
     monkeypatch.setattr("langgraph.checkpoint.mysql.asyncmy.AsyncMySaver", FakeSaver)
 
     saver = LazyAsyncMySQLSaver(
-        "mysql+asyncmy://user:password@localhost:3306/wallet_agent"
+        "mysql+asyncmy://user:password@localhost:3306/wallet_agent",
+        pool_min_size=2,
+        pool_max_size=17,
+        pool_recycle_seconds=1234,
     )
 
     assert await saver.ready() is True
@@ -66,9 +69,9 @@ async def test_mysql_checkpointer_opens_a_recycled_connection_pool(monkeypatch):
     assert captured["password"] == "password"
     assert captured["db"] == "wallet_agent"
     assert captured["autocommit"] is True
-    assert captured["minsize"] >= 1
-    assert captured["maxsize"] > captured["minsize"]
-    assert captured["pool_recycle"] > 0
+    assert captured["minsize"] == 2
+    assert captured["maxsize"] == 17
+    assert captured["pool_recycle"] == 1234
 
     await saver.aclose()
     assert pool.closed is True
@@ -90,3 +93,26 @@ async def test_mysql_checkpointer_reports_not_ready_when_pool_cannot_connect(mon
     )
 
     assert await saver.ready() is False
+
+
+def test_mysql_checkpointer_rejects_invalid_pool_bounds():
+    with pytest.raises(ValueError, match="pool max size"):
+        LazyAsyncMySQLSaver(
+            "mysql+asyncmy://user:password@localhost:3306/wallet_agent",
+            pool_min_size=11,
+            pool_max_size=10,
+        )
+
+
+def test_create_checkpointer_passes_mysql_pool_configuration():
+    handle = create_checkpointer(
+        "mysql+asyncmy://user:password@localhost:3306/wallet_agent",
+        mysql_pool_min_size=3,
+        mysql_pool_max_size=12,
+        mysql_pool_recycle_seconds=900,
+    )
+
+    assert isinstance(handle.checkpointer, LazyAsyncMySQLSaver)
+    assert handle.checkpointer.pool_min_size == 3
+    assert handle.checkpointer.pool_max_size == 12
+    assert handle.checkpointer.pool_recycle_seconds == 900

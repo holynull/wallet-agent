@@ -242,6 +242,27 @@ class LazyAsyncMySQLSaver(LazyAsyncPostgresSaver):
     _module = "langgraph.checkpoint.mysql.asyncmy"
     _class_name = "AsyncMySaver"
 
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        pool_min_size: int = 1,
+        pool_max_size: int = 10,
+        pool_recycle_seconds: int = 1800,
+    ) -> None:
+        if pool_min_size < 0:
+            raise ValueError("MySQL checkpointer pool min size must be non-negative")
+        if pool_max_size < 1:
+            raise ValueError("MySQL checkpointer pool max size must be positive")
+        if pool_min_size > pool_max_size:
+            raise ValueError("MySQL checkpointer pool max size must be >= min size")
+        if pool_recycle_seconds < 1:
+            raise ValueError("MySQL checkpointer pool recycle must be positive")
+        super().__init__(dsn)
+        self.pool_min_size = pool_min_size
+        self.pool_max_size = pool_max_size
+        self.pool_recycle_seconds = pool_recycle_seconds
+
     @staticmethod
     def _normalize(url: str) -> str:
         return _mysql_dsn(url)
@@ -265,9 +286,9 @@ class LazyAsyncMySQLSaver(LazyAsyncPostgresSaver):
             # becomes permanently unusable after an RDS/network reset and every
             # later checkpoint fails with "(0, 'Not connected')". Recycling idle
             # pool connections also avoids MySQL wait_timeout failures.
-            minsize=1,
-            maxsize=10,
-            pool_recycle=1800,
+            minsize=self.pool_min_size,
+            maxsize=self.pool_max_size,
+            pool_recycle=self.pool_recycle_seconds,
         )
         saver = AsyncMySaver(pool)
         await saver.setup()
@@ -293,12 +314,25 @@ class LazyAsyncMySQLSaver(LazyAsyncPostgresSaver):
             return False
 
 
-def create_checkpointer(persistence_url: str) -> CheckpointerHandle:
+def create_checkpointer(
+    persistence_url: str,
+    *,
+    mysql_pool_min_size: int = 1,
+    mysql_pool_max_size: int = 10,
+    mysql_pool_recycle_seconds: int = 1800,
+) -> CheckpointerHandle:
     """Create a durable checkpointer for the configured persistence URL."""
     if persistence_url.startswith(("sqlite://", "sqlite+aiosqlite://")):
         return CheckpointerHandle(LazyAsyncSqliteSaver(_sqlite_path(persistence_url)))
     if persistence_url.startswith(("postgres://", "postgresql://", "postgresql+")):
         return CheckpointerHandle(LazyAsyncPostgresSaver(persistence_url))
     if persistence_url.startswith(("mysql://", "mysql+")):
-        return CheckpointerHandle(LazyAsyncMySQLSaver(persistence_url))
+        return CheckpointerHandle(
+            LazyAsyncMySQLSaver(
+                persistence_url,
+                pool_min_size=mysql_pool_min_size,
+                pool_max_size=mysql_pool_max_size,
+                pool_recycle_seconds=mysql_pool_recycle_seconds,
+            )
+        )
     raise ValueError(f"unsupported persistence URL: {persistence_url}")

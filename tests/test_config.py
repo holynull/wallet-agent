@@ -34,6 +34,9 @@ def test_settings_load_non_secret_defaults(monkeypatch):
     assert settings.run_event_max_entries == 2_000
     assert settings.conversation_lock_lease_seconds == 120
     assert settings.conversation_lock_wait_seconds == 30
+    assert settings.mysql_checkpoint_pool_min_size == 1
+    assert settings.mysql_checkpoint_pool_max_size == 10
+    assert settings.mysql_checkpoint_pool_recycle_seconds == 1800
     assert settings.request_signature_mode == "off"
     assert settings.request_signature_ttl_seconds == 300
     assert settings.admin_token is None
@@ -85,11 +88,38 @@ def test_react_compatibility_mode_requires_explicit_opt_in(monkeypatch):
         ("react_max_steps", 33),
         ("react_tool_timeout_seconds", 0),
         ("metadata_cache_max_entries", -1),
+        ("mysql_checkpoint_pool_min_size", -1),
+        ("mysql_checkpoint_pool_max_size", 0),
+        ("mysql_checkpoint_pool_recycle_seconds", 0),
     ],
 )
 def test_settings_rejects_invalid_polling_and_timeout_values(monkeypatch, field, value):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **{field: value})
+
+
+def test_settings_rejects_mysql_pool_min_above_max(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            mysql_checkpoint_pool_min_size=11,
+            mysql_checkpoint_pool_max_size=10,
+        )
+
+
+def test_settings_read_mysql_pool_environment_overrides(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("MYSQL_CHECKPOINT_POOL_MIN_SIZE", "3")
+    monkeypatch.setenv("MYSQL_CHECKPOINT_POOL_MAX_SIZE", "12")
+    monkeypatch.setenv("MYSQL_CHECKPOINT_POOL_RECYCLE_SECONDS", "900")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.mysql_checkpoint_pool_min_size == 3
+    assert settings.mysql_checkpoint_pool_max_size == 12
+    assert settings.mysql_checkpoint_pool_recycle_seconds == 900
 
 

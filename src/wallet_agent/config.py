@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     metadata_cache_max_entries: int = Field(default=512, ge=0, le=100_000)
 
     persistence_url: str = "sqlite+aiosqlite:///./wallet_agent.db"
+    mysql_checkpoint_pool_min_size: int = Field(default=1, ge=0, le=100)
+    mysql_checkpoint_pool_max_size: int = Field(default=10, ge=1, le=1000)
+    mysql_checkpoint_pool_recycle_seconds: int = Field(default=1800, ge=1, le=86_400)
     redis_url: str | None = None
     redis_key_prefix: str = "wallet-agent"
     run_event_ttl_seconds: int = Field(default=86_400, ge=60)
@@ -99,6 +102,11 @@ class Settings(BaseSettings):
     def require_model_key(self) -> "Settings":
         if not (self.deepseek_api_key or self.openai_api_key):
             raise ValueError("DEEPSEEK_API_KEY or OPENAI_API_KEY is required")
+        if self.mysql_checkpoint_pool_min_size > self.mysql_checkpoint_pool_max_size:
+            raise ValueError(
+                "MYSQL_CHECKPOINT_POOL_MIN_SIZE must not exceed "
+                "MYSQL_CHECKPOINT_POOL_MAX_SIZE"
+            )
         configured_signature_secret = (
             self.request_signature_secret is not None
             and bool(self.request_signature_secret.get_secret_value())

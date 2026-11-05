@@ -293,7 +293,12 @@ def build_application(settings: Settings | None = None) -> Any:
     metadata_cache = dependencies["metadata_cache"]
     metrics = dependencies["metrics"]
     okx_client = dependencies["okx_client"]
-    checkpoint_handle = initialize_checkpointer(settings.persistence_url)
+    checkpoint_handle = initialize_checkpointer(
+        settings.persistence_url,
+        mysql_pool_min_size=settings.mysql_checkpoint_pool_min_size,
+        mysql_pool_max_size=settings.mysql_checkpoint_pool_max_size,
+        mysql_pool_recycle_seconds=settings.mysql_checkpoint_pool_recycle_seconds,
+    )
     graph = build_runtime_graph(settings, checkpointer=checkpoint_handle.checkpointer)
     session_store = SqlSessionStore(settings.persistence_url)
     redis_client = None
