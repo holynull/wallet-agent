@@ -34,6 +34,7 @@
 | 运行时 | Dockerfile 单阶段、**以 root 运行**、无 workers、无资源限制 | 非 root 用户；uvicorn/gunicorn 多 worker；compose 里加 CPU/内存限额 |
 | 发布 | ssh + `git pull` + 手工 `./scripts/redeploy.sh` | CI/CD：构建镜像 → 推 registry → 滚动发布；**必须能一键回滚**（现在回滚只能 `git reset --hard`，属破坏性操作） |
 | 可观测性 | 只有进程内 `/debug/metrics` + 容器日志 | 结构化日志聚合 + 指标导出（Prometheus/OTel）。注意 `/debug/metrics` **是单副本进程内的，多实例下不能当全局指标** |
+| Redis 客户端韧性 | `redis.asyncio.from_url()` 使用默认连接池，未显式配置 timeout、health check、keepalive、retry、连接池上限 | 配置 `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS`、`REDIS_SOCKET_TIMEOUT_SECONDS`、`REDIS_HEALTH_CHECK_INTERVAL_SECONDS`、`REDIS_SOCKET_KEEPALIVE`、`REDIS_RETRY_ON_TIMEOUT`、`REDIS_MAX_CONNECTIONS`；详见 roadmap backlog |
 
 ### P2（按需）
 

@@ -198,6 +198,37 @@ extractor 提取，业务 Graph 负责合并、校验、路由和确认安全。
 
 ## 待办工作（Backlog）
 
+### Redis 客户端连接与故障恢复显式配置
+
+记录时间：2026-11-05。来源：MySQL checkpointer 长连接故障复盘。
+
+背景：当前 Redis 客户端由 `redis.asyncio.from_url(settings.redis_url, decode_responses=True)`
+创建。它内部有连接池，不是单 socket 长连接，但目前没有显式设置连接超时、健康检查、
+keepalive、重试和连接池上限。Redis 重启或网络抖动时，run event 写入、conversation
+lock 获取/续租、HMAC nonce 写入都可能直接失败，`/ready` 也可能因默认等待策略而变慢。
+
+建议配置：
+
+- `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS`（默认 5）
+- `REDIS_SOCKET_TIMEOUT_SECONDS`（默认 5）
+- `REDIS_HEALTH_CHECK_INTERVAL_SECONDS`（默认 30）
+- `REDIS_SOCKET_KEEPALIVE`（默认 true）
+- `REDIS_RETRY_ON_TIMEOUT`（默认 true）
+- `REDIS_MAX_CONNECTIONS`（默认按 API 副本数与 ElastiCache 上限计算）
+
+实现要点：
+
+- [ ] `src/wallet_agent/main.py` 构造 Redis 客户端时显式传入上述参数。
+- [ ] `RedisRunStore.ready()` 使用有界超时的 `PING`，避免 Redis 卡住时 readiness 挂死。
+- [ ] Redis run event 写入、lock acquire/renew/release、request replay nonce 写入增加
+      有界重试；重试耗尽后返回 `PERSISTENCE_UNAVAILABLE`，不向 App 暴露底层异常。
+- [ ] `RedisRunStore.create/append` 的多步写入（metadata / TTL / stream）改为 pipeline 或
+      Lua，避免半写入状态。
+- [ ] 增加 Redis 重启、连接 reset、超时、lock 续租失败的回归测试。
+
+优先级：P1。Redis 不是单连接风险，但当前默认客户端缺少显式韧性配置，需与 MySQL
+checkpointer 的故障复盘一起补齐。
+
 ### BTC 地址派生（xpub / output descriptor）
 
 记录时间：2026-10-10。来源：多地址 UTXO 聚合落地后的遗留问题。
